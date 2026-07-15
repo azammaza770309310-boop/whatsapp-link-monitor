@@ -5,7 +5,7 @@ __pycache__/
 *.so
 .Python
 
-# Sessions (تحتاج رفعها يدوياً بعد أول تسجيل دخول)
+# Sessions (ملفات الجلسة - لن تُرفع)
 sessions/*.session
 sessions/*.session-journal
 sessions/*.session-shm
@@ -19,10 +19,6 @@ data/*.db-shm
 
 # Logs
 logs/*.log
-
-# Environment
-accounts.env
-.env
 
 # IDE
 .vscode/
