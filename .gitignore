@@ -1,0 +1,35 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# Sessions (تحتاج رفعها يدوياً بعد أول تسجيل دخول)
+sessions/*.session
+sessions/*.session-journal
+sessions/*.session-shm
+sessions/*.session-wal
+
+# Database
+data/*.db
+data/*.db-journal
+data/*.db-wal
+data/*.db-shm
+
+# Logs
+logs/*.log
+
+# Environment
+accounts.env
+.env
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
