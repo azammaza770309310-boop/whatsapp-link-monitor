@@ -940,26 +940,30 @@ class Monitor:
         if self._handlers_registered:
             return
 
-        # User client: monitor new messages in all chats
+        # User client: monitor new messages in all chats (incoming + outgoing)
+        # outgoing=True ضروري لرؤية رسائلك أنت في القناة (للأوامر)
         self.user_client.add_event_handler(
             self._on_new_message,
-            events.NewMessage(),
+            events.NewMessage(incoming=True, outgoing=True),
         )
         # User client: monitor edited messages
         self.user_client.add_event_handler(
             self._on_message_edited,
-            events.MessageEdited(),
+            events.MessageEdited(incoming=True, outgoing=True),
         )
         # User client: listen for commands in destination channel
+        # outgoing=True حتى يرى أوامرك أنت عندما ترسلها من نفس الحساب
         self.user_client.add_event_handler(
             self._on_command,
             events.NewMessage(
                 chats=self.config.channel_id,
                 pattern=r"^/[a-zA-Z_]+",
+                incoming=True,
+                outgoing=True,
             ),
         )
         self._handlers_registered = True
-        logging.info("Handlers registered (user_client)")
+        logging.info("Handlers registered (user_client) - sees incoming + outgoing")
 
     async def _on_new_message(self, event):
         await self._process_message(event)
