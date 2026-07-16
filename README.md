@@ -1,35 +1,34 @@
-# WhatsApp Link Monitor v6 - Production Edition
+# Help Requests Monitor v7
 
-بوت تيليجرام احترافي لسحب روابط واتساب من المجموعات والقنوات تلقائياً.
+بوت سحب طلبات المساعدة الدراسية من المجموعات متعدد المستخدمين.
 
 ## المميزات
 
-- ✅ معمارية مزدوجة (User + Bot)
-- ✅ سحب جميع أنواع روابط واتساب
-- ✅ فلترة الروابط المنتهية تلقائياً
-- ✅ مسح تاريخي متزايد ذكي
-- ✅ أوامر تحكم كاملة عبر تيليجرام
-- ✅ إعادة اتصال تلقائي
-- ✅ جاهز للنشر على Render/Railway
+- ✅ دعم متعدد المستخدمين (كل مستخدم يراقب مجموعاته)
+- ✅ سحب طلبات المساعدة الدراسية (30+ كلمة مفتاحية)
+- ✅ فلترة السبام والإعلانات
+- ✅ مسح تاريخي تلقائي عند الاشتراك
+- ✅ أوامر إدارة كاملة
+- ✅ دعم StringSession للنشر السحابي
+
+## الكلمات المفتاحية المكتشفة
+
+- طلبات: ابي، اريد، ابغى، احتاج، ممكن، مساعدة، ساعدني
+- مهام: اسايمنت، واجب، بحث، عرض، برزنتيشن، مشروع، سكليف، فاينل، كويز
+- مقابل: بمقابل، مجاني، مدفوع
+- مهارات: مختص، خبير، شاطر، محترف
 
 ## النشر على Render
 
-### Build Command
-```
-pip install -r requirements.txt
-```
-
 ### Start Command
 ```
-python monitor_v6.py
+python monitor_v7.py
 ```
 
 ### Service Type
-**Background Worker** (not Web Service)
+**Background Worker** or **Web Service** (with HTTP server)
 
 ### Environment Variables
-انسخ قيم accounts.env.example إلى Environment Variables في Render.
-
-## ملاحظة تسجيل الدخول
-
-عند أول نشر، ستحتاج لتسجيل الدخول محلياً ورفع ملف الجلسة.
+- API_ID, API_HASH, BOT_TOKEN, CHANNEL_ID
+- USER_SESSION_STRING (للمالك)
+- STARTUP_SCAN_DAYS=30 (افتراضي)
