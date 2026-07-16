@@ -41,6 +41,9 @@ from telethon.errors import FloodWaitError, RPCError
 from telethon.sessions import StringSession
 from telethon.tl.types import Message
 
+# لإضافة خادم HTTP خفيف (Web Service mode)
+from aiohttp import web
+
 # -------------------------------------------------------------------
 # Constants
 # -------------------------------------------------------------------
@@ -1401,6 +1404,47 @@ class Monitor:
 # -------------------------------------------------------------------
 
 
+async def health_handler(request):
+    """HTTP endpoint لـ Render Web Service - يحافظ على الخدمة مستيقظة"""
+    return web.Response(text="✅ Bot is running", status=200)
+
+
+async def keep_alive_task():
+    """إرسال طلب HTTP لنفسه كل 10 دقائق لمنع السكون"""
+    app_url = os.getenv("RENDER_EXTERNAL_URL") or os.getenv("APP_URL")
+    if not app_url:
+        logging.info("Keep-alive disabled (no RENDER_EXTERNAL_URL)")
+        return
+    # إزالة الشرطة المائلة الأخيرة إن وجدت
+    app_url = app_url.rstrip("/")
+    health_url = f"{app_url}/health"
+    logging.info(f"Keep-alive enabled: will ping {health_url} every 10 minutes")
+    async with aiohttp.ClientSession() as session:
+        while True:
+            try:
+                await asyncio.sleep(600)  # كل 10 دقائق
+                async with session.get(health_url, timeout=10) as resp:
+                    logging.debug(f"Keep-alive ping: {resp.status}")
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logging.warning(f"Keep-alive failed: {e}")
+
+
+async def start_http_server():
+    """تشغيل خادم HTTP خفيف على PORT (يطلبه Render)"""
+    port = int(os.getenv("PORT", "10000"))
+    app = web.Application()
+    app.router.add_get("/", health_handler)
+    app.router.add_get("/health", health_handler)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", port)
+    await site.start()
+    logging.info(f"HTTP server listening on port {port}")
+    return runner
+
+
 async def main():
     config = load_config()
     setup_logging(config.log_level)
@@ -1429,6 +1473,12 @@ async def main():
     monitor = Monitor(config, db, expired_checker)
     await monitor.start()
 
+    # تشغيل خادم HTTP (مطلوب لـ Render Web Service)
+    http_runner = await start_http_server()
+
+    # تشغيل مهمة منع السكون (Keep-alive)
+    keep_alive = asyncio.create_task(keep_alive_task())
+
     logging.info(
         "✅ Monitor started. Live monitoring active. Send /help to the channel for commands."
     )
@@ -1456,11 +1506,13 @@ async def main():
     await shutdown_event.wait()
 
     logging.info("Stopping monitor...")
+    keep_alive.cancel()
     await monitor.stop()
 
     if expired_checker:
         await expired_checker.close()
     await db.close()
+    await http_runner.cleanup()
     logging.info("Application stopped.")
 
 
