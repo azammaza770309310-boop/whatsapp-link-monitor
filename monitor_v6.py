@@ -145,6 +145,10 @@ class Config:
                 self.startup_scan_days = int(ssd)
             except ValueError:
                 pass
+        # افتراضي: مسح 60 يوم عند بدء التشغيل (إذا لم يُحدد غير ذلك)
+        if self.startup_scan_days is None and not ssd:
+            self.startup_scan_days = 60
+            logging.info("Default startup scan: 60 days")
 
         # String Session (for cloud deployment - Render/Railway)
         self.user_session_string: Optional[str] = os.getenv("USER_SESSION_STRING", "") or None
@@ -964,6 +968,107 @@ class Monitor:
         )
         self._handlers_registered = True
         logging.info("Handlers registered (user_client) - sees incoming + outgoing")
+
+        # معالج إضافي على bot_client - البوت يرى كل رسائل القناة مباشرة
+        # هذا يضمن أن البوت يرد على أوامرك حتى لو user_client لم يلتقطها
+        if hasattr(self, 'bot_client') and self.bot_client:
+            self.bot_client.add_event_handler(
+                self._on_command_bot,
+                events.NewMessage(
+                    chats=self.config.channel_id,
+                    pattern=r"^/[a-zA-Z_]+",
+                ),
+            )
+            logging.info("Bot command handler registered (sees channel messages directly)")
+
+    async def _on_command_bot(self, event):
+        """معالج أوامر احتياطي على bot_client - يرد على أوامر القناة مباشرة"""
+        try:
+            text = (event.message.text or "").strip()
+            parts = text.split()
+            if not parts:
+                return
+            cmd = parts[0].lower()
+
+            # Owner check (optional)
+            if self.config.owner_id:
+                sender = await event.get_sender()
+                sender_id = getattr(sender, 'id', None)
+                if sender_id != self.config.owner_id:
+                    return
+
+            logging.info(f"[CMD-BOT] Received: {cmd}")
+
+            # Reply via BOT
+            async def reply(text: str):
+                try:
+                    await self.bot_client.send_message(self.config.channel_id, text)
+                except FloodWaitError as e:
+                    await asyncio.sleep(e.seconds + 1)
+                    try:
+                        await self.bot_client.send_message(self.config.channel_id, text)
+                    except Exception as e2:
+                        logging.error(f"Reply failed after FloodWait: {e2}")
+                except Exception as e:
+                    logging.error(f"Reply failed: {e}")
+
+            if cmd == "/help":
+                await reply(MessageFormatter.format_help())
+
+            elif cmd == "/status":
+                live = await self.db.count_links("live")
+                hist = await self.db.count_links("history")
+                expired_count = len(self.db._expired_cache)
+                await reply(MessageFormatter.format_status(
+                    live_links=live,
+                    history_links=hist,
+                    expired_count=expired_count,
+                    scan_running=self.is_scan_running(),
+                    scan_progress=self._scan_progress,
+                ))
+
+            elif cmd in SCAN_COMMANDS:
+                days = SCAN_COMMANDS[cmd]
+                await self._start_scan_command(days, cmd)
+
+            elif cmd == "/scan_stop":
+                if self.is_scan_running():
+                    self.stop_scan()
+                    await reply("⏹️ تم إرسال إشارة إيقاف المسح.")
+                else:
+                    await reply("ℹ️ لا يوجد مسح قيد التنفيذ.")
+
+            elif cmd == "/last_scan":
+                conn = await self.db._ensure_conn()
+                cursor = await conn.execute(
+                    "SELECT chat_name, last_scanned_at FROM scan_state "
+                    "ORDER BY last_scanned_at DESC LIMIT 15"
+                )
+                rows = await cursor.fetchall()
+                if not rows:
+                    await reply("ℹ️ لا يوجد سجل مسح سابق.")
+                else:
+                    lines = ["📋 آخر مسح لكل محادثة:", ""]
+                    for chat_name, last_at in rows:
+                        try:
+                            dt = datetime.fromisoformat(last_at).strftime("%Y-%m-%d %H:%M")
+                        except Exception:
+                            dt = last_at
+                        chat_short = (chat_name or "Unknown")[:25]
+                        lines.append(f"• {chat_short} | {dt}")
+                    await reply("\n".join(lines))
+
+            elif cmd == "/reset_scan":
+                deleted = await self.db.reset_scan_state()
+                await reply(
+                    f"✅ تم إعادة تعيين سجل المسح.\nحُذف {deleted} سجل."
+                )
+
+            else:
+                await reply(f"❓ أمر غير معروف: {cmd}\nاكتب /help لعرض الأوامر.")
+
+        except Exception as e:
+            logging.error(f"Bot command handler error: {e}", exc_info=True)
 
     async def _on_new_message(self, event):
         await self._process_message(event)
