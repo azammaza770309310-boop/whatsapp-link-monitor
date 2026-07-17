@@ -101,7 +101,28 @@ PAID_SERVICE_KEYWORDS = [
 
 class Config:
     def __init__(self):
-        load_dotenv()
+        # البحث عن accounts.env في عدة مواقع
+        env_search_paths = [
+            'accounts.env',
+            './accounts.env',
+            '../accounts.env',
+            '/storage/emulated/0/accounts.env',
+            '/sdcard/accounts.env',
+            os.path.expanduser('~/accounts.env'),
+            os.path.join(os.getcwd(), 'accounts.env'),
+            os.path.join(os.path.dirname(os.path.abspath(__file__)), 'accounts.env') if '__file__' in dir() else 'accounts.env',
+        ]
+        env_loaded = False
+        for path in env_search_paths:
+            if os.path.exists(path):
+                load_dotenv(dotenv_path=path)
+                logging.info(f"Loaded accounts.env from: {os.path.abspath(path)}")
+                env_loaded = True
+                break
+        if not env_loaded:
+            # محاولة أخيرة: load_dotenv() الافتراضي
+            load_dotenv()
+            logging.warning("accounts.env not found in standard paths, trying default")
         self.api_id = int(os.getenv("API_ID", "0") or "0")
         self.api_hash = os.getenv("API_HASH", "") or ""
         self.bot_token = os.getenv("BOT_TOKEN", "") or ""
