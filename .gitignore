@@ -4,18 +4,33 @@ __pycache__/
 *$py.class
 *.so
 .Python
+*.egg-info/
+*.egg
+dist/
+build/
+.pytest_cache/
+.coverage
+htmlcov/
+.mypy_cache/
 
-# Sessions (ملفات الجلسة - لن تُرفع)
-sessions/*.session
-sessions/*.session-journal
-sessions/*.session-shm
-sessions/*.session-wal
+# Environment
+.env
+venv/
+env/
+ENV/
 
 # Database
 data/*.db
 data/*.db-journal
 data/*.db-wal
 data/*.db-shm
+data/backups/*.json
+
+# Sessions
+sessions/*.session
+sessions/*.session-journal
+sessions/*.session-shm
+sessions/*.session-wal
 
 # Logs
 logs/*.log
@@ -25,7 +40,15 @@ logs/*.log
 .idea/
 *.swp
 *.swo
+*~
 
 # OS
 .DS_Store
 Thumbs.db
+
+# Docker
+docker/data/
+docker/logs/
+
+# Exports
+export_*.json
