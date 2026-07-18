@@ -50,52 +50,136 @@ DB_FILE = os.path.join(DATA_DIR, "help_requests.db")
 LOG_FILE = os.path.join(LOGS_DIR, "app.log")
 MAX_MESSAGE_LENGTH = 800
 
-# كلمات طلبات المساعدة الدراسية
-HELP_KEYWORDS = [
-    # طلبات عامة
-    "ابي", "أبي", "اري", "أريد", "ابغى", "ابغ", "احتاج", "أحتاج",
-    "ممكن", "ممكن تساعدني", "ممكن تساعد", "طلبتكم", "طلبكم",
-    "مساعدة", "ساعدوني", "ساعدني", "يساعدني", "يساعد", "نبي", "نريد",
-    # مهام دراسية
-    "اسايمنت", "assignment", "اسمنت", "اسمنت",
-    "واجب", "واجبات", "homework", "hw",
-    "بحث", "ابحاث", "research", "report",
-    "عرض", "عرض تقديمي", "presentation", "presentaion",
-    "برزنتيشن", "بريزنتيشن", "برزنت",
-    "مشروع", "مشروع تخرج", "project",
-    "سكليف", "اسكليف", "تصميم",
-    "فاينل", "final", "نهائي",
-    "كويز", "quiz", "اختبار", "اختبارات",
-    "استماع", "محاضرة", "ملخص", "خلاصة",
-    "تفسير", "شرح", "توضيح",
-    # عروض ومقابل
-    "بمقابل", "مقابل", "بأجر", "باجر", "مدفوع",
-    "بدون مقابل", "مجان", "مجاناً", "مجاني", "free",
-    # مهارات
-    "مختص", "خبير", "شاطر", "محترف", "بديع", "مبدع",
-    "مين يقدر", "مين يعرف", "مين يساعد",
-    "من يعرف", "من يقدر", "من يساعد",
-    "ثقة", "بثقة", "موثوق",
-    "شطور", "شطورة",
-    "لي", "الي", "لى",
-    # صيغ أخرى
-    "help", "help me", "ممكن مساعدة",
-]
-
-# كلمات سبام/إعلانية (لتجاهلها)
-SPAM_KEYWORDS = [
-    "buy", "sell", "تخفيض", "عرض خاص", "limited offer",
-    "click here", "اضغط هنا", "follow me", "تابعني",
-    "اشتراكي", "يوتيوب", "tiktok", "انستقرام",
-    "https://t.me/+", "https://telegram.me/joinchat",
-    "كورس مجاني", "تطبيق مجاني", "ربح", "كاش", "money",
-]
-
-# تجميع الكلمات في pattern واحد (regex)
-HELP_PATTERN = re.compile(
-    r'\b(' + '|'.join(re.escape(kw) for kw in HELP_KEYWORDS if ' ' not in kw) + r')\b',
-    re.IGNORECASE
+# Regex لروابط واتساب وتيليجرام فقط
+WHATSAPP_LINK_PATTERN = re.compile(
+    r"""
+    (?:https?://)?
+    (?:
+        chat\.whatsapp\.com
+      | whatsapp\.com/channel
+      | whatsapp\.com/contact
+      | wa\.me
+      | api\.whatsapp\.com
+      | l\.whatsapp\.com
+    )
+    [^\s<>"'\)\]]*
+    """,
+    re.IGNORECASE | re.VERBOSE,
 )
+
+TELEGRAM_LINK_PATTERN = re.compile(
+    r"""
+    (?:https?://)?
+    (?:
+        t\.me
+      | telegram\.me
+    )
+    /[^\s<>"'\)\]]*
+    """,
+    re.IGNORECASE | re.VERBOSE,
+)
+
+# كلمات إعلانية - إذا وجدت في الرسالة، يتم استبعاد الرابط
+ADVERTISER_KEYWORDS = [
+    # تواصل وخدمات
+    "للتواصل", "عبر حسابنا", "مكتبنا", "خدمات طلابية", "بأسعار مناسبة",
+    "تواصل خاص", "تواصل واتساب", "عرض احتياجك", "سجل طلبك",
+    "اعذار ولقيت", "اعذار طبية جاهزة", "في صحتي",
+    "يكلمني ويبشر", "سكليف اجازه مرضيه معتمدة بصحتي",
+    "رقم للتواصل", "ارسال رسالة", "عرض خدمات", "طلب خدمة",
+    "حساب شخصي", "رقم جوال", "مراسلة", "سجل طلبك هنا",
+    "خدمة مدرسية", "حل واجبات", "طلب تدريبي", "تواصل معانا",
+    "خدمات تعليمية", "project service", "study help",
+    "دعم دراسي", "توصيل مشروع", "تسليم واجب",
+    "خدمة اونلاين", "حل واجب فوري", "حل بحث سريع",
+    "طلب مشروع", "تسليم مشروع", "خدمات اكاديمية",
+    "مراسلة عبر واتساب", "رقم واتساب", "تواصل شخصي",
+    # أرقام هواتف
+    "+966", "056", "053", "050", "054", "055", "058", "059",
+    # كلمات تسويقية
+    "promotion", "announcement", "اعلان", "اعلانات",
+    "خصم", "عروض", "تخفيض", "خصومات", "عروض خاصة",
+    "عرض محدود", "عرض لفترة محدودة", "استفد الآن",
+    "احجز الآن", "اطلب الآن", "سارع", "بسرعة",
+    "فرصة", "فرصه", "محدودة", "العدد محدود",
+    "أماكن محدودة", "مقاعد محدودة", "حجز", "احجز",
+    "حجوزات", "حجز مسبق", "حجز الآن",
+    # دفع
+    "دفع", "الدفع", "دفع اونلاين", "الدفع اونلاين",
+    "سداد", "السداد", "الدفع المسبق", "دفع مسبق",
+    "الدفع عند الاستلام", "دفع عند الاستلام",
+    # ضمانات تسويقية
+    "ضمان", "ضمان استرجاع", "ضمان الجودة",
+    "جودة عالية", "عالية الجودة", "مضمون",
+    "نتيجة مضمونة", "نتائج مضمونة", "ضمان النتيجة",
+    "خبرة طويلة", "سنوات من الخبرة",
+    "كفاءة عالية", "سرعة في التنفيذ", "تنفيذ سريع",
+    "انجاز سريع", "انجاز في وقت قياسي",
+    "سرية تامة", "خصوصية تامة",
+    # مؤسسات تعليمية (إعلانات)
+    "مكتب خدمات", "مركز تعليمي", "مركز تدريب",
+    "معهد تعليمي", "معهد تدريب", "أكاديمية تعليمية",
+    "أكاديمية تدريب", "مؤسسة تعليمية", "مؤسسة تدريب",
+    "شركة تعليمية", "شركة تدريب", "مجموعة تعليمية",
+    "مجموعة تدريب", "فريق تعليمي", "فريق تدريب",
+]
+
+# كلمات للتجاهل التام (رسائل قصيرة/ترحيبية)
+IGNORE_KEYWORDS = [
+    "صباح الخير", "مساء الخير", "اهلا", "مرحبا", "شكرا",
+    "الله يسعدك", "ماقصرت", "يعطيك العافية", "تمام",
+    "حلو", "جيد", "ممتاز", "تسلم", "بالتوفيق",
+]
+
+
+def is_advertiser_message(text: str) -> bool:
+    """يتحقق إن كانت الرسالة إعلانية (يتم استبعادها)"""
+    if not text:
+        return False
+
+    # رسائل طويلة جداً = غالباً إعلانات
+    if len(text.splitlines()) >= 6:
+        return True
+
+    text_lower = text.lower()
+
+    # فحص الكلمات الإعلانية
+    for kw in ADVERTISER_KEYWORDS:
+        if kw.lower() in text_lower:
+            return True
+
+    # فحص أرقام الهواتف السعودية
+    if re.search(r"\+966\d{9}", text):
+        return True
+    if re.search(r"\b05\d{8}\b", text):
+        return True
+
+    return False
+
+
+def extract_whatsapp_telegram_links(text: str) -> list:
+    """يستخرج روابط واتساب وتيليجرام فقط من النص"""
+    if not text:
+        return []
+
+    links = []
+
+    # روابط واتساب
+    for match in WHATSAPP_LINK_PATTERN.findall(text):
+        link = match.rstrip(".,;:!?)]}>\"'")
+        if link and link not in links:
+            links.append(link)
+
+    # روابط تيليجرام
+    for match in TELEGRAM_LINK_PATTERN.findall(text):
+        link = match.rstrip(".,;:!?)]}>\"'")
+        # استبعاد روابط الانضمام للمجموعات (t.me/+xxx) - هذه دعوات، ليست محتوى
+        if "/+" in link or "joinchat" in link.lower():
+            continue
+        if link and link not in links:
+            links.append(link)
+
+    return links
 
 SCAN_COMMANDS = {"/scan_week": 7, "/scan_month": 30, "/scan_60": 60, "/scan_90": 90, "/scan_full": None}
 
@@ -216,13 +300,26 @@ class DatabaseManager:
         await conn.commit()
 
     async def add_watcher(self, phone: str, display_name: str, session_string: str) -> bool:
-        """إضافة مستخدم مراقب جديد"""
+        """إضافة مستخدم مراقب جديد - يدعم التحديث إذا كان موجوداً"""
         async with self._lock:
             conn = await self._ensure_conn()
             try:
-                await conn.execute(
-                    "INSERT OR REPLACE INTO watchers (phone, display_name, session_string, is_active) VALUES (?, ?, ?, 1)",
-                    (phone, display_name, session_string))
+                # التحقق إن كان موجوداً أولاً
+                cursor = await conn.execute(
+                    "SELECT phone FROM watchers WHERE phone = ?", (phone,))
+                existing = await cursor.fetchone()
+                if existing:
+                    # تحديث الموجود
+                    await conn.execute(
+                        """UPDATE watchers SET display_name = ?, session_string = ?, is_active = 1
+                        WHERE phone = ?""",
+                        (display_name, session_string, phone))
+                else:
+                    # إدراج جديد
+                    await conn.execute(
+                        """INSERT INTO watchers (phone, display_name, session_string, is_active)
+                        VALUES (?, ?, ?, 1)""",
+                        (phone, display_name, session_string))
                 await conn.commit()
                 return True
             except Exception as e:
@@ -374,9 +471,43 @@ class HelpRequestDetector:
 
 class MessageFormatter:
     @staticmethod
+    def format_link_message(group_name, sender_name, message_date, link,
+                            message_text, source_phone, message_link=None):
+        """تنسيق رابط واتساب/تيليجرام للنشر في القناة"""
+        # اقتطاع النص الطويل
+        if len(message_text) > MAX_MESSAGE_LENGTH:
+            message_text = message_text[:MAX_MESSAGE_LENGTH] + "..."
+
+        date_str = message_date.strftime("%Y-%m-%d %H:%M") if message_date else "غير معروف"
+
+        # تحديد نوع الرابط
+        link_lower = link.lower()
+        if "chat.whatsapp.com" in link_lower or "wa.me" in link_lower or "whatsapp.com" in link_lower:
+            link_type = "📱 واتساب"
+        elif "t.me" in link_lower or "telegram.me" in link_lower:
+            link_type = "✈️ تيليجرام"
+        else:
+            link_type = "🔗 رابط"
+
+        lines = [
+            f"📥 رابط جديد ({link_type})",
+            "",
+            f"👥 المجموعة: {group_name}",
+            f"👤 المرسل: {sender_name}",
+            f"🕒 التاريخ: {date_str}",
+            f"📡 المصدر: {source_phone}",
+            "",
+            f"🔗 الرابط: {link}",
+        ]
+        if message_link:
+            lines.append(f"📨 الرسالة الأصلية: {message_link}")
+        lines.extend(["", "💬 النص:", message_text])
+        return "\n".join(lines)
+
+    @staticmethod
     def format_help_request(group_name, sender_name, message_date, message_text,
                             keywords_found, source_phone, message_link=None):
-        """تنسيق طلب مساعدة للنشر في القناة"""
+        """تنسيق طلب مساعدة للنشر في القناة (محفوظ للتوافق)"""
         # اقتطاع النص الطويل
         if len(message_text) > MAX_MESSAGE_LENGTH:
             message_text = message_text[:MAX_MESSAGE_LENGTH] + "..."
@@ -563,35 +694,39 @@ class HistoryScanner:
                 if md and (last_date is None or md > last_date): last_date = md
                 if not msg or not msg.text: continue
 
-                # فحص طلب مساعدة
-                is_help, keywords = HelpRequestDetector.is_help_request(msg.text)
-                if not is_help: continue
+                # استخراج روابط واتساب وتيليجرام
+                links = extract_whatsapp_telegram_links(msg.text)
+                if not links: continue
 
-                self.total_found += 1
+                # استبعاد الرسائل الإعلانية
+                if is_advertiser_message(msg.text):
+                    continue
+
+                self.total_found += len(links)
                 try:
                     sender = await msg.get_sender()
                     sn = Monitor._get_sender_name(sender)
                 except: sn = "Unknown"
 
-                # محاولة الحصول على رابط الرسالة
+                # رابط الرسالة
                 msg_link = None
                 try:
-                    msg_link = f"https://t.me/c/{dialog.id}/{msg.id}"
+                    msg_link = f"https://t.me/c/{str(dialog.id).replace('-100', '')}/{msg.id}"
                 except: pass
 
-                # إدراج في DB
-                inserted = await self.db.insert_request(
-                    msg.text, md, name, sn, self.source_phone, msg_link)
-                if inserted:
-                    self.new_count += 1
-                    batch.append({
-                        'text': msg.text, 'date': md,
-                        'group': name, 'sender': sn,
-                        'keywords': keywords, 'link': msg_link
-                    })
-                    if len(batch) >= self.batch_size:
-                        await self._send_batch(batch)
-                        batch = []
+                # إدراج كل رابط
+                for link in links:
+                    inserted = await self.db.insert_request(
+                        link, md, name, sn, self.source_phone, msg_link)
+                    if inserted:
+                        self.new_count += 1
+                        batch.append({
+                            'link': link, 'text': msg.text, 'date': md,
+                            'group': name, 'sender': sn, 'msg_link': msg_link
+                        })
+                        if len(batch) >= self.batch_size:
+                            await self._send_batch(batch)
+                            batch = []
         except FloodWaitError: raise
         except Exception as e:
             logging.error(f"[SCAN {self.source_phone}] iter error: {e}")
@@ -606,12 +741,12 @@ class HistoryScanner:
         self.chats_scanned += 1
 
     async def _send_batch(self, batch):
-        # نشر كل طلب على حدة (أفضل من الدفعات - لمساعدة الطلاب)
+        # نشر كل رابط على حدة
         for item in batch:
             try:
-                formatted = MessageFormatter.format_help_request(
+                formatted = MessageFormatter.format_link_message(
                     item['group'], item['sender'], item['date'],
-                    item['text'], item['keywords'], self.source_phone, item.get('link'))
+                    item['link'], item['text'], self.source_phone, item.get('msg_link'))
                 await self.bot_client.send_message(self.channel_id, formatted)
                 await asyncio.sleep(0.5)  # تجنب الفلو
             except FloodWaitError as e:
@@ -836,7 +971,7 @@ class Monitor:
         logging.info(f"User handlers registered for {phone}")
 
     async def _on_user_message(self, event, source_phone: str):
-        """معالج رسائل المستخدم - يفحص طلبات المساعدة"""
+        """معالج رسائل المستخدم - يستخرج روابط واتساب وتيليجرام"""
         try:
             msg = event.message
             if not msg or not msg.text: return
@@ -846,27 +981,34 @@ class Monitor:
             sender = await event.get_sender()
             sender_name = self._get_sender_name(sender)
 
-            # فحص طلب مساعدة
-            is_help, keywords = HelpRequestDetector.is_help_request(msg.text)
-            if not is_help: return
+            # استخراج روابط واتساب وتيليجرام
+            links = extract_whatsapp_telegram_links(msg.text)
+            if not links: return  # لا توجد روابط
+
+            # استبعاد الرسائل الإعلانية
+            if is_advertiser_message(msg.text):
+                logging.info(f"[LIVE {source_phone}] Skipped advertiser message in {group_name}")
+                return
 
             # محاولة الحصول على رابط الرسالة
             msg_link = None
             try:
-                msg_link = f"https://t.me/c/{chat.id}/{msg.id}"
+                msg_link = f"https://t.me/c/{str(chat.id).replace('-100', '')}/{msg.id}"
             except: pass
 
-            # إدراج في DB
-            inserted = await self.db.insert_request(
-                msg.text, msg.date.replace(tzinfo=None) if msg.date else datetime.now(),
-                group_name, sender_name, source_phone, msg_link)
-            if not inserted: return  # مكرر
+            # نشر كل رابط جديد
+            for link in links:
+                # إدراج في DB (يمنع التكرار)
+                inserted = await self.db.insert_request(
+                    link, msg.date.replace(tzinfo=None) if msg.date else datetime.now(),
+                    group_name, sender_name, source_phone, msg_link)
+                if not inserted: continue  # مكرر
 
-            # نشر في القناة
-            formatted = MessageFormatter.format_help_request(
-                group_name, sender_name, msg.date, msg.text, keywords, source_phone, msg_link)
-            await self._send(formatted)
-            logging.info(f"[LIVE {source_phone}] Forwarded help request from {group_name}")
+                # تنسيق ونشر
+                formatted = MessageFormatter.format_link_message(
+                    group_name, sender_name, msg.date, link, msg.text, source_phone, msg_link)
+                await self._send(formatted)
+                logging.info(f"[LIVE {source_phone}] Forwarded link from {group_name}: {link[:50]}")
 
         except FloodWaitError as e:
             await asyncio.sleep(e.seconds)
@@ -1433,12 +1575,8 @@ async def main():
     db = DatabaseManager()
     await db.init_db()
 
-    # إضافة المستخدم الأول (المالك) تلقائياً من USER_SESSION_STRING
-    user_session_string = os.getenv("USER_SESSION_STRING", "")
-    if user_session_string:
-        owner_phone = os.getenv("PHONE", "owner")
-        await db.add_watcher(owner_phone, "Owner", user_session_string)
-        logging.info(f"Added owner as watcher: {owner_phone}")
+    # ملاحظة: لا نضيف المالك تلقائياً - سيستخدم /login للتسجيل
+    # هذا يحل مشكلة "فشل الحفظ" عند إضافة رقم المالك
 
     monitor = Monitor(config, db)
     await monitor.start()
