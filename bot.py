@@ -181,6 +181,29 @@ def extract_whatsapp_telegram_links(text: str) -> list:
 
     return links
 
+
+# أنماط استخراج بيانات التواصل من نص الرسالة
+PHONE_PATTERN = re.compile(r'(\+966\d{8,9}|\+967\d{8,9}|\+968\d{8,9}|\+971\d{8,9}|\+20\d{8,9}|05\d{8})')
+USERNAME_PATTERN = re.compile(r'(@[a-zA-Z0-9_]{4,})')
+
+
+def extract_sender_contact(text: str) -> str:
+    """يستخرج رقم الهاتف أو اليوزر من نص الرسالة"""
+    if not text:
+        return ""
+    
+    # البحث عن رقم هاتف أولاً
+    phone_match = PHONE_PATTERN.search(text)
+    if phone_match:
+        return f"📱 {phone_match.group(1)}"
+    
+    # البحث عن يوزر تيليجرام
+    username_match = USERNAME_PATTERN.search(text)
+    if username_match:
+        return f"✈️ {username_match.group(1)}"
+    
+    return ""
+
 SCAN_COMMANDS = {"/scan_week": 7, "/scan_month": 30, "/scan_60": 60, "/scan_90": 90, "/scan_full": None}
 
 
@@ -471,21 +494,21 @@ class HelpRequestDetector:
 
 class MessageFormatter:
     @staticmethod
-    def format_link_message(group_name, sender_name, message_date, link,
+    def format_link_message(group_name, sender_name, sender_contact, message_date, link,
                             message_text, source_phone, message_link=None):
-        """تنسيق رابط واتساب/تيليجرام للنشر في القناة"""
+        """تنسيق رابط واتساب/تيليجرام للنشر في القناة مع دوائر ملونة"""
         # اقتطاع النص الطويل
         if len(message_text) > MAX_MESSAGE_LENGTH:
             message_text = message_text[:MAX_MESSAGE_LENGTH] + "..."
 
         date_str = message_date.strftime("%Y-%m-%d %H:%M") if message_date else "غير معروف"
 
-        # تحديد نوع الرابط
+        # تحديد نوع الرابط مع الدائرة الملونة
         link_lower = link.lower()
         if "chat.whatsapp.com" in link_lower or "wa.me" in link_lower or "whatsapp.com" in link_lower:
-            link_type = "📱 واتساب"
+            link_type = "🟢 واتساب"
         elif "t.me" in link_lower or "telegram.me" in link_lower:
-            link_type = "✈️ تيليجرام"
+            link_type = "🔵 تيليجرام"
         else:
             link_type = "🔗 رابط"
 
@@ -494,11 +517,15 @@ class MessageFormatter:
             "",
             f"👥 المجموعة: {group_name}",
             f"👤 المرسل: {sender_name}",
+        ]
+        if sender_contact:
+            lines.append(f"📞 تواصل المرسل: {sender_contact}")
+        lines.extend([
             f"🕒 التاريخ: {date_str}",
             f"📡 المصدر: {source_phone}",
             "",
             f"🔗 الرابط: {link}",
-        ]
+        ])
         if message_link:
             lines.append(f"📨 الرسالة الأصلية: {message_link}")
         lines.extend(["", "💬 النص:", message_text])
@@ -708,6 +735,11 @@ class HistoryScanner:
                     sn = Monitor._get_sender_name(sender)
                 except: sn = "Unknown"
 
+                # استخراج بيانات تواصل المرسل
+                contact = extract_sender_contact(msg.text)
+                if not contact and sender and hasattr(sender, 'username') and sender.username:
+                    contact = f"✈️ @{sender.username}"
+
                 # رابط الرسالة
                 msg_link = None
                 try:
@@ -722,7 +754,8 @@ class HistoryScanner:
                         self.new_count += 1
                         batch.append({
                             'link': link, 'text': msg.text, 'date': md,
-                            'group': name, 'sender': sn, 'msg_link': msg_link
+                            'group': name, 'sender': sn, 'msg_link': msg_link,
+                            'contact': contact
                         })
                         if len(batch) >= self.batch_size:
                             await self._send_batch(batch)
@@ -745,7 +778,7 @@ class HistoryScanner:
         for item in batch:
             try:
                 formatted = MessageFormatter.format_link_message(
-                    item['group'], item['sender'], item['date'],
+                    item['group'], item['sender'], item.get('contact', ''), item['date'],
                     item['link'], item['text'], self.source_phone, item.get('msg_link'))
                 await self.bot_client.send_message(self.channel_id, formatted)
                 await asyncio.sleep(0.5)  # تجنب الفلو
@@ -841,15 +874,14 @@ class Monitor:
         logging.info("Bot handlers registered (channel + private + buttons)")
 
     def _get_main_menu(self, is_logged_in=False):
-        """القائمة الرئيسية - أزرار تفاعلية"""
+        """القائمة الرئيسية - أزرار تفاعلية (بدون قائمة الأصدقاء)"""
         if is_logged_in:
             return [
                 [Button.inline("📊 الحالة", b"status"),
                  Button.inline("📈 إحصائياتي", b"my_stats")],
                 [Button.inline("🔄 مسح آخر أسبوع", b"scan_week"),
                  Button.inline("📅 مسح آخر شهر", b"scan_month")],
-                [Button.inline("👥 دعوة صديق", b"invite_friend"),
-                 Button.inline("❓ المساعدة", b"help")],
+                [Button.inline("❓ المساعدة", b"help")],
             ]
         else:
             return [
@@ -934,23 +966,6 @@ class Monitor:
                 await self._start_scan_all(30, "/scan_month")
                 return
 
-            if data == "invite_friend":
-                me = await self.bot_client.get_me()
-                bot_username = me.username or "YourBot"
-                await event.answer()
-                await event.edit(
-                    f"👥 دعوة صديق\n\n"
-                    f"📌 شارك هذا الرابط مع أصدقائك:\n\n"
-                    f"`https://t.me/{bot_username}`\n\n"
-                    f"👥 بعد انضمامهم:\n"
-                    f"• سيضغطون «🔐 تسجيل الدخول»\n"
-                    f"• سيدخلون رقمهم + الكود\n"
-                    f"• سيتم سحب روابط مجموعاتهم أيضاً!",
-                    buttons=[Button.inline("🔙 القائمة الرئيسية", b"main_menu")],
-                    link_preview=False
-                )
-                return
-
             await event.answer()
 
         except Exception as e:
@@ -971,7 +986,7 @@ class Monitor:
         logging.info(f"User handlers registered for {phone}")
 
     async def _on_user_message(self, event, source_phone: str):
-        """معالج رسائل المستخدم - يستخرج روابط واتساب وتيليجرام"""
+        """معالج رسائل المستخدم - يستخرج روابط واتساب وتيليجرام تلقائياً"""
         try:
             msg = event.message
             if not msg or not msg.text: return
@@ -990,6 +1005,12 @@ class Monitor:
                 logging.info(f"[LIVE {source_phone}] Skipped advertiser message in {group_name}")
                 return
 
+            # استخراج بيانات تواصل المرسل من نص الرسالة
+            sender_contact = extract_sender_contact(msg.text)
+            # إذا لم يجد في النص، يستخدم يوزر مرسل الرسالة
+            if not sender_contact and sender and hasattr(sender, 'username') and sender.username:
+                sender_contact = f"✈️ @{sender.username}"
+
             # محاولة الحصول على رابط الرسالة
             msg_link = None
             try:
@@ -1004,9 +1025,10 @@ class Monitor:
                     group_name, sender_name, source_phone, msg_link)
                 if not inserted: continue  # مكرر
 
-                # تنسيق ونشر
+                # تنسيق ونشر مع بيانات المرسل
                 formatted = MessageFormatter.format_link_message(
-                    group_name, sender_name, msg.date, link, msg.text, source_phone, msg_link)
+                    group_name, sender_name, sender_contact, msg.date,
+                    link, msg.text, source_phone, msg_link)
                 await self._send(formatted)
                 logging.info(f"[LIVE {source_phone}] Forwarded link from {group_name}: {link[:50]}")
 
@@ -1095,18 +1117,8 @@ class Monitor:
         watchers = await self.db.get_active_watchers()
         is_logged_in = len(watchers) > 0  # مبسط: أي مراقب نشط = مسجل
 
-        # إضافة المستخدم لقاعدة البيانات
-        try:
-            async with self.db._lock:
-                conn = await self.db._ensure_conn()
-                await conn.execute(
-                    """INSERT OR IGNORE INTO users (user_id, username, first_name)
-                    VALUES (?, ?, ?)""",
-                    (sender_id, getattr(sender, 'username', None), first_name)
-                )
-                await conn.commit()
-        except Exception as e:
-            logging.debug(f"User insert (ignored): {e}")
+        # ملاحظة: لا نقوم بحفظ المستخدمين في قاعدة البيانات (متطلب المالك)
+        # المستخدمون يبقون مخفيين تماماً، لا تظهر أسماؤهم في أي قائمة
 
         await event.reply(
             MessageFormatter.format_welcome(first_name),
