@@ -1375,6 +1375,144 @@ class HelpRequestDetector:
 
 
 # -------------------------------------------------------------------
+# Educational Filter — يميز الروابط التعليمية عن غيرها
+# -------------------------------------------------------------------
+
+
+class EducationalFilter:
+    """فلتر ذكي لتمييز الروابط التعليمية.
+
+    المعايير الإيجابية (كلمات في اسم المجموعة أو وصفها):
+    - جامعة/كلية/معهد/روضة/مدرسة
+    - تخصص/قسم/شعبة/فرقة
+    - طلاب/طالبات/تجمع
+    - أسماء جامعات سعودية معروفة
+
+    المعايير السلبية (تستبعد الرسالة):
+    - إعلانات/متاجر/تسوق
+    - قنوات إخبارية/ترفيهية
+    - ربح مال/استثمار
+    - محتوى غير لائق
+    """
+
+    # كلمات إيجابية قوية (تعليمية مؤكدة)
+    STRONG_POSITIVE = [
+        # أنواع المؤسسات التعليمية
+        'جامعة', 'كلية', 'معهد', 'روضة', 'مدرسة', 'مدراس',
+        'university', 'college', 'institute', 'school', 'academy',
+        # مستويات دراسية
+        'تخصص', 'قسم', 'شعبة', 'فرقة', 'مستوى', 'ترم', 'فصل دراسي',
+        'بكالوريوس', 'ماجستير', 'دكتوراه', 'دبلوم', 'ماجستير',
+        'bachelor', 'master', 'phd', 'diploma', 'degree',
+        # مجموعات طلابية
+        'طلاب', 'طالبات', 'تجمع', 'دفع', 'دفعة', 'cohort', 'students',
+        # أنشطة دراسية
+        'محاضرة', 'سكشن', 'واجب', 'بحث', 'مشروع', 'تقرير', 'عرض',
+        'ميدتيرم', 'فاينل', 'اختبار', 'امتحان', 'كويز', 'واجبات',
+        'lecture', 'section', 'assignment', 'exam', 'quiz', ' midterm', 'final',
+        # أنظمة جامعية
+        'تسجيل', 'add drop', 'withdraw', 'معدل', 'gpa', 'credit',
+        'blackboard', 'بلاك بورد', 'moodle', 'مودل',
+        # مواد دراسية
+        'مادة', 'مواد', 'منهج', 'كتاب', 'ملخص', 'شرائح', 'slides',
+        'course', 'subject', 'curriculum',
+    ]
+
+    # أسماء جامعات سعودية معروفة (مطابقة قوية)
+    SAUDI_UNIVERSITIES = [
+        'الملك سعود', 'الملك عبدالعزيز', 'الملك فيصل', 'الملك خالد',
+        'الملك فهد', 'الملك عبدالله', 'الملك سلمان',
+        'أم القرى', 'ام القرى', 'الطائف', 'الباحة', 'جازان', 'نجران',
+        'الجوف', 'الحدود الشمالية', 'حائل', 'تبوك', 'القصيم',
+        'الإمام محمد بن سعود', 'الإمام', 'النعيرية', 'شقراء',
+        'المجمعة', 'رماح', 'الخرج', 'الدوادمي', 'الأفلاج',
+        ' Prince Sattam', 'سطام', 'الإمام عبدالرحمن', 'الإمام',
+        'جدة', 'طيبة', 'حائل', 'تبوك',
+        # اختصارات
+        'ksu', 'kau', 'kfu', 'kku', 'uqu', 'taibahu', 'iau', 'ju',
+        'pnu', 'nu', 'su', 'bu', 'qu', 'ha il',
+        # جامعات أجنبية شائعة
+        'pnu1445', 'noracom', 'fonnorasakn', 'majeedseu', 'uqucc',
+        'qassim_u', 'ngran4',
+    ]
+
+    # كلمات سلبية قوية (تستبعد الرسالة)
+    STRONG_NEGATIVE = [
+        # إعلانات ومتاجر
+        'متجر', 'متاجر', 'تسوق', 'شراء', 'بيع', 'سعر', 'خصم', 'عرض خاص',
+        'store', 'shop', 'buy', 'sell', 'price', 'discount', 'offer',
+        'متوفر', 'للبيع', 'للإيجار', 'توصيل', 'شحن',
+        # ربح مال واستثمار
+        'ربح', 'ارباح', 'استثمار', 'تداول', 'فوركس', 'كريبتو', 'بيتكوين',
+        'earn money', 'make money', 'profit', 'investment', 'crypto', 'forex',
+        'ايرد المبلغ', 'هديه مجاني', 'ربح مال', 'ربح سريع',
+        # ترفيه وغير تعليمي
+        'افلام', 'أنمي', 'أنمي', 'روايات', 'شعر', 'خواطر',
+        'movies', 'anime', 'novels', 'poetry',
+        'ألعاب', 'العاب', 'ببجي', 'فورتنايت', 'minecraft',
+        'games', 'gaming', 'pubg', 'fortnite',
+        # قنوات إخبارية وإعلامية
+        'أخبار', 'اخبار', 'عاجل', 'خبر', 'news', 'breaking',
+        'قناة إخبارية', 'صحيفة', 'جريدة',
+        # محتوى غير لائق
+        'porn', 'xxx', 'adult', '18+', 'محتوى للكبار',
+        # تواصل اجتماعي (متابعين/لايكات)
+        'sub4sub', 'follow4follow', 'like4like', 'متابعين', 'لايكات',
+        'followers', 'subscribers', 'تيك توك', 'يوتيوب', 'سناب',
+    ]
+
+    # كلمات تشير لأن الرابط لقناة وليس مجموعة
+    CHANNEL_INDICATORS = [
+        'قناة', 'channel', 'telegram channel', 'قناة تيليجرام',
+        'اخبار', 'news', 'إعلام', 'broadcast', 'اذاعة',
+    ]
+
+    @classmethod
+    def is_educational(cls, text: str, link_username: str = '') -> Tuple[bool, str]:
+        """يتحقق هل النص/الرابط تعليمي.
+
+        Returns:
+            (True, reason) لو تعليمي
+            (False, reason) لو غير تعليمي
+        """
+        if not text and not link_username:
+            return False, 'empty_text'
+
+        combined = f"{text or ''} {link_username or ''}".lower()
+
+        # 1. فحص سلبي أولاً (الأقوى)
+        for neg in cls.STRONG_NEGATIVE:
+            if neg.lower() in combined:
+                return False, f'negative_{neg}'
+
+        # 2. فحص الجامعات السعودية (مطابقة قوية جداً)
+        for uni in cls.SAUDI_UNIVERSITIES:
+            if uni.lower() in combined:
+                return True, f'saudi_uni_{uni}'
+
+        # 3. فحص الكلمات الإيجابية
+        positive_matches = []
+        for pos in cls.STRONG_POSITIVE:
+            if pos.lower() in combined:
+                positive_matches.append(pos)
+
+        if len(positive_matches) >= 1:
+            return True, f'positive_{positive_matches[0]}'
+
+        # 4. لو ما في مطابقة، اعتبره غير تعليمي (احتياط)
+        return False, 'no_educational_keywords'
+
+    @classmethod
+    def is_likely_channel(cls, text: str, link_username: str = '') -> bool:
+        """يتحقق هل الرابط غالباً لقناة (وليس مجموعة)."""
+        combined = f"{text or ''} {link_username or ''}".lower()
+        for ind in cls.CHANNEL_INDICATORS:
+            if ind.lower() in combined:
+                return True
+        return False
+
+
+# -------------------------------------------------------------------
 # Message Formatter
 # -------------------------------------------------------------------
 
@@ -1560,7 +1698,11 @@ class MessageFormatter:
             "• /bulk_join — الانضمام لكل روابط القناة (22 ألف+)\n"
             "• /bulk_join_status — تقدم الانضمام الجماعي\n"
             "• /bulk_join_stop — إيقاف الانضمام الجماعي\n"
-            "• /clear_floodwait — مسح FloodWait وإعادة تفعيل الانضمام"
+            "• /clear_floodwait — مسح FloodWait وإعادة تفعيل الانضمام\n\n"
+            "📌 أوامر تنظيف القناة:\n"
+            "• /cleanup_preview — معاينة ما سيُحذف (بدون حذف فعلي)\n"
+            "• /cleanup_links — حذف الروابط غير التعليمية والمكررة\n"
+            "• /cleanup_status — تقدم التنظيف"
         )
 
     @staticmethod
@@ -3077,6 +3219,33 @@ class Monitor:
                 else:
                     await reply("ℹ️ البوك جون لا يعمل")
 
+            elif cmd == "/cleanup_preview":
+                # === معاينة ما سيُحذف (dry-run) ===
+                await reply("🔍 بدأ التحليل... قد يستغرق عدة دقائق لـ 22 ألف رسالة")
+                asyncio.create_task(self._cleanup_worker(preview_only=True))
+
+            elif cmd == "/cleanup_links":
+                # === حذف فعلي للروابط غير التعليمية والمكررة ===
+                await reply("🗑️ بدأ التنظيف الفعلي... سيتم حذف الروابط غير التعليمية والمكررة")
+                asyncio.create_task(self._cleanup_worker(preview_only=False))
+
+            elif cmd == "/cleanup_status":
+                # === تقدم التنظيف ===
+                s = getattr(self, '_cleanup_stats', None)
+                if not s or not s.get('running', False):
+                    await reply("ℹ️ التنظيف لا يعمل. أرسل /cleanup_preview أو /cleanup_links")
+                else:
+                    await reply(
+                        f"🧹 Cleanup Status\n"
+                        f"════════════════════\n"
+                        f"📊 Total scanned: {s.get('total', 0)}\n"
+                        f"✅ Educational: {s.get('educational', 0)}\n"
+                        f"❌ Non-educational: {s.get('non_educational', 0)}\n"
+                        f"🔄 Duplicates: {s.get('duplicates', 0)}\n"
+                        f"🗑️ Deleted: {s.get('deleted', 0)}\n"
+                        f"📍 Current: {s.get('current', '')[:60]}"
+                    )
+
             else: await reply(f"❓ أمر غير معروف: {cmd}\nاكتب /help")
 
         except Exception as e:
@@ -3464,6 +3633,12 @@ class Monitor:
                     # رابط WhatsApp — لا يحتاج انضمام
                     logging.info(f"[PIPELINE-6] ⏭️ WhatsApp link — no join needed")
                     await self.prod_db.update_queue_status(link_data['id'], 'DONE')
+                elif status == "IS_CHANNEL":
+                    # الرابط لقناة (broadcast) وليس مجموعة — نتخطى
+                    logging.info(f"[PIPELINE-6] 📢 Skipped channel (broadcast): {raw_link[:50]}")
+                    await self.prod_db.set_group_state(normalized, GroupState.FAILED, raw_link,
+                                                       error='is_channel')
+                    await self.prod_db.update_queue_status(link_data['id'], 'DONE')
                 elif status == "PRIVATE":
                     await self.prod_db.set_group_state(normalized, GroupState.PRIVATE, raw_link,
                                                        error='Channel private')
@@ -3581,6 +3756,26 @@ class Monitor:
                                 logging.debug(f"[BULK_JOIN] Skip non-telegram: {raw_link[:50]}")
                                 continue
 
+                            # a2. فلتر تعليمي — تجاوز غير التعليمي
+                            # نستخدم نص الرسالة الأصلية (التي نُشرت في القناة) لتحديد التعليمي
+                            msg_text = msg.raw_text or ''
+                            is_edu, edu_reason = EducationalFilter.is_educational(msg_text, link_info.get('username', ''))
+                            if not is_edu:
+                                self._bulk_join_stats['skipped'] += 1
+                                logging.info(f"[BULK_JOIN] Skip non-educational: {raw_link[:50]} ({edu_reason})")
+                                # سجل في group_states لتخطيه مستقبلاً
+                                await self.prod_db.set_group_state(normalized, GroupState.FAILED, raw_link,
+                                                                   error=f'non_educational_{edu_reason}')
+                                continue
+
+                            # a3. تجاوز القنوات (broadcast) — نريد المجموعات فقط
+                            if EducationalFilter.is_likely_channel(msg_text, link_info.get('username', '')):
+                                self._bulk_join_stats['skipped'] += 1
+                                logging.info(f"[BULK_JOIN] Skip likely channel: {raw_link[:50]}")
+                                await self.prod_db.set_group_state(normalized, GroupState.FAILED, raw_link,
+                                                                   error='likely_channel')
+                                continue
+
                             # b. تجاوز لو الحالة معروفة في group_states
                             state = await self.prod_db.get_group_state(normalized)
                             if state in (GroupState.JOINED, GroupState.ALREADY_MEMBER, GroupState.BANNED, GroupState.PRIVATE):
@@ -3598,7 +3793,7 @@ class Monitor:
                                 continue
 
                             # d. حاول الانضمام
-                            logging.info(f"[BULK_JOIN] ({self._bulk_join_stats['total']}) Joining: {raw_link[:60]}")
+                            logging.info(f"[BULK_JOIN] ({self._bulk_join_stats['total']}) Joining EDUCATIONAL: {raw_link[:60]}")
                             link_data = {
                                 'raw': raw_link,
                                 'raw_link': raw_link,
@@ -3621,6 +3816,14 @@ class Monitor:
                                 await self.prod_db.set_group_state(normalized, GroupState.ALREADY_MEMBER, raw_link,
                                                                    joined_by=joiner_phone)
                                 logging.info(f"[BULK_JOIN] ℹ️ Already member: {raw_link[:50]}")
+                            elif status == "IS_CHANNEL":
+                                # قناة broadcast — سجلها ولا تعد المحاولة
+                                self._bulk_join_stats['skipped'] += 1
+                                await self.prod_db.set_group_state(normalized, GroupState.FAILED, raw_link,
+                                                                   error='is_channel')
+                                logging.info(f"[BULK_JOIN] 📢 Skipped channel: {raw_link[:50]}")
+                                # لا ننتظر 120s لأن ما في API call
+                                continue
                             elif status == "FLOODWAIT":
                                 self._bulk_join_stats['failed'] += 1
                                 logging.warning(f"[BULK_JOIN] ⚠️ FloodWait — pausing")
@@ -3668,6 +3871,146 @@ class Monitor:
         except Exception as e:
             self._bulk_join_running = False
             logging.error(f"[BULK_JOIN] Fatal: {e}", exc_info=True)
+
+    async def _cleanup_worker(self, preview_only: bool = True):
+        """عامل التنظيف — يحلل روابط القناة ويحذف غير التعليمية والمكررة.
+
+        Args:
+            preview_only: True = معاينة فقط (بدون حذف)، False = حذف فعلي
+        """
+        mode = "PREVIEW" if preview_only else "DELETE"
+        logging.info(f"[CLEANUP] {mode} mode — scanning channel messages")
+        self._cleanup_stats = {
+            'running': True, 'total': 0, 'educational': 0,
+            'non_educational': 0, 'duplicates': 0, 'deleted': 0, 'current': ''
+        }
+
+        # set لتتبع الروابط التعليمية المرئية (لاكتشاف التكرار)
+        seen_educational_links = set()
+        offset_id = 0
+        batch_size = 200
+        deleted_count = 0
+
+        try:
+            while self._cleanup_stats['running']:
+                try:
+                    # اجلب batch من رسائل القناة (الأقدم أولاً)
+                    messages = await self.bot_client.get_messages(
+                        self.config.channel_id,
+                        limit=batch_size,
+                        offset_id=offset_id,
+                        reverse=True  # الأقدم أولاً
+                    )
+
+                    if not messages:
+                        logging.info(f"[CLEANUP] {mode} — No more messages")
+                        break
+
+                    offset_id = messages[-1].id
+
+                    for msg in messages:
+                        self._cleanup_stats['current'] = f"msg_{msg.id}"
+                        raw_text = msg.raw_text or ''
+                        if not raw_text:
+                            continue
+
+                        # استخرج الروابط من الرسالة
+                        links = LinkNormalizer.extract_links(raw_text)
+                        if not links:
+                            continue
+
+                        self._cleanup_stats['total'] += 1
+
+                        for link_info in links:
+                            raw_link = link_info['raw']
+                            normalized = link_info['normalized']
+                            username = link_info.get('username', '')
+
+                            # فحص تعليمي
+                            is_edu, reason = EducationalFilter.is_educational(raw_text, username)
+
+                            if not is_edu:
+                                # غير تعليمي → احذف
+                                self._cleanup_stats['non_educational'] += 1
+                                logging.info(f"[CLEANUP] {mode} non-educational msg={msg.id}: {raw_link[:50]} ({reason})")
+                                if not preview_only:
+                                    try:
+                                        await self.bot_client.delete_messages(
+                                            self.config.channel_id, [msg.id])
+                                        deleted_count += 1
+                                        self._cleanup_stats['deleted'] = deleted_count
+                                        await asyncio.sleep(0.5)  # تجنب FloodWait
+                                    except FloodWaitError as e:
+                                        logging.warning(f"[CLEANUP] FloodWait {e.seconds}s — pausing")
+                                        await asyncio.sleep(e.seconds + 1)
+                                    except Exception as e:
+                                        logging.error(f"[CLEANUP] Delete error: {e}")
+                                break  # لا تفحص روابط أخرى في نفس الرسالة
+
+                            # تعليمي → تحقق من التكرار
+                            if normalized in seen_educational_links:
+                                # مكرر → احذف
+                                self._cleanup_stats['duplicates'] += 1
+                                logging.info(f"[CLEANUP] {mode} duplicate msg={msg.id}: {raw_link[:50]}")
+                                if not preview_only:
+                                    try:
+                                        await self.bot_client.delete_messages(
+                                            self.config.channel_id, [msg.id])
+                                        deleted_count += 1
+                                        self._cleanup_stats['deleted'] = deleted_count
+                                        await asyncio.sleep(0.5)
+                                    except FloodWaitError as e:
+                                        logging.warning(f"[CLEANUP] FloodWait {e.seconds}s — pausing")
+                                        await asyncio.sleep(e.seconds + 1)
+                                    except Exception as e:
+                                        logging.error(f"[CLEANUP] Delete error: {e}")
+                                break
+                            else:
+                                # تعليمي جديد → سجل
+                                seen_educational_links.add(normalized)
+                                self._cleanup_stats['educational'] += 1
+
+                        # تقرير دوري
+                        if self._cleanup_stats['total'] % 100 == 0:
+                            s = self._cleanup_stats
+                            logging.info(f"[CLEANUP] {mode} progress: {s['total']} scanned, "
+                                         f"{s['educational']} edu, {s['non_educational']} non-edu, "
+                                         f"{s['duplicates']} dup, {s['deleted']} deleted")
+
+                except FloodWaitError as e:
+                    logging.warning(f"[CLEANUP] FloodWait {e.seconds}s — pausing")
+                    await asyncio.sleep(e.seconds + 1)
+                except asyncio.CancelledError:
+                    break
+                except Exception as e:
+                    logging.error(f"[CLEANUP] Batch error: {e}", exc_info=True)
+                    await asyncio.sleep(5)
+
+            # انتهى
+            self._cleanup_stats['running'] = False
+            s = self._cleanup_stats
+            action = "🔍 PREVIEW RESULTS" if preview_only else "✅ CLEANUP COMPLETE"
+            final_msg = (
+                f"{action}\n"
+                f"════════════════════\n"
+                f"📊 Total scanned: {s['total']}\n"
+                f"✅ Educational: {s['educational']}\n"
+                f"❌ Non-educational: {s['non_educational']}\n"
+                f"🔄 Duplicates: {s['duplicates']}\n"
+                f"🗑️ Deleted: {s['deleted']}"
+            )
+            if not preview_only:
+                final_msg += f"\n\n✨ تم تنظيف القناة!\nالآن أرسل /bulk_join للانضمام للمجموعات التعليمية المتبقية"
+            logging.info(f"[CLEANUP] {final_msg}")
+            await self._send(final_msg)
+
+        except asyncio.CancelledError:
+            self._cleanup_stats['running'] = False
+            logging.info("[CLEANUP] Cancelled")
+        except Exception as e:
+            self._cleanup_stats['running'] = False
+            logging.error(f"[CLEANUP] Fatal: {e}", exc_info=True)
+            await self._send(f"❌ خطأ في التنظيف: {e}")
 
     async def _safety_guard(self, phone: str, normalized_link: str, link_data: dict) -> Tuple[bool, str]:
         """Safety Guard — 6 فحوصات صارمة قبل أي Join API call.
@@ -3879,6 +4222,25 @@ class Monitor:
                 try:
                     # timeout 30s لمنع التعليق لو Telegram ما رد
                     entity = await asyncio.wait_for(client.get_entity(username), timeout=30)
+
+                    # تحقق: هل الكيان قناة (channel) وليس مجموعة؟
+                    # Channel = نوع "channel" (broadcast)، Chat = "group" أو "supergroup"
+                    # نريد الانضمام للمجموعات فقط، نتخطى القنوات
+                    is_channel = False
+                    if hasattr(entity, 'broadcast') and entity.broadcast:
+                        is_channel = True
+                    elif hasattr(entity, 'megagroup') and entity.megagroup:
+                        is_channel = False  # megagroup = مجموعة كبيرة (مناسب)
+                    elif hasattr(entity, 'gigagroup') and entity.gigagroup:
+                        is_channel = False  # gigagroup = مجموعة عملاقة (مناسب)
+                    elif (not hasattr(entity, 'megagroup') and
+                          hasattr(entity, 'broadcast') and not entity.broadcast):
+                        is_channel = False  # مجموعة عادية
+
+                    if is_channel:
+                        logging.info(f"[JOIN] {phone} skipped CHANNEL (broadcast): {raw_link[:50]}")
+                        return False, "IS_CHANNEL", None
+
                     await asyncio.wait_for(client(JoinChannelRequest(entity)), timeout=30)
                     await self.metrics.record_api_call(phone)
 
