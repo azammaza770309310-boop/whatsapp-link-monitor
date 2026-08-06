@@ -1,0 +1,500 @@
+                await self._start_scan_all(30, "/scan_month")
+                return
+
+            await event.answer()
+
+        except Exception as e:
+            logging.error(f"Callback error: {e}", exc_info=True)
+            try:
+                await event.answer("حدث خطأ")
+            except:
+                pass
+
+    def _register_user_handlers(self, phone: str):
+        """تسجيل معالجات الرسائل لكل user_client"""
+        client = self.user_clients.get(phone)
+        if not client: return
+        client.add_event_handler(
+            lambda e: self._on_user_message(e, phone),
+            events.NewMessage(incoming=True)
+        )
+        logging.info(f"User handlers registered for {phone}")
+
+    async def _check_telegram_membership(self, link: str) -> dict:
+        """
+        يفحص العضوية بدقة عالية وسرعة.
+        يعيد: {phone: True(مشترك) / False(غير مشترك) / None(تعذر الفحص)}
+        """
+        results = {}
+        
+        # 1. استخراج username وتنظيفه
+        link_lower = link.lower()
+        if "t.me/+" in link or "joinchat" in link_lower:
+            return {}  # روابط خاصة لا يمكن فحصها
+        
+        username = None
+        if "t.me/" in link_lower:
+            parts = link.split("t.me/", 1)
+            if len(parts) > 1:
+                username = parts[1].split("/")[0].split("?")[0].strip()
+        
+        if not username or len(username) < 5:
+            return {}  # غالباً رابط مستخدم أو غير صالح
+        
+        # 2. بناء قاموس (Cache) لكل المراقبين: {username_lowercase: phone}
+        # هذا أسرع بكثير من البحث في كل مرة
+        watchers_dialogs = {}
+        for phone, client in self.user_clients.items():
+            if not client or not client.is_connected():
+                results[phone] = None
+                continue
+            
+            try:
+                # جلب كل المجموعات/القنوات التي يشترك فيها هذا المراقب دفعة واحدة
+                async for dialog in client.iter_dialogs(limit=500):
+                    if hasattr(dialog.entity, 'username') and dialog.entity.username:
+                        watchers_dialogs[dialog.entity.username.lower()] = phone
+                    # أيضاً التحقق من المعرف الرقمي (للمجموعات بدون يوزرنيم)
+                    if hasattr(dialog.entity, 'id'):
+                        watchers_dialogs[f"id_{dialog.entity.id}"] = phone
+            except Exception as e:
+                logging.warning(f"[MEMBERSHIP] Failed to fetch dialogs for {phone}: {e}")
+                results[phone] = None
+        
+        # 3. الآن نفحص الرابط المحدد
+        username_lower = username.lower()
+        
+        for phone, client in self.user_clients.items():
+            if phone in results and results[phone] is None:
+                continue  # تم تعليمه كغير متصل
+                
+            try:
+                # محاولة الفحص المباشر عبر API (الأدق)
+                try:
+                    from telethon.tl.functions.channels import GetParticipantRequest
+                    entity = await client.get_entity(username)
+                    
+                    # التأكد أنه ليس مستخدم عادي
+                    if hasattr(entity, 'first_name') and not hasattr(entity, 'megagroup') and not hasattr(entity, 'broadcast'):
+                        results[phone] = True  # مستخدم، اعتبره مشترك لتجاهله
+                        continue
+                    
+                    try:
+                        await client(GetParticipantRequest(channel=entity, participant="me"))
+                        results[phone] = True  # مشترك تأكيداً
+                    except Exception:
+                        results[phone] = False  # تأكد عدم الاشتراك
+                except Exception:
+                    # لو فشل الـ API، نعتمد على الـ Cache الذي بنيناه
+                    if username_lower in watchers_dialogs and watchers_dialogs[username_lower] == phone:
+                        results[phone] = True
+                    else:
+                        results[phone] = False
+                        
+            except Exception as e:
+                logging.error(f"[MEMBERSHIP] Error checking {phone}: {e}")
+                results[phone] = None
+        
+        logging.info(f"[MEMBERSHIP] Check for @{username}: {results}")
+        return results
+
+    async def _send_recommendation(self, phone: str, link: str, group_name: str, description: str = ""):
+        """يرسل توصية للمراقب بالانضمام للرابط"""
+        client = self.user_clients.get(phone)
+        if not client or not client.is_connected():
+            return
+        
+        try:
+            msg = (
+                f"📌 <b>توصية بالانضمام</b>\n\n"
+                f"تم اكتشاف رابط جديد في مجموعة: <b>{group_name}</b>\n"
+            )
+            if description:
+                msg += f"📝 <b>الوصف:</b> {description}\n"
+            msg += f"\n🔗 <a href=\"{link}\">اضغط هنا للانضمام</a>\n\n"
+            msg += f"⚠️ <i>أنت غير مشترك في هذا الرابط بعد.</i>"
+            
+            await client.send_message("me", msg, parse_mode='html', link_preview=False)
+            logging.info(f"[RECOMMEND] Sent to {phone} for {link[:50]}")
+        except Exception as e:
+            logging.error(f"[RECOMMEND] Failed for {phone}: {e}")
+
+    async def _on_user_message(self, event, source_phone: str):
+        """معالج رسائل المستخدم - نظام عبقري للسحب"""
+        try:
+            msg = event.message
+            if not msg or not msg.text: return
+            chat = await event.get_chat()
+            if hasattr(chat, 'id') and chat.id == self.config.channel_id: return
+            group_name = self._get_chat_name(chat)
+            sender = await event.get_sender()
+            sender_name = self._get_sender_name(sender)
+
+            # فحص سريع: هل توجد كلمات مفتاحية لروابط؟
+            text_lower = msg.text.lower()
+            if not any(x in text_lower for x in ["whatsapp.com", "wa.me", "t.me", "telegram.me"]):
+                return
+
+            # 🤖 استخدام الذكاء الاصطناعي لتحليل الرسالة
+            ai_result = await self.ai_analyzer.analyze_message(msg.text)
+
+            # إذا قرر AI عدم الحفظ → تجاهل
+            if not ai_result.get("should_save", False):
+                logging.info(f"[AI {source_phone}] Skipped: should_save=False in {group_name}")
+                return
+
+            link = ai_result.get("link", "").strip()
+            if not link:
+                return
+
+            link_type = ai_result.get("link_type", "other")
+            sender_contact = ai_result.get("sender_contact", "")
+            country = ai_result.get("country", "")
+            description = ai_result.get("description", "")
+
+            # إذا لم يجد AI بيانات تواصل، يستخدم يوزر مرسل الرسالة
+            if not sender_contact and sender and hasattr(sender, 'username') and sender.username:
+                sender_contact = f"✈️ @{sender.username}"
+
+            # محاولة الحصول على رابط الرسالة
+            msg_link = None
+            try:
+                msg_link = f"https://t.me/c/{str(chat.id).replace('-100', '')}/{msg.id}"
+            except: pass
+
+            # 🔍 فحص العضوية للروابط التيليجرامية
+            non_members = []
+            if link_type == "telegram" and "t.me/+" not in link:
+                logging.info(f"[SMART] Checking membership for: {link[:80]}")
+                membership = await self._check_telegram_membership(link)
+                
+                if membership:
+                    # معالجة دقيقة للنتائج
+                    confirmed_members = 0
+                    for phone, is_member in membership.items():
+                        if is_member is True:
+                            confirmed_members += 1
+                        elif is_member is False:
+                            # غير مشترك تأكيداً → أضفه للتوصية
+                            non_members.append(phone)
+                        # لو None (تعذر الفحص) → لا نضيفه ولا نحسبه مشترك
+                    
+                    # لو كل المراقبين المشتركين (True) → تجاهل الرابط
+                    # (نتجاهل الـ None لأننا لا نعرف حالتهم)
+                    if confirmed_members > 0 and not non_members:
+                        logging.info(f"[SMART {source_phone}] All connected watchers are members - skipping: {link[:50]}")
+                        return
+                    
+                    # لو لا يوجد أحد للتوصية → تجاهل
+                    if not non_members:
+                        logging.info(f"[SMART {source_phone}] No non-members to recommend - skipping: {link[:50]}")
+                        return
+            
+            # إدراج في DB (يمنع التكرار)
+            inserted = await self.db.insert_request(
+                link, msg.date.replace(tzinfo=None) if msg.date else datetime.now(),
+                group_name, sender_name, source_phone, msg_link,
+                message_text=msg.text, sender_contact=sender_contact, link_type=link_type)
+            if not inserted:
+                return  # مكرر
+
+            # جلب أسماء المراقبين
+            watchers = await self.db.get_active_watchers()
+            watchers_names = {w['phone']: w.get('display_name', w['phone']) for w in watchers}
+
+            # تنسيق ونشر مع قائمة غير المشتركين
+            formatted = MessageFormatter.format_link_message(
+                group_name, sender_name, sender_contact, msg.date,
+                link, msg.text, source_phone, msg_link,
+                non_members=non_members, watchers_names=watchers_names)
+            buttons = MessageFormatter.get_link_buttons(link)
+            await self._send(formatted, buttons=buttons)
+            logging.info(f"[SMART {source_phone}] ✅ Forwarded {link_type} link from {group_name}: {link[:50]}")
+
+            if non_members:
+                logging.info(f"[SMART] Non-members listed in message: {non_members}")
+
+        except FloodWaitError as e:
+            await asyncio.sleep(e.seconds)
+        except Exception as e:
+            logging.error(f"User message error: {e}", exc_info=True)
+
+    async def _send(self, text, retries=3, buttons=None, parse_mode='html'):
+        """إرسال رسالة للقناة مع دعم HTML والأزرار"""
+        async with self._send_lock:
+            for a in range(1, retries + 1):
+                try:
+                    await self.bot_client.send_message(
+                        self.config.channel_id, text,
+                        parse_mode=parse_mode,
+                        buttons=buttons,
+                        link_preview=False
+                    )
+                    return
+                except FloodWaitError as e:
+                    await asyncio.sleep(e.seconds + 1)
+                except (RPCError, OSError, ConnectionError):
+                    await asyncio.sleep(min(10 * a, 60))
+            logging.error(f"Failed after {retries} attempts")
+
+    async def _on_private_message(self, event):
+        """معالج رسائل الدردشة الخاصة مع البوت - يدعم /start و /login"""
+        try:
+            text = (event.message.text or "").strip()
+            if not text:
+                return
+
+            sender = await event.get_sender()
+            sender_id = sender.id if sender else None
+            if not sender_id:
+                return
+
+            # الأوامر
+            if text.startswith("/start"):
+                await self._handle_start(event, sender)
+                return
+
+            if text.startswith("/login"):
+                await self._handle_login_start(event, sender)
+                return
+
+            if text == "/cancel":
+                if sender_id in self._login_sessions:
+                    del self._login_sessions[sender_id]
+                await event.reply("❌ تم إلغاء عملية التسجيل.")
+                return
+
+            if text == "/status":
+                watchers = await self.db.get_active_watchers()
+                user_phone = sender.phone if hasattr(sender, 'phone') and sender.phone else None
+                is_watcher = any(w['phone'] == user_phone for w in watchers) if user_phone else False
+                await event.reply(
+                    f"📊 حالتك:\n"
+                    f"👤 معرّفك: {sender_id}\n"
+                    f"📡 مراقب نشط: {'✅ نعم' if is_watcher else '❌ لا'}\n"
+                    f"👥 إجمالي المراقبين: {len(watchers)}\n\n"
+                    f"للتسجيل: /login\n"
+                    f"للمساعدة: /start"
+                )
+                return
+
+            # إذا كان في عملية تسجيل
+            if sender_id in self._login_sessions:
+                await self._handle_login_step(event, sender, text)
+                return
+
+            # رسالة غير معروفة
+            await event.reply(
+                "🤖 أهلاً!\n\n"
+                "📌 الأوامر المتاحة:\n"
+                "• /start - البدء\n"
+                "• /login - تسجيل الدخول بحسابك\n"
+                "• /status - حالتك\n"
+                "• /cancel - إلغاء العملية"
+            )
+
+        except Exception as e:
+            logging.error(f"Private message error: {e}", exc_info=True)
+
+    async def _handle_start(self, event, sender):
+        """معالج أمر /start - يعرض القائمة بالأزرار"""
+        sender_id = sender.id
+        first_name = sender.first_name if sender and hasattr(sender, 'first_name') else ""
+
+        # التحقق إن كان المستخدم مسجل دخول (لديه جلسة نشطة)
+        watchers = await self.db.get_active_watchers()
+        is_logged_in = len(watchers) > 0  # مبسط: أي مراقب نشط = مسجل
+
+        # ملاحظة: لا نقوم بحفظ المستخدمين في قاعدة البيانات (متطلب المالك)
+        # المستخدمون يبقون مخفيين تماماً، لا تظهر أسماؤهم في أي قائمة
+
+        await event.reply(
+            MessageFormatter.format_welcome(first_name),
+            buttons=self._get_main_menu(is_logged_in)
+        )
+
+    async def _handle_login_start(self, event, sender):
+        """بدء عملية تسجيل الدخول التفاعلية"""
+        sender_id = sender.id
+
+        # التحقق من عدم وجود تسجيل سابق
+        if sender_id in self._login_sessions:
+            await event.reply("⚠️ لديك عملية تسجيل قائمة بالفعل. أرسل /cancel للإلغاء.")
+            return
+
+        # بدء جلسة تسجيل جديدة
+        self._login_sessions[sender_id] = {
+            "step": "phone",
+            "temp_client": None,
+            "phone": None,
+            "phone_code_hash": None,
+        }
+
+        await event.reply(
+            "🔐 تسجيل الدخول\n\n"
+            "📌 أرسل رقم هاتفك بالصيغة الدولية.\n"
+            "مثال: +967770309310\n\n"
+            "⚠️ الرقم يجب أن يكون مرتبطاً بحساب تيليجرام.\n\n"
+            "للإلغاء: /cancel"
+        )
+
+    async def _handle_login_step(self, event, sender, text):
+        """معالجة خطوات تسجيل الدخول التفاعلية"""
+        sender_id = sender.id
+        session = self._login_sessions.get(sender_id)
+        if not session:
+            return
+
+        step = session.get("step")
+
+        if step == "phone":
+            # استلام رقم الهاتف
+            phone = text.strip()
+            if not phone.startswith("+"):
+                await event.reply("❌ الرقم يجب أن يبدأ بـ +\nمثال: +967770309310\n\nأعد الإرسال أو /cancel")
+                return
+
+            # إنشاء عميل مؤقت
+            try:
+                # تنظيف أي عميل سابق
+                if session.get("temp_client"):
+                    await session["temp_client"].disconnect()
+
+                temp_client = TelegramClient(
+                    StringSession(),
+                    self.config.api_id, self.config.api_hash,
+                    connection_retries=3, retry_delay=2, request_retries=3,
+                )
+                await temp_client.connect()
+
+                # إرسال كود تيليجرام
+                result = await temp_client.send_code_request(phone)
+                session["temp_client"] = temp_client
+                session["phone"] = phone
+                session["phone_code_hash"] = result.phone_code_hash
+                session["step"] = "code"
+
+                await event.reply(
+                    f"✅ تم إرسال كود التحقق إلى حسابك في تيليجرام.\n\n"
+                    f"📲 تحقق من رسائل تيليجرام (من حساب Telegram الرسمي).\n\n"
+                    f"📌 أرسل الكود الآن (مثال: 12345):\n\n"
+                    f"للإلغاء: /cancel"
+                )
+            except Exception as e:
+                logging.error(f"Login phone error: {e}")
+                await event.reply(f"❌ خطأ: {e}\n\nأعد المحاولة بـ /login أو /cancel")
+                if session.get("temp_client"):
+                    try: await session["temp_client"].disconnect()
+                    except: pass
+                del self._login_sessions[sender_id]
+
+        elif step == "code":
+            # استلام كود التحقق
+            code = text.strip().replace(" ", "").replace("-", "")
+            try:
+                temp_client = session["temp_client"]
+                phone = session["phone"]
+                phone_code_hash = session["phone_code_hash"]
+
+                # محاولة تسجيل الدخول
+                try:
+                    await temp_client.sign_in(phone=phone, code=code, phone_code_hash=phone_code_hash)
+                except Exception as e:
+                    err_str = str(e)
+                    if "SessionPasswordNeeded" in err_str or "PASSWORD" in err_str.upper():
+                        # الحساب محمي بكلمة سر (2FA)
+                        session["step"] = "password"
+                        await event.reply(
+                            "🔐 حسابك محمي بالتحقق بخطوتين (2FA).\n\n"
+                            "📌 أرسل كلمة سر تيليجرام الآن:\n\n"
+                            "للإلغاء: /cancel"
+                        )
+                        return
+                    elif "PhoneCodeInvalid" in err_str:
+                        await event.reply("❌ الكود غير صحيح. أعد الإرسال أو /cancel")
+                        return
+                    elif "PhoneCodeExpired" in err_str:
+                        await event.reply("❌ انتهت صلاحية الكود. ابدأ من جديد بـ /login")
+                        del self._login_sessions[sender_id]
+                        return
+                    else:
+                        raise
+
+                # نجح تسجيل الدخول! توليد StringSession
+                string_session = StringSession.save(temp_client.session)
+                me = await temp_client.get_me()
+                display_name = me.first_name or "User"
+
+                # حفظ في DB
+                added = await self.db.add_watcher(phone, display_name, string_session)
+                if not added:
+                    await event.reply("❌ فشل الحفظ في قاعدة البيانات. حاول لاحقاً.")
+                    await temp_client.disconnect()
+                    del self._login_sessions[sender_id]
+                    return
+
+                # بدء user_client للمستخدم الجديد فوراً
+                watcher = {"phone": phone, "display_name": display_name, "session_string": string_session}
+                if phone not in self.user_clients:
+                    self._user_tasks[phone] = asyncio.create_task(self._run_user_client(watcher))
+
+                # تنظيف
+                await temp_client.disconnect()
+                del self._login_sessions[sender_id]
+
+                await event.reply(
+                    f"🎉 تم تسجيلك بنجاح!\n\n"
+                    f"👤 الاسم: {display_name}\n"
+                    f"📞 الرقم: {phone}\n\n"
+                    f"📚 سيبدأ البوت بمسح آخر 30 يوم من مجموعاتك.\n"
+                    f"📡 ستظهر طلبات المساعدة في قناة المشتركة.\n\n"
+                    f"✅ شكراً لانضمامك!"
+                )
+
+                logging.info(f"[LOGIN] New watcher registered: {phone} ({display_name})")
+
+            except Exception as e:
+                logging.error(f"Login code error: {e}")
+                await event.reply(f"❌ خطأ: {e}\n\nأعد المحاولة بـ /login")
+
+        elif step == "password":
+            # استلام كلمة سر 2FA
+            password = text.strip()
+            try:
+                temp_client = session["temp_client"]
+                await temp_client.sign_in(password=password)
+
+                # نجح! نفس خطوات النجاح السابقة
+                string_session = StringSession.save(temp_client.session)
+                me = await temp_client.get_me()
+                display_name = me.first_name or "User"
+                phone = session["phone"]
+
+                added = await self.db.add_watcher(phone, display_name, string_session)
+                if not added:
+                    await event.reply("❌ فشل الحفظ. حاول لاحقاً.")
+                    await temp_client.disconnect()
+                    del self._login_sessions[sender_id]
+                    return
+
+                watcher = {"phone": phone, "display_name": display_name, "session_string": string_session}
+                if phone not in self.user_clients:
+                    self._user_tasks[phone] = asyncio.create_task(self._run_user_client(watcher))
+
+                await temp_client.disconnect()
+                del self._login_sessions[sender_id]
+
+                await event.reply(
+                    f"🎉 تم تسجيلك بنجاح!\n\n"
+                    f"👤 {display_name} ({phone})\n\n"
+                    f"📚 سيبدأ المسح التاريخي من مجموعاتك...\n"
+                    f"✅ شكراً لانضمامك!"
+                )
+                logging.info(f"[LOGIN] New watcher (2FA): {phone}")
+
+            except Exception as e:
+                logging.error(f"Login password error: {e}")
+                err = str(e)
+                if "PasswordHashInvalid" in err:
+                    await event.reply("❌ كلمة السر غير صحيحة. أعد الإرسال أو /cancel")
+                else:

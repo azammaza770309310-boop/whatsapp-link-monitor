@@ -1,0 +1,240 @@
+[
+  {
+    "scenario": "Telegram API outage (100 messages)",
+    "elapsed_sec": 0.01,
+    "memory_growth_mb": 0.79,
+    "verdict": "PASS",
+    "notes": "100 messages in 0.0s, mem +0.8MB"
+  },
+  {
+    "scenario": "Sustained FloodWait(60s) × 5 messages",
+    "elapsed_sec": 0.0,
+    "verdict": "PASS",
+    "notes": "With sleep mocked, 5 messages should complete in <10s (cap works)"
+  },
+  {
+    "scenario": "Supabase outage (50 links)",
+    "inserted_locally": 50,
+    "local_count": 50,
+    "verdict": "PASS",
+    "notes": "All links must be saved locally even when Supabase is down"
+  },
+  {
+    "scenario": "SQLite database locked",
+    "elapsed_sec": 5.01,
+    "result": false,
+    "verdict": "PASS",
+    "notes": "busy_timeout=5s, completed in 5.0s with result=False"
+  },
+  {
+    "scenario": "Corrupted SQLite database",
+    "init_succeeded": true,
+    "insert_result": true,
+    "verdict": "PASS",
+    "notes": "Corruption handling — may need manual intervention"
+  },
+  {
+    "scenario": "Disk full (OSError on INSERT)",
+    "result": false,
+    "verdict": "PASS",
+    "notes": "Should return False gracefully, not crash"
+  },
+  {
+    "scenario": "AI: HTTP 429",
+    "elapsed_ms": 6,
+    "should_save": true,
+    "used_fallback": true,
+    "verdict": "PASS"
+  },
+  {
+    "scenario": "AI: HTTP 500",
+    "elapsed_ms": 2,
+    "should_save": true,
+    "used_fallback": true,
+    "verdict": "PASS"
+  },
+  {
+    "scenario": "AI: HTTP 401",
+    "elapsed_ms": 2,
+    "should_save": true,
+    "used_fallback": true,
+    "verdict": "PASS"
+  },
+  {
+    "scenario": "AI: Empty response",
+    "elapsed_ms": 1,
+    "should_save": true,
+    "used_fallback": true,
+    "verdict": "PASS"
+  },
+  {
+    "scenario": "AI: No content",
+    "elapsed_ms": 2,
+    "should_save": true,
+    "used_fallback": true,
+    "verdict": "PASS"
+  },
+  {
+    "scenario": "AI: Invalid JSON",
+    "elapsed_ms": 1,
+    "should_save": true,
+    "used_fallback": true,
+    "verdict": "PASS"
+  },
+  {
+    "scenario": "AI: Malformed JSON",
+    "elapsed_ms": 2,
+    "should_save": true,
+    "used_fallback": true,
+    "verdict": "PASS"
+  },
+  {
+    "scenario": "1000 inserts (memory pressure)",
+    "memory_growth_mb": 0.31,
+    "verdict": "PASS",
+    "notes": "+0.3MB for 1000 inserts"
+  },
+  {
+    "scenario": "SIGTERM during active processing",
+    "shutdown_time_sec": 0.0,
+    "verdict": "PASS",
+    "notes": "Shutdown should complete in <10s"
+  },
+  {
+    "scenario": "Load test: 100 users × 10 messages",
+    "elapsed_sec": 0.14,
+    "messages_per_sec": 7346.1,
+    "memory_growth_mb": 1.8,
+    "total_inserts": 1000,
+    "expected_inserts": 1000,
+    "verdict": "PASS"
+  },
+  {
+    "scenario": "Load test: 500 users × 10 messages",
+    "elapsed_sec": 0.8,
+    "messages_per_sec": 6259.4,
+    "memory_growth_mb": 7.95,
+    "total_inserts": 5000,
+    "expected_inserts": 5000,
+    "verdict": "PASS"
+  },
+  {
+    "scenario": "Load test: 1000 users × 10 messages",
+    "elapsed_sec": 1.56,
+    "messages_per_sec": 6413.9,
+    "memory_growth_mb": 13.62,
+    "total_inserts": 10000,
+    "expected_inserts": 10000,
+    "verdict": "PASS"
+  },
+  {
+    "scenario": "Soak test: 24h simulated (2400 inserts + 240 queries)",
+    "mem_samples": [
+      {
+        "hour": 0,
+        "mem_mb": 104.93,
+        "tasks": 1
+      },
+      {
+        "hour": 4,
+        "mem_mb": 104.93,
+        "tasks": 1
+      },
+      {
+        "hour": 8,
+        "mem_mb": 104.93,
+        "tasks": 1
+      },
+      {
+        "hour": 12,
+        "mem_mb": 104.93,
+        "tasks": 1
+      },
+      {
+        "hour": 16,
+        "mem_mb": 104.93,
+        "tasks": 1
+      },
+      {
+        "hour": 20,
+        "mem_mb": 104.93,
+        "tasks": 1
+      }
+    ],
+    "memory_growth_mb": 0.0,
+    "final_link_count": 2400,
+    "max_tasks": 1,
+    "verdict": "PASS",
+    "notes": "Memory grew 0.0MB over 24h simulated"
+  },
+  {
+    "scenario": "Random failure injection (500 ops, 10% fail rate)",
+    "successful_inserts": 465,
+    "failed_or_duplicate": 35,
+    "unique_errors": 0,
+    "final_db_count": 465,
+    "verdict": "PASS",
+    "notes": "DB count must match successful inserts (no corruption)"
+  },
+  {
+    "scenario": "Flood attack: 10000 messages (100 unique links)",
+    "elapsed_sec": 1.07,
+    "successful_inserts": 100,
+    "duplicates_rejected": 9900,
+    "memory_growth_mb": 0.0,
+    "verdict": "PASS",
+    "notes": "Must deduplicate: 100 unique + 9900 rejected"
+  },
+  {
+    "case": "1MB text",
+    "elapsed_ms": 0,
+    "html_length": 706,
+    "verdict": "PASS"
+  },
+  {
+    "case": "1MB link",
+    "elapsed_ms": 0,
+    "html_length": 1177,
+    "verdict": "PASS"
+  },
+  {
+    "case": "100K emojis",
+    "elapsed_ms": 0,
+    "html_length": 706,
+    "verdict": "PASS"
+  },
+  {
+    "case": "100K newlines",
+    "elapsed_ms": 0,
+    "html_length": 706,
+    "verdict": "PASS"
+  },
+  {
+    "case": "Nested HTML",
+    "elapsed_ms": 0,
+    "html_length": 1042,
+    "verdict": "PASS"
+  },
+  {
+    "case": "SQL injection",
+    "elapsed_ms": 0,
+    "html_length": 811,
+    "verdict": "PASS"
+  },
+  {
+    "case": "Path traversal",
+    "elapsed_ms": 0,
+    "html_length": 706,
+    "verdict": "PASS"
+  },
+  {
+    "case": "Link extraction with malformed UTF-8",
+    "verdict": "PASS",
+    "result": []
+  },
+  {
+    "case": "JSON cleaning with malformed UTF-8",
+    "verdict": "PASS",
+    "result": "��\u0000��"
+  }
+]

@@ -1,0 +1,57 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# Sessions (ملفات الجلسة - لن تُرفع)
+sessions/
+sessions/*.session
+sessions/*.session-journal
+sessions/*.session-shm
+sessions/*.session-wal
+
+# Database
+data/
+data/*.db
+data/*.db-journal
+data/*.db-wal
+data/*.db-shm
+
+# Logs
+logs/
+logs/*.log
+
+# Environment & secrets (NEVER commit real credentials)
+accounts.env
+.env
+.env.*
+!.env.example
+*.env
+!accounts.env.example
+
+# API keys / session strings
+*.session-string
+secrets.json
+credentials.json
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Build artifacts
+*.egg-info/
+dist/
+build/
+.pytest_cache/
+.coverage
+htmlcov/
+.mypy_cache/
+.ruff_cache/

@@ -1,0 +1,29 @@
+version: '3.8'
+
+services:
+  bot:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+    container_name: whatsapp-link-monitor
+    restart: unless-stopped
+    env_file:
+      - .env
+    ports:
+      - "${HTTP_PORT:-10000}:10000"
+    volumes:
+      - ./data:/app/data
+      - ./logs:/app/logs
+      - ./sessions:/app/sessions
+      - ./backups:/app/data/backups
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:10000/health', timeout=5)"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"

@@ -1,0 +1,330 @@
+                    await event.reply(f"❌ خطأ: {e}\n\nأعد بـ /login")
+
+    async def _on_command(self, event):
+        try:
+            text = (event.message.text or "").strip()
+            parts = text.split()
+            if not parts: return
+            cmd = parts[0].lower()
+
+            if self.config.owner_id:
+                s = await event.get_sender()
+                if getattr(s, 'id', None) != self.config.owner_id: return
+
+            logging.info(f"[CMD] {cmd}")
+
+            async def reply(t):
+                try: await self.bot_client.send_message(self.config.channel_id, t)
+                except FloodWaitError as e:
+                    await asyncio.sleep(e.seconds + 1)
+                    try: await self.bot_client.send_message(self.config.channel_id, t)
+                    except: pass
+                except: pass
+
+            if cmd == "/help": await reply(MessageFormatter.format_help())
+
+            elif cmd == "/status":
+                total = await self.db.count_requests()
+                watchers = await self.db.get_active_watchers()
+                await reply(MessageFormatter.format_status(total, len(watchers), self.is_scan_running(), self._scan_progress))
+
+            elif cmd == "/watchers":
+                watchers = await self.db.get_active_watchers()
+                if not watchers:
+                    await reply("ℹ️ لا يوجد مستخدمون مراقبون")
+                else:
+                    lines = ["👥 المستخدمون المراقبون:", ""]
+                    for w in watchers:
+                        lines.append(f"• {w['phone']} ({w['display_name'] or 'بدون اسم'})")
+                    await reply("\n".join(lines))
+
+            elif cmd == "/add_watcher":
+                await reply("ℹ️ لإضافة مستخدم مراقب:\n1. شغّل سكريبت add_watcher.py على هاتفه\n2. سيرسل لك StringSession\n3. أضفه يدوياً لـ DB أو استخدم /add_watcher PHONE SESSION_STRING")
+
+            elif cmd in SCAN_COMMANDS:
+                days = SCAN_COMMANDS[cmd]
+                await self._start_scan_all(days, cmd)
+
+            elif cmd == "/scan_stop":
+                if self.is_scan_running():
+                    for scanner in self._current_scanners.values():
+                        scanner.cancel()
+                    await reply("⏹️ تم إيقاف المسح")
+                else:
+                    await reply("ℹ️ لا يوجد مسح")
+
+            elif cmd == "/reset_scan":
+                d = await self.db.reset_scan_state()
+                await reply(f"✅ تم حذف {d} سجل مسح")
+
+            else: await reply(f"❓ أمر غير معروف: {cmd}\nاكتب /help")
+
+        except Exception as e:
+            logging.error(f"CMD error: {e}", exc_info=True)
+
+    def is_scan_running(self):
+        return any(not t.done() for t in self._current_scan_tasks)
+
+    def stop_scan(self):
+        for s in self._current_scanners.values(): s.cancel()
+
+    async def _start_scan_all(self, days, cmd_name):
+        """بدء مسح لكل المستخدمين المراقبين"""
+        if self.is_scan_running():
+            await self._send("⚠️ يوجد مسح قيد التنفيذ\nأرسل /scan_stop لإيقافه")
+            return
+        watchers = await self.db.get_active_watchers()
+        if not watchers:
+            await self._send("❌ لا يوجد مستخدمون مراقبون")
+            return
+        d = f"{days} يوم" if days else "كامل"
+        await self._send(f"🚀 بدء المسح ({cmd_name}) لـ {len(watchers)} مستخدم\n📅 الفترة: {d}\n⏳ جاري...")
+        self._current_scan_tasks = []
+        for w in watchers:
+            task = asyncio.create_task(self._run_scan_for_watcher(w, days))
+            self._current_scan_tasks.append(task)
+
+    async def _run_scan_for_watcher(self, watcher, days):
+        try:
+            phone = watcher['phone']
+            client = self.user_clients.get(phone)
+            if not client or not client.is_connected():
+                logging.warning(f"[SCAN] {phone} not connected, skipping")
+                return
+            def p(i, t, n): self._scan_progress = f"{phone}: {i}/{t}"
+            scanner = HistoryScanner(
+                client, self.bot_client, self.db, self.config.channel_id,
+                days, self.config.history_max_per_chat, self.config.history_batch_size,
+                self.config.history_skip_channel_posts, phone, watcher.get('display_name', ''), p)
+            self._current_scanners[phone] = scanner
+            await scanner.scan()
+        except asyncio.CancelledError: pass
+        except Exception as e: logging.error(f"Scan error {watcher['phone']}: {e}", exc_info=True)
+        finally: self._current_scanners.pop(watcher['phone'], None)
+
+    async def _run_user_client(self, watcher):
+        """تشغيل user_client لمستخدم مراقب"""
+        phone = watcher['phone']
+        session_string = watcher['session_string']
+        backoff = 5
+        while self._running:
+            try:
+                client = self.user_clients.get(phone)
+                if client is None:
+                    # حماية من الجلسات التالفة
+                    if not session_string or not isinstance(session_string, str) or len(session_string) < 50:
+                        logging.error(f"User {phone} has invalid/corrupted session string! Skipping.")
+                        return
+                    try:
+                        client = self._create_user_client(session_string, phone)
+                    except ValueError as ve:
+                        logging.error(f"User {phone} session string is invalid: {ve}. Skipping this user.")
+                        return
+                    except Exception as ce:
+                        logging.error(f"User {phone} failed to create client: {ce}")
+                        return
+                    self.user_clients[phone] = client
+                    self._register_user_handlers(phone)
+                if not client.is_connected():
+                    logging.info(f"Connecting user {phone}...")
+                    await client.connect()
+                    if not await client.is_user_authorized():
+                        logging.error(f"User {phone} session not authorized! Please re-login.")
+                        return
+                    logging.info(f"User {phone} connected")
+                    backoff = 5
+                    # مسح البدء لهذا المستخدم
+                    if phone not in self._startup_scan_done:
+                        self._startup_scan_done.add(phone)
+                        if self.config.startup_scan_days is not None:
+                            asyncio.create_task(self._run_startup_scan(watcher))
+                await client.run_until_disconnected()
+            except FloodWaitError as e: await asyncio.sleep(e.seconds + 1)
+            except (RPCError, ConnectionError, OSError) as e: logging.error(f"User {phone} error: {e}")
+            except asyncio.CancelledError: raise
+            except Exception as e: logging.error(f"User {phone} unexpected: {e}", exc_info=True)
+            finally:
+                client = self.user_clients.get(phone)
+                if client and client.is_connected():
+                    try: await client.disconnect()
+                    except: pass
+            if not self._running: break
+            await asyncio.sleep(backoff)
+            backoff = min(backoff * 2, 600)
+
+    async def _run_startup_scan(self, watcher):
+        try:
+            await asyncio.sleep(5)
+            scanner = HistoryScanner(
+                self.user_clients[watcher['phone']], self.bot_client, self.db,
+                self.config.channel_id, self.config.startup_scan_days,
+                self.config.history_max_per_chat, self.config.history_batch_size,
+                self.config.history_skip_channel_posts, watcher['phone'],
+                watcher.get('display_name', ''))
+            self._current_scanners[watcher['phone']] = scanner
+            await scanner.scan()
+        except asyncio.CancelledError: pass
+        except Exception as e: logging.error(f"Startup scan: {e}", exc_info=True)
+        finally: self._current_scanners.pop(watcher['phone'], None)
+
+    async def _run_bot(self):
+        backoff = 5
+        while self._running:
+            try:
+                if not self.bot_client.is_connected():
+                    logging.info("Connecting bot...")
+                    await self.bot_client.start(bot_token=self.config.bot_token)
+                    me = await self.bot_client.get_me()
+                    logging.info(f"Bot: @{me.username} ({me.first_name})")
+                    backoff = 5
+                await self.bot_client.run_until_disconnected()
+            except FloodWaitError as e: await asyncio.sleep(e.seconds + 1)
+            except (RPCError, ConnectionError, OSError) as e: logging.error(f"Bot error: {e}")
+            except asyncio.CancelledError: raise
+            except Exception as e: logging.error(f"Bot unexpected: {e}", exc_info=True)
+            finally:
+                if self.bot_client and self.bot_client.is_connected():
+                    try: await self.bot_client.disconnect()
+                    except: pass
+            if not self._running: break
+            await asyncio.sleep(backoff)
+            backoff = min(backoff * 2, 600)
+
+    async def _keep_alive(self):
+        app_url = os.getenv("RENDER_EXTERNAL_URL") or os.getenv("APP_URL")
+        if not app_url:
+            logging.info("Keep-alive disabled (no RENDER_EXTERNAL_URL)")
+            return
+        app_url = app_url.rstrip("/")
+        health_url = f"{app_url}/health"
+        logging.info(f"Keep-alive: will ping {health_url}")
+        async with aiohttp.ClientSession() as session:
+            while True:
+                try:
+                    await asyncio.sleep(600)
+                    async with session.get(health_url, timeout=10) as r:
+                        logging.debug(f"Keep-alive: {r.status}")
+                except asyncio.CancelledError: break
+                except: pass
+
+    async def start(self):
+        self._running = True
+        self.bot_client = self._create_bot_client()
+        self._register_handlers()
+        # بدء البوت أولاً
+        self._bot_task = asyncio.create_task(self._run_bot())
+        await asyncio.sleep(3)
+        # بدء كل المستخدمين المراقبين
+        watchers = await self.db.get_active_watchers()
+        logging.info(f"Starting {len(watchers)} watchers")
+        for w in watchers:
+            self._user_tasks[w['phone']] = asyncio.create_task(self._run_user_client(w))
+        self._keep_alive_task = asyncio.create_task(self._keep_alive())
+
+    async def stop(self):
+        """إيقاف نظيف لمنع تسريب الذاكرة"""
+        self._running = False
+        self.stop_scan()
+        
+        # إغلاق جلسة AI Analyzer (يمنع Unclosed client session)
+        if hasattr(self, 'ai_analyzer') and self.ai_analyzer:
+            try:
+                await self.ai_analyzer.close()
+            except: pass
+        
+        # إغلاق البوت
+        if self.bot_client and self.bot_client.is_connected():
+            try: await self.bot_client.disconnect()
+            except: pass
+        
+        # إغلاق حسابات المراقبة
+        for c in self.user_clients.values():
+            if c and c.is_connected():
+                try: await c.disconnect()
+                except: pass
+        
+        # إلغاء المهام
+        for t in [self._bot_task, self._keep_alive_task] + list(self._user_tasks.values()) + self._current_scan_tasks:
+            if t and not t.done():
+                t.cancel()
+                try: await t
+                except (asyncio.CancelledError, Exception): pass
+
+
+# -------------------------------------------------------------------
+# HTTP Server (for Render)
+# -------------------------------------------------------------------
+
+
+async def health_handler(request):
+    return web.Response(text="✅ Bot is running", status=200)
+
+
+async def start_http_server():
+    port = int(os.getenv("PORT", "10000"))
+    app = web.Application()
+    app.router.add_get("/", health_handler)
+    app.router.add_get("/health", health_handler)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", port)
+    await site.start()
+    logging.info(f"HTTP server listening on port {port}")
+    return runner
+
+
+# -------------------------------------------------------------------
+# Main
+# -------------------------------------------------------------------
+
+
+async def main():
+    load_dotenv(dotenv_path='accounts.env')
+    config = Config()
+    errors = config.validate()
+    if errors:
+        for e in errors: print(f"❌ {e}", file=sys.stderr)
+        sys.exit(1)
+    setup_logging(config.log_level)
+    logging.info("=== Telegram Help Requests Monitor v7 ===")
+    logging.info(f"Bot token: {config.bot_token[:20]}...")
+    logging.info(f"Channel ID: {config.channel_id}")
+    if config.startup_scan_days is not None:
+        logging.info(f"Startup scan: {config.startup_scan_days} days for each watcher")
+
+    Path(SESSIONS_DIR).mkdir(parents=True, exist_ok=True)
+    Path(DATA_DIR).mkdir(parents=True, exist_ok=True)
+    Path(LOGS_DIR).mkdir(parents=True, exist_ok=True)
+
+    db = DatabaseManager()
+    await db.init_db()
+
+    # ملاحظة: لا نضيف المالك تلقائياً - سيستخدم /login للتسجيل
+    # هذا يحل مشكلة "فشل الحفظ" عند إضافة رقم المالك
+
+    monitor = Monitor(config, db)
+    await monitor.start()
+    http_runner = await start_http_server()
+
+    logging.info("✅ Monitor started. Send /help to channel.")
+
+    shutdown = asyncio.Event()
+    def sh(): shutdown.set()
+    loop = asyncio.get_event_loop()
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        try: loop.add_signal_handler(sig, sh)
+        except:
+            try: signal.signal(sig, lambda *_: sh())
+            except: pass
+    await shutdown.wait()
+    logging.info("Stopping...")
+    await monitor.stop()
+    await db.close()
+    await http_runner.cleanup()
+    logging.info("Stopped.")
+
+
+if __name__ == "__main__":
+    try: asyncio.run(main())
+    except KeyboardInterrupt: logging.info("Interrupted")
+    except Exception as e: logging.critical(f"Fatal: {e}", exc_info=True)

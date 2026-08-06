@@ -1,0 +1,32 @@
+# Default configuration
+database:
+  path: data/links.db
+  journal_mode: WAL
+  busy_timeout: 30000
+  synchronous: NORMAL
+
+logging:
+  level: INFO
+  format: json  # json or text
+
+telegram:
+  session_dir: sessions
+  connection_retries: 5
+  retry_delay: 5
+  request_retries: 5
+  auto_reconnect: true
+
+jobs:
+  validation_interval_hours: 24
+  backup_interval_hours: 24
+  backup_retention_days: 30
+
+rate_limit:
+  per_minute: 10
+  burst: 20
+
+http:
+  host: 0.0.0.0
+  port: 10000
+
+plugins: []
