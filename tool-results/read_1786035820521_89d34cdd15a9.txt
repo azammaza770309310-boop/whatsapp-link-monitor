@@ -1,0 +1,260 @@
+     1→2026-08-06T16:52:45.339037727Z ==> Cloning from https://github.com/azammaza770309310-boop/whatsapp-link-monitor
+     2→2026-08-06T16:52:46.264392612Z ==> Checking out commit e3c10ca8e41609e21a2bd6f242efc9d224787813 in branch main
+     3→2026-08-06T16:52:47.137088976Z ==> Using Python version 3.14.3 (default)
+     4→2026-08-06T16:52:47.137100694Z ==> Docs on specifying a Python version: https://render.com/docs/python-version
+     5→2026-08-06T16:52:47.137101899Z ==> Installing Python version 3.14.3...
+     6→2026-08-06T16:52:49.855316805Z ==> Using Poetry version 2.1.3 (default)
+     7→2026-08-06T16:52:49.890808345Z ==> Docs on specifying a Poetry version: https://render.com/docs/poetry-version
+     8→2026-08-06T16:52:49.93952485Z ==> Running build command 'pip install -r requirements.txt'...
+     9→2026-08-06T16:52:50.300099263Z Collecting telethon>=1.28.0 (from -r requirements.txt (line 1))
+    10→2026-08-06T16:52:50.368577716Z   Downloading telethon-1.44.0-py3-none-any.whl.metadata (4.0 kB)
+    11→2026-08-06T16:52:50.387642535Z Collecting aiosqlite>=0.19.0 (from -r requirements.txt (line 2))
+    12→2026-08-06T16:52:50.395640255Z   Downloading aiosqlite-0.22.1-py3-none-any.whl.metadata (4.3 kB)
+    13→2026-08-06T16:52:50.416263979Z Collecting python-dotenv>=1.0.0 (from -r requirements.txt (line 3))
+    14→2026-08-06T16:52:50.42421012Z   Downloading python_dotenv-1.2.2-py3-none-any.whl.metadata (27 kB)
+    15→2026-08-06T16:52:50.79631235Z Collecting aiohttp>=3.9.0 (from -r requirements.txt (line 4))
+    16→2026-08-06T16:52:50.804597955Z   Downloading aiohttp-3.14.3-cp314-cp314-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl.metadata (8.3 kB)
+    17→2026-08-06T16:52:50.821454427Z Collecting PySocks>=1.7.1 (from -r requirements.txt (line 5))
+    18→2026-08-06T16:52:50.829429764Z   Downloading PySocks-1.7.1-py3-none-any.whl.metadata (13 kB)
+    19→2026-08-06T16:52:50.84469967Z Collecting pyaes (from telethon>=1.28.0->-r requirements.txt (line 1))
+    20→2026-08-06T16:52:50.853123745Z   Downloading pyaes-1.6.1.tar.gz (28 kB)
+    21→2026-08-06T16:52:50.858542802Z   Installing build dependencies: started
+    22→2026-08-06T16:52:51.502259643Z   Installing build dependencies: finished with status 'done'
+    23→2026-08-06T16:52:51.502740156Z   Getting requirements to build wheel: started
+    24→2026-08-06T16:52:51.758551788Z   Getting requirements to build wheel: finished with status 'done'
+    25→2026-08-06T16:52:51.759255476Z   Preparing metadata (pyproject.toml): started
+    26→2026-08-06T16:52:51.887818116Z   Preparing metadata (pyproject.toml): finished with status 'done'
+    27→2026-08-06T16:52:51.933417035Z Collecting rsa (from telethon>=1.28.0->-r requirements.txt (line 1))
+    28→2026-08-06T16:52:51.941992791Z   Downloading rsa-4.9.1-py3-none-any.whl.metadata (5.6 kB)
+    29→2026-08-06T16:52:51.962928879Z Collecting aiohappyeyeballs>=2.5.0 (from aiohttp>=3.9.0->-r requirements.txt (line 4))
+    30→2026-08-06T16:52:51.971661591Z   Downloading aiohappyeyeballs-2.7.1-py3-none-any.whl.metadata (5.9 kB)
+    31→2026-08-06T16:52:51.990222077Z Collecting aiosignal>=1.4.0 (from aiohttp>=3.9.0->-r requirements.txt (line 4))
+    32→2026-08-06T16:52:51.998600084Z   Downloading aiosignal-1.4.0-py3-none-any.whl.metadata (3.7 kB)
+    33→2026-08-06T16:52:52.017505314Z Collecting attrs>=17.3.0 (from aiohttp>=3.9.0->-r requirements.txt (line 4))
+    34→2026-08-06T16:52:52.025171387Z   Downloading attrs-26.1.0-py3-none-any.whl.metadata (8.8 kB)
+    35→2026-08-06T16:52:52.077089453Z Collecting frozenlist>=1.1.1 (from aiohttp>=3.9.0->-r requirements.txt (line 4))
+    36→2026-08-06T16:52:52.085034021Z   Downloading frozenlist-1.8.0-cp314-cp314-manylinux1_x86_64.manylinux_2_28_x86_64.manylinux_2_5_x86_64.whl.metadata (20 kB)
+    37→2026-08-06T16:52:52.23344862Z Collecting multidict<7.0,>=4.5 (from aiohttp>=3.9.0->-r requirements.txt (line 4))
+    38→2026-08-06T16:52:52.241851219Z   Downloading multidict-6.7.1-cp314-cp314-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl.metadata (5.3 kB)
+    39→2026-08-06T16:52:52.286379527Z Collecting propcache>=0.2.0 (from aiohttp>=3.9.0->-r requirements.txt (line 4))
+    40→2026-08-06T16:52:52.295135134Z   Downloading propcache-0.5.2-cp314-cp314-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl.metadata (16 kB)
+    41→2026-08-06T16:52:52.475966399Z Collecting yarl<2.0,>=1.17.0 (from aiohttp>=3.9.0->-r requirements.txt (line 4))
+    42→2026-08-06T16:52:52.484298564Z   Downloading yarl-1.24.5-cp314-cp314-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl.metadata (103 kB)
+    43→2026-08-06T16:52:52.516400498Z Collecting idna>=2.0 (from yarl<2.0,>=1.17.0->aiohttp>=3.9.0->-r requirements.txt (line 4))
+    44→2026-08-06T16:52:52.524515485Z   Downloading idna-3.18-py3-none-any.whl.metadata (6.1 kB)
+    45→2026-08-06T16:52:52.552918381Z Collecting pyasn1>=0.1.3 (from rsa->telethon>=1.28.0->-r requirements.txt (line 1))
+    46→2026-08-06T16:52:52.560760559Z   Downloading pyasn1-0.6.4-py3-none-any.whl.metadata (8.4 kB)
+    47→2026-08-06T16:52:52.572606691Z Downloading telethon-1.44.0-py3-none-any.whl (789 kB)
+    48→2026-08-06T16:52:52.590422029Z    ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 789.8/789.8 kB 58.0 MB/s  0:00:00
+    49→2026-08-06T16:52:52.598732051Z Downloading aiosqlite-0.22.1-py3-none-any.whl (17 kB)
+    50→2026-08-06T16:52:52.607781985Z Downloading python_dotenv-1.2.2-py3-none-any.whl (22 kB)
+    51→2026-08-06T16:52:52.617393883Z Downloading aiohttp-3.14.3-cp314-cp314-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl (1.8 MB)
+    52→2026-08-06T16:52:52.629993497Z    ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 1.8/1.8 MB 136.7 MB/s  0:00:00
+    53→2026-08-06T16:52:52.637833557Z Downloading multidict-6.7.1-cp314-cp314-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl (248 kB)
+    54→2026-08-06T16:52:52.647830891Z Downloading yarl-1.24.5-cp314-cp314-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl (110 kB)
+    55→2026-08-06T16:52:52.656630658Z Downloading PySocks-1.7.1-py3-none-any.whl (16 kB)
+    56→2026-08-06T16:52:52.665566878Z Downloading aiohappyeyeballs-2.7.1-py3-none-any.whl (15 kB)
+    57→2026-08-06T16:52:52.674386362Z Downloading aiosignal-1.4.0-py3-none-any.whl (7.5 kB)
+    58→2026-08-06T16:52:52.684178229Z Downloading attrs-26.1.0-py3-none-any.whl (67 kB)
+    59→2026-08-06T16:52:52.694075153Z Downloading frozenlist-1.8.0-cp314-cp314-manylinux1_x86_64.manylinux_2_28_x86_64.manylinux_2_5_x86_64.whl (231 kB)
+    60→2026-08-06T16:52:52.703818669Z Downloading idna-3.18-py3-none-any.whl (65 kB)
+    61→2026-08-06T16:52:52.713034527Z Downloading propcache-0.5.2-cp314-cp314-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl (61 kB)
+    62→2026-08-06T16:52:52.722160719Z Downloading rsa-4.9.1-py3-none-any.whl (34 kB)
+    63→2026-08-06T16:52:52.731492527Z Downloading pyasn1-0.6.4-py3-none-any.whl (84 kB)
+    64→2026-08-06T16:52:52.745190452Z Building wheels for collected packages: pyaes
+    65→2026-08-06T16:52:52.745849642Z   Building wheel for pyaes (pyproject.toml): started
+    66→2026-08-06T16:52:52.90428477Z   Building wheel for pyaes (pyproject.toml): finished with status 'done'
+    67→2026-08-06T16:52:52.904640355Z   Created wheel for pyaes: filename=pyaes-1.6.1-py3-none-any.whl size=26420 sha256=400197440c5ee4724a8b977b5db194eccbc26ce2c9576eac0aa6735e211dfd85
+    68→2026-08-06T16:52:52.904714056Z   Stored in directory: /opt/render/.cache/wheels/d1/14/ec/f27d9124264441d195bbf80a3e627664f4e61220935cc39343
+    69→2026-08-06T16:52:52.906015072Z Successfully built pyaes
+    70→2026-08-06T16:52:52.927379628Z Installing collected packages: pyaes, python-dotenv, PySocks, pyasn1, propcache, multidict, idna, frozenlist, attrs, aiosqlite, aiohappyeyeballs, yarl, rsa, aiosignal, telethon, aiohttp
+    71→2026-08-06T16:52:53.997676161Z 
+    72→2026-08-06T16:52:53.99910142Z Successfully installed PySocks-1.7.1 aiohappyeyeballs-2.7.1 aiohttp-3.14.3 aiosignal-1.4.0 aiosqlite-0.22.1 attrs-26.1.0 frozenlist-1.8.0 idna-3.18 multidict-6.7.1 propcache-0.5.2 pyaes-1.6.1 pyasn1-0.6.4 python-dotenv-1.2.2 rsa-4.9.1 telethon-1.44.0 yarl-1.24.5
+    73→2026-08-06T16:52:54.10163069Z 
+    74→2026-08-06T16:52:54.101642525Z [notice] A new release of pip is available: 25.3 -> 26.2.1
+    75→2026-08-06T16:52:54.101643796Z [notice] To update, run: pip install --upgrade pip
+    76→2026-08-06T16:52:55.176068228Z ==> Uploading build...
+    77→2026-08-06T16:52:59.396959032Z ==> Uploaded in 3.3s. Compression took 0.9s
+    78→2026-08-06T16:52:59.40015008Z ==> Build successful 🎉
+    79→2026-08-06T16:53:00.346558396Z ==> Deploying...
+    80→2026-08-06T16:53:00.445980845Z ==> Setting WEB_CONCURRENCY=1 by default, based on available CPUs in the instance
+    81→2026-08-06T16:53:08.281958616Z ==> Running 'python bot.py'
+    82→2026-08-06T16:53:16.57749783Z 2026-08-06 16:53:16,577 - root - INFO - === Telegram Help Requests Monitor v7 ===
+    83→2026-08-06T16:53:16.577525451Z 2026-08-06 16:53:16,577 - root - INFO - Bot token: 88210336...yxJM (loaded, len=46)
+    84→2026-08-06T16:53:16.577595012Z 2026-08-06 16:53:16,577 - root - INFO - Channel ID: -1004402529305
+    85→2026-08-06T16:53:16.588948839Z 2026-08-06 16:53:16,588 - root - INFO - ✅ Production tables initialized (link_queue, group_states, membership_cache, floodwait_tracker, api_operations_log, system_settings)
+    86→2026-08-06T16:53:16.588977749Z 2026-08-06 16:53:16,588 - root - INFO - ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    87→2026-08-06T16:53:16.5890259Z 2026-08-06 16:53:16,588 - root - INFO - [MIGRATION] Checking Supabase watchers schema (role, joiner_enabled)...
+    88→2026-08-06T16:53:16.928740476Z 2026-08-06 16:53:16,928 - root - INFO - [SUPABASE] Schema OK: role + joiner_enabled columns exist
+    89→2026-08-06T16:53:16.929645455Z 2026-08-06 16:53:16,929 - root - INFO - [MIGRATION] SQLite tables after init_db: ['api_operations_log', 'floodwait_tracker', 'forwarded_requests', 'group_states', 'link_queue', 'membership_cache', 'scan_state', 'sqlite_sequence', 'system_settings', 'target_groups']
+    90→2026-08-06T16:53:16.929657805Z 2026-08-06 16:53:16,929 - root - INFO - [MIGRATION] ✅ PROVEN: 'watchers' table does NOT exist in SQLite
+    91→2026-08-06T16:53:16.929661496Z 2026-08-06 16:53:16,929 - root - INFO - ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    92→2026-08-06T16:53:16.930007373Z 2026-08-06 16:53:16,929 - root - INFO - 🤖 AI Analyzer مفعّل - 8 مفتاح متاح
+    93→2026-08-06T16:53:16.93032577Z 2026-08-06 16:53:16,930 - root - INFO - ▶️ Join enabled (from DB setting)
+    94→2026-08-06T16:53:16.931203869Z 2026-08-06 16:53:16,930 - root - INFO - ✅ No accounts in FloodWait
+    95→2026-08-06T16:53:16.931214239Z 2026-08-06 16:53:16,930 - root - INFO - 📡 Production Mode: Real Telegram API calls enabled
+    96→2026-08-06T16:53:16.931217489Z 2026-08-06 16:53:16,930 - root - INFO - 📊 Daily Join Limit: 15/day
+    97→2026-08-06T16:53:16.93122327Z 2026-08-06 16:53:16,930 - root - INFO - 📊 Hourly Join Limit: 5/hour
+    98→2026-08-06T16:53:16.931225819Z 2026-08-06 16:53:16,930 - root - INFO - 📊 Join Cooldown: 600s (10 min)
+    99→2026-08-06T16:53:16.931229079Z 2026-08-06 16:53:16,930 - root - INFO - ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+   100→2026-08-06T16:53:16.93125541Z 2026-08-06 16:53:16,930 - root - INFO - [STARTUP VERIFICATION] Supabase = SOLE source of truth for accounts
+   101→2026-08-06T16:53:16.93125872Z 2026-08-06 16:53:16,930 - root - INFO - ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+   102→2026-08-06T16:53:17.149325848Z 2026-08-06 16:53:17,149 - root - INFO - [SUPABASE] Loaded 4 watchers from Supabase (with role)
+   103→2026-08-06T16:53:17.359419883Z 2026-08-06 16:53:17,359 - root - INFO - [STARTUP VERIFICATION] ════════════════════════════════════
+   104→2026-08-06T16:53:17.359857863Z 2026-08-06 16:53:17,359 - root - INFO - [STARTUP VERIFICATION]  Supabase accounts (is_active=true): 4
+   105→2026-08-06T16:53:17.359876683Z 2026-08-06 16:53:17,359 - root - INFO - [STARTUP VERIFICATION]  Supabase count (REST count=exact): 4
+   106→2026-08-06T16:53:17.359884303Z 2026-08-06 16:53:17,359 - root - INFO - [STARTUP VERIFICATION]  Monitors: 3
+   107→2026-08-06T16:53:17.359887263Z 2026-08-06 16:53:17,359 - root - INFO - [STARTUP VERIFICATION]  Joiners:  1
+   108→2026-08-06T16:53:17.359890543Z 2026-08-06 16:53:17,359 - root - INFO - [STARTUP VERIFICATION] ────────────────────────────────────
+   109→2026-08-06T16:53:17.359894473Z 2026-08-06 16:53:17,359 - root - INFO - [STARTUP VERIFICATION]  Account list (phone | role):
+   110→2026-08-06T16:53:17.359897133Z 2026-08-06 16:53:17,359 - root - INFO - [STARTUP VERIFICATION]    → +967735451189 (role=monitor)
+   111→2026-08-06T16:53:17.359899084Z 2026-08-06 16:53:17,359 - root - INFO - [STARTUP VERIFICATION]    → +967784642961 (role=monitor)
+   112→2026-08-06T16:53:17.359900953Z 2026-08-06 16:53:17,359 - root - INFO - [STARTUP VERIFICATION]    → +967770309310 (role=monitor)
+   113→2026-08-06T16:53:17.359903413Z 2026-08-06 16:53:17,359 - root - INFO - [STARTUP VERIFICATION]    → +967739407274 (role=joiner)
+   114→2026-08-06T16:53:17.359906464Z 2026-08-06 16:53:17,359 - root - INFO - [STARTUP VERIFICATION] ────────────────────────────────────
+   115→2026-08-06T16:53:17.359910194Z 2026-08-06 16:53:17,359 - root - INFO - [STARTUP VERIFICATION]  SQLite tables: ['api_operations_log', 'floodwait_tracker', 'forwarded_requests', 'group_states', 'link_queue', 'membership_cache', 'scan_state', 'sqlite_sequence', 'system_settings', 'target_groups']
+   116→2026-08-06T16:53:17.359943434Z 2026-08-06 16:53:17,359 - root - INFO - [STARTUP VERIFICATION]  'watchers' in SQLite: ✅ NO (correct)
+   117→2026-08-06T16:53:17.359996155Z 2026-08-06 16:53:17,359 - root - INFO - [STARTUP VERIFICATION] ════════════════════════════════════
+   118→2026-08-06T16:53:17.360026626Z 2026-08-06 16:53:17,359 - root - INFO - ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+   119→2026-08-06T16:53:17.383815392Z 2026-08-06 16:53:17,383 - root - INFO - Bot handlers registered (channel + private + buttons)
+   120→2026-08-06T16:53:17.383928534Z 2026-08-06 16:53:17,383 - root - INFO - Connecting bot...
+   121→2026-08-06T16:53:20.606499903Z 2026-08-06 16:53:20,606 - root - INFO - [SUPABASE] Loaded 4 watchers from Supabase (with role)
+   122→2026-08-06T16:53:20.606579384Z 2026-08-06 16:53:20,606 - root - INFO - Starting 4 accounts (3 monitors, 1 joiners)
+   123→2026-08-06T16:53:20.606584875Z 2026-08-06 16:53:20,606 - root - INFO -   → +967735451189 (role=monitor)
+   124→2026-08-06T16:53:20.606637586Z 2026-08-06 16:53:20,606 - root - INFO -   → +967784642961 (role=monitor)
+   125→2026-08-06T16:53:20.606702567Z 2026-08-06 16:53:20,606 - root - INFO -   → +967770309310 (role=monitor)
+   126→2026-08-06T16:53:20.606716647Z 2026-08-06 16:53:20,606 - root - INFO -   → +967739407274 (role=joiner)
+   127→2026-08-06T16:53:20.606768068Z 2026-08-06 16:53:20,606 - root - INFO - 🚀 Joiner worker started
+   128→2026-08-06T16:53:20.607461794Z 2026-08-06 16:53:20,607 - root - INFO - User handlers registered for +967735451189
+   129→2026-08-06T16:53:20.607481414Z 2026-08-06 16:53:20,607 - root - INFO - 👁️ Monitor +967735451189: handlers registered
+   130→2026-08-06T16:53:20.607523705Z 2026-08-06 16:53:20,607 - root - INFO - Connecting user +967735451189...
+   131→2026-08-06T16:53:20.607937094Z 2026-08-06 16:53:20,607 - root - INFO - User handlers registered for +967784642961
+   132→2026-08-06T16:53:20.607977825Z 2026-08-06 16:53:20,607 - root - INFO - 👁️ Monitor +967784642961: handlers registered
+   133→2026-08-06T16:53:20.608003405Z 2026-08-06 16:53:20,607 - root - INFO - Connecting user +967784642961...
+   134→2026-08-06T16:53:20.608384303Z 2026-08-06 16:53:20,608 - root - INFO - User handlers registered for +967770309310
+   135→2026-08-06T16:53:20.608423474Z 2026-08-06 16:53:20,608 - root - INFO - 👁️ Monitor +967770309310: handlers registered
+   136→2026-08-06T16:53:20.608460175Z 2026-08-06 16:53:20,608 - root - INFO - Connecting user +967770309310...
+   137→2026-08-06T16:53:20.608789752Z 2026-08-06 16:53:20,608 - root - INFO - 🚀 Joiner +967739407274: connected (no message handlers)
+   138→2026-08-06T16:53:20.608825263Z 2026-08-06 16:53:20,608 - root - INFO - Connecting user +967739407274...
+   139→2026-08-06T16:53:20.609067428Z 2026-08-06 16:53:20,608 - root - INFO - Keep-alive: will ping https://whatsapp-userbot-0xwu.onrender.com/health
+   140→2026-08-06T16:53:20.609338104Z 2026-08-06 16:53:20,609 - root - INFO - HTTP server listening on port 10000 (endpoints: /health /ready /metrics)
+   141→2026-08-06T16:53:20.609362265Z 2026-08-06 16:53:20,609 - root - INFO - ✅ Monitor started. Send /help to channel.
+   142→2026-08-06T16:53:21.43845778Z 2026-08-06 16:53:21,438 - root - ERROR - User +967784642961 session not authorized! Please re-login.
+   143→2026-08-06T16:53:21.438524312Z 2026-08-06 16:53:21,438 - root - INFO - [CLEANUP] Removed user_client for +967784642961
+   144→2026-08-06T16:53:21.687585781Z 2026-08-06 16:53:21,687 - root - INFO - User +967770309310 connected (role=monitor)
+   145→2026-08-06T16:53:21.687678714Z 2026-08-06 16:53:21,687 - root - INFO - User +967739407274 connected (role=joiner)
+   146→2026-08-06T16:53:21.862067975Z 2026-08-06 16:53:21,861 - root - INFO - User +967735451189 connected (role=monitor)
+   147→2026-08-06T16:53:21.862647967Z 2026-08-06 16:53:21,862 - root - INFO - [PIPELINE-1] 📨 Event Handler received message from source=+967735451189 chat_id=-1001550778078 (len=165)
+   148→2026-08-06T16:53:22.11140928Z 2026-08-06 16:53:22,111 - root - INFO - [PIPELINE-1] 📨 Event Handler received message from source=+967770309310 chat_id=-1003817064055 (len=156)
+   149→2026-08-06T16:53:22.111455011Z 2026-08-06 16:53:22,111 - root - INFO - [PIPELINE-1] 🔗 Found 1 link(s) in message from chat_-1003817064055
+   150→2026-08-06T16:53:22.112341521Z 2026-08-06 16:53:22,112 - root - INFO - [PIPELINE-2] ✅ Link enqueued: https://t.me/PNU1445/1094010 (state=DISCOVERED)
+   151→2026-08-06T16:53:23.629757572Z 2026-08-06 16:53:23,629 - root - INFO - Bot: @Azzamntheer2026_bot (Azzam)
+   152→2026-08-06T16:53:31.342663099Z ==> Your service is live 🎉
+   153→2026-08-06T16:53:31.438206312Z ==> 
+   154→2026-08-06T16:53:31.441343394Z ==> ///////////////////////////////////////////////////////////
+   155→2026-08-06T16:53:31.443788217Z ==> 
+   156→2026-08-06T16:53:31.446272482Z ==> Available at your primary URL https://whatsapp-userbot-0xwu.onrender.com
+   157→2026-08-06T16:53:31.448755716Z ==> 
+   158→2026-08-06T16:53:31.451271011Z ==> ///////////////////////////////////////////////////////////
+   159→2026-08-06T16:53:42.093430367Z 2026-08-06 16:53:42,093 - root - INFO - [PIPELINE-1] 📨 Event Handler received message from source=+967770309310 chat_id=-1002149306400 (len=80)
+   160→2026-08-06T16:53:42.098636522Z 2026-08-06 16:53:42,098 - root - INFO - [PIPELINE-1] 📨 Event Handler received message from source=+967770309310 chat_id=-1002149306400 (len=55)
+   161→2026-08-06T16:53:42.120763488Z 2026-08-06 16:53:42,120 - root - INFO - [PIPELINE-1] 📨 Event Handler received message from source=+967770309310 chat_id=-1001444151480 (len=29)
+   162→2026-08-06T16:53:42.120898911Z 2026-08-06 16:53:42,120 - root - INFO - [PIPELINE-1] 📨 Event Handler received message from source=+967770309310 chat_id=-1001444151480 (len=47)
+   163→2026-08-06T16:53:42.12177533Z 2026-08-06 16:53:42,121 - root - INFO - [PIPELINE-1] 📨 Event Handler received message from source=+967770309310 chat_id=-1001160369245 (len=13)
+   164→2026-08-06T16:53:42.121885903Z 2026-08-06 16:53:42,121 - root - INFO - [PIPELINE-1] 📨 Event Handler received message from source=+967770309310 chat_id=-1001275400403 (len=17)
+   165→2026-08-06T16:53:42.131742449Z 2026-08-06 16:53:42,131 - root - INFO - [PIPELINE-1] 📨 Event Handler received message from source=+967770309310 chat_id=-1001542682879 (len=4)
+   166→2026-08-06T16:53:42.131841872Z 2026-08-06 16:53:42,131 - root - INFO - [PIPELINE-1] 📨 Event Handler received message from source=+967770309310 chat_id=-1001542682879 (len=5)
+   167→2026-08-06T16:53:42.132043016Z 2026-08-06 16:53:42,131 - root - INFO - [PIPELINE-1] 📨 Event Handler received message from source=+967770309310 chat_id=-1001542682879 (len=32)
+   168→2026-08-06T16:53:42.142850684Z 2026-08-06 16:53:42,142 - root - INFO - [PIPELINE-1] 📨 Event Handler received message from source=+967770309310 chat_id=-1002246603553 (len=4)
+   169→2026-08-06T16:53:42.143489068Z 2026-08-06 16:53:42,143 - root - INFO - [PIPELINE-1] 📨 Event Handler received message from source=+967770309310 chat_id=-1001899175509 (len=51)
+   170→2026-08-06T16:53:42.14360091Z 2026-08-06 16:53:42,143 - root - INFO - [PIPELINE-1] 📨 Event Handler received message from source=+967770309310 chat_id=-1001432931864 (len=38)
+   171→2026-08-06T16:53:42.143888127Z 2026-08-06 16:53:42,143 - root - INFO - [PIPELINE-1] 📨 Event Handler received message from source=+967770309310 chat_id=-1001922310041 (len=83)
+   172→2026-08-06T16:53:42.144002919Z 2026-08-06 16:53:42,143 - root - INFO - [PIPELINE-1] 📨 Event Handler received message from source=+967770309310 chat_id=-1001766972313 (len=41)
+   173→2026-08-06T16:53:42.16495734Z 2026-08-06 16:53:42,164 - root - INFO - [PIPELINE-1] 📨 Event Handler received message from source=+967770309310 chat_id=-1001358726040 (len=417)
+   174→2026-08-06T16:53:42.165061842Z 2026-08-06 16:53:42,164 - root - INFO - [PIPELINE-1] 🔗 Found 1 link(s) in message from chat_-1001358726040
+   175→2026-08-06T16:53:42.174343756Z 2026-08-06 16:53:42,174 - root - INFO - [PIPELINE-2] ✅ Link enqueued: https://t.me/Majeedseu (state=DISCOVERED)
+   176→2026-08-06T16:53:42.250977261Z 2026-08-06 16:53:42,250 - root - INFO - [PIPELINE-1] 📨 Event Handler received message from source=+967770309310 chat_id=-1001398472728 (len=1615)
+   177→2026-08-06T16:53:43.596368687Z 2026-08-06 16:53:43,596 - root - INFO - [PIPELINE-1] 📨 Event Handler received message from source=+967770309310 chat_id=-1002149306400 (len=4)
+   178→2026-08-06T16:53:44.773034855Z 2026-08-06 16:53:44,772 - root - INFO - [PIPELINE-1] 📨 Event Handler received message from source=+967770309310 chat_id=-1001694711944 (len=12)
+   179→2026-08-06T16:53:47.284468965Z 2026-08-06 16:53:47,284 - root - INFO - [PIPELINE-1] 📨 Event Handler received message from source=+967770309310 chat_id=-1002149306400 (len=3)
+   180→2026-08-06T16:53:47.284498656Z 2026-08-06 16:53:47,284 - root - INFO - [PIPELINE-1] 📨 Event Handler received message from source=+967770309310 chat_id=-1001194577082 (len=13)
+   181→2026-08-06T16:53:47.284912565Z 2026-08-06 16:53:47,284 - root - INFO - [PIPELINE-1] 📨 Event Handler received message from source=+967770309310 chat_id=-1001444151480 (len=32)
+   182→2026-08-06T16:53:47.285064068Z 2026-08-06 16:53:47,284 - root - INFO - [PIPELINE-1] 📨 Event Handler received message from source=+967770309310 chat_id=-1001444151480 (len=40)
+   183→2026-08-06T16:53:47.286713184Z 2026-08-06 16:53:47,286 - root - INFO - [PIPELINE-1] 📨 Event Handler received message from source=+967770309310 chat_id=-1001444151480 (len=45)
+   184→2026-08-06T16:53:48.268035207Z 2026-08-06 16:53:48,267 - root - INFO - [PIPELINE-1] 📨 Event Handler received message from source=+967770309310 chat_id=-1002119925760 (len=55)
+   185→2026-08-06T16:53:50.595904162Z 2026-08-06 16:53:50,595 - root - INFO - [PIPELINE-1] 📨 Event Handler received message from source=+967770309310 chat_id=-1001213459323 (len=25)
+   186→2026-08-06T16:53:50.596659059Z 2026-08-06 16:53:50,596 - root - INFO - [PIPELINE-1] 📨 Event Handler received message from source=+967770309310 chat_id=-1001444151480 (len=1)
+   187→2026-08-06T16:53:50.597139609Z 2026-08-06 16:53:50,596 - root - INFO - [PIPELINE-1] 📨 Event Handler received message from source=+967770309310 chat_id=-1001444151480 (len=106)
+   188→2026-08-06T16:53:50.597318643Z 2026-08-06 16:53:50,597 - root - INFO - [PIPELINE-1] 📨 Event Handler received message from source=+967770309310 chat_id=-1001444151480 (len=4)
+   189→2026-08-06T16:53:50.609544782Z 2026-08-06 16:53:50,609 - root - INFO - 🔄 Production Scheduler started — runs every 60s
+   190→2026-08-06T16:53:50.610580965Z 2026-08-06 16:53:50,610 - root - INFO - [PIPELINE-3] 🔄 Scheduler picked link from queue: https://t.me/PNU1445/1094010 (id=1, type=telegram)
+   191→2026-08-06T16:53:50.612050597Z 2026-08-06 16:53:50,610 - root - INFO - [PIPELINE-4] 🤖 AI verifying link: https://t.me/PNU1445/1094010
+   192→2026-08-06T16:53:50.998578194Z 2026-08-06 16:53:50,998 - root - INFO - 🤖 AI [Primary]: True | telegram
+   193→2026-08-06T16:53:50.998607515Z 2026-08-06 16:53:50,998 - root - INFO - [PIPELINE-4] ✅ AI APPROVED link: https://t.me/PNU1445/1094010
+   194→2026-08-06T16:53:51.720010374Z 2026-08-06 16:53:51,719 - root - INFO - [PIPELINE-5] 📢 PUBLISHED to channel: https://t.me/PNU1445/1094010
+   195→2026-08-06T16:53:51.725787371Z 2026-08-06 16:53:51,725 - root - INFO - [PIPELINE-1] 📨 Event Handler received message from source=+967735451189 chat_id=-1001899175509 (len=117)
+   196→2026-08-06T16:53:51.72664678Z 2026-08-06 16:53:51,726 - root - INFO - [PIPELINE-1] 📨 Event Handler received message from source=+967735451189 chat_id=-1001848778323 (len=113)
+   197→2026-08-06T16:53:51.727332805Z 2026-08-06 16:53:51,727 - root - INFO - [PIPELINE-1] 📨 Event Handler received message from source=+967735451189 chat_id=-1001836771784 (len=33)
+   198→2026-08-06T16:53:51.730782621Z 2026-08-06 16:53:51,730 - root - INFO - [PIPELINE-1] 📨 Event Handler received message from source=+967735451189 chat_id=-1001848778323 (len=10)
+   199→2026-08-06T16:53:51.731354063Z 2026-08-06 16:53:51,731 - root - INFO - [PIPELINE-1] 📨 Event Handler received message from source=+967735451189 chat_id=-1001329722299 (len=6)
+   200→2026-08-06T16:53:51.731425125Z 2026-08-06 16:53:51,731 - root - INFO - [PIPELINE-1] 📨 Event Handler received message from source=+967735451189 chat_id=-1001275400403 (len=17)
+   201→2026-08-06T16:53:51.753248145Z 2026-08-06 16:53:51,753 - root - INFO - [PIPELINE-1] 📨 Event Handler received message from source=+967735451189 chat_id=-1001836771784 (len=18)
+   202→2026-08-06T16:53:51.753334567Z 2026-08-06 16:53:51,753 - root - INFO - [PIPELINE-1] 📨 Event Handler received message from source=+967735451189 chat_id=-1001836771784 (len=31)
+   203→2026-08-06T16:53:51.754003271Z 2026-08-06 16:53:51,753 - root - INFO - [PIPELINE-1] 📨 Event Handler received message from source=+967735451189 chat_id=-1001582321512 (len=18)
+   204→2026-08-06T16:53:51.754120524Z 2026-08-06 16:53:51,754 - root - INFO - [PIPELINE-1] 📨 Event Handler received message from source=+967735451189 chat_id=-1001582321512 (len=49)
+   205→2026-08-06T16:53:51.764010221Z 2026-08-06 16:53:51,763 - root - INFO - [PIPELINE-1] 📨 Event Handler received message from source=+967735451189 chat_id=-1001899175509 (len=51)
+   206→2026-08-06T16:53:51.764124164Z 2026-08-06 16:53:51,764 - root - INFO - [PIPELINE-1] 📨 Event Handler received message from source=+967735451189 chat_id=-1002119925760 (len=55)
+   207→2026-08-06T16:53:51.764361759Z 2026-08-06 16:53:51,764 - root - INFO - [PIPELINE-1] 📨 Event Handler received message from source=+967735451189 chat_id=-1002246603553 (len=4)
+   208→2026-08-06T16:53:52.317463538Z 2026-08-06 16:53:52,317 - root - INFO - [SUPABASE] Loaded 4 watchers from Supabase (with role)
+   209→2026-08-06T16:53:53.237140516Z 2026-08-06 16:53:53,236 - root - INFO - [PIPELINE-6] 🛡️ Safety Guard checking +967739407274 for https://t.me/PNU1445/1094010
+   210→2026-08-06T16:53:53.685937652Z 2026-08-06 16:53:53,685 - root - INFO - [PIPELINE-6] ✅ Safety Guard PASSED for +967739407274
+   211→2026-08-06T16:53:53.685963473Z 2026-08-06 16:53:53,685 - root - INFO - [METRIC] Join attempt #1 for +967739407274
+   212→2026-08-06T16:53:53.686907773Z 2026-08-06 16:53:53,686 - root - INFO - [PIPELINE-6] 🚀 Joiner +967739407274 attempting to join: https://t.me/PNU1445/1094010
+   213→2026-08-06T16:54:04.170991592Z 2026-08-06 16:54:04,170 - root - INFO - [PIPELINE-1] 📨 Event Handler received message from source=+967770309310 chat_id=-1002149306400 (len=12)
+   214→2026-08-06T16:54:04.172567566Z 2026-08-06 16:54:04,172 - root - INFO - [PIPELINE-1] 📨 Event Handler received message from source=+967770309310 chat_id=-1002298216361 (len=30)
+   215→2026-08-06T16:54:04.173598668Z 2026-08-06 16:54:04,172 - root - INFO - [PIPELINE-1] 📨 Event Handler received message from source=+967770309310 chat_id=-1003817064055 (len=151)
+   216→2026-08-06T16:54:04.173612718Z 2026-08-06 16:54:04,173 - root - INFO - [PIPELINE-1] 🔗 Found 1 link(s) in message from chat_-1003817064055
+   217→2026-08-06T16:54:04.173618089Z 2026-08-06 16:54:04,173 - root - INFO - [PIPELINE-1] 📨 Event Handler received message from source=+967770309310 chat_id=-1002168976654 (len=13)
+   218→2026-08-06T16:54:04.174368555Z 2026-08-06 16:54:04,174 - root - INFO - [PIPELINE-2] ✅ Link enqueued: https://t.me/NGRAN4/2167522 (state=DISCOVERED)
+   219→2026-08-06T16:54:04.177443312Z 2026-08-06 16:54:04,177 - root - INFO - [PIPELINE-1] 📨 Event Handler received message from source=+967770309310 chat_id=-1002149306400 (len=2)
+   220→2026-08-06T16:54:04.177591345Z 2026-08-06 16:54:04,177 - root - INFO - [PIPELINE-1] 📨 Event Handler received message from source=+967770309310 chat_id=-1002149306400 (len=6)
+   221→2026-08-06T16:54:04.183765659Z 2026-08-06 16:54:04,183 - root - INFO - [PIPELINE-1] 📨 Event Handler received message from source=+967770309310 chat_id=-1001542682879 (len=29)
+   222→2026-08-06T16:54:04.183777939Z 2026-08-06 16:54:04,183 - root - INFO - [PIPELINE-1] 📨 Event Handler received message from source=+967770309310 chat_id=-1001444151480 (len=16)
+   223→2026-08-06T16:54:04.184546176Z 2026-08-06 16:54:04,184 - root - INFO - [PIPELINE-1] 📨 Event Handler received message from source=+967770309310 chat_id=-1001204499324 (len=19)
+   224→2026-08-06T16:54:04.184870383Z 2026-08-06 16:54:04,184 - root - INFO - [PIPELINE-1] 📨 Event Handler received message from source=+967770309310 chat_id=-1001432931864 (len=105)
+   225→2026-08-06T16:54:04.184994836Z 2026-08-06 16:54:04,184 - root - INFO - [PIPELINE-1] 📨 Event Handler received message from source=+967770309310 chat_id=-1001540385756 (len=2)
+   226→2026-08-06T16:54:04.189879352Z 2026-08-06 16:54:04,189 - root - INFO - [PIPELINE-1] 📨 Event Handler received message from source=+967770309310 chat_id=-1002149306400 (len=2)
+   227→2026-08-06T16:54:04.190008235Z 2026-08-06 16:54:04,189 - root - INFO - [PIPELINE-1] 📨 Event Handler received message from source=+967770309310 chat_id=-1001194577082 (len=1)
+   228→2026-08-06T16:54:04.190164598Z 2026-08-06 16:54:04,190 - root - INFO - [PIPELINE-1] 📨 Event Handler received message from source=+967770309310 chat_id=-1001766972313 (len=26)
+   229→2026-08-06T16:54:21.854459627Z 2026-08-06 16:54:21,854 - root - INFO - [PIPELINE-1] 📨 Event Handler received message from source=+967770309310 chat_id=-1002149306400 (len=7)
+   230→2026-08-06T16:54:21.854505599Z 2026-08-06 16:54:21,854 - root - INFO - [PIPELINE-1] 📨 Event Handler received message from source=+967770309310 chat_id=-1002149306400 (len=7)
+   231→2026-08-06T16:54:21.854644371Z 2026-08-06 16:54:21,854 - root - INFO - [PIPELINE-1] 📨 Event Handler received message from source=+967770309310 chat_id=-1002149306400 (len=44)
+   232→2026-08-06T16:54:21.855287425Z 2026-08-06 16:54:21,855 - root - INFO - [PIPELINE-1] 📨 Event Handler received message from source=+967770309310 chat_id=-1002298216361 (len=185)
+   233→2026-08-06T16:54:21.861157703Z 2026-08-06 16:54:21,861 - root - INFO - [PIPELINE-1] 📨 Event Handler received message from source=+967770309310 chat_id=-1002298216361 (len=22)
+   234→2026-08-06T16:54:21.861275736Z 2026-08-06 16:54:21,861 - root - INFO - [PIPELINE-1] 📨 Event Handler received message from source=+967770309310 chat_id=-1001160369245 (len=29)
+   235→2026-08-06T16:54:21.861572752Z 2026-08-06 16:54:21,861 - root - INFO - [PIPELINE-1] 📨 Event Handler received message from source=+967770309310 chat_id=-1002246603553 (len=73)
+   236→2026-08-06T16:54:21.866592511Z 2026-08-06 16:54:21,866 - root - INFO - [PIPELINE-1] 📨 Event Handler received message from source=+967770309310 chat_id=-1002149306400 (len=48)
+   237→2026-08-06T16:54:21.866691033Z 2026-08-06 16:54:21,866 - root - INFO - [PIPELINE-1] 📨 Event Handler received message from source=+967770309310 chat_id=-1002149306400 (len=23)
+   238→2026-08-06T16:54:21.86745812Z 2026-08-06 16:54:21,867 - root - INFO - [PIPELINE-1] 📨 Event Handler received message from source=+967770309310 chat_id=-1001540385756 (len=69)
+   239→2026-08-06T16:54:21.867819718Z 2026-08-06 16:54:21,867 - root - INFO - [PIPELINE-1] 📨 Event Handler received message from source=+967770309310 chat_id=-1001548985342 (len=68)
+   240→2026-08-06T16:54:21.86792966Z 2026-08-06 16:54:21,867 - root - INFO - [PIPELINE-1] 📨 Event Handler received message from source=+967770309310 chat_id=-1001275400403 (len=4)
+   241→2026-08-06T16:54:21.874216677Z 2026-08-06 16:54:21,874 - root - INFO - [PIPELINE-1] 📨 Event Handler received message from source=+967770309310 chat_id=-1001213459323 (len=6)
+   242→2026-08-06T16:54:21.879034282Z 2026-08-06 16:54:21,878 - root - INFO - [PIPELINE-1] 📨 Event Handler received message from source=+967770309310 chat_id=-1001444151480 (len=81)
+   243→2026-08-06T16:54:21.879187985Z 2026-08-06 16:54:21,879 - root - INFO - [PIPELINE-1] 📨 Event Handler received message from source=+967770309310 chat_id=-1001444151480 (len=59)
+   244→2026-08-06T16:54:21.879301017Z 2026-08-06 16:54:21,879 - root - INFO - [PIPELINE-1] 📨 Event Handler received message from source=+967770309310 chat_id=-1001444151480 (len=32)
+   245→2026-08-06T16:54:21.87940983Z 2026-08-06 16:54:21,879 - root - INFO - [PIPELINE-1] 📨 Event Handler received message from source=+967770309310 chat_id=-1001444151480 (len=47)
+   246→2026-08-06T16:54:21.879519672Z 2026-08-06 16:54:21,879 - root - INFO - [PIPELINE-1] 📨 Event Handler received message from source=+967770309310 chat_id=-1001444151480 (len=55)
+   247→2026-08-06T16:54:21.880440322Z 2026-08-06 16:54:21,880 - root - INFO - [PIPELINE-1] 📨 Event Handler received message from source=+967770309310 chat_id=-1001275400403 (len=16)
+   248→2026-08-06T16:54:21.885124764Z 2026-08-06 16:54:21,884 - root - INFO - [PIPELINE-1] 📨 Event Handler received message from source=+967770309310 chat_id=-1001970799988 (len=23)
+   249→2026-08-06T16:54:22.023532271Z 2026-08-06 16:54:22,023 - root - INFO - [PIPELINE-1] 📨 Event Handler received message from source=+967735451189 chat_id=-1001494651260 (len=6)
+   250→2026-08-06T16:54:22.023564312Z 2026-08-06 16:54:22,023 - root - INFO - [PIPELINE-1] 📨 Event Handler received message from source=+967735451189 chat_id=-1001836771784 (len=26)
+   251→2026-08-06T16:54:22.03266977Z 2026-08-06 16:54:22,032 - root - INFO - [PIPELINE-1] 📨 Event Handler received message from source=+967735451189 chat_id=-1001836771784 (len=9)
+   252→2026-08-06T16:54:22.032750001Z 2026-08-06 16:54:22,032 - root - INFO - [PIPELINE-1] 📨 Event Handler received message from source=+967735451189 chat_id=-1001836771784 (len=6)
+   253→2026-08-06T16:54:22.043085126Z 2026-08-06 16:54:22,042 - root - INFO - [PIPELINE-1] 📨 Event Handler received message from source=+967735451189 chat_id=-1002246603553 (len=73)
+   254→2026-08-06T16:54:22.044125099Z 2026-08-06 16:54:22,043 - root - INFO - [PIPELINE-1] 📨 Event Handler received message from source=+967735451189 chat_id=-1001848778323 (len=7)
+   255→2026-08-06T16:54:22.056282563Z 2026-08-06 16:54:22,056 - root - INFO - [PIPELINE-1] 📨 Event Handler received message from source=+967735451189 chat_id=-1001329722299 (len=38)
+   256→2026-08-06T16:54:22.056402515Z 2026-08-06 16:54:22,056 - root - INFO - [PIPELINE-1] 📨 Event Handler received message from source=+967735451189 chat_id=-1001329722299 (len=44)
+   257→2026-08-06T16:54:22.056551939Z 2026-08-06 16:54:22,056 - root - INFO - [PIPELINE-1] 📨 Event Handler received message from source=+967735451189 chat_id=-1001329722299 (len=116)
+   258→2026-08-06T16:54:23.053244455Z 2026-08-06 16:54:23,052 - root - INFO - [PIPELINE-1] 📨 Event Handler received message from source=+967770309310 chat_id=-1003817064055 (len=141)
+   259→2026-08-06T16:54:23.053616733Z 2026-08-06 16:54:23,053 - root - INFO - [PIPELINE-1] 🔗 Found 1 link(s) in message from chat_-1003817064055
+   260→2026-08-06T16:54:23.054153685Z 2026-08-06 16:54:23,054 - root - INFO - [PIPELINE-2] ✅ Link enqueued: https://t.me/Qassim_U/5272907 (state=DISCOVERED)
