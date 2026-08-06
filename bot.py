@@ -1555,7 +1555,12 @@ class MessageFormatter:
             "• /disable_joiner <phone> — إيقاف فدائي\n\n"
             "📌 أوامر التحقق (E2E):\n"
             "• /verify — تقرير شامل (Supabase + Started + SQLite)\n"
-            "• /sqlite_check — إثبات عدم وجود جدول watchers في SQLite"
+            "• /sqlite_check — إثبات عدم وجود جدول watchers في SQLite\n\n"
+            "📌 أوامر الانضمام الجماعي:\n"
+            "• /bulk_join — الانضمام لكل روابط القناة (22 ألف+)\n"
+            "• /bulk_join_status — تقدم الانضمام الجماعي\n"
+            "• /bulk_join_stop — إيقاف الانضمام الجماعي\n"
+            "• /clear_floodwait — مسح FloodWait وإعادة تفعيل الانضمام"
         )
 
     @staticmethod
@@ -1824,6 +1829,11 @@ class Monitor:
         # Cache for dialog lists (per-watcher) used by membership check.
         # Key: phone, Value: (dict of {username_lower: phone}, timestamp)
         self._dialogs_cache: Dict[str, Tuple[Dict[str, str], datetime]] = {}
+        # Bulk Join state
+        self._bulk_join_running = False
+        self._bulk_join_stop = False
+        self._bulk_join_task = None
+        self._bulk_join_stats = {'total': 0, 'joined': 0, 'already': 0, 'failed': 0, 'skipped': 0, 'current': ''}
 
     @staticmethod
     def _get_chat_name(chat):
@@ -3005,6 +3015,68 @@ class Monitor:
                     logging.error(f"[SQLITE_CHECK] Error: {e}", exc_info=True)
                     await reply(f"❌ sqlite_check error: {e}")
 
+            elif cmd == "/clear_floodwait":
+                # === مسح FloodWait القديم ===
+                try:
+                    conn = await self.db._ensure_conn()
+                    cursor = await conn.execute("DELETE FROM floodwait_tracker")
+                    await conn.commit()
+                    count = cursor.rowcount
+                    # امسح من الذاكرة كمان
+                    if hasattr(self.rate_limiter, '_floodwait'):
+                        self.rate_limiter._floodwait.clear()
+                    # أعد تفعيل الانضمام
+                    self._join_paused = False
+                    await self.prod_db.set_setting('join_paused', 'false')
+                    logging.info(f"[CLEAR_FLOODWAIT] Cleared {count} floodwait records")
+                    await reply(f"✅ تم مسح {count} سجل FloodWait\n▶️ تم إعادة تفعيل الانضمام")
+                except Exception as e:
+                    logging.error(f"[CLEAR_FLOODWAIT] Error: {e}")
+                    await reply(f"❌ خطأ: {e}")
+
+            elif cmd == "/bulk_join":
+                # === البدء بالانضمام الجماعي لروابط القناة ===
+                if hasattr(self, '_bulk_join_running') and self._bulk_join_running:
+                    await reply("⚠️ البوك جون يعمل بالفعل!\nأرسل /bulk_join_status لرؤية التقدم")
+                else:
+                    self._bulk_join_running = True
+                    self._bulk_join_stop = False
+                    self._bulk_join_stats = {'total': 0, 'joined': 0, 'already': 0, 'failed': 0, 'skipped': 0, 'current': ''}
+                    self._bulk_join_task = asyncio.create_task(self._bulk_join_worker())
+                    await reply(
+                        "🚀 بدأ الانضمام الجماعي\n\n"
+                        "📝 سيقرأ البوت كل روابط القناة ويحاول الانضمام لكل واحد.\n"
+                        "⏱️ معدل آمن: انضمام كل 2 دقيقة\n"
+                        "📊 أرسل /bulk_join_status للتقدم\n"
+                        "⏹️ أرسل /bulk_join_stop للإيقاف"
+                    )
+
+            elif cmd == "/bulk_join_status":
+                # === تقدم الانضمام الجماعي ===
+                if not hasattr(self, '_bulk_join_running') or not self._bulk_join_running:
+                    await reply("ℹ️ البوك جون لا يعمل. أرسل /bulk_join للبدء")
+                else:
+                    s = getattr(self, '_bulk_join_stats', {})
+                    current = s.get('current', 'none')
+                    await reply(
+                        f"📊 Bulk Join Status\n"
+                        f"════════════════════\n"
+                        f"🔗 Total processed: {s.get('total', 0)}\n"
+                        f"✅ Joined: {s.get('joined', 0)}\n"
+                        f"ℹ️ Already member: {s.get('already', 0)}\n"
+                        f"❌ Failed: {s.get('failed', 0)}\n"
+                        f"⏭️ Skipped: {s.get('skipped', 0)}\n"
+                        f"📍 Current: {current[:60]}"
+                    )
+
+            elif cmd == "/bulk_join_stop":
+                # === إيقاف الانضمام الجماعي ===
+                if hasattr(self, '_bulk_join_running') and self._bulk_join_running:
+                    self._bulk_join_stop = True
+                    await reply("⏹️ سيتم إيقاف البوك جون بعد الرابط الحالي")
+                else:
+                    await reply("ℹ️ البوك جون لا يعمل")
+
             else: await reply(f"❓ أمر غير معروف: {cmd}\nاكتب /help")
 
         except Exception as e:
@@ -3421,6 +3493,181 @@ class Monitor:
             except Exception as e:
                 logging.error(f"[SCHED] Error: {e}", exc_info=True)
                 await asyncio.sleep(60)
+
+    async def _bulk_join_worker(self):
+        """Bulk Join Worker — يقرأ روابط القناة ويحاول الانضمام لكل واحد.
+
+        الاستراتيجية:
+        1. اقرأ رسائل القناة من الأحدث للأقدم (1000 رسالة في كل batch)
+        2. استخرج الروابط من كل رسالة
+        3. لكل رابط:
+           a. تجاوز لو ليس تيليجرام (WhatsApp لا يمكن الانضمام)
+           b. تجاوز لو الحالة = JOINED أو ALREADY_MEMBER في group_states
+           c. حاول الانضمام عبر _join_group_safe
+           d. انتظر 120 ثانية بين كل انضمام (آمن)
+        4. توقف عند /bulk_join_stop أو FloodWait
+        """
+        logging.info("[BULK_JOIN] Worker started — reading channel history")
+        joiner_phone = None
+        joiner_client = None
+
+        # ابحث عن حساب الفدائي المتصل
+        for phone, client in self.user_clients.items():
+            w = await self.db._supabase_get_watcher(phone)
+            if w and w.get('role') == 'joiner' and client and client.is_connected():
+                joiner_phone = phone
+                joiner_client = client
+                break
+
+        if not joiner_phone or not joiner_client:
+            logging.error("[BULK_JOIN] No connected joiner account found!")
+            self._bulk_join_running = False
+            await self._send("❌ لا يوجد حساب فدائي متصل. أرسل /bulk_join بعد ربط حساب فدائي.")
+            return
+
+        logging.info(f"[BULK_JOIN] Using joiner: {joiner_phone}")
+
+        try:
+            # اقرأ رسائل القناة من الأقدم للأحدث
+            # iter_messages يعيد الأحدث أولاً افتراضياً، نعكسه بreverse=True
+            offset_id = 0
+            batch_size = 200
+
+            while self._bulk_join_running and not self._bulk_join_stop:
+                try:
+                    # اجلب batch من رسائل القناة
+                    messages = await self.bot_client.get_messages(
+                        self.config.channel_id,
+                        limit=batch_size,
+                        offset_id=offset_id,
+                        reverse=False  # الأحدث أولاً
+                    )
+
+                    if not messages:
+                        logging.info("[BULK_JOIN] No more messages — done!")
+                        break
+
+                    # حدّث offset للدفعة التالية
+                    offset_id = messages[-1].id
+
+                    for msg in messages:
+                        if self._bulk_join_stop:
+                            logging.info("[BULK_JOIN] Stop requested — exiting")
+                            break
+
+                        raw_text = msg.raw_text or ''
+                        if not raw_text:
+                            continue
+
+                        # استخرج الروابط من نص الرسالة
+                        links = LinkNormalizer.extract_links(raw_text)
+                        if not links:
+                            continue
+
+                        for link_info in links:
+                            if self._bulk_join_stop:
+                                break
+
+                            raw_link = link_info['raw']
+                            normalized = link_info['normalized']
+                            link_type = link_info.get('link_type', 'other')
+
+                            self._bulk_join_stats['current'] = raw_link
+                            self._bulk_join_stats['total'] += 1
+
+                            # a. تجاوز غير Telegram
+                            if link_type not in ('telegram', 'telegram_private'):
+                                self._bulk_join_stats['skipped'] += 1
+                                logging.debug(f"[BULK_JOIN] Skip non-telegram: {raw_link[:50]}")
+                                continue
+
+                            # b. تجاوز لو الحالة معروفة في group_states
+                            state = await self.prod_db.get_group_state(normalized)
+                            if state in (GroupState.JOINED, GroupState.ALREADY_MEMBER, GroupState.BANNED, GroupState.PRIVATE):
+                                self._bulk_join_stats['skipped'] += 1
+                                logging.debug(f"[BULK_JOIN] Skip {state}: {raw_link[:50]}")
+                                continue
+
+                            # c. تحقق من FloodWait
+                            is_blocked, wait = await self.floodwait_mgr.is_blocked(joiner_phone)
+                            if is_blocked:
+                                logging.warning(f"[BULK_JOIN] Joiner in FloodWait ({wait}s) — pausing")
+                                await self._send(f"⏳ FloodWait {wait}s — Bulk join paused\n📊 {self._bulk_join_stats}")
+                                # انتظر حتى ينتهي FloodWait
+                                await asyncio.sleep(min(wait + 10, 3600))
+                                continue
+
+                            # d. حاول الانضمام
+                            logging.info(f"[BULK_JOIN] ({self._bulk_join_stats['total']}) Joining: {raw_link[:60]}")
+                            link_data = {
+                                'raw': raw_link,
+                                'raw_link': raw_link,
+                                'normalized_link': normalized,
+                                'link_type': link_type,
+                                'username': link_info.get('username', ''),
+                                'invite_hash': link_info.get('invite_hash', ''),
+                            }
+
+                            success, status, member_count = await self._join_group_safe(
+                                joiner_client, link_data, joiner_phone)
+
+                            if success:
+                                self._bulk_join_stats['joined'] += 1
+                                await self.prod_db.set_group_state(normalized, GroupState.JOINED, raw_link,
+                                                                   joined_by=joiner_phone, member_count=member_count)
+                                logging.info(f"[BULK_JOIN] ✅ JOINED: {raw_link[:50]}")
+                            elif status == "ALREADY_MEMBER":
+                                self._bulk_join_stats['already'] += 1
+                                await self.prod_db.set_group_state(normalized, GroupState.ALREADY_MEMBER, raw_link,
+                                                                   joined_by=joiner_phone)
+                                logging.info(f"[BULK_JOIN] ℹ️ Already member: {raw_link[:50]}")
+                            elif status == "FLOODWAIT":
+                                self._bulk_join_stats['failed'] += 1
+                                logging.warning(f"[BULK_JOIN] ⚠️ FloodWait — pausing")
+                                # FloodWait تم تسجيله في _join_group_safe
+                                break  # اخرج من حلقة الروابط، انتظر
+                            else:
+                                self._bulk_join_stats['failed'] += 1
+                                await self.prod_db.set_group_state(normalized, GroupState.FAILED, raw_link,
+                                                                   error=status)
+                                logging.warning(f"[BULK_JOIN] ❌ {status}: {raw_link[:50]}")
+
+                            # e. انتظر 120 ثانية بين كل انضمام (آمن)
+                            await asyncio.sleep(120)
+
+                    # تقرير كل 1000 رسالة
+                    if self._bulk_join_stats['total'] % 50 == 0 and self._bulk_join_stats['total'] > 0:
+                        s = self._bulk_join_stats
+                        logging.info(f"[BULK_JOIN] Progress: {s['total']} processed, {s['joined']} joined, "
+                                     f"{s['already']} already, {s['failed']} failed, {s['skipped']} skipped")
+
+                except asyncio.CancelledError:
+                    break
+                except Exception as e:
+                    logging.error(f"[BULK_JOIN] Batch error: {e}", exc_info=True)
+                    await asyncio.sleep(60)
+
+            # انتهى
+            self._bulk_join_running = False
+            s = self._bulk_join_stats
+            final_msg = (
+                f"🏁 Bulk Join Finished\n"
+                f"════════════════════\n"
+                f"🔗 Total: {s['total']}\n"
+                f"✅ Joined: {s['joined']}\n"
+                f"ℹ️ Already: {s['already']}\n"
+                f"❌ Failed: {s['failed']}\n"
+                f"⏭️ Skipped: {s['skipped']}"
+            )
+            logging.info(f"[BULK_JOIN] {final_msg}")
+            await self._send(final_msg)
+
+        except asyncio.CancelledError:
+            self._bulk_join_running = False
+            logging.info("[BULK_JOIN] Cancelled")
+        except Exception as e:
+            self._bulk_join_running = False
+            logging.error(f"[BULK_JOIN] Fatal: {e}", exc_info=True)
 
     async def _safety_guard(self, phone: str, normalized_link: str, link_data: dict) -> Tuple[bool, str]:
         """Safety Guard — 6 فحوصات صارمة قبل أي Join API call.
