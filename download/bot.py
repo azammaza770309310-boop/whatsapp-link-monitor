@@ -1548,6 +1548,7 @@ class MessageFormatter:
             "📌 أوامر التحكم بالانضمام:\n"
             "• /pause_join — إيقاف الانضمام\n"
             "• /resume_join — استئناف الانضمام\n"
+            "• /set_role <phone> <role> — تغيير دور الحساب (monitor/joiner/backup)\n"
             "• /join_status — حالة حسابات الفدائيين\n"
             "• /enable_joiner <phone> — تفعيل فدائي\n"
             "• /disable_joiner <phone> — إيقاف فدائي\n\n"
@@ -2774,6 +2775,40 @@ class Monitor:
                     else:
                         await reply(f"❌ فشل تحديث Supabase للحساب: {target_phone}")
 
+            elif cmd == "/set_role":
+                # /set_role PHONE ROLE — يغير دور الحساب (monitor / joiner / backup)
+                # هذه خاصية الحساب الفدائي: تحول أي حساب إلى فدائي ينضم للمجموعات
+                parts = text.split()
+                if len(parts) < 3:
+                    await reply(
+                        "📋 الاستخدام: /set_role <phone> <role>\n"
+                        "الأدوار المتاحة:\n"
+                        "  • monitor — يراقب فقط (لا ينضم)\n"
+                        "  • joiner  — فدائي ينضم للمجموعات\n"
+                        "  • backup  — احتياطي (ينضم عند الحاجة)\n\n"
+                        "مثال: /set_role +967739407274 joiner\n\n"
+                        "⚠️ ملاحظة: الحساب الفدائي يجب أن يكون عضواً في مجموعات مختلفة عن المراقب"
+                    )
+                else:
+                    target_phone = parts[1]
+                    new_role = parts[2].lower().strip()
+                    if new_role not in ('monitor', 'joiner', 'backup'):
+                        await reply(f"❌ دور غير صالح: {new_role}\nالأدوار: monitor / joiner / backup")
+                    else:
+                        ok = await self.db._supabase_update_watcher(target_phone, role=new_role)
+                        if ok:
+                            role_icon = {'monitor': '👁️', 'joiner': '🚀', 'backup': '🔄'}.get(new_role, '❓')
+                            await reply(
+                                f"{role_icon} تم تغيير دور الحساب {target_phone} إلى: {new_role}\n"
+                                f"📦 Source: Supabase (sole source of truth)\n\n"
+                                f"ℹ️ التغيير يسري بعد إعادة تشغيل البوت (أو تلقائياً خلال دقيقة)"
+                            )
+                            # سجل في الـ logs
+                            logging.info(f"[SET_ROLE] {target_phone} → {new_role}")
+                            # لو الحساب متصل، حدّث في الذاكرة (role يُقرأ من Supabase في كل عملية)
+                        else:
+                            await reply(f"❌ فشل تحديث Supabase للحساب: {target_phone}")
+
             elif cmd == "/join_status":
                 # === تقرير حالة كل حساب فدائي — يقرأ من Supabase ===
                 joiners = await self.db.get_watchers_by_role("joiner")
@@ -3222,19 +3257,13 @@ class Monitor:
                     else:
                         logging.info(f"[PIPELINE-5] ⏭️ Already published (duplicate): {raw_link[:60]}")
 
-                # 4. Group Reputation — تقييم المجموعة قبل الانضمام
-                reputation = await self._calculate_group_reputation(normalized, link_data)
-                if reputation < 30:
-                    logging.info(f"[SCHED] Low reputation ({reputation}) — skipping {raw_link[:50]}")
-                    await self.prod_db.set_group_state(normalized, GroupState.FAILED, raw_link, error=f'low_reputation_{reputation}')
-                    await self.prod_db.update_queue_status(link_data['id'], 'REJECTED')
-                    await self.metrics.record_skip('low_reputation')
-                    continue
+                # 4. Group Reputation — تم إزالته (تخفيف)
+                # كان يمنع الانضمام للمجموعات الجديدة، الآن مسموح للجميع
 
                 # 5. اختر حساب فدائي: غير محظور + ضمن Daily Budget
                 joiners = await self.db.get_watchers_by_role("joiner")
                 if not joiners:
-                    logging.debug("[SCHED] No joiner accounts — sleeping")
+                    logging.warning("[SCHED] ⚠️ No joiner accounts! Use /set_role <phone> joiner to designate one")
                     await asyncio.sleep(60)
                     continue
 
@@ -3403,27 +3432,19 @@ class Monitor:
 
         # 3. Hourly Join Limit (DB-backed, survives restart) — conservative: 1/hour
         hourly_joins = await self.prod_db.count_operations(phone, 'join', 3600)
-        if hourly_joins >= 1:  # conservative: 1/hour max
-            return False, f'hourly_limit_{hourly_joins}/1'
+        if hourly_joins >= 5:  # 5/hour max (تخفيف)
+            return False, f'hourly_limit_{hourly_joins}/5'
 
-        # 4. Group Reputation
-        reputation = await self._calculate_group_reputation(normalized_link, link_data)
-        if reputation < 30:
-            return False, f'low_reputation_{reputation}'
+        # 4. Group Reputation — تم إزالته (تخفيف)
+        # كان يمنع الانضمام للمجموعات الجديدة، الآن مسموح
 
-        # 5. Attempt history — هل تمت محاولة الانضمام لهذه المجموعة سابقاً؟
+        # 5. Attempt history — تم تخفيف (فقط لو انضم بالفعل)
         state = await self.prod_db.get_group_state(normalized_link)
         if state in (GroupState.JOINING, GroupState.JOINED, GroupState.ALREADY_MEMBER):
             return False, f'already_attempted_{state}'
-        conn = await self.db._ensure_conn()
-        cursor = await conn.execute(
-            "SELECT attempt_count FROM group_states WHERE normalized_link = ?",
-            (normalized_link,))
-        row = await cursor.fetchone()
-        if row and row[0] and row[0] >= 3:
-            return False, f'too_many_attempts_{row[0]}'
+        # تم إزالة فحص attempt_count >= 3 (تخفيف)
 
-        # 6. Last join timestamp for this account — 3600s (1h) minimum between joins (conservative)
+        # 6. Last join timestamp for this account — 600s (10 min) minimum between joins
         # اقرأ من Supabase (المصدر الوحيد) — ليس من SQLite watchers
         w = await self.db._supabase_get_watcher(phone)
         if w and w.get('last_join_timestamp'):
@@ -3431,8 +3452,8 @@ class Monitor:
                 last_join_ts = w['last_join_timestamp']
                 last_join = datetime.fromisoformat(str(last_join_ts).replace('Z', '+00:00')) if isinstance(last_join_ts, str) else last_join_ts
                 elapsed = (datetime.now() - last_join.replace(tzinfo=None)).total_seconds()
-                if elapsed < 3600:  # conservative: 1 hour cooldown
-                    return False, f'join_cooldown_{int(3600-elapsed)}s'
+                if elapsed < 600:  # 10 min cooldown (تخفيف من ساعة إلى 10 دقائق)
+                    return False, f'join_cooldown_{int(600-elapsed)}s'
             except Exception:
                 pass
 
@@ -3448,9 +3469,9 @@ class Monitor:
         role = w.get('role', 'monitor') if w else 'monitor'
 
         if role == 'joiner':
-            return int(os.getenv('DAILY_JOIN_LIMIT', '2'))  # conservative: 2/day
+            return int(os.getenv('DAILY_JOIN_LIMIT', '15'))  # 15/day (تخفيف)
         elif role == 'backup':
-            return int(os.getenv('DAILY_BACKUP_LIMIT', '1'))
+            return int(os.getenv('DAILY_BACKUP_LIMIT', '5'))  # 5/day (تخفيف)
         else:
             return 0  # monitor: لا انضمام
 
@@ -3872,7 +3893,7 @@ async def main():
 
     # ===== Recovery Mode Startup =====
     # 1. اقرأ join_paused من DB
-    db_paused = await monitor.prod_db.get_setting('join_paused', 'true')
+    db_paused = await monitor.prod_db.get_setting('join_paused', 'false')  # افتراضي: يعمل تلقائياً
     monitor._join_paused = (db_paused == 'true')
     if monitor._join_paused:
         logging.info("🔒 Recovery Mode: JOIN PAUSED (send /resume_join to enable)")
@@ -3896,10 +3917,10 @@ async def main():
         logging.info("📡 Production Mode: Real Telegram API calls enabled")
 
     # 4. Conservative post-FloodWait limits
-    daily_limit = os.getenv('DAILY_JOIN_LIMIT', '2')
-    logging.info(f"📊 Daily Join Limit: {daily_limit}/day (conservative)")
-    logging.info(f"📊 Hourly Join Limit: 1/hour")
-    logging.info(f"📊 Join Cooldown: 3600s (1 hour)")
+    daily_limit = os.getenv('DAILY_JOIN_LIMIT', '15')
+    logging.info(f"📊 Daily Join Limit: {daily_limit}/day")
+    logging.info(f"📊 Hourly Join Limit: 5/hour")
+    logging.info(f"📊 Join Cooldown: 600s (10 min)")
 
     # ===== Startup Verification — تأكد من وجود حسابات في Supabase =====
     logging.info("━" * 60)
