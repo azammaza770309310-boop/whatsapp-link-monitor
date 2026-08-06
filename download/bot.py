@@ -3379,6 +3379,19 @@ class Monitor:
                     logging.info(f"[PIPELINE-6] ⏳ {phone} rate limited — will retry in 10 min")
                     await self.prod_db.update_queue_status(link_data['id'], 'QUEUED',
                                                            next_retry=datetime.now() + timedelta(minutes=10))
+                elif status == "TIMEOUT":
+                    # Telegram API timed out (30s) — don't auto-pause, retry later
+                    logging.info(f"[PIPELINE-6] ⏰ {phone} join timed out — will retry in 5 min")
+                    await self.prod_db.update_queue_status(link_data['id'], 'QUEUED',
+                                                           next_retry=datetime.now() + timedelta(minutes=5))
+                elif status == "INVALID":
+                    # لا يوجد username في الرابط — لا يمكن الانضمام
+                    logging.info(f"[PIPELINE-6] ❌ invalid link (no username) — skipping")
+                    await self.prod_db.update_queue_status(link_data['id'], 'DONE')
+                elif status == "SKIP":
+                    # رابط WhatsApp — لا يحتاج انضمام
+                    logging.info(f"[PIPELINE-6] ⏭️ WhatsApp link — no join needed")
+                    await self.prod_db.update_queue_status(link_data['id'], 'DONE')
                 elif status == "PRIVATE":
                     await self.prod_db.set_group_state(normalized, GroupState.PRIVATE, raw_link,
                                                        error='Channel private')
@@ -3583,9 +3596,12 @@ class Monitor:
                     return False, "FLOODWAIT", None
 
                 try:
-                    await client(ImportChatInviteRequest(invite_hash))
+                    await asyncio.wait_for(client(ImportChatInviteRequest(invite_hash)), timeout=30)
                     await self.metrics.record_api_call(phone)
                     return True, "JOINED", None
+                except asyncio.TimeoutError:
+                    logging.error(f"[TELEGRAM_ERROR] phone={phone} op=IMPORT_INVITE group={raw_link[:50]} error=TIMEOUT (30s)")
+                    return False, "TIMEOUT", None
                 except UserAlreadyParticipantError:
                     return False, "ALREADY_MEMBER", None
                 except FloodWaitError as e:
@@ -3614,8 +3630,9 @@ class Monitor:
                     return False, "RATE_LIMITED", None
 
                 try:
-                    entity = await client.get_entity(username)
-                    await client(JoinChannelRequest(entity))
+                    # timeout 30s لمنع التعليق لو Telegram ما رد
+                    entity = await asyncio.wait_for(client.get_entity(username), timeout=30)
+                    await asyncio.wait_for(client(JoinChannelRequest(entity)), timeout=30)
                     await self.metrics.record_api_call(phone)
 
                     member_count = None
@@ -3623,6 +3640,9 @@ class Monitor:
                         member_count = entity.participants_count
 
                     return True, "JOINED", member_count
+                except asyncio.TimeoutError:
+                    logging.error(f"[TELEGRAM_ERROR] phone={phone} op=JOIN group={raw_link[:50]} error=TIMEOUT (30s)")
+                    return False, "TIMEOUT", None
                 except UserAlreadyParticipantError:
                     return False, "ALREADY_MEMBER", None
                 except FloodWaitError as e:
