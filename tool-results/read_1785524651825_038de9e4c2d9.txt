@@ -1,0 +1,602 @@
+     1→   600→
+     2→   601→
+     3→   602→# -------------------------------------------------------------------
+     4→   603→# Configuration
+     5→   604→# -------------------------------------------------------------------
+     6→   605→
+     7→   606→
+     8→   607→class Config:
+     9→   608→    def __init__(self):
+    10→   609→        load_dotenv(dotenv_path='accounts.env')
+    11→   610→        self.api_id = int(os.getenv("API_ID", "0"))
+    12→   611→        self.api_hash = os.getenv("API_HASH", "")
+    13→   612→        self.bot_token = os.getenv("BOT_TOKEN", "")
+    14→   613→        self.channel_id = int(os.getenv("CHANNEL_ID", "0"))
+    15→   614→        self.owner_id = None
+    16→   615→        oid = os.getenv("OWNER_ID", "")
+    17→   616→        if oid:
+    18→   617→            try:
+    19→   618→                self.owner_id = int(oid)
+    20→   619→            except ValueError:
+    21→   620→                logging.warning(f"Invalid OWNER_ID value: {oid!r}, ignoring")
+    22→   621→        self.log_level = os.getenv("LOG_LEVEL", "INFO")
+    23→   622→        self.history_max_per_chat = int(os.getenv("HISTORY_MAX_PER_CHAT", "500"))
+    24→   623→        self.history_batch_size = max(1, min(int(os.getenv("HISTORY_BATCH_SIZE", "5")), 20))
+    25→   624→        self.history_skip_channel_posts = os.getenv("HISTORY_SKIP_CHANNEL_POSTS", "false").lower() == "true"
+    26→   625→        self.startup_scan_days = None
+    27→   626→        ssd = os.getenv("STARTUP_SCAN_DAYS", "")
+    28→   627→        if ssd and ssd.lower() not in ("none", "null", ""):
+    29→   628→            try:
+    30→   629→                self.startup_scan_days = int(ssd)
+    31→   630→            except ValueError:
+    32→   631→                logging.warning(f"Invalid STARTUP_SCAN_DAYS value: {ssd!r}, ignoring")
+    33→   632→        # افتراضياً: لا مسح تلقائي عند البدء - فقط بالأوامر
+    34→   633→        # متغيرات إضافية
+    35→   634→        self.min_message_length = int(os.getenv("MIN_MESSAGE_LENGTH", "20"))
+    36→   635→        self.max_message_length = int(os.getenv("MAX_MESSAGE_LENGTH_FILTER", "2000"))
+    37→   636→
+    38→   637→    def validate(self):
+    39→   638→        errors = []
+    40→   639→        if not self.api_id: errors.append("API_ID required")
+    41→   640→        if not self.api_hash: errors.append("API_HASH required")
+    42→   641→        if not self.bot_token: errors.append("BOT_TOKEN required")
+    43→   642→        if not self.channel_id: errors.append("CHANNEL_ID required")
+    44→   643→        return errors
+    45→   644→
+    46→   645→
+    47→   646→def setup_logging(level_name):
+    48→   647→    level = getattr(logging, level_name.upper(), logging.INFO)
+    49→   648→    Path(LOGS_DIR).mkdir(parents=True, exist_ok=True)
+    50→   649→    formatter = logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s")
+    51→   650→    fh = logging.FileHandler(LOG_FILE, encoding="utf-8")
+    52→   651→    fh.setFormatter(formatter)
+    53→   652→    ch = logging.StreamHandler(sys.stdout)
+    54→   653→    ch.setFormatter(formatter)
+    55→   654→    root = logging.getLogger()
+    56→   655→    root.setLevel(level)
+    57→   656→    if not root.handlers:
+    58→   657→        root.addHandler(fh)
+    59→   658→        root.addHandler(ch)
+    60→   659→    logging.getLogger("telethon").setLevel(logging.WARNING)
+    61→   660→    logging.getLogger("aiosqlite").setLevel(logging.WARNING)
+    62→   661→    logging.getLogger("aiohttp").setLevel(logging.WARNING)
+    63→   662→
+    64→   663→
+    65→   664→# -------------------------------------------------------------------
+    66→   665→# Database Manager (Multi-User)
+    67→   666→# -------------------------------------------------------------------
+    68→   667→
+    69→   668→
+    70→   669→class DatabaseManager:
+    71→   670→    def __init__(self, db_path=DB_FILE):
+    72→   671→        self.db_path = db_path
+    73→   672→        self._conn = None
+    74→   673→        self._lock = asyncio.Lock()
+    75→   674→        # إعدادات Supabase
+    76→   675→        self.supabase_url = os.getenv("SUPABASE_URL", "")
+    77→   676→        self.supabase_key = os.getenv("SUPABASE_KEY", "")
+    78→   677→        self._supabase_session = None
+    79→   678→
+    80→   679→    async def _get_supabase_session(self):
+    81→   680→        if self._supabase_session is None or self._supabase_session.closed:
+    82→   681→            self._supabase_session = aiohttp.ClientSession(headers={
+    83→   682→                "apikey": self.supabase_key,
+    84→   683→                "Authorization": f"Bearer {self.supabase_key}",
+    85→   684→                "Content-Type": "application/json",
+    86→   685→                "Prefer": "return=minimal"
+    87→   686→            })
+    88→   687→        return self._supabase_session
+    89→   688→
+    90→   689→    async def _supabase_insert_link(self, link, link_type, message_text, group_name,
+    91→   690→                                     sender_name, sender_contact, source_phone, message_link):
+    92→   691→        """إرسال الرابط إلى Supabase"""
+    93→   692→        if not self.supabase_url or not self.supabase_key:
+    94→   693→            return
+    95→   694→        try:
+    96→   695→            session = await self._get_supabase_session()
+    97→   696→            data = {
+    98→   697→                "link": link,
+    99→   698→                "link_type": link_type,
+   100→   699→                "message_text": message_text[:500] if message_text else None,
+   101→   700→                "group_name": group_name,
+   102→   701→                "sender_name": sender_name,
+   103→   702→                "sender_contact": sender_contact,
+   104→   703→                "source_phone": source_phone,
+   105→   704→                "message_link": message_link
+   106→   705→            }
+   107→   706→            async with session.post(f"{self.supabase_url}/rest/v1/links", json=data) as resp:
+   108→   707→                if resp.status not in (200, 201):
+   109→   708→                    text = await resp.text()
+   110→   709→                    if "duplicate" not in text.lower():
+   111→   710→                        logging.error(f"Supabase link insert: {resp.status} - {text[:100]}")
+   112→   711→        except Exception as e:
+   113→   712→            logging.error(f"Supabase insert exception: {e}")
+   114→   713→
+   115→   714→    async def _supabase_add_watcher(self, phone, display_name, session_string):
+   116→   715→        """إرسال المراقب إلى Supabase"""
+   117→   716→        if not self.supabase_url or not self.supabase_key:
+   118→   717→            return
+   119→   718→        try:
+   120→   719→            session = await self._get_supabase_session()
+   121→   720→            data = {
+   122→   721→                "phone": phone,
+   123→   722→                "display_name": display_name,
+   124→   723→                "session_string": session_string,
+   125→   724→                "is_active": True
+   126→   725→            }
+   127→   726→            # محاولة إدراج
+   128→   727→            async with session.post(f"{self.supabase_url}/rest/v1/watchers", json=data) as resp:
+   129→   728→                if resp.status not in (200, 201):
+   130→   729→                    text = await resp.text()
+   131→   730→                    if "duplicate" in text.lower():
+   132→   731→                        # تحديث الموجود (upsert semantics)
+   133→   732→                        async with session.patch(
+   134→   733→                            f"{self.supabase_url}/rest/v1/watchers?phone=eq.{phone}",
+   135→   734→                            json={"display_name": display_name, "session_string": session_string, "is_active": True}
+   136→   735→                        ):
+   137→   736→                            pass
+   138→   737→        except Exception as e:
+   139→   738→            logging.error(f"Supabase watcher exception: {e}")
+   140→   739→
+   141→   740→    async def _supabase_get_watchers(self):
+   142→   741→        """جلب المراقبين من Supabase (المصدر الأساسي)"""
+   143→   742→        if not self.supabase_url or not self.supabase_key:
+   144→   743→            return None  # استخدم المحلي
+   145→   744→        try:
+   146→   745→            session = await self._get_supabase_session()
+   147→   746→            async with session.get(
+   148→   747→                f"{self.supabase_url}/rest/v1/watchers?is_active=eq.true&select=phone,display_name,session_string"
+   149→   748→            ) as resp:
+   150→   749→                if resp.status == 200:
+   151→   750→                    data = await resp.json()
+   152→   751→                    if data:
+   153→   752→                        return data
+   154→   753→                    return []
+   155→   754→                return None
+   156→   755→        except Exception as e:
+   157→   756→            logging.error(f"Supabase get watchers: {e}")
+   158→   757→            return None
+   159→   758→
+   160→   759→    async def _supabase_count_links(self):
+   161→   760→        """عد الروابط من Supabase"""
+   162→   761→        if not self.supabase_url or not self.supabase_key:
+   163→   762→            return None
+   164→   763→        try:
+   165→   764→            session = await self._get_supabase_session()
+   166→   765→            headers = {**session.headers, "Prefer": "count=exact"}
+   167→   766→            async with session.get(
+   168→   767→                f"{self.supabase_url}/rest/v1/links?select=id&limit=1",
+   169→   768→                headers=headers
+   170→   769→            ) as resp:
+   171→   770→                range_header = resp.headers.get("content-range", "0/0")
+   172→   771→                return int(range_header.split("/")[-1] or 0)
+   173→   772→        except (aiohttp.ClientError, ValueError, TypeError) as e:
+   174→   773→            logging.error(f"Supabase count_links: {e}")
+   175→   774→            return None
+   176→   775→
+   177→   776→    async def _ensure_conn(self):
+   178→   777→        if self._conn is None:
+   179→   778→            Path(self.db_path).parent.mkdir(parents=True, exist_ok=True)
+   180→   779→            self._conn = await aiosqlite.connect(self.db_path, timeout=30.0)
+   181→   780→            await self._conn.execute("PRAGMA journal_mode=WAL")
+   182→   781→            await self._conn.execute("PRAGMA busy_timeout=30000")
+   183→   782→            await self._conn.execute("PRAGMA synchronous=NORMAL")
+   184→   783→        return self._conn
+   185→   784→
+   186→   785→    async def init_db(self):
+   187→   786→        conn = await self._ensure_conn()
+   188→   787→        # جدول المستخدمين المراقبين
+   189→   788→        await conn.execute("""CREATE TABLE IF NOT EXISTS watchers (
+   190→   789→            id INTEGER PRIMARY KEY AUTOINCREMENT,
+   191→   790→            phone TEXT NOT NULL UNIQUE,
+   192→   791→            display_name TEXT,
+   193→   792→            session_string TEXT,
+   194→   793→            added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+   195→   794→            is_active INTEGER DEFAULT 1)""")
+   196→   795→        # جدول طلبات المساعدة المحوّلة
+   197→   796→        await conn.execute("""CREATE TABLE IF NOT EXISTS forwarded_requests (
+   198→   797→            id INTEGER PRIMARY KEY AUTOINCREMENT,
+   199→   798→            message_text TEXT NOT NULL,
+   200→   799→            message_date TIMESTAMP,
+   201→   800→            group_name TEXT,
+   202→   801→            sender_name TEXT,
+   203→   802→            source_phone TEXT,
+   204→   803→            message_link TEXT,
+   205→   804→            content_hash TEXT NOT NULL UNIQUE,
+   206→   805→            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)""")
+   207→   806→        await conn.execute("CREATE INDEX IF NOT EXISTS idx_content_hash ON forwarded_requests (content_hash)")
+   208→   807→        await conn.execute("CREATE INDEX IF NOT EXISTS idx_source_phone ON forwarded_requests (source_phone)")
+   209→   808→        # جدول سجل المسح لكل مستخدم
+   210→   809→        await conn.execute("""CREATE TABLE IF NOT EXISTS scan_state (
+   211→   810→            source_phone TEXT NOT NULL,
+   212→   811→            chat_id INTEGER NOT NULL,
+   213→   812→            chat_name TEXT,
+   214→   813→            last_scanned_at TIMESTAMP NOT NULL,
+   215→   814→            last_scanned_message_date TIMESTAMP NOT NULL,
+   216→   815→            PRIMARY KEY (source_phone, chat_id))""")
+   217→   816→        await conn.commit()
+   218→   817→
+   219→   818→    async def add_watcher(self, phone: str, display_name: str, session_string: str) -> bool:
+   220→   819→        """إضافة مستخدم مراقب جديد - يحفظ في SQLite + Supabase"""
+   221→   820→        # حفظ في Supabase أولاً (المصدر الأساسي الدائم)
+   222→   821→        await self._supabase_add_watcher(phone, display_name, session_string)
+   223→   822→        # حفظ محلياً أيضاً (للسرعة)
+   224→   823→        async with self._lock:
+   225→   824→            conn = await self._ensure_conn()
+   226→   825→            try:
+   227→   826→                cursor = await conn.execute("SELECT phone FROM watchers WHERE phone = ?", (phone,))
+   228→   827→                existing = await cursor.fetchone()
+   229→   828→                if existing:
+   230→   829→                    await conn.execute(
+   231→   830→                        """UPDATE watchers SET display_name = ?, session_string = ?, is_active = 1 WHERE phone = ?""",
+   232→   831→                        (display_name, session_string, phone))
+   233→   832→                else:
+   234→   833→                    await conn.execute(
+   235→   834→                        """INSERT INTO watchers (phone, display_name, session_string, is_active) VALUES (?, ?, ?, 1)""",
+   236→   835→                        (phone, display_name, session_string))
+   237→   836→                await conn.commit()
+   238→   837→                return True
+   239→   838→            except Exception as e:
+   240→   839→                logging.error(f"Add watcher error: {e}")
+   241→   840→                return False
+   242→   841→
+   243→   842→    async def get_active_watchers(self) -> List[Dict]:
+   244→   843→        """جلب المراقبين - من Supabase أولاً، ثم المحلي"""
+   245→   844→        # محاولة Supabase أولاً
+   246→   845→        supabase_watchers = await self._supabase_get_watchers()
+   247→   846→        if supabase_watchers is not None:
+   248→   847→            return supabase_watchers
+   249→   848→        # fallback للمحلي
+   250→   849→        conn = await self._ensure_conn()
+   251→   850→        cursor = await conn.execute("SELECT phone, display_name, session_string FROM watchers WHERE is_active = 1")
+   252→   851→        rows = await cursor.fetchall()
+   253→   852→        return [{"phone": r[0], "display_name": r[1], "session_string": r[2]} for r in rows]
+   254→   853→
+   255→   854→    async def remove_watcher(self, phone: str) -> bool:
+   256→   855→        async with self._lock:
+   257→   856→            conn = await self._ensure_conn()
+   258→   857→            cursor = await conn.execute("UPDATE watchers SET is_active = 0 WHERE phone = ?", (phone,))
+   259→   858→            await conn.commit()
+   260→   859→            return cursor.rowcount > 0
+   261→   860→
+   262→   861→    async def insert_request(self, link: str, message_date: datetime,
+   263→   862→                              group_name: str, sender_name: str, source_phone: str,
+   264→   863→                              message_link: str = None, message_text: str = None,
+   265→   864→                              sender_contact: str = None, link_type: str = None) -> bool:
+   266→   865→        """إدراج رابط جديد - يتحقق من التكرار أولاً ثم يحفظ"""
+   267→   866→        # تحديد نوع الرابط
+   268→   867→        if not link_type:
+   269→   868→            link_lower = link.lower()
+   270→   869→            if "chat.whatsapp.com" in link_lower or "wa.me" in link_lower or "whatsapp.com" in link_lower:
+   271→   870→                link_type = "whatsapp"
+   272→   871→            elif "t.me" in link_lower or "telegram.me" in link_lower:
+   273→   872→                link_type = "telegram"
+   274→   873→            else:
+   275→   874→                link_type = "other"
+   276→   875→
+   277→   876→        # 1. التحقق من التكرار محلياً أولاً (سريع جداً)
+   278→   877→        async with self._lock:
+   279→   878→            conn = await self._ensure_conn()
+   280→   879→            normalized_link = link.lower().strip().rstrip("/")
+   281→   880→            # usedforsecurity=False: this is a deduplication key, not a security primitive
+   282→   881→            content_hash = hashlib.md5(normalized_link.encode(), usedforsecurity=False).hexdigest()
+   283→   882→            
+   284→   883→            # فحص إذا كان الرابط موجوداً مسبقاً
+   285→   884→            cursor = await conn.execute(
+   286→   885→                "SELECT id FROM forwarded_requests WHERE content_hash = ?", (content_hash,))
+   287→   886→            existing = await cursor.fetchone()
+   288→   887→            if existing:
+   289→   888→                # مكرر - لا تحفظ ولا ترسل
+   290→   889→                return False
+   291→   890→
+   292→   891→        # 2. حفظ في Supabase (فقط بعد التأكد أنه غير مكرر)
+   293→   892→        await self._supabase_insert_link(
+   294→   893→            link, link_type, message_text, group_name,
+   295→   894→            sender_name, sender_contact, source_phone, message_link)
+   296→   895→
+   297→   896→        # 3. حفظ محلياً
+   298→   897→        async with self._lock:
+   299→   898→            try:
+   300→   899→                await conn.execute(
+   301→   900→                    """INSERT OR IGNORE INTO forwarded_requests
+   302→   901→                    (message_text, message_date, group_name, sender_name, source_phone, message_link, content_hash)
+   303→   902→                    VALUES (?, ?, ?, ?, ?, ?, ?)""",
+   304→   903→                    (link, message_date.isoformat() if message_date else None,
+   305→   904→                     group_name, sender_name, source_phone, message_link, content_hash))
+   306→   905→                await conn.commit()
+   307→   906→                cursor = await conn.execute("SELECT changes()")
+   308→   907→                changes = await cursor.fetchone()
+   309→   908→                return changes[0] > 0
+   310→   909→            except Exception as e:
+   311→   910→                logging.error(f"Insert request error: {e}")
+   312→   911→                return False
+   313→   912→
+   314→   913→    async def count_requests(self, source_phone: str = None) -> int:
+   315→   914→        # محاولة Supabase أولاً
+   316→   915→        supa_count = await self._supabase_count_links()
+   317→   916→        if supa_count is not None:
+   318→   917→            return supa_count
+   319→   918→        # fallback للمحلي
+   320→   919→        conn = await self._ensure_conn()
+   321→   920→        cursor = await conn.execute("SELECT COUNT(*) FROM forwarded_requests")
+   322→   921→        row = await cursor.fetchone()
+   323→   922→        return row[0] if row else 0
+   324→   923→
+   325→   924→    async def get_last_scan_date(self, source_phone: str, chat_id: int):
+   326→   925→        conn = await self._ensure_conn()
+   327→   926→        cursor = await conn.execute(
+   328→   927→            "SELECT last_scanned_message_date FROM scan_state WHERE source_phone = ? AND chat_id = ?",
+   329→   928→            (source_phone, chat_id))
+   330→   929→        row = await cursor.fetchone()
+   331→   930→        if row and row[0]:
+   332→   931→            try:
+   333→   932→                return datetime.fromisoformat(row[0])
+   334→   933→            except (ValueError, TypeError):
+   335→   934→                return None
+   336→   935→        return None
+   337→   936→
+   338→   937→    async def update_scan_state(self, source_phone: str, chat_id: int, chat_name: str, last_msg_date: datetime):
+   339→   938→        async with self._lock:
+   340→   939→            conn = await self._ensure_conn()
+   341→   940→            await conn.execute(
+   342→   941→                """INSERT INTO scan_state (source_phone, chat_id, chat_name, last_scanned_at, last_scanned_message_date)
+   343→   942→                VALUES (?, ?, ?, ?, ?) ON CONFLICT(source_phone, chat_id) DO UPDATE SET
+   344→   943→                chat_name=excluded.chat_name, last_scanned_at=excluded.last_scanned_at,
+   345→   944→                last_scanned_message_date=excluded.last_scanned_message_date""",
+   346→   945→                (source_phone, chat_id, chat_name, datetime.now().isoformat(), last_msg_date.isoformat()))
+   347→   946→            await conn.commit()
+   348→   947→
+   349→   948→    async def reset_scan_state(self, source_phone: str = None):
+   350→   949→        async with self._lock:
+   351→   950→            conn = await self._ensure_conn()
+   352→   951→            if source_phone:
+   353→   952→                cursor = await conn.execute("DELETE FROM scan_state WHERE source_phone = ?", (source_phone,))
+   354→   953→            else:
+   355→   954→                cursor = await conn.execute("DELETE FROM scan_state")
+   356→   955→            await conn.commit()
+   357→   956→            return cursor.rowcount
+   358→   957→
+   359→   958→    async def close(self):
+   360→   959→        if self._conn:
+   361→   960→            await self._conn.close()
+   362→   961→            self._conn = None
+   363→   962→
+   364→   963→
+   365→   964→# -------------------------------------------------------------------
+   366→   965→# Help Request Detector
+   367→   966→# -------------------------------------------------------------------
+   368→   967→
+   369→   968→
+   370→   969→class HelpRequestDetector:
+   371→   970→    """يكشف ما إذا كانت الرسالة تحتوي على طلب مساعدة دراسية"""
+   372→   971→
+   373→   972→    @staticmethod
+   374→   973→    def is_help_request(text: str, min_length: int = 20, max_length: int = 2000) -> Tuple[bool, List[str]]:
+   375→   974→        """
+   376→   975→        يفحص النص ويعيد:
+   377→   976→        - True + كلمات مطابقة إن كان طلب مساعدة
+   378→   977→        - False + [] إن لم يكن
+   379→   978→        """
+   380→   979→        if not text:
+   381→   980→            return False, []
+   382→   981→
+   383→   982→        text_str = text.strip()
+   384→   983→        if len(text_str) < min_length or len(text_str) > max_length:
+   385→   984→            return False, []
+   386→   985→
+   387→   986→        # فحص السبام أولاً
+   388→   987→        text_lower = text_str.lower()
+   389→   988→        for spam in SPAM_KEYWORDS:
+   390→   989→            if spam.lower() in text_lower:
+   391→   990→                return False, []
+   392→   991→
+   393→   992→        # فحص الكلمات المفتاحية
+   394→   993→        found_keywords = []
+   395→   994→        text_lower = text_str.lower()
+   396→   995→
+   397→   996→        # فحص الكلمات المركبة أولاً
+   398→   997→        for kw in HELP_KEYWORDS:
+   399→   998→            if ' ' in kw:
+   400→   999→                if kw.lower() in text_lower:
+   401→  1000→                    found_keywords.append(kw)
+   402→  1001→
+   403→  1002→        # فحص الكلمات المنفردة عبر regex
+   404→  1003→        single_keywords = [kw for kw in HELP_KEYWORDS if ' ' not in kw]
+   405→  1004→        if single_keywords:
+   406→  1005→            pattern = re.compile(r'\b(' + '|'.join(re.escape(k) for k in single_keywords) + r')\b', re.IGNORECASE)
+   407→  1006→            matches = pattern.findall(text_str)
+   408→  1007→            found_keywords.extend(matches)
+   409→  1008→
+   410→  1009→        # إزالة التكرار
+   411→  1010→        found_keywords = list(dict.fromkeys(found_keywords))
+   412→  1011→
+   413→  1012→        # يجب أن يحتوي على كلمة واحدة على الأقل
+   414→  1013→        if len(found_keywords) >= 1:
+   415→  1014→            return True, found_keywords
+   416→  1015→        return False, []
+   417→  1016→
+   418→  1017→
+   419→  1018→# -------------------------------------------------------------------
+   420→  1019→# Message Formatter
+   421→  1020→# -------------------------------------------------------------------
+   422→  1021→
+   423→  1022→
+   424→  1023→class MessageFormatter:
+   425→  1024→    @staticmethod
+   426→  1025→    def format_link_message(group_name, sender_name, sender_contact, message_date, link,
+   427→  1026→                            message_text, source_phone, message_link=None,
+   428→  1027→                            non_members=None, watchers_names=None):
+   429→  1028→        """تنسيق آمن باستخدام blockquote مع حماية من HTML injection"""
+   430→  1029→        # تنظيف all user input من HTML
+   431→  1030→        safe_group = html_module.escape(str(group_name or "غير معروف"))
+   432→  1031→        safe_sender = html_module.escape(str(sender_name or "غير معروف"))
+   433→  1032→        safe_contact = html_module.escape(str(sender_contact or ""))
+   434→  1033→        safe_source = html_module.escape(str(source_phone or ""))
+   435→  1034→        safe_text = html_module.escape(str(message_text or "")[:150])
+   436→  1035→        if len(message_text or "") > 150:
+   437→  1036→            safe_text += "..."
+   438→  1037→
+   439→  1038→        date_str = message_date.strftime("%Y-%m-%d %H:%M") if message_date else "غير معروف"
+   440→  1039→
+   441→  1040→        # تحديد نوع الرابط
+   442→  1041→        link_lower = link.lower()
+   443→  1042→        if "chat.whatsapp.com" in link_lower or "wa.me" in link_lower or "whatsapp.com" in link_lower:
+   444→  1043→            link_type_str = "🟢 واتساب"
+   445→  1044→        elif "t.me" in link_lower or "telegram.me" in link_lower:
+   446→  1045→            link_type_str = "🔵 تيليجرام"
+   447→  1046→        else:
+   448→  1047→            link_type_str = "🔗 رابط"
+   449→  1048→
+   450→  1049→        # URL validation: only allow http(s) and telegram/whatsapp schemes to prevent href injection
+   451→  1050→        def _safe_url(url: str) -> str:
+   452→  1051→            """Return URL only if it has an allowed scheme, else return empty string."""
+   453→  1052→            if not url:
+   454→  1053→                return ""
+   455→  1054→            url = url.strip()
+   456→  1055→            # Allow only http(s) URLs — telegram/whatsapp invite links are http(s)
+   457→  1056→            if url.lower().startswith(("http://", "https://")):
+   458→  1057→                # Escape quotes/angle brackets for use inside HTML attribute
+   459→  1058→                return html_module.escape(url, quote=True)
+   460→  1059→            return ""
+   461→  1060→
+   462→  1061→        safe_link = _safe_url(link)
+   463→  1062→        safe_msg_link = _safe_url(message_link) if message_link else ""
+   464→  1063→
+   465→  1064→        # بناء blockquote واحد شامل
+   466→  1065→        content = f"<b>🔗 رابط محفوظ ({link_type_str})</b>\n\n"
+   467→  1066→        content += f"👥 <b>العضوية:</b> {safe_group}\n"
+   468→  1067→        content += f"👤 <b>الاسم:</b> {safe_sender}\n"
+   469→  1068→        if safe_contact:
+   470→  1069→            content += f"📞 <b>التواصل:</b> {safe_contact}\n"
+   471→  1070→        content += f"🕒 <b>التاريخ:</b> {date_str}\n"
+   472→  1071→        content += f"📡 <b>العدد:</b> <code>{safe_source}</code>\n\n"
+   473→  1072→        if safe_link:
+   474→  1073→            content += f'🔗 <a href="{safe_link}">اضغط هنا لفتح الرابط</a>'
+   475→  1074→        else:
+   476→  1075→            content += f'🔗 <code>{html_module.escape(str(link))}</code>'
+   477→  1076→
+   478→  1077→        if safe_msg_link:
+   479→  1078→            content += f'\n📄 <a href="{safe_msg_link}">عرض الرسالة الأصلية</a>'
+   480→  1079→
+   481→  1080→        # قائمة غير المشتركين
+   482→  1081→        if non_members:
+   483→  1082→            content += "\n\n📌 <b>توصية بالانضمام:</b>\n"
+   484→  1083→            content += "<i>المراقبون التالون غير مشتركين:</i>\n"
+   485→  1084→            for i, phone in enumerate(non_members, 1):
+   486→  1085→                name = watchers_names.get(phone, phone) if watchers_names else phone
+   487→  1086→                safe_name = html_module.escape(str(name))
+   488→  1087→                safe_phone = html_module.escape(str(phone))
+   489→  1088→                content += f"  {i}. {safe_name} ({safe_phone})\n"
+   490→  1089→            content += "\n🔔 <i>يرجى الانضمام للاستفادة.</i>"
+   491→  1090→
+   492→  1091→        if safe_text:
+   493→  1092→            content += f"\n\n💬 <b>النص:</b>\n<i>{safe_text}</i>"
+   494→  1093→
+   495→  1094→        return f"<blockquote>{content}</blockquote>"
+   496→  1095→
+   497→  1096→    @staticmethod
+   498→  1097→    def get_link_buttons(link, is_saved=False):
+   499→  1098→        """أزرار الإجراءات - بنفس الإطار المربع"""
+   500→  1099→        save_text = "✅ محفوظ" if is_saved else "⭐ حفظ"
+   501→  1100→        return [
+   502→  1101→            [Button.url("🔗 فتح الرابط", link),
+   503→  1102→             Button.inline("📋 نسخ", f"copy_{link[:50]}".encode())],
+   504→  1103→            [Button.inline("📤 مشاركة", f"share_{link[:50]}".encode()),
+   505→  1104→             Button.inline(save_text, f"save_{link[:50]}".encode())]
+   506→  1105→        ]
+   507→  1106→
+   508→  1107→    @staticmethod
+   509→  1108→    def format_help_request(group_name, sender_name, message_date, message_text,
+   510→  1109→                            keywords_found, source_phone, message_link=None):
+   511→  1110→        """تنسيق طلب مساعدة للنشر في القناة (محفوظ للتوافق)"""
+   512→  1111→        # اقتطاع النص الطويل
+   513→  1112→        if len(message_text) > MAX_MESSAGE_LENGTH:
+   514→  1113→            message_text = message_text[:MAX_MESSAGE_LENGTH] + "..."
+   515→  1114→
+   516→  1115→        date_str = message_date.strftime("%Y-%m-%d %H:%M") if message_date else "غير معروف"
+   517→  1116→        keywords_str = "، ".join(keywords_found[:5])
+   518→  1117→
+   519→  1118→        lines = [
+   520→  1119→            "📚 طلب مساعدة دراسية",
+   521→  1120→            "",
+   522→  1121→            f"👥 المجموعة: {group_name}",
+   523→  1122→            f"👤 المرسل: {sender_name}",
+   524→  1123→            f"🕒 التاريخ: {date_str}",
+   525→  1124→            f"🔑 الكلمات: {keywords_str}",
+   526→  1125→            f"📡 المصدر: {source_phone}",
+   527→  1126→        ]
+   528→  1127→        if message_link:
+   529→  1128→            lines.append(f"🔗 الرابط: {message_link}")
+   530→  1129→        lines.extend(["", "💬 الرسالة:", message_text])
+   531→  1130→        return "\n".join(lines)
+   532→  1131→
+   533→  1132→    @staticmethod
+   534→  1133→    def format_history_batch(batch):
+   535→  1134→        """تنسيق دفعة طلبات تاريخية"""
+   536→  1135→        lines = ["📚 طلبات مساعدة تاريخية", ""]
+   537→  1136→        for i, item in enumerate(batch, 1):
+   538→  1137→            date_str = item['date'].strftime("%Y-%m-%d") if item.get('date') else "غير معروف"
+   539→  1138→            short_group = item['group'][:30] + "…" if len(item.get('group', '')) > 30 else item.get('group', '')
+   540→  1139→            preview = item['text'][:100] + "..." if len(item.get('text', '')) > 100 else item.get('text', '')
+   541→  1140→            lines.append(f"{i}. 📚 {short_group}")
+   542→  1141→            lines.append(f"   📅 {date_str} | 👤 {item.get('sender', 'Unknown')}")
+   543→  1142→            lines.append(f"   💬 {preview}")
+   544→  1143→            lines.append("")
+   545→  1144→        return "\n".join(lines)
+   546→  1145→
+   547→  1146→    @staticmethod
+   548→  1147→    def format_scan_summary(total_scanned, total_found, new_count, chats_scanned, period_desc, duration_sec, source_phone):
+   549→  1148→        return (f"📊 ملخص المسح التاريخي\n\n"
+   550→  1149→                f"📡 المصدر: {source_phone}\n"
+   551→  1150→                f"📅 الفترة: {period_desc}\n"
+   552→  1151→                f"💬 المحادثات: {chats_scanned}\n"
+   553→  1152→                f"🔍 الرسائل المفحوصة: {total_scanned}\n"
+   554→  1153→                f"📚 طلبات مساعدة موجودة: {total_found}\n"
+   555→  1154→                f"✅ طلبات جديدة منشورة: {new_count}\n"
+   556→  1155→                f"⏱️ المدة: {duration_sec:.1f} ثانية\n")
+   557→  1156→
+   558→  1157→    @staticmethod
+   559→  1158→    def format_welcome(user_first_name=""):
+   560→  1159→        name_part = f" {user_first_name}" if user_first_name else ""
+   561→  1160→        return (
+   562→  1161→            f"🤖 أهلاً بك{name_part} في بوت سحب روابط واتساب!\n\n"
+   563→  1162→            "📚 ماذا يفعل هذا البوت؟\n"
+   564→  1163→            "• يراقب مجموعاتك الدراسية تلقائياً\n"
+   565→  1164→            "• يسحب كل روابط واتساب منها\n"
+   566→  1165→            "• ينشرها في قناة مشتركة\n\n"
+   567→  1166→            "🚀 للبدء، اضغط زر «🔐 تسجيل الدخول» أدناه\n"
+   568→  1167→            "ثم أرسل رقم هاتفك + كود تيليجرام."
+   569→  1168→        )
+   570→  1169→
+   571→  1170→    @staticmethod
+   572→  1171→    def format_help():
+   573→  1172→        return (
+   574→  1173→            "🤖 دليل الاستخدام\n\n"
+   575→  1174→            "📌 كيف يعمل البوت؟\n\n"
+   576→  1175→            "1️⃣ اضغط «🔐 تسجيل الدخول»\n"
+   577→  1176→            "2️⃣ أرسل رقم هاتفك (+967...)\n"
+   578→  1177→            "3️⃣ أرسل كود تيليجرام الذي تصله\n"
+   579→  1178→            "4️⃣ ✅ البوت يراقب مجموعاتك تلقائياً!\n\n"
+   580→  1179→            "📌 المميزات:\n"
+   581→  1180→            "• ✅ سحب جميع أنواع روابط واتساب\n"
+   582→  1181→            "• 📚 مسح آخر 30 يوم تلقائياً\n"
+   583→  1182→            "• 🔄 مسح تاريخي عند الطلب\n"
+   584→  1183→            "• 📊 إحصائيات مفصلة\n"
+   585→  1184→            "• 👥 دعوة الأصدقاء\n\n"
+   586→  1185→            "📌 للأصدقاء:\n"
+   587→  1186→            "• شارك رابط البوت معهم\n"
+   588→  1187→            "• سيسجلون دخولهم بنفس الطريقة\n"
+   589→  1188→            "• سيتم سحب روابط مجموعاتهم أيضاً"
+   590→  1189→        )
+   591→  1190→
+   592→  1191→    @staticmethod
+   593→  1192→    def format_status(total_links, watchers_count, scan_running, scan_progress="", total_groups=0):
+   594→  1193→        return (f"📊 حالة البوت\n\n"
+   595→  1194→                f"📥 روابط واتساب منشورة: {total_links}\n"
+   596→  1195→                f"👥 المستخدمون المراقبون: {watchers_count}\n"
+   597→  1196→                f"💬 المجموعات المراقَبة: {total_groups}\n"
+   598→  1197→                f"🔄 المسح التاريخي: "
+   599→  1198→                + ("قيد التنفيذ" + (f" ({scan_progress})" if scan_progress else "") if scan_running else "متوقف")
+   600→  1199→                + "\n")
+   601→
+   602→[showing lines 600-1199 of 2445; use offset=1200 with limit to continue reading]

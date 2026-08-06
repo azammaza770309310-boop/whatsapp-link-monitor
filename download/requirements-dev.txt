@@ -1,0 +1,25 @@
+# Development dependencies for testing and linting
+# Install with: pip install -r requirements-dev.txt
+
+# Production deps (re-listed for dev convenience)
+-r requirements.txt
+
+# Testing
+pytest>=8.0.0
+pytest-asyncio>=0.23.0
+pytest-cov>=4.1.0
+
+# Linting & formatting
+ruff>=0.5.0
+black>=24.3.0
+isort>=5.13.0
+
+# Type checking
+mypy>=1.10.0
+
+# Security
+bandit>=1.7.9
+pip-audit>=2.7.0
+
+# Type stubs for telethon
+types-requests>=2.31.0

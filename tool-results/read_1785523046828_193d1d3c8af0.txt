@@ -1,0 +1,702 @@
+   600→def setup_logging(level_name):
+   601→    level = getattr(logging, level_name.upper(), logging.INFO)
+   602→    Path(LOGS_DIR).mkdir(parents=True, exist_ok=True)
+   603→    formatter = logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s")
+   604→    fh = logging.FileHandler(LOG_FILE, encoding="utf-8")
+   605→    fh.setFormatter(formatter)
+   606→    ch = logging.StreamHandler(sys.stdout)
+   607→    ch.setFormatter(formatter)
+   608→    root = logging.getLogger()
+   609→    root.setLevel(level)
+   610→    if not root.handlers:
+   611→        root.addHandler(fh)
+   612→        root.addHandler(ch)
+   613→    logging.getLogger("telethon").setLevel(logging.WARNING)
+   614→    logging.getLogger("aiosqlite").setLevel(logging.WARNING)
+   615→    logging.getLogger("aiohttp").setLevel(logging.WARNING)
+   616→
+   617→
+   618→# -------------------------------------------------------------------
+   619→# Database Manager (Multi-User)
+   620→# -------------------------------------------------------------------
+   621→
+   622→
+   623→class DatabaseManager:
+   624→    def __init__(self, db_path=DB_FILE):
+   625→        self.db_path = db_path
+   626→        self._conn = None
+   627→        self._lock = asyncio.Lock()
+   628→        # إعدادات Supabase
+   629→        self.supabase_url = os.getenv("SUPABASE_URL", "")
+   630→        self.supabase_key = os.getenv("SUPABASE_KEY", "")
+   631→        self._supabase_session = None
+   632→
+   633→    async def _get_supabase_session(self):
+   634→        if self._supabase_session is None or self._supabase_session.closed:
+   635→            self._supabase_session = aiohttp.ClientSession(headers={
+   636→                "apikey": self.supabase_key,
+   637→                "Authorization": f"Bearer {self.supabase_key}",
+   638→                "Content-Type": "application/json",
+   639→                "Prefer": "return=minimal"
+   640→            })
+   641→        return self._supabase_session
+   642→
+   643→    async def _supabase_insert_link(self, link, link_type, message_text, group_name,
+   644→                                     sender_name, sender_contact, source_phone, message_link):
+   645→        """إرسال الرابط إلى Supabase"""
+   646→        if not self.supabase_url or not self.supabase_key:
+   647→            return
+   648→        try:
+   649→            session = await self._get_supabase_session()
+   650→            data = {
+   651→                "link": link,
+   652→                "link_type": link_type,
+   653→                "message_text": message_text[:500] if message_text else None,
+   654→                "group_name": group_name,
+   655→                "sender_name": sender_name,
+   656→                "sender_contact": sender_contact,
+   657→                "source_phone": source_phone,
+   658→                "message_link": message_link
+   659→            }
+   660→            async with session.post(f"{self.supabase_url}/rest/v1/links", json=data) as resp:
+   661→                if resp.status not in (200, 201):
+   662→                    text = await resp.text()
+   663→                    if "duplicate" not in text.lower():
+   664→                        logging.error(f"Supabase link insert: {resp.status} - {text[:100]}")
+   665→        except Exception as e:
+   666→            logging.error(f"Supabase insert exception: {e}")
+   667→
+   668→    async def _supabase_add_watcher(self, phone, display_name, session_string):
+   669→        """إرسال المراقب إلى Supabase"""
+   670→        if not self.supabase_url or not self.supabase_key:
+   671→            return
+   672→        try:
+   673→            session = await self._get_supabase_session()
+   674→            data = {
+   675→                "phone": phone,
+   676→                "display_name": display_name,
+   677→                "session_string": session_string,
+   678→                "is_active": True
+   679→            }
+   680→            # محاولة إدراج
+   681→            async with session.post(f"{self.supabase_url}/rest/v1/watchers", json=data) as resp:
+   682→                if resp.status not in (200, 201):
+   683→                    text = await resp.text()
+   684→                    if "duplicate" in text.lower():
+   685→                        # تحديث الموجود
+   686→                        headers = {**session.headers, "Content-Type": "application/json"}
+   687→                        async with session.patch(
+   688→                            f"{self.supabase_url}/rest/v1/watchers?phone=eq.{phone}",
+   689→                            json={"display_name": display_name, "session_string": session_string, "is_active": True}
+   690→                        ) as upd:
+   691→                            pass
+   692→        except Exception as e:
+   693→            logging.error(f"Supabase watcher exception: {e}")
+   694→
+   695→    async def _supabase_get_watchers(self):
+   696→        """جلب المراقبين من Supabase (المصدر الأساسي)"""
+   697→        if not self.supabase_url or not self.supabase_key:
+   698→            return None  # استخدم المحلي
+   699→        try:
+   700→            session = await self._get_supabase_session()
+   701→            async with session.get(
+   702→                f"{self.supabase_url}/rest/v1/watchers?is_active=eq.true&select=phone,display_name,session_string"
+   703→            ) as resp:
+   704→                if resp.status == 200:
+   705→                    data = await resp.json()
+   706→                    if data:
+   707→                        return data
+   708→                    return []
+   709→                return None
+   710→        except Exception as e:
+   711→            logging.error(f"Supabase get watchers: {e}")
+   712→            return None
+   713→
+   714→    async def _supabase_count_links(self):
+   715→        """عد الروابط من Supabase"""
+   716→        if not self.supabase_url or not self.supabase_key:
+   717→            return None
+   718→        try:
+   719→            session = await self._get_supabase_session()
+   720→            headers = {**session.headers, "Prefer": "count=exact"}
+   721→            async with session.get(
+   722→                f"{self.supabase_url}/rest/v1/links?select=id&limit=1",
+   723→                headers=headers
+   724→            ) as resp:
+   725→                range = resp.headers.get("content-range", "0/0")
+   726→                return int(range.split("/")[-1] or 0)
+   727→        except:
+   728→            return None
+   729→
+   730→    async def _ensure_conn(self):
+   731→        if self._conn is None:
+   732→            Path(self.db_path).parent.mkdir(parents=True, exist_ok=True)
+   733→            self._conn = await aiosqlite.connect(self.db_path, timeout=30.0)
+   734→            await self._conn.execute("PRAGMA journal_mode=WAL")
+   735→            await self._conn.execute("PRAGMA busy_timeout=30000")
+   736→            await self._conn.execute("PRAGMA synchronous=NORMAL")
+   737→        return self._conn
+   738→
+   739→    async def init_db(self):
+   740→        conn = await self._ensure_conn()
+   741→        # جدول المستخدمين المراقبين
+   742→        await conn.execute("""CREATE TABLE IF NOT EXISTS watchers (
+   743→            id INTEGER PRIMARY KEY AUTOINCREMENT,
+   744→            phone TEXT NOT NULL UNIQUE,
+   745→            display_name TEXT,
+   746→            session_string TEXT,
+   747→            added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+   748→            is_active INTEGER DEFAULT 1)""")
+   749→        # جدول طلبات المساعدة المحوّلة
+   750→        await conn.execute("""CREATE TABLE IF NOT EXISTS forwarded_requests (
+   751→            id INTEGER PRIMARY KEY AUTOINCREMENT,
+   752→            message_text TEXT NOT NULL,
+   753→            message_date TIMESTAMP,
+   754→            group_name TEXT,
+   755→            sender_name TEXT,
+   756→            source_phone TEXT,
+   757→            message_link TEXT,
+   758→            content_hash TEXT NOT NULL UNIQUE,
+   759→            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)""")
+   760→        await conn.execute("CREATE INDEX IF NOT EXISTS idx_content_hash ON forwarded_requests (content_hash)")
+   761→        await conn.execute("CREATE INDEX IF NOT EXISTS idx_source_phone ON forwarded_requests (source_phone)")
+   762→        # جدول سجل المسح لكل مستخدم
+   763→        await conn.execute("""CREATE TABLE IF NOT EXISTS scan_state (
+   764→            source_phone TEXT NOT NULL,
+   765→            chat_id INTEGER NOT NULL,
+   766→            chat_name TEXT,
+   767→            last_scanned_at TIMESTAMP NOT NULL,
+   768→            last_scanned_message_date TIMESTAMP NOT NULL,
+   769→            PRIMARY KEY (source_phone, chat_id))""")
+   770→        await conn.commit()
+   771→
+   772→    async def add_watcher(self, phone: str, display_name: str, session_string: str) -> bool:
+   773→        """إضافة مستخدم مراقب جديد - يحفظ في SQLite + Supabase"""
+   774→        # حفظ في Supabase أولاً (المصدر الأساسي الدائم)
+   775→        await self._supabase_add_watcher(phone, display_name, session_string)
+   776→        # حفظ محلياً أيضاً (للسرعة)
+   777→        async with self._lock:
+   778→            conn = await self._ensure_conn()
+   779→            try:
+   780→                cursor = await conn.execute("SELECT phone FROM watchers WHERE phone = ?", (phone,))
+   781→                existing = await cursor.fetchone()
+   782→                if existing:
+   783→                    await conn.execute(
+   784→                        """UPDATE watchers SET display_name = ?, session_string = ?, is_active = 1 WHERE phone = ?""",
+   785→                        (display_name, session_string, phone))
+   786→                else:
+   787→                    await conn.execute(
+   788→                        """INSERT INTO watchers (phone, display_name, session_string, is_active) VALUES (?, ?, ?, 1)""",
+   789→                        (phone, display_name, session_string))
+   790→                await conn.commit()
+   791→                return True
+   792→            except Exception as e:
+   793→                logging.error(f"Add watcher error: {e}")
+   794→                return False
+   795→
+   796→    async def get_active_watchers(self) -> List[Dict]:
+   797→        """جلب المراقبين - من Supabase أولاً، ثم المحلي"""
+   798→        # محاولة Supabase أولاً
+   799→        supabase_watchers = await self._supabase_get_watchers()
+   800→        if supabase_watchers is not None:
+   801→            return supabase_watchers
+   802→        # fallback للمحلي
+   803→        conn = await self._ensure_conn()
+   804→        cursor = await conn.execute("SELECT phone, display_name, session_string FROM watchers WHERE is_active = 1")
+   805→        rows = await cursor.fetchall()
+   806→        return [{"phone": r[0], "display_name": r[1], "session_string": r[2]} for r in rows]
+   807→
+   808→    async def remove_watcher(self, phone: str) -> bool:
+   809→        async with self._lock:
+   810→            conn = await self._ensure_conn()
+   811→            cursor = await conn.execute("UPDATE watchers SET is_active = 0 WHERE phone = ?", (phone,))
+   812→            await conn.commit()
+   813→            return cursor.rowcount > 0
+   814→
+   815→    async def insert_request(self, link: str, message_date: datetime,
+   816→                              group_name: str, sender_name: str, source_phone: str,
+   817→                              message_link: str = None, message_text: str = None,
+   818→                              sender_contact: str = None, link_type: str = None) -> bool:
+   819→        """إدراج رابط جديد - يتحقق من التكرار أولاً ثم يحفظ"""
+   820→        # تحديد نوع الرابط
+   821→        if not link_type:
+   822→            link_lower = link.lower()
+   823→            if "chat.whatsapp.com" in link_lower or "wa.me" in link_lower or "whatsapp.com" in link_lower:
+   824→                link_type = "whatsapp"
+   825→            elif "t.me" in link_lower or "telegram.me" in link_lower:
+   826→                link_type = "telegram"
+   827→            else:
+   828→                link_type = "other"
+   829→
+   830→        # 1. التحقق من التكرار محلياً أولاً (سريع جداً)
+   831→        async with self._lock:
+   832→            conn = await self._ensure_conn()
+   833→            import hashlib
+   834→            normalized_link = link.lower().strip().rstrip("/")
+   835→            content_hash = hashlib.md5(normalized_link.encode()).hexdigest()
+   836→            
+   837→            # فحص إذا كان الرابط موجوداً مسبقاً
+   838→            cursor = await conn.execute(
+   839→                "SELECT id FROM forwarded_requests WHERE content_hash = ?", (content_hash,))
+   840→            existing = await cursor.fetchone()
+   841→            if existing:
+   842→                # مكرر - لا تحفظ ولا ترسل
+   843→                return False
+   844→
+   845→        # 2. حفظ في Supabase (فقط بعد التأكد أنه غير مكرر)
+   846→        await self._supabase_insert_link(
+   847→            link, link_type, message_text, group_name,
+   848→            sender_name, sender_contact, source_phone, message_link)
+   849→
+   850→        # 3. حفظ محلياً
+   851→        async with self._lock:
+   852→            try:
+   853→                await conn.execute(
+   854→                    """INSERT OR IGNORE INTO forwarded_requests
+   855→                    (message_text, message_date, group_name, sender_name, source_phone, message_link, content_hash)
+   856→                    VALUES (?, ?, ?, ?, ?, ?, ?)""",
+   857→                    (link, message_date.isoformat() if message_date else None,
+   858→                     group_name, sender_name, source_phone, message_link, content_hash))
+   859→                await conn.commit()
+   860→                cursor = await conn.execute("SELECT changes()")
+   861→                changes = await cursor.fetchone()
+   862→                return changes[0] > 0
+   863→            except Exception as e:
+   864→                logging.error(f"Insert request error: {e}")
+   865→                return False
+   866→
+   867→    async def count_requests(self, source_phone: str = None) -> int:
+   868→        # محاولة Supabase أولاً
+   869→        supa_count = await self._supabase_count_links()
+   870→        if supa_count is not None:
+   871→            return supa_count
+   872→        # fallback للمحلي
+   873→        conn = await self._ensure_conn()
+   874→        cursor = await conn.execute("SELECT COUNT(*) FROM forwarded_requests")
+   875→        row = await cursor.fetchone()
+   876→        return row[0] if row else 0
+   877→
+   878→    async def get_last_scan_date(self, source_phone: str, chat_id: int):
+   879→        conn = await self._ensure_conn()
+   880→        cursor = await conn.execute(
+   881→            "SELECT last_scanned_message_date FROM scan_state WHERE source_phone = ? AND chat_id = ?",
+   882→            (source_phone, chat_id))
+   883→        row = await cursor.fetchone()
+   884→        if row and row[0]:
+   885→            try: return datetime.fromisoformat(row[0])
+   886→            except: return None
+   887→        return None
+   888→
+   889→    async def update_scan_state(self, source_phone: str, chat_id: int, chat_name: str, last_msg_date: datetime):
+   890→        async with self._lock:
+   891→            conn = await self._ensure_conn()
+   892→            await conn.execute(
+   893→                """INSERT INTO scan_state (source_phone, chat_id, chat_name, last_scanned_at, last_scanned_message_date)
+   894→                VALUES (?, ?, ?, ?, ?) ON CONFLICT(source_phone, chat_id) DO UPDATE SET
+   895→                chat_name=excluded.chat_name, last_scanned_at=excluded.last_scanned_at,
+   896→                last_scanned_message_date=excluded.last_scanned_message_date""",
+   897→                (source_phone, chat_id, chat_name, datetime.now().isoformat(), last_msg_date.isoformat()))
+   898→            await conn.commit()
+   899→
+   900→    async def reset_scan_state(self, source_phone: str = None):
+   901→        async with self._lock:
+   902→            conn = await self._ensure_conn()
+   903→            if source_phone:
+   904→                cursor = await conn.execute("DELETE FROM scan_state WHERE source_phone = ?", (source_phone,))
+   905→            else:
+   906→                cursor = await conn.execute("DELETE FROM scan_state")
+   907→            await conn.commit()
+   908→            return cursor.rowcount
+   909→
+   910→    async def close(self):
+   911→        if self._conn:
+   912→            await self._conn.close()
+   913→            self._conn = None
+   914→
+   915→
+   916→# -------------------------------------------------------------------
+   917→# Help Request Detector
+   918→# -------------------------------------------------------------------
+   919→
+   920→
+   921→class HelpRequestDetector:
+   922→    """يكشف ما إذا كانت الرسالة تحتوي على طلب مساعدة دراسية"""
+   923→
+   924→    @staticmethod
+   925→    def is_help_request(text: str, min_length: int = 20, max_length: int = 2000) -> Tuple[bool, List[str]]:
+   926→        """
+   927→        يفحص النص ويعيد:
+   928→        - True + كلمات مطابقة إن كان طلب مساعدة
+   929→        - False + [] إن لم يكن
+   930→        """
+   931→        if not text:
+   932→            return False, []
+   933→
+   934→        text_str = text.strip()
+   935→        if len(text_str) < min_length or len(text_str) > max_length:
+   936→            return False, []
+   937→
+   938→        # فحص السبام أولاً
+   939→        text_lower = text_str.lower()
+   940→        for spam in SPAM_KEYWORDS:
+   941→            if spam.lower() in text_lower:
+   942→                return False, []
+   943→
+   944→        # فحص الكلمات المفتاحية
+   945→        found_keywords = []
+   946→        text_lower = text_str.lower()
+   947→
+   948→        # فحص الكلمات المركبة أولاً
+   949→        for kw in HELP_KEYWORDS:
+   950→            if ' ' in kw:
+   951→                if kw.lower() in text_lower:
+   952→                    found_keywords.append(kw)
+   953→
+   954→        # فحص الكلمات المنفردة عبر regex
+   955→        single_keywords = [kw for kw in HELP_KEYWORDS if ' ' not in kw]
+   956→        if single_keywords:
+   957→            pattern = re.compile(r'\b(' + '|'.join(re.escape(k) for k in single_keywords) + r')\b', re.IGNORECASE)
+   958→            matches = pattern.findall(text_str)
+   959→            found_keywords.extend(matches)
+   960→
+   961→        # إزالة التكرار
+   962→        found_keywords = list(dict.fromkeys(found_keywords))
+   963→
+   964→        # يجب أن يحتوي على كلمة واحدة على الأقل
+   965→        if len(found_keywords) >= 1:
+   966→            return True, found_keywords
+   967→        return False, []
+   968→
+   969→
+   970→# -------------------------------------------------------------------
+   971→# Message Formatter
+   972→# -------------------------------------------------------------------
+   973→
+   974→
+   975→class MessageFormatter:
+   976→    @staticmethod
+   977→    def format_link_message(group_name, sender_name, sender_contact, message_date, link,
+   978→                            message_text, source_phone, message_link=None,
+   979→                            non_members=None, watchers_names=None):
+   980→        """تنسيق آمن باستخدام blockquote مع حماية من HTML injection"""
+   981→        # تنظيف all user input من HTML
+   982→        safe_group = html_module.escape(str(group_name or "غير معروف"))
+   983→        safe_sender = html_module.escape(str(sender_name or "غير معروف"))
+   984→        safe_contact = html_module.escape(str(sender_contact or ""))
+   985→        safe_source = html_module.escape(str(source_phone or ""))
+   986→        safe_text = html_module.escape(str(message_text or "")[:150])
+   987→        if len(message_text or "") > 150:
+   988→            safe_text += "..."
+   989→
+   990→        date_str = message_date.strftime("%Y-%m-%d %H:%M") if message_date else "غير معروف"
+   991→
+   992→        # تحديد نوع الرابط
+   993→        link_lower = link.lower()
+   994→        if "chat.whatsapp.com" in link_lower or "wa.me" in link_lower or "whatsapp.com" in link_lower:
+   995→            link_type_str = "🟢 واتساب"
+   996→        elif "t.me" in link_lower or "telegram.me" in link_lower:
+   997→            link_type_str = "🔵 تيليجرام"
+   998→        else:
+   999→            link_type_str = "🔗 رابط"
+  1000→
+  1001→        # بناء blockquote واحد شامل
+  1002→        content = f"<b>🔗 رابط محفوظ ({link_type_str})</b>\n\n"
+  1003→        content += f"👥 <b>العضوية:</b> {safe_group}\n"
+  1004→        content += f"👤 <b>الاسم:</b> {safe_sender}\n"
+  1005→        if safe_contact:
+  1006→            content += f"📞 <b>التواصل:</b> {safe_contact}\n"
+  1007→        content += f"🕒 <b>التاريخ:</b> {date_str}\n"
+  1008→        content += f"📡 <b>العدد:</b> <code>{safe_source}</code>\n\n"
+  1009→        content += f'🔗 <a href="{link}">اضغط هنا لفتح الرابط</a>'
+  1010→
+  1011→        if message_link:
+  1012→            content += f'\n📄 <a href="{message_link}">عرض الرسالة الأصلية</a>'
+  1013→
+  1014→        # قائمة غير المشتركين
+  1015→        if non_members:
+  1016→            content += f"\n\n📌 <b>توصية بالانضمام:</b>\n"
+  1017→            content += f"<i>المراقبون التالون غير مشتركين:</i>\n"
+  1018→            for i, phone in enumerate(non_members, 1):
+  1019→                name = watchers_names.get(phone, phone) if watchers_names else phone
+  1020→                safe_name = html_module.escape(str(name))
+  1021→                safe_phone = html_module.escape(str(phone))
+  1022→                content += f"  {i}. {safe_name} ({safe_phone})\n"
+  1023→            content += f"\n🔔 <i>يرجى الانضمام للاستفادة.</i>"
+  1024→
+  1025→        if safe_text:
+  1026→            content += f"\n\n💬 <b>النص:</b>\n<i>{safe_text}</i>"
+  1027→
+  1028→        return f"<blockquote>{content}</blockquote>"
+  1029→
+  1030→    @staticmethod
+  1031→    def get_link_buttons(link, is_saved=False):
+  1032→        """أزرار الإجراءات - بنفس الإطار المربع"""
+  1033→        save_text = "✅ محفوظ" if is_saved else "⭐ حفظ"
+  1034→        return [
+  1035→            [Button.url("🔗 فتح الرابط", link),
+  1036→             Button.inline("📋 نسخ", f"copy_{link[:50]}".encode())],
+  1037→            [Button.inline("📤 مشاركة", f"share_{link[:50]}".encode()),
+  1038→             Button.inline(save_text, f"save_{link[:50]}".encode())]
+  1039→        ]
+  1040→
+  1041→    @staticmethod
+  1042→    def format_help_request(group_name, sender_name, message_date, message_text,
+  1043→                            keywords_found, source_phone, message_link=None):
+  1044→        """تنسيق طلب مساعدة للنشر في القناة (محفوظ للتوافق)"""
+  1045→        # اقتطاع النص الطويل
+  1046→        if len(message_text) > MAX_MESSAGE_LENGTH:
+  1047→            message_text = message_text[:MAX_MESSAGE_LENGTH] + "..."
+  1048→
+  1049→        date_str = message_date.strftime("%Y-%m-%d %H:%M") if message_date else "غير معروف"
+  1050→        keywords_str = "، ".join(keywords_found[:5])
+  1051→
+  1052→        lines = [
+  1053→            "📚 طلب مساعدة دراسية",
+  1054→            "",
+  1055→            f"👥 المجموعة: {group_name}",
+  1056→            f"👤 المرسل: {sender_name}",
+  1057→            f"🕒 التاريخ: {date_str}",
+  1058→            f"🔑 الكلمات: {keywords_str}",
+  1059→            f"📡 المصدر: {source_phone}",
+  1060→        ]
+  1061→        if message_link:
+  1062→            lines.append(f"🔗 الرابط: {message_link}")
+  1063→        lines.extend(["", "💬 الرسالة:", message_text])
+  1064→        return "\n".join(lines)
+  1065→
+  1066→    @staticmethod
+  1067→    def format_history_batch(batch):
+  1068→        """تنسيق دفعة طلبات تاريخية"""
+  1069→        lines = ["📚 طلبات مساعدة تاريخية", ""]
+  1070→        for i, item in enumerate(batch, 1):
+  1071→            date_str = item['date'].strftime("%Y-%m-%d") if item.get('date') else "غير معروف"
+  1072→            short_group = item['group'][:30] + "…" if len(item.get('group', '')) > 30 else item.get('group', '')
+  1073→            preview = item['text'][:100] + "..." if len(item.get('text', '')) > 100 else item.get('text', '')
+  1074→            lines.append(f"{i}. 📚 {short_group}")
+  1075→            lines.append(f"   📅 {date_str} | 👤 {item.get('sender', 'Unknown')}")
+  1076→            lines.append(f"   💬 {preview}")
+  1077→            lines.append("")
+  1078→        return "\n".join(lines)
+  1079→
+  1080→    @staticmethod
+  1081→    def format_scan_summary(total_scanned, total_found, new_count, chats_scanned, period_desc, duration_sec, source_phone):
+  1082→        return (f"📊 ملخص المسح التاريخي\n\n"
+  1083→                f"📡 المصدر: {source_phone}\n"
+  1084→                f"📅 الفترة: {period_desc}\n"
+  1085→                f"💬 المحادثات: {chats_scanned}\n"
+  1086→                f"🔍 الرسائل المفحوصة: {total_scanned}\n"
+  1087→                f"📚 طلبات مساعدة موجودة: {total_found}\n"
+  1088→                f"✅ طلبات جديدة منشورة: {new_count}\n"
+  1089→                f"⏱️ المدة: {duration_sec:.1f} ثانية\n")
+  1090→
+  1091→    @staticmethod
+  1092→    def format_welcome(user_first_name=""):
+  1093→        name_part = f" {user_first_name}" if user_first_name else ""
+  1094→        return (
+  1095→            f"🤖 أهلاً بك{name_part} في بوت سحب روابط واتساب!\n\n"
+  1096→            "📚 ماذا يفعل هذا البوت؟\n"
+  1097→            "• يراقب مجموعاتك الدراسية تلقائياً\n"
+  1098→            "• يسحب كل روابط واتساب منها\n"
+  1099→            "• ينشرها في قناة مشتركة\n\n"
+  1100→            "🚀 للبدء، اضغط زر «🔐 تسجيل الدخول» أدناه\n"
+  1101→            "ثم أرسل رقم هاتفك + كود تيليجرام."
+  1102→        )
+  1103→
+  1104→    @staticmethod
+  1105→    def format_help():
+  1106→        return (
+  1107→            "🤖 دليل الاستخدام\n\n"
+  1108→            "📌 كيف يعمل البوت؟\n\n"
+  1109→            "1️⃣ اضغط «🔐 تسجيل الدخول»\n"
+  1110→            "2️⃣ أرسل رقم هاتفك (+967...)\n"
+  1111→            "3️⃣ أرسل كود تيليجرام الذي تصله\n"
+  1112→            "4️⃣ ✅ البوت يراقب مجموعاتك تلقائياً!\n\n"
+  1113→            "📌 المميزات:\n"
+  1114→            "• ✅ سحب جميع أنواع روابط واتساب\n"
+  1115→            "• 📚 مسح آخر 30 يوم تلقائياً\n"
+  1116→            "• 🔄 مسح تاريخي عند الطلب\n"
+  1117→            "• 📊 إحصائيات مفصلة\n"
+  1118→            "• 👥 دعوة الأصدقاء\n\n"
+  1119→            "📌 للأصدقاء:\n"
+  1120→            "• شارك رابط البوت معهم\n"
+  1121→            "• سيسجلون دخولهم بنفس الطريقة\n"
+  1122→            "• سيتم سحب روابط مجموعاتهم أيضاً"
+  1123→        )
+  1124→
+  1125→    @staticmethod
+  1126→    def format_status(total_links, watchers_count, scan_running, scan_progress="", total_groups=0):
+  1127→        return (f"📊 حالة البوت\n\n"
+  1128→                f"📥 روابط واتساب منشورة: {total_links}\n"
+  1129→                f"👥 المستخدمون المراقبون: {watchers_count}\n"
+  1130→                f"💬 المجموعات المراقَبة: {total_groups}\n"
+  1131→                f"🔄 المسح التاريخي: "
+  1132→                + ("قيد التنفيذ" + (f" ({scan_progress})" if scan_progress else "") if scan_running else "متوقف")
+  1133→                + "\n")
+  1134→
+  1135→
+  1136→# -------------------------------------------------------------------
+  1137→# History Scanner
+  1138→# -------------------------------------------------------------------
+  1139→
+  1140→
+  1141→class HistoryScanner:
+  1142→    def __init__(self, user_client, bot_client, db, channel_id,
+  1143→                 days_back, max_per_chat, batch_size, skip_channel_posts,
+  1144→                 source_phone, source_name, progress_callback=None):
+  1145→        self.user_client = user_client
+  1146→        self.bot_client = bot_client
+  1147→        self.db = db
+  1148→        self.channel_id = channel_id
+  1149→        self.days_back = days_back
+  1150→        self.max_per_chat = max_per_chat
+  1151→        self.batch_size = batch_size
+  1152→        self.skip_channel_posts = skip_channel_posts
+  1153→        self.source_phone = source_phone
+  1154→        self.source_name = source_name
+  1155→        self.progress_callback = progress_callback
+  1156→
+  1157→        self.total_scanned = 0
+  1158→        self.total_found = 0
+  1159→        self.new_count = 0
+  1160→        self.chats_scanned = 0
+  1161→        self._cancelled = False
+  1162→
+  1163→    def cancel(self): self._cancelled = True
+  1164→    def _is_cancelled(self): return self._cancelled
+  1165→
+  1166→    async def scan(self):
+  1167→        start = datetime.now()
+  1168→        if self.days_back is not None:
+  1169→            hard = datetime.now() - timedelta(days=self.days_back)
+  1170→        else: hard = None
+  1171→        soft = None
+  1172→        try:
+  1173→            conn = await self.db._ensure_conn()
+  1174→            cursor = await conn.execute(
+  1175→                "SELECT MAX(last_scanned_message_date) FROM scan_state WHERE source_phone = ?",
+  1176→                (self.source_phone,))
+  1177→            row = await cursor.fetchone()
+  1178→            if row and row[0]:
+  1179→                soft = datetime.fromisoformat(row[0])
+  1180→        except: pass
+  1181→        eff = max(hard, soft) if (hard and soft) else (hard or soft)
+  1182→        period = f"آخر {(datetime.now()-eff).days} يوم (متزايد)" if eff else "كامل"
+  1183→        logging.info(f"[SCAN {self.source_phone}] Period: {period}")
+  1184→
+  1185→        try:
+  1186→            dialogs = await self.user_client.get_dialogs()
+  1187→        except Exception as e:
+  1188→            logging.error(f"[SCAN {self.source_phone}] get_dialogs: {e}")
+  1189→            return period
+  1190→
+  1191→        for idx, d in enumerate(dialogs, 1):
+  1192→            if self._is_cancelled(): break
+  1193→            if d.id == self.channel_id: continue
+  1194→            if self.skip_channel_posts:
+  1195→                try:
+  1196→                    if d.is_channel: continue
+  1197→                except: pass
+  1198→            name = d.name or "Unknown"
+  1199→            if self.progress_callback:
+  1200→                try: self.progress_callback(idx, len(dialogs), name)
+  1201→                except: pass
+  1202→            try: await self._scan_chat(d, eff, name)
+  1203→            except FloodWaitError as e:
+  1204→                await asyncio.sleep(e.seconds + 1)
+  1205→            except Exception as e:
+  1206→                logging.error(f"[SCAN {self.source_phone}] Error {name}: {e}")
+  1207→            await asyncio.sleep(0.3)
+  1208→        dur = (datetime.now()-start).total_seconds()
+  1209→        await self._send_summary(period, dur)
+  1210→        return period
+  1211→
+  1212→    async def _scan_chat(self, dialog, cutoff, name):
+  1213→        batch = []
+  1214→        last_date = None
+  1215→        chat_cut = cutoff
+  1216→        if chat_cut is None:
+  1217→            try:
+  1218→                ls = await self.db.get_last_scan_date(self.source_phone, dialog.id)
+  1219→                if ls: chat_cut = ls
+  1220→            except: pass
+  1221→        try:
+  1222→            async for msg in self.user_client.iter_messages(dialog, reverse=False, limit=self.max_per_chat):
+  1223→                if self._is_cancelled(): break
+  1224→                try: md = msg.date.replace(tzinfo=None) if msg.date else None
+  1225→                except: md = None
+  1226→                if md and chat_cut and md < chat_cut: break
+  1227→                self.total_scanned += 1
+  1228→                if md and (last_date is None or md > last_date): last_date = md
+  1229→                if not msg or not msg.text: continue
+  1230→
+  1231→                # استخراج روابط واتساب وتيليجرام
+  1232→                links = extract_whatsapp_telegram_links(msg.text)
+  1233→                if not links: continue
+  1234→
+  1235→                # فلتر: السماح فقط برسائل الجامعات الأهلية المستهدفة
+  1236→                if not is_target_university_message(msg.text):
+  1237→                    continue
+  1238→
+  1239→                # استبعاد الرسائل الإعلانية
+  1240→                if is_advertiser_message(msg.text):
+  1241→                    continue
+  1242→
+  1243→                self.total_found += len(links)
+  1244→                try:
+  1245→                    sender = await msg.get_sender()
+  1246→                    sn = Monitor._get_sender_name(sender)
+  1247→                except: sn = "Unknown"
+  1248→
+  1249→                # استخراج بيانات تواصل المرسل
+  1250→                contact = extract_sender_contact(msg.text)
+  1251→                if not contact and sender and hasattr(sender, 'username') and sender.username:
+  1252→                    contact = f"✈️ @{sender.username}"
+  1253→
+  1254→                # رابط الرسالة
+  1255→                msg_link = None
+  1256→                try:
+  1257→                    msg_link = f"https://t.me/c/{str(dialog.id).replace('-100', '')}/{msg.id}"
+  1258→                except: pass
+  1259→
+  1260→                # إدراج كل رابط
+  1261→                for link in links:
+  1262→                    inserted = await self.db.insert_request(
+  1263→                        link, md, name, sn, self.source_phone, msg_link,
+  1264→                        message_text=msg.text, sender_contact=contact)
+  1265→                    if inserted:
+  1266→                        self.new_count += 1
+  1267→                        batch.append({
+  1268→                            'link': link, 'text': msg.text, 'date': md,
+  1269→                            'group': name, 'sender': sn, 'msg_link': msg_link,
+  1270→                            'contact': contact
+  1271→                        })
+  1272→                        if len(batch) >= self.batch_size:
+  1273→                            await self._send_batch(batch)
+  1274→                            batch = []
+  1275→        except FloodWaitError: raise
+  1276→        except Exception as e:
+  1277→            logging.error(f"[SCAN {self.source_phone}] iter error: {e}")
+  1278→            if last_date:
+  1279→                try: await self.db.update_scan_state(self.source_phone, dialog.id, name, last_date)
+  1280→                except: pass
+  1281→            return
+  1282→        if batch: await self._send_batch(batch)
+  1283→        if last_date:
+  1284→            try: await self.db.update_scan_state(self.source_phone, dialog.id, name, last_date)
+  1285→            except: pass
+  1286→        self.chats_scanned += 1
+  1287→
+  1288→    async def _send_batch(self, batch):
+  1289→        # نشر كل رابط على حدة
+  1290→        for item in batch:
+  1291→            try:
+  1292→                formatted = MessageFormatter.format_link_message(
+  1293→                    item['group'], item['sender'], item.get('contact', ''), item['date'],
+  1294→                    item['link'], item['text'], self.source_phone, item.get('msg_link'))
+  1295→                buttons = MessageFormatter.get_link_buttons(item['link'])
+  1296→                await self.bot_client.send_message(
+  1297→                    self.channel_id, formatted,
+  1298→                    parse_mode='html',
+  1299→                    buttons=buttons,
+
+[showing lines 600-1299 of 2331; use offset=1300 with limit to continue reading]

@@ -1,0 +1,500 @@
+        # بناء blockquote واحد شامل
+        content = f"<b>🔗 رابط محفوظ ({link_type_str})</b>\n\n"
+        content += f"👥 <b>العضوية:</b> {safe_group}\n"
+        content += f"👤 <b>الاسم:</b> {safe_sender}\n"
+        if safe_contact:
+            content += f"📞 <b>التواصل:</b> {safe_contact}\n"
+        content += f"🕒 <b>التاريخ:</b> {date_str}\n"
+        content += f"📡 <b>العدد:</b> <code>{safe_source}</code>\n\n"
+        content += f'🔗 <a href="{link}">اضغط هنا لفتح الرابط</a>'
+
+        if message_link:
+            content += f'\n📄 <a href="{message_link}">عرض الرسالة الأصلية</a>'
+
+        # قائمة غير المشتركين
+        if non_members:
+            content += f"\n\n📌 <b>توصية بالانضمام:</b>\n"
+            content += f"<i>المراقبون التالون غير مشتركين:</i>\n"
+            for i, phone in enumerate(non_members, 1):
+                name = watchers_names.get(phone, phone) if watchers_names else phone
+                safe_name = html_module.escape(str(name))
+                safe_phone = html_module.escape(str(phone))
+                content += f"  {i}. {safe_name} ({safe_phone})\n"
+            content += f"\n🔔 <i>يرجى الانضمام للاستفادة.</i>"
+
+        if safe_text:
+            content += f"\n\n💬 <b>النص:</b>\n<i>{safe_text}</i>"
+
+        return f"<blockquote>{content}</blockquote>"
+
+    @staticmethod
+    def get_link_buttons(link, is_saved=False):
+        """أزرار الإجراءات - بنفس الإطار المربع"""
+        save_text = "✅ محفوظ" if is_saved else "⭐ حفظ"
+        return [
+            [Button.url("🔗 فتح الرابط", link),
+             Button.inline("📋 نسخ", f"copy_{link[:50]}".encode())],
+            [Button.inline("📤 مشاركة", f"share_{link[:50]}".encode()),
+             Button.inline(save_text, f"save_{link[:50]}".encode())]
+        ]
+
+    @staticmethod
+    def format_help_request(group_name, sender_name, message_date, message_text,
+                            keywords_found, source_phone, message_link=None):
+        """تنسيق طلب مساعدة للنشر في القناة (محفوظ للتوافق)"""
+        # اقتطاع النص الطويل
+        if len(message_text) > MAX_MESSAGE_LENGTH:
+            message_text = message_text[:MAX_MESSAGE_LENGTH] + "..."
+
+        date_str = message_date.strftime("%Y-%m-%d %H:%M") if message_date else "غير معروف"
+        keywords_str = "، ".join(keywords_found[:5])
+
+        lines = [
+            "📚 طلب مساعدة دراسية",
+            "",
+            f"👥 المجموعة: {group_name}",
+            f"👤 المرسل: {sender_name}",
+            f"🕒 التاريخ: {date_str}",
+            f"🔑 الكلمات: {keywords_str}",
+            f"📡 المصدر: {source_phone}",
+        ]
+        if message_link:
+            lines.append(f"🔗 الرابط: {message_link}")
+        lines.extend(["", "💬 الرسالة:", message_text])
+        return "\n".join(lines)
+
+    @staticmethod
+    def format_history_batch(batch):
+        """تنسيق دفعة طلبات تاريخية"""
+        lines = ["📚 طلبات مساعدة تاريخية", ""]
+        for i, item in enumerate(batch, 1):
+            date_str = item['date'].strftime("%Y-%m-%d") if item.get('date') else "غير معروف"
+            short_group = item['group'][:30] + "…" if len(item.get('group', '')) > 30 else item.get('group', '')
+            preview = item['text'][:100] + "..." if len(item.get('text', '')) > 100 else item.get('text', '')
+            lines.append(f"{i}. 📚 {short_group}")
+            lines.append(f"   📅 {date_str} | 👤 {item.get('sender', 'Unknown')}")
+            lines.append(f"   💬 {preview}")
+            lines.append("")
+        return "\n".join(lines)
+
+    @staticmethod
+    def format_scan_summary(total_scanned, total_found, new_count, chats_scanned, period_desc, duration_sec, source_phone):
+        return (f"📊 ملخص المسح التاريخي\n\n"
+                f"📡 المصدر: {source_phone}\n"
+                f"📅 الفترة: {period_desc}\n"
+                f"💬 المحادثات: {chats_scanned}\n"
+                f"🔍 الرسائل المفحوصة: {total_scanned}\n"
+                f"📚 طلبات مساعدة موجودة: {total_found}\n"
+                f"✅ طلبات جديدة منشورة: {new_count}\n"
+                f"⏱️ المدة: {duration_sec:.1f} ثانية\n")
+
+    @staticmethod
+    def format_welcome(user_first_name=""):
+        name_part = f" {user_first_name}" if user_first_name else ""
+        return (
+            f"🤖 أهلاً بك{name_part} في بوت سحب روابط واتساب!\n\n"
+            "📚 ماذا يفعل هذا البوت؟\n"
+            "• يراقب مجموعاتك الدراسية تلقائياً\n"
+            "• يسحب كل روابط واتساب منها\n"
+            "• ينشرها في قناة مشتركة\n\n"
+            "🚀 للبدء، اضغط زر «🔐 تسجيل الدخول» أدناه\n"
+            "ثم أرسل رقم هاتفك + كود تيليجرام."
+        )
+
+    @staticmethod
+    def format_help():
+        return (
+            "🤖 دليل الاستخدام\n\n"
+            "📌 كيف يعمل البوت؟\n\n"
+            "1️⃣ اضغط «🔐 تسجيل الدخول»\n"
+            "2️⃣ أرسل رقم هاتفك (+967...)\n"
+            "3️⃣ أرسل كود تيليجرام الذي تصله\n"
+            "4️⃣ ✅ البوت يراقب مجموعاتك تلقائياً!\n\n"
+            "📌 المميزات:\n"
+            "• ✅ سحب جميع أنواع روابط واتساب\n"
+            "• 📚 مسح آخر 30 يوم تلقائياً\n"
+            "• 🔄 مسح تاريخي عند الطلب\n"
+            "• 📊 إحصائيات مفصلة\n"
+            "• 👥 دعوة الأصدقاء\n\n"
+            "📌 للأصدقاء:\n"
+            "• شارك رابط البوت معهم\n"
+            "• سيسجلون دخولهم بنفس الطريقة\n"
+            "• سيتم سحب روابط مجموعاتهم أيضاً"
+        )
+
+    @staticmethod
+    def format_status(total_links, watchers_count, scan_running, scan_progress="", total_groups=0):
+        return (f"📊 حالة البوت\n\n"
+                f"📥 روابط واتساب منشورة: {total_links}\n"
+                f"👥 المستخدمون المراقبون: {watchers_count}\n"
+                f"💬 المجموعات المراقَبة: {total_groups}\n"
+                f"🔄 المسح التاريخي: "
+                + ("قيد التنفيذ" + (f" ({scan_progress})" if scan_progress else "") if scan_running else "متوقف")
+                + "\n")
+
+
+# -------------------------------------------------------------------
+# History Scanner
+# -------------------------------------------------------------------
+
+
+class HistoryScanner:
+    def __init__(self, user_client, bot_client, db, channel_id,
+                 days_back, max_per_chat, batch_size, skip_channel_posts,
+                 source_phone, source_name, progress_callback=None):
+        self.user_client = user_client
+        self.bot_client = bot_client
+        self.db = db
+        self.channel_id = channel_id
+        self.days_back = days_back
+        self.max_per_chat = max_per_chat
+        self.batch_size = batch_size
+        self.skip_channel_posts = skip_channel_posts
+        self.source_phone = source_phone
+        self.source_name = source_name
+        self.progress_callback = progress_callback
+
+        self.total_scanned = 0
+        self.total_found = 0
+        self.new_count = 0
+        self.chats_scanned = 0
+        self._cancelled = False
+
+    def cancel(self): self._cancelled = True
+    def _is_cancelled(self): return self._cancelled
+
+    async def scan(self):
+        start = datetime.now()
+        if self.days_back is not None:
+            hard = datetime.now() - timedelta(days=self.days_back)
+        else: hard = None
+        soft = None
+        try:
+            conn = await self.db._ensure_conn()
+            cursor = await conn.execute(
+                "SELECT MAX(last_scanned_message_date) FROM scan_state WHERE source_phone = ?",
+                (self.source_phone,))
+            row = await cursor.fetchone()
+            if row and row[0]:
+                soft = datetime.fromisoformat(row[0])
+        except: pass
+        eff = max(hard, soft) if (hard and soft) else (hard or soft)
+        period = f"آخر {(datetime.now()-eff).days} يوم (متزايد)" if eff else "كامل"
+        logging.info(f"[SCAN {self.source_phone}] Period: {period}")
+
+        try:
+            dialogs = await self.user_client.get_dialogs()
+        except Exception as e:
+            logging.error(f"[SCAN {self.source_phone}] get_dialogs: {e}")
+            return period
+
+        for idx, d in enumerate(dialogs, 1):
+            if self._is_cancelled(): break
+            if d.id == self.channel_id: continue
+            if self.skip_channel_posts:
+                try:
+                    if d.is_channel: continue
+                except: pass
+            name = d.name or "Unknown"
+            if self.progress_callback:
+                try: self.progress_callback(idx, len(dialogs), name)
+                except: pass
+            try: await self._scan_chat(d, eff, name)
+            except FloodWaitError as e:
+                await asyncio.sleep(e.seconds + 1)
+            except Exception as e:
+                logging.error(f"[SCAN {self.source_phone}] Error {name}: {e}")
+            await asyncio.sleep(0.3)
+        dur = (datetime.now()-start).total_seconds()
+        await self._send_summary(period, dur)
+        return period
+
+    async def _scan_chat(self, dialog, cutoff, name):
+        batch = []
+        last_date = None
+        chat_cut = cutoff
+        if chat_cut is None:
+            try:
+                ls = await self.db.get_last_scan_date(self.source_phone, dialog.id)
+                if ls: chat_cut = ls
+            except: pass
+        try:
+            async for msg in self.user_client.iter_messages(dialog, reverse=False, limit=self.max_per_chat):
+                if self._is_cancelled(): break
+                try: md = msg.date.replace(tzinfo=None) if msg.date else None
+                except: md = None
+                if md and chat_cut and md < chat_cut: break
+                self.total_scanned += 1
+                if md and (last_date is None or md > last_date): last_date = md
+                if not msg or not msg.text: continue
+
+                # استخراج روابط واتساب وتيليجرام
+                links = extract_whatsapp_telegram_links(msg.text)
+                if not links: continue
+
+                # فلتر: السماح فقط برسائل الجامعات الأهلية المستهدفة
+                if not is_target_university_message(msg.text):
+                    continue
+
+                # استبعاد الرسائل الإعلانية
+                if is_advertiser_message(msg.text):
+                    continue
+
+                self.total_found += len(links)
+                try:
+                    sender = await msg.get_sender()
+                    sn = Monitor._get_sender_name(sender)
+                except: sn = "Unknown"
+
+                # استخراج بيانات تواصل المرسل
+                contact = extract_sender_contact(msg.text)
+                if not contact and sender and hasattr(sender, 'username') and sender.username:
+                    contact = f"✈️ @{sender.username}"
+
+                # رابط الرسالة
+                msg_link = None
+                try:
+                    msg_link = f"https://t.me/c/{str(dialog.id).replace('-100', '')}/{msg.id}"
+                except: pass
+
+                # إدراج كل رابط
+                for link in links:
+                    inserted = await self.db.insert_request(
+                        link, md, name, sn, self.source_phone, msg_link,
+                        message_text=msg.text, sender_contact=contact)
+                    if inserted:
+                        self.new_count += 1
+                        batch.append({
+                            'link': link, 'text': msg.text, 'date': md,
+                            'group': name, 'sender': sn, 'msg_link': msg_link,
+                            'contact': contact
+                        })
+                        if len(batch) >= self.batch_size:
+                            await self._send_batch(batch)
+                            batch = []
+        except FloodWaitError: raise
+        except Exception as e:
+            logging.error(f"[SCAN {self.source_phone}] iter error: {e}")
+            if last_date:
+                try: await self.db.update_scan_state(self.source_phone, dialog.id, name, last_date)
+                except: pass
+            return
+        if batch: await self._send_batch(batch)
+        if last_date:
+            try: await self.db.update_scan_state(self.source_phone, dialog.id, name, last_date)
+            except: pass
+        self.chats_scanned += 1
+
+    async def _send_batch(self, batch):
+        # نشر كل رابط على حدة
+        for item in batch:
+            try:
+                formatted = MessageFormatter.format_link_message(
+                    item['group'], item['sender'], item.get('contact', ''), item['date'],
+                    item['link'], item['text'], self.source_phone, item.get('msg_link'))
+                buttons = MessageFormatter.get_link_buttons(item['link'])
+                await self.bot_client.send_message(
+                    self.channel_id, formatted,
+                    parse_mode='html',
+                    buttons=buttons,
+                    link_preview=False
+                )
+                await asyncio.sleep(0.5)  # تجنب الفلو
+            except FloodWaitError as e:
+                await asyncio.sleep(e.seconds + 1)
+            except Exception as e:
+                logging.error(f"[SCAN] send error: {e}")
+
+    async def _send_summary(self, period, dur):
+        if self.new_count == 0 and self.total_scanned == 0: return
+        f = MessageFormatter.format_scan_summary(
+            self.total_scanned, self.total_found, self.new_count,
+            self.chats_scanned, period, dur, self.source_phone)
+        try: await self.bot_client.send_message(self.channel_id, f)
+        except Exception as e: logging.error(f"[SCAN] summary: {e}")
+
+
+# -------------------------------------------------------------------
+# Monitor (Multi-User)
+# -------------------------------------------------------------------
+
+
+class Monitor:
+    def __init__(self, config, db):
+        self.config = config
+        self.db = db
+        self.bot_client = None
+        # كل مستخدم مراقب له user_client خاص
+        self.user_clients: Dict[str, TelegramClient] = {}
+        self._running = False
+        self._handlers_registered = False
+        self._send_lock = asyncio.Lock()
+        self._current_scanners: Dict[str, HistoryScanner] = {}
+        self._current_scan_tasks: List[asyncio.Task] = []
+        self._scan_progress: str = ""
+        self._bot_task = None
+        self._keep_alive_task = None
+        # نظام تسجيل الدخول التفاعلي
+        self._login_sessions: Dict[int, Dict] = {}
+        self._user_tasks: Dict[str, asyncio.Task] = {}
+        # محلل الذكاء الاصطناعي
+        self.ai_analyzer = AIAnalyzer()
+        self._startup_scan_done: Set[str] = set()
+
+    @staticmethod
+    def _get_chat_name(chat):
+        if hasattr(chat, "title") and chat.title: return chat.title
+        if hasattr(chat, "first_name"):
+            n = chat.first_name or ""
+            if hasattr(chat, "last_name") and chat.last_name: n += f" {chat.last_name}"
+            return n.strip() or "Private"
+        return "Unknown Group"
+
+    @staticmethod
+    def _get_sender_name(sender):
+        if not sender: return "Unknown"
+        if hasattr(sender, "first_name"):
+            n = sender.first_name or ""
+            if hasattr(sender, "last_name") and sender.last_name: n += f" {sender.last_name}"
+            return n.strip() or getattr(sender, "username", "") or "Unknown"
+        return getattr(sender, "username", "Unknown") or "Unknown"
+
+    def _create_bot_client(self):
+        sp = os.path.join(SESSIONS_DIR, "bot")
+        return TelegramClient(sp, self.config.api_id, self.config.api_hash,
+                              connection_retries=None, retry_delay=5, request_retries=5,
+                              auto_reconnect=True, sequential_updates=False)
+
+    def _create_user_client(self, session_string, phone):
+        """إنشاء user_client من StringSession"""
+        return TelegramClient(
+            StringSession(session_string),
+            self.config.api_id, self.config.api_hash,
+            connection_retries=None, retry_delay=5, request_retries=5,
+            auto_reconnect=True, sequential_updates=False)
+
+    def _register_handlers(self):
+        if self._handlers_registered: return
+        # معالج أوامر القناة
+        self.bot_client.add_event_handler(
+            self._on_command,
+            events.NewMessage(chats=self.config.channel_id, pattern=r"^/[a-zA-Z_]+"))
+        # معالج الدردشة الخاصة مع البوت (لـ /start و /login)
+        self.bot_client.add_event_handler(
+            self._on_private_message,
+            events.NewMessage(func=lambda e: e.is_private))
+        # معالج ضغطات الأزرار (Callback Queries)
+        self.bot_client.add_event_handler(
+            self._on_callback,
+            events.CallbackQuery()
+        )
+        self._handlers_registered = True
+        logging.info("Bot handlers registered (channel + private + buttons)")
+
+    def _get_main_menu(self, is_logged_in=False):
+        """القائمة الرئيسية - أزرار تفاعلية (بدون قائمة الأصدقاء)"""
+        if is_logged_in:
+            return [
+                [Button.inline("📊 الحالة", b"status"),
+                 Button.inline("📈 إحصائياتي", b"my_stats")],
+                [Button.inline("🔄 مسح آخر أسبوع", b"scan_week"),
+                 Button.inline("📅 مسح آخر شهر", b"scan_month")],
+                [Button.inline("❓ المساعدة", b"help")],
+            ]
+        else:
+            return [
+                [Button.inline("🔐 تسجيل الدخول", b"login_start")],
+                [Button.inline("❓ المساعدة", b"help"),
+                 Button.inline("📊 الحالة", b"status")],
+            ]
+
+    async def _on_callback(self, event):
+        """معالج ضغطات الأزرار"""
+        try:
+            data = event.data.decode('utf-8')
+            sender = await event.get_sender()
+            sender_id = sender.id if sender else None
+
+            logging.info(f"[CALLBACK] {sender_id}: {data}")
+
+            if data == "login_start":
+                await self._handle_login_start(event, sender)
+                return
+
+            # معالجة أزرار الروابط (نسخ/مشاركة/حفظ)
+            if data.startswith("save_") or data.startswith("copy_") or data.startswith("share_"):
+                if data.startswith("save_"):
+                    # تغيير الزر إلى "محفوظ"
+                    try:
+                        await event.edit(buttons=MessageFormatter.get_link_buttons(
+                            data[5:], is_saved=True
+                        ))
+                    except:
+                        pass
+                    await event.answer("✅ تم الحفظ!")
+                elif data.startswith("copy_"):
+                    await event.answer("📋 تم نسخ الرابط!", alert=False)
+                elif data.startswith("share_"):
+                    await event.answer("📤 استخدم زر المشاركة في تيليجرام", alert=False)
+                return
+
+            if data == "main_menu":
+                # التحقق إن كان المستخدم مسجل دخول
+                watchers = await self.db.get_active_watchers()
+                user_phone = None
+                for w in watchers:
+                    if w.get('session_string'):
+                        # التحقق عبر StringSession
+                        user_phone = w['phone']
+                        break
+                is_logged_in = user_phone is not None
+                first_name = sender.first_name if sender and hasattr(sender, 'first_name') else ""
+                await event.edit(
+                    MessageFormatter.format_welcome(first_name),
+                    buttons=self._get_main_menu(is_logged_in)
+                )
+                return
+
+            if data == "help":
+                await event.answer()
+                await event.edit(
+                    MessageFormatter.format_help(),
+                    buttons=[Button.inline("🔙 القائمة الرئيسية", b"main_menu")]
+                )
+                return
+
+            if data == "status":
+                watchers = await self.db.get_active_watchers()
+                total_links = await self.db.count_requests()
+                is_running = self.is_scan_running()
+                await event.answer()
+                await event.edit(
+                    MessageFormatter.format_status(
+                        total_links, len(watchers), is_running, self._scan_progress
+                    ),
+                    buttons=[Button.inline("🔙 القائمة الرئيسية", b"main_menu")]
+                )
+                return
+
+            if data == "my_stats":
+                watchers = await self.db.get_active_watchers()
+                await event.answer()
+                if not watchers:
+                    await event.edit(
+                        "ℹ️ أنت لم تسجل دخولك بعد.\nاضغط «🔐 تسجيل الدخول» للبدء.",
+                        buttons=[Button.inline("🔙 القائمة الرئيسية", b"main_menu")]
+                    )
+                    return
+                await event.edit(
+                    f"📈 إحصائياتك\n\n👥 المستخدمون المراقبون: {len(watchers)}\n🔄 المسح: {'قيد التنفيذ' if self.is_scan_running() else 'متوقف'}",
+                    buttons=[Button.inline("🔙 القائمة الرئيسية", b"main_menu")]
+                )
+                return
+
+            if data == "scan_week":
+                await event.answer("جاري بدء المسح...")
+                await self._start_scan_all(7, "/scan_week")
+                return
+
+            if data == "scan_month":
+                await event.answer("جاري بدء المسح...")
