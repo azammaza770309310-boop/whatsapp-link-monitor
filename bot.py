@@ -3374,6 +3374,11 @@ class Monitor:
                     # إعادة الرابط للقائمة بعد ساعة
                     await self.prod_db.update_queue_status(link_data['id'], 'QUEUED',
                                                            next_retry=datetime.now() + timedelta(hours=1))
+                elif status == "RATE_LIMITED":
+                    # Rate limiter blocked — NOT a FloodWait, don't auto-pause
+                    logging.info(f"[PIPELINE-6] ⏳ {phone} rate limited — will retry in 10 min")
+                    await self.prod_db.update_queue_status(link_data['id'], 'QUEUED',
+                                                           next_retry=datetime.now() + timedelta(minutes=10))
                 elif status == "PRIVATE":
                     await self.prod_db.set_group_state(normalized, GroupState.PRIVATE, raw_link,
                                                        error='Channel private')
@@ -3605,7 +3610,8 @@ class Monitor:
 
                 allowed = await self.rate_limiter.acquire(phone, 'join_channel')
                 if not allowed:
-                    return False, "FLOODWAIT", None
+                    logging.info(f"[JOIN] {phone} rate limited (not FloodWait) — will retry later")
+                    return False, "RATE_LIMITED", None
 
                 try:
                     entity = await client.get_entity(username)
@@ -3897,7 +3903,14 @@ async def main():
     db_paused = await monitor.prod_db.get_setting('join_paused', 'false')  # افتراضي: يعمل تلقائياً
     monitor._join_paused = (db_paused == 'true')
     if monitor._join_paused:
-        logging.info("🔒 Recovery Mode: JOIN PAUSED (send /resume_join to enable)")
+        # تحقق: هل في حسابات فعلاً في FloodWait؟ لو لا، أعد التفعيل تلقائياً
+        blocked = await monitor.floodwait_mgr.get_blocked_accounts()
+        if not blocked:
+            logging.info("▶️ Auto-resume: join_paused was true but no accounts in FloodWait — resuming")
+            monitor._join_paused = False
+            await monitor.prod_db.set_setting('join_paused', 'false')
+        else:
+            logging.info("🔒 Recovery Mode: JOIN PAUSED (accounts in FloodWait)")
     else:
         logging.info("▶️ Join enabled (from DB setting)")
 
