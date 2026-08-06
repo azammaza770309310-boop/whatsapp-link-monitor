@@ -1660,9 +1660,13 @@ class MessageFormatter:
             "📚 ماذا يفعل هذا البوت؟\n"
             "• يراقب مجموعاتك الدراسية تلقائياً\n"
             "• يسحب كل روابط واتساب منها\n"
-            "• ينشرها في قناة مشتركة\n\n"
+            "• ينشرها في قناة مشتركة\n"
+            "• 🎓 فلتر تعليمي ذكي\n"
+            "• 🚀 انضمام جماعي للمجموعات\n"
+            "• 🧹 تنظيف القناة من المكرر\n\n"
             "🚀 للبدء، اضغط زر «🔐 تسجيل الدخول» أدناه\n"
-            "ثم أرسل رقم هاتفك + كود تيليجرام."
+            "أو استخدم الأزرار للتحكم في النظام.\n\n"
+            "💡 يمكنك أيضاً كتابة: Boot أو /start"
         )
 
     @staticmethod
@@ -2028,13 +2032,27 @@ class Monitor:
         logging.info("Bot handlers registered (channel + private + buttons)")
 
     def _get_main_menu(self, is_logged_in=False):
-        """القائمة الرئيسية - أزرار تفاعلية (بدون قائمة الأصدقاء)"""
+        """القائمة الرئيسية - أزرار تفاعلية شاملة"""
         if is_logged_in:
             return [
                 [Button.inline("📊 الحالة", b"status"),
                  Button.inline("📈 إحصائياتي", b"my_stats")],
                 [Button.inline("🔄 مسح آخر أسبوع", b"scan_week"),
                  Button.inline("📅 مسح آخر شهر", b"scan_month")],
+                # أوامر الانضمام الجماعي
+                [Button.inline("🚀 بدء الانضمام الجماعي", b"bulk_join"),
+                 Button.inline("📊 تقدم الانضمام", b"bulk_join_status")],
+                [Button.inline("⏹️ إيقاف الانضمام", b"bulk_join_stop"),
+                 Button.inline("🧹 مسح FloodWait", b"clear_floodwait")],
+                # أوامر تنظيف القناة
+                [Button.inline("🔍 معاينة التنظيف", b"cleanup_preview"),
+                 Button.inline("🗑️ تنظيف القناة", b"cleanup_links")],
+                [Button.inline("📈 تقدم التنظيف", b"cleanup_status")],
+                # إدارة الحسابات والتحقق
+                [Button.inline("👤 إدارة الأدوار", b"role_menu"),
+                 Button.inline("🔍 تحقق النظام", b"verify")],
+                [Button.inline("🗄️ فحص SQLite", b"sqlite_check"),
+                 Button.inline("📊 حالة الفدائيين", b"join_status")],
                 [Button.inline("❓ المساعدة", b"help")],
             ]
         else:
@@ -2042,6 +2060,12 @@ class Monitor:
                 [Button.inline("🔐 تسجيل الدخول", b"login_start")],
                 [Button.inline("❓ المساعدة", b"help"),
                  Button.inline("📊 الحالة", b"status")],
+                # أزرar الانضمام والتنظيف متاحة حتى بدون تسجيل (للمشرف)
+                [Button.inline("🚀 بدء الانضمام الجماعي", b"bulk_join"),
+                 Button.inline("📊 تقدم الانضمام", b"bulk_join_status")],
+                [Button.inline("🔍 معاينة التنظيف", b"cleanup_preview"),
+                 Button.inline("🗑️ تنظيف القناة", b"cleanup_links")],
+                [Button.inline("🔍 تحقق النظام", b"verify")],
             ]
 
     async def _on_callback(self, event):
@@ -2175,6 +2199,212 @@ class Monitor:
             if data == "scan_month":
                 await event.answer("جاري بدء المسح...")
                 await self._start_scan_all(30, "/scan_month")
+                return
+
+            # === أوامر الانضمام الجماعي ===
+            if data == "bulk_join":
+                await event.answer("بدء الانضمام الجماعي...")
+                if hasattr(self, '_bulk_join_running') and self._bulk_join_running:
+                    await event.reply("⚠️ البوك جون يعمل بالفعل!\nأرسل /bulk_join_status لرؤية التقدم")
+                else:
+                    self._bulk_join_running = True
+                    self._bulk_join_stop = False
+                    self._bulk_join_stats = {'total': 0, 'joined': 0, 'already': 0, 'failed': 0, 'skipped': 0, 'current': ''}
+                    self._bulk_join_task = asyncio.create_task(self._bulk_join_worker())
+                    await event.reply(
+                        "🚀 بدأ الانضمام الجماعي\n\n"
+                        "📝 سيقرأ البوت كل روابط القناة ويحاول الانضمام لكل واحد.\n"
+                        "🎓 فلتر تعليمي: ينضم فقط للمجموعات الجامعية\n"
+                        "📢 يتخطى القنوات (broadcast)\n"
+                        "⏱️ معدل آمن: انضمام كل 2 دقيقة"
+                    )
+                return
+
+            if data == "bulk_join_status":
+                await event.answer()
+                if not hasattr(self, '_bulk_join_running') or not self._bulk_join_running:
+                    await event.reply("ℹ️ البوك جون لا يعمل. أرسل /bulk_join للبدء")
+                else:
+                    s = getattr(self, '_bulk_join_stats', {})
+                    await event.reply(
+                        f"📊 Bulk Join Status\n"
+                        f"════════════════════\n"
+                        f"🔗 Total processed: {s.get('total', 0)}\n"
+                        f"✅ Joined: {s.get('joined', 0)}\n"
+                        f"ℹ️ Already member: {s.get('already', 0)}\n"
+                        f"❌ Failed: {s.get('failed', 0)}\n"
+                        f"⏭️ Skipped: {s.get('skipped', 0)}\n"
+                        f"📍 Current: {s.get('current', '')[:60]}"
+                    )
+                return
+
+            if data == "bulk_join_stop":
+                await event.answer("إيقاف البوك جون...")
+                if hasattr(self, '_bulk_join_running') and self._bulk_join_running:
+                    self._bulk_join_stop = True
+                    await event.reply("⏹️ سيتم إيقاف البوك جون بعد الرابط الحالي")
+                else:
+                    await event.reply("ℹ️ البوك جون لا يعمل")
+                return
+
+            if data == "clear_floodwait":
+                await event.answer("مسح FloodWait...")
+                try:
+                    conn = await self.db._ensure_conn()
+                    cursor = await conn.execute("DELETE FROM floodwait_tracker")
+                    await conn.commit()
+                    count = cursor.rowcount
+                    if hasattr(self.rate_limiter, '_floodwait'):
+                        self.rate_limiter._floodwait.clear()
+                    self._join_paused = False
+                    await self.prod_db.set_setting('join_paused', 'false')
+                    await event.reply(f"✅ تم مسح {count} سجل FloodWait\n▶️ تم إعادة تفعيل الانضمام")
+                except Exception as e:
+                    await event.reply(f"❌ خطأ: {e}")
+                return
+
+            # === أوامر تنظيف القناة ===
+            if data == "cleanup_preview":
+                await event.answer("بدأ التحليل...")
+                await event.reply("🔍 بدأ التحليل... قد يستغرق عدة دقائق لـ 22 ألف رسالة")
+                asyncio.create_task(self._cleanup_worker(preview_only=True))
+                return
+
+            if data == "cleanup_links":
+                await event.answer("بدأ التنظيف الفعلي...")
+                await event.reply("🗑️ بدأ التنظيف الفعلي... سيتم حذف الروابط غير التعليمية والمكررة")
+                asyncio.create_task(self._cleanup_worker(preview_only=False))
+                return
+
+            if data == "cleanup_status":
+                await event.answer()
+                s = getattr(self, '_cleanup_stats', None)
+                if not s or not s.get('running', False):
+                    await event.reply("ℹ️ التنظيف لا يعمل. استخدم أزرار المعاينة أو التنظيف")
+                else:
+                    await event.reply(
+                        f"🧹 Cleanup Status\n"
+                        f"════════════════════\n"
+                        f"📊 Total scanned: {s.get('total', 0)}\n"
+                        f"✅ Educational: {s.get('educational', 0)}\n"
+                        f"❌ Non-educational: {s.get('non_educational', 0)}\n"
+                        f"🔄 Duplicates: {s.get('duplicates', 0)}\n"
+                        f"🗑️ Deleted: {s.get('deleted', 0)}\n"
+                        f"📍 Current: {s.get('current', '')[:60]}"
+                    )
+                return
+
+            # === أوامر التحقق وإدارة الأدوار ===
+            if data == "verify":
+                await event.answer("جاري التحقق...")
+                # استدعاء نفس منطق /verify
+                try:
+                    all_accounts = await self.db.get_active_watchers()
+                    supa_count = len(all_accounts)
+                    started_count = len(self.user_clients)
+                    connected_count = sum(1 for c in self.user_clients.values() if c and c.is_connected())
+                    sqlite_tables = await self.db._sqlite_list_tables()
+                    has_watchers_table = 'watchers' in sqlite_tables
+                    lines = [
+                        "🔍 E2E Verification Report",
+                        "═══════════════════════════",
+                        f"📦 Supabase accounts: {supa_count}",
+                        f"🚀 Started clients: {started_count}",
+                        f"🔗 Connected clients: {connected_count}",
+                        "",
+                        "📋 Account list:",
+                    ]
+                    for w in all_accounts:
+                        ph = w.get('phone', '?')
+                        rl = w.get('role', 'monitor')
+                        conn = self.user_clients.get(ph)
+                        icon = "✅" if (conn and conn.is_connected()) else "❌"
+                        lines.append(f"   {icon} {ph} (role={rl})")
+                    lines.append("")
+                    if has_watchers_table:
+                        lines.append("❌ BUG: 'watchers' table EXISTS in SQLite!")
+                    else:
+                        lines.append("✅ PROVEN: 'watchers' table does NOT exist in SQLite.")
+                    if supa_count == started_count and not has_watchers_table:
+                        lines.append("✅ E2E PASS")
+                    else:
+                        lines.append("❌ E2E FAIL")
+                    await event.reply("\n".join(lines))
+                except Exception as e:
+                    await event.reply(f"❌ خطأ: {e}")
+                return
+
+            if data == "sqlite_check":
+                await event.answer("فحص SQLite...")
+                try:
+                    tables = await self.db._sqlite_list_tables()
+                    has_watchers = 'watchers' in tables
+                    lines = ["🗄️ SQLite Tables Check", "═══════════════════════════", f"Total tables: {len(tables)}", "", "Tables:"]
+                    for t in tables:
+                        marker = "❌" if t == 'watchers' else "✅"
+                        lines.append(f"   {marker} {t}")
+                    if has_watchers:
+                        lines.append("\n❌ BUG: 'watchers' table EXISTS!")
+                    else:
+                        lines.append("\n✅ PROVEN: 'watchers' does NOT exist in SQLite.")
+                    await event.reply("\n".join(lines))
+                except Exception as e:
+                    await event.reply(f"❌ خطأ: {e}")
+                return
+
+            if data == "join_status":
+                await event.answer("جاري عرض حالة الفدائيين...")
+                # استدعاء نفس منطق /join_status
+                try:
+                    joiners = await self.db.get_watchers_by_role("joiner")
+                    if not joiners:
+                        await event.reply("ℹ️ لا يوجد حسابات فدائية مسجلة.")
+                    else:
+                        lines = ["📊 Joiner Status (source: Supabase)", ""]
+                        for j in joiners:
+                            jphone = j['phone']
+                            w = await self.db._supabase_get_watcher(jphone)
+                            enabled = bool(w.get('joiner_enabled', 1)) if w else True
+                            is_blocked, wait = await self.floodwait_mgr.is_blocked(jphone)
+                            await self.db.reset_daily_joins_if_needed(jphone)
+                            daily = await self.db.get_daily_join_count(jphone)
+                            daily_limit = await self._get_daily_limit(jphone)
+                            if not enabled:
+                                status = "DISABLED"
+                            elif is_blocked:
+                                hours = wait // 3600
+                                mins = (wait % 3600) // 60
+                                status = f"FLOODWAIT ({hours}h {mins}m)"
+                            elif daily >= daily_limit:
+                                status = "DAILY_LIMIT"
+                            else:
+                                status = "READY"
+                            lines.append(f"📞 {jphone}")
+                            lines.append(f"   Status: {status}")
+                            lines.append(f"   Daily: {daily}/{daily_limit}")
+                            lines.append("")
+                        pause_str = "⏸️ PAUSED" if self._join_paused else "▶️ ACTIVE"
+                        sim_str = "🧪 SIMULATION" if self.simulation_mode else "📡 PRODUCTION"
+                        lines.append(f"🔒 Global: {pause_str} | {sim_str}")
+                        await event.reply("\n".join(lines))
+                except Exception as e:
+                    await event.reply(f"❌ خطأ: {e}")
+                return
+
+            if data == "role_menu":
+                await event.answer()
+                await event.reply(
+                    "👤 إدارة الأدوار\n"
+                    "════════════════════\n"
+                    "لتحويل حساب بين الأدوار، أرسل:\n\n"
+                    "• /set_role <phone> monitor — مراقب\n"
+                    "• /set_role <phone> joiner — فدائي\n"
+                    "• /set_role <phone> backup — احتياطي\n\n"
+                    "مثال: /set_role +967739407274 joiner\n\n"
+                    "لتفعيل/إيقاف فدائي:\n"
+                    "• /enable_joiner <phone>\n"
+                    "• /disable_joiner <phone>"
+                )
                 return
 
             await event.answer()
@@ -2406,7 +2636,8 @@ class Monitor:
             self._cleanup_expired_login_sessions()
 
             # الأوامر
-            if text.startswith("/start"):
+            # Boot (بدون شرطة) أو /start كلاهما يفتح القائمة الرئيسية
+            if text.strip().lower() in ("boot", "/start", "/boot", "بوت", "ابدأ", "Start"):
                 await self._handle_start(event, sender)
                 return
 
