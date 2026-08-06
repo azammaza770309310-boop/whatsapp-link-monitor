@@ -2164,31 +2164,129 @@ class Monitor:
                 return
 
             if data == "status":
-                watchers = await self.db.get_active_watchers()
-                total_links = await self.db.count_requests()
-                is_running = self.is_scan_running()
-                await event.answer()
-                await event.edit(
-                    MessageFormatter.format_status(
-                        total_links, len(watchers), is_running, self._scan_progress
-                    ),
-                    buttons=[Button.inline("🔙 القائمة الرئيسية", b"main_menu")]
-                )
+                # === تقرير حالة شامل (محدّث) ===
+                try:
+                    total = await self.db.count_requests()
+                    watchers = await self.db.get_active_watchers()
+                    monitors = [w for w in watchers if w.get('role', 'monitor') == 'monitor']
+                    joiners = [w for w in watchers if w.get('role') == 'joiner']
+                    backups = [w for w in watchers if w.get('role') == 'backup']
+
+                    # عدد المتصلين فعلياً
+                    connected_count = sum(1 for c in self.user_clients.values() if c and c.is_connected())
+                    disconnected = []
+                    for w in watchers:
+                        ph = w['phone']
+                        c = self.user_clients.get(ph)
+                        if not c or not c.is_connected():
+                            disconnected.append(ph)
+
+                    # join_paused state
+                    pause_state = "⏸️ متوقف" if self._join_paused else "▶️ نشط"
+                    sim_state = "🧪 محاكاة" if self.simulation_mode else "📡 إنتاج"
+
+                    # FloodWait accounts
+                    blocked = await self.floodwait_mgr.get_blocked_accounts()
+                    if blocked:
+                        blocked_lines = []
+                        for b in blocked:
+                            wait_s = int(b['next_retry_at'] - time.time())
+                            wait_min = max(wait_s // 60, 0)
+                            blocked_lines.append(f"   ⚠️ {b['phone']}: {wait_min}د متبقية")
+                        blocked_str = "\n".join(blocked_lines)
+                    else:
+                        blocked_str = "   ✅ لا يوجد"
+
+                    # Queue
+                    queue_sz = await self.prod_db.get_queue_size() if hasattr(self, 'prod_db') else 0
+
+                    # Bulk join status
+                    bulk_str = "لا يعمل"
+                    if hasattr(self, '_bulk_join_running') and self._bulk_join_running:
+                        s = self._bulk_join_stats
+                        bulk_str = f"يعمل ✅ ({s.get('joined',0)} انضمام، {s.get('skipped',0)} تخطي)"
+
+                    # Cleanup status
+                    cleanup_str = "لا يعمل"
+                    if hasattr(self, '_cleanup_stats') and self._cleanup_stats.get('running', False):
+                        s = self._cleanup_stats
+                        cleanup_str = f"يعمل ✅ ({s.get('deleted',0)} محذوف)"
+
+                    status_msg = (
+                        f"📊 تقرير حالة النظام\n"
+                        f"━━━━━━━━━━━━━━━━━━━━\n"
+                        f"📦 Supabase: {len(watchers)} حساب\n"
+                        f"   👁️ مراقبين: {len(monitors)}\n"
+                        f"   🚀 فدائيين: {len(joiners)}\n"
+                        f"   🔄 احتياط: {len(backups)}\n"
+                        f"━━━━━━━━━━━━━━━━━━━━\n"
+                        f"🔗 متصل فعلياً: {connected_count}/{len(watchers)}\n"
+                    )
+                    if disconnected:
+                        status_msg += f"❌ غير متصل: {', '.join(disconnected)}\n"
+                    status_msg += (
+                        f"━━━━━━━━━━━━━━━━━━━━\n"
+                        f"🔒 الانضمام: {pause_state}\n"
+                        f"🔬 الوضع: {sim_state}\n"
+                        f"📦 القائمة: {queue_sz} رابط معلق\n"
+                        f"━━━━━━━━━━━━━━━━━━━━\n"
+                        f"⚠️ FloodWait:\n{blocked_str}\n"
+                        f"━━━━━━━━━━━━━━━━━━━━\n"
+                        f"🚀 الانضمام الجماعي: {bulk_str}\n"
+                        f"🧹 التنظيف: {cleanup_str}\n"
+                        f"━━━━━━━━━━━━━━━━━━━━\n"
+                        f"📥 إجمالي الروابط المنشورة: {total}\n"
+                    )
+
+                    await event.answer()
+                    await event.edit(
+                        status_msg,
+                        buttons=[Button.inline("🔙 القائمة الرئيسية", b"main_menu")]
+                    )
+                except Exception as e:
+                    logging.error(f"[STATUS] Error: {e}", exc_info=True)
+                    await event.answer(f"❌ خطأ: {e}")
                 return
 
             if data == "my_stats":
-                watchers = await self.db.get_active_watchers()
-                await event.answer()
-                if not watchers:
+                # === إحصائيات تفصيلية ===
+                try:
+                    watchers = await self.db.get_active_watchers()
+                    monitors = [w for w in watchers if w.get('role', 'monitor') == 'monitor']
+                    joiners = [w for w in watchers if w.get('role') == 'joiner']
+
+                    total_links = await self.db.count_requests()
+                    queue_sz = await self.prod_db.get_queue_size() if hasattr(self, 'prod_db') else 0
+                    metrics = await self.metrics.get_summary() if hasattr(self, 'metrics') else {}
+
+                    stats_msg = (
+                        f"📈 الإحصائيات التفصيلية\n"
+                        f"━━━━━━━━━━━━━━━━━━━━\n"
+                        f"📦 الحسابات:\n"
+                        f"   👁️ مراقبين: {len(monitors)}\n"
+                        f"   🚀 فدائيين: {len(joiners)}\n"
+                        f"   المجموع: {len(watchers)}\n"
+                        f"━━━━━━━━━━━━━━━━━━━━\n"
+                        f"📥 إجمالي الروابط: {total_links}\n"
+                        f"📦 القائمة المعلقة: {queue_sz}\n"
+                        f"━━━━━━━━━━━━━━━━━━━━\n"
+                        f"🚀 الانضمامات:\n"
+                        f"   ناجحة: {metrics.get('total_joins', 0)}\n"
+                        f"   FloodWait: {metrics.get('total_floodwait', 0)}\n"
+                        f"   مكررة: {metrics.get('total_duplicates', 0)}\n"
+                        f"   متجاوزة: {metrics.get('total_skips', 0)}\n"
+                        f"━━━━━━━━━━━━━━━━━━━━\n"
+                        f"🔄 المسح التاريخي: "
+                        f"{'قيد التنفيذ' + (' (' + self._scan_progress + ')' if self._scan_progress else '') if self.is_scan_running() else 'متوقف'}\n"
+                    )
+                    await event.answer()
                     await event.edit(
-                        "ℹ️ أنت لم تسجل دخولك بعد.\nاضغط «🔐 تسجيل الدخول» للبدء.",
+                        stats_msg,
                         buttons=[Button.inline("🔙 القائمة الرئيسية", b"main_menu")]
                     )
-                    return
-                await event.edit(
-                    f"📈 إحصائياتك\n\n👥 المستخدمون المراقبون: {len(watchers)}\n🔄 المسح: {'قيد التنفيذ' if self.is_scan_running() else 'متوقف'}",
-                    buttons=[Button.inline("🔙 القائمة الرئيسية", b"main_menu")]
-                )
+                except Exception as e:
+                    logging.error(f"[MY_STATS] Error: {e}", exc_info=True)
+                    await event.answer(f"❌ خطأ: {e}")
                 return
 
             if data == "scan_week":
@@ -3036,7 +3134,13 @@ class Monitor:
                 # === تقرير حالة شامل ===
                 total = await self.db.count_requests()
                 watchers = await self.db.get_active_watchers()
-                joiners = await self.db.get_watchers_by_role("joiner")
+                monitors = [w for w in watchers if w.get('role', 'monitor') == 'monitor']
+                joiners = [w for w in watchers if w.get('role') == 'joiner']
+                backups = [w for w in watchers if w.get('role') == 'backup']
+                connected_count = sum(1 for c in self.user_clients.values() if c and c.is_connected())
+                disconnected = [w['phone'] for w in watchers
+                                if not self.user_clients.get(w['phone']) or
+                                not self.user_clients.get(w['phone']).is_connected()]
 
                 # join_paused state
                 pause_state = "⏸️ متوقف" if self._join_paused else "▶️ نشط"
@@ -3048,7 +3152,7 @@ class Monitor:
                 if blocked:
                     for b in blocked:
                         wait_s = int(b['next_retry_at'] - time.time())
-                        wait_min = wait_s // 60
+                        wait_min = max(wait_s // 60, 0)
                         blocked_lines.append(f"   ⚠️ {b['phone']}: {wait_min}دقيقة متبقية")
                 else:
                     blocked_lines.append("   ✅ لا يوجد")
@@ -3074,6 +3178,17 @@ class Monitor:
                 status_msg = (
                     f"📊 تقرير حالة النظام\n"
                     f"━━━━━━━━━━━━━━━━━━━━\n"
+                    f"📦 Supabase: {len(watchers)} حساب\n"
+                    f"   👁️ مراقبين: {len(monitors)}\n"
+                    f"   🚀 فدائيين: {len(joiners)}\n"
+                    f"   🔄 احتياط: {len(backups)}\n"
+                    f"━━━━━━━━━━━━━━━━━━━━\n"
+                    f"🔗 متصل فعلياً: {connected_count}/{len(watchers)}\n"
+                )
+                if disconnected:
+                    status_msg += f"❌ غير متصل: {', '.join(disconnected)}\n"
+                status_msg += (
+                    f"━━━━━━━━━━━━━━━━━━━━\n"
                     f"🔒 الانضمام: {pause_state}\n"
                     f"🔬 الوضع: {sim_state}\n"
                     f"📦 القائمة: {queue_sz} رابط معلق\n"
@@ -3090,7 +3205,6 @@ class Monitor:
                     f"   روابط مكررة: {total_dups}\n"
                     f"   روابط متجاوزة: {total_skips}\n"
                     f"   إجمالي الروابط: {total}\n"
-                    f"   مراقبين: {len(watchers)}\n"
                 )
                 await reply(status_msg)
 
