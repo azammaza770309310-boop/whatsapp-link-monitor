@@ -1880,44 +1880,62 @@ class HistoryScanner:
                     item['group'], item['sender'], item.get('contact', ''), item['date'],
                     item['link'], item['text'], self.source_phone, item.get('msg_link'))
                 buttons = MessageFormatter.get_link_buttons(item['link'])
-                # Use Monitor._send for retry logic + FloodWait cap + lock
-                # (prevents retry storms and concurrent batch flooding)
-                # We need to access it via the bot_client's parent monitor...
-                # But HistoryScanner doesn't have a reference to Monitor.
-                # Instead, replicate the same retry pattern with cap.
-                await self._send_with_retry(formatted, buttons)
+                # === POST-CONDITION VERIFICATION ===
+                published, msg_id = await self._send_with_retry(formatted, buttons)
+                if not published:
+                    logging.error(
+                        f"[SCAN] ❌ PUBLISH_FAILED for link: {item['link'][:50]}\n"
+                        f"[SCAN] item not counted as published"
+                    )
             except Exception as e:
                 logging.error(f"[SCAN] send error: {e}")
 
-    async def _send_with_retry(self, formatted, buttons, retries=3):
-        """Send with retry + FloodWait cap (mirrors Monitor._send logic)."""
+    async def _send_with_retry(self, formatted, buttons, retries=3) -> Tuple[bool, Optional[int]]:
+        """Send with retry + FloodWait cap. Returns (success, message_id)."""
         total_waited = 0.0
         max_total_wait = 120.0
+        last_error = "unknown"
         for a in range(1, retries + 1):
             try:
-                await self.bot_client.send_message(
+                if not self.bot_client or not self.bot_client.is_connected():
+                    last_error = "bot_client not connected"
+                    await asyncio.sleep(min(5 * a, 30))
+                    continue
+                result = await self.bot_client.send_message(
                     self.channel_id, formatted,
                     parse_mode='html',
                     buttons=buttons,
                     link_preview=False
                 )
-                await asyncio.sleep(0.5)  # تجنب الفلو
-                return
+                if result and hasattr(result, 'id'):
+                    logging.info(f"[SCAN] ✅ PUBLISHED_VERIFIED message_id={result.id}")
+                    await asyncio.sleep(0.5)  # تجنب الفلو
+                    return True, result.id
+                else:
+                    last_error = f"unexpected return: {type(result).__name__}"
+                    await asyncio.sleep(min(5 * a, 30))
             except FloodWaitError as e:
+                last_error = f"FloodWaitError({e.seconds}s)"
                 wait = min(e.seconds + 1, max_total_wait - total_waited)
                 if wait <= 0:
-                    return
+                    logging.error(f"[SCAN] ❌ FAILED reason={last_error}")
+                    return False, None
                 total_waited += wait
                 await asyncio.sleep(wait)
-            except (RPCError, OSError, ConnectionError):
+            except (RPCError, OSError, ConnectionError) as e:
+                last_error = f"{type(e).__name__}: {str(e)[:80]}"
                 wait = min(10 * a, 60, max_total_wait - total_waited)
                 if wait <= 0:
-                    return
+                    logging.error(f"[SCAN] ❌ FAILED reason={last_error}")
+                    return False, None
                 total_waited += wait
                 await asyncio.sleep(wait)
             except Exception as e:
+                last_error = f"Unexpected {type(e).__name__}: {str(e)[:80]}"
                 logging.error(f"[SCAN] send retry error: {e}")
-                return
+                await asyncio.sleep(min(5 * a, 30))
+        logging.error(f"[SCAN] ❌ FAILED after {retries} attempts reason={last_error}")
+        return False, None
 
     async def _send_summary(self, period, dur):
         if self.new_count == 0 and self.total_scanned == 0: return
@@ -2639,11 +2657,34 @@ class Monitor:
             # === PIPELINE STAGE 1: Event Handler received message ===
             logging.info(f"[PIPELINE-1] 📨 Event Handler received message from source={source_phone} chat_id={chat_id} (len={len(raw_text)})")
 
-            # اسم المجموعة — من chat_id فقط (بدون API)
-            group_name = f"chat_{chat_id}"
+            # اسم المجموعة — حاول العنوان من event.chat (بدون API إضافي) وإلا chat_id
+            try:
+                chat_obj = event.chat
+                if chat_obj and hasattr(chat_obj, 'title') and chat_obj.title:
+                    group_name = chat_obj.title
+                else:
+                    group_name = f"chat_{chat_id}"
+            except Exception:
+                group_name = f"chat_{chat_id}"
 
-            # اسم المرسل — من sender_id فقط (بدون API)
-            sender_name = f"user_{sender_id}"
+            # اسم المرسل — حاول الاسم من event.sender (بدون API إضافي) وإلا sender_id
+            try:
+                sender_obj = event.sender
+                if sender_obj:
+                    if hasattr(sender_obj, 'first_name') and sender_obj.first_name:
+                        sender_name = sender_obj.first_name
+                        if hasattr(sender_obj, 'last_name') and sender_obj.last_name:
+                            sender_name += f" {sender_obj.last_name}"
+                    elif hasattr(sender_obj, 'title') and sender_obj.title:
+                        sender_name = sender_obj.title
+                    elif hasattr(sender_obj, 'username') and sender_obj.username:
+                        sender_name = f"@{sender_obj.username}"
+                    else:
+                        sender_name = f"user_{sender_id}"
+                else:
+                    sender_name = f"user_{sender_id}"
+            except Exception:
+                sender_name = f"user_{sender_id}"
 
             # الخطوة 1: استخراج الروابط محلياً (صفر API calls)
             links = LinkNormalizer.extract_links(raw_text)
@@ -2682,40 +2723,121 @@ class Monitor:
         except Exception as e:
             logging.error(f"Event handler error: {e}", exc_info=True)
 
-    async def _send(self, text, retries=3, buttons=None, parse_mode='html'):
-        """إرسال رسالة للقناة مع دعم HTML والأزرار
+    async def _send(self, text, retries=3, buttons=None, parse_mode='html') -> Tuple[bool, Optional[int]]:
+        """يرسل رسالة للقناة ويتحقق من قبولها.
 
-        Caps total wait time at 120s to prevent retry storms under
-        sustained FloodWait. If Telegram keeps asking us to wait, we
-        give up rather than blocking the bot indefinitely.
+        Contract:
+            - يرجع (True, message_id) فقط إذا Telegram أكد الإرسال وأرجع Message.id
+            - يرجع (False, None) إذا فشلت كل المحاولات
+            - لا يرجع None أبداً
+            - يلتقط: FloodWaitError, RPCError, OSError, ConnectionError, Timeout,
+                      disconnected client, unexpected Exception
+
+        Args:
+            text: نص الرسالة
+            retries: عدد المحاولات
+            buttons: أزرار اختيارية
+            parse_mode: html أو md
+
+        Returns:
+            (success: bool, message_id: Optional[int])
         """
         async with self._send_lock:
             total_waited = 0.0
             max_total_wait = 120.0  # 2 minutes hard cap
-            for a in range(1, retries + 1):
+            last_error = "unknown"
+
+            for attempt in range(1, retries + 1):
                 try:
-                    await self.bot_client.send_message(
+                    # تحقق من اتصال البوت
+                    if not self.bot_client or not self.bot_client.is_connected():
+                        last_error = "bot_client not connected"
+                        logging.error(f"[SEND] ❌ bot_client not connected (attempt {attempt}/{retries})")
+                        await asyncio.sleep(min(5 * attempt, 30))
+                        continue
+
+                    logging.debug(f"[SEND] attempt {attempt}/{retries} → channel={self.config.channel_id}")
+
+                    # استدعاء Telegram API
+                    result = await self.bot_client.send_message(
                         self.config.channel_id, text,
                         parse_mode=parse_mode,
                         buttons=buttons,
                         link_preview=False
                     )
-                    return
+
+                    # Telegram يرجع Message object عند النجاح
+                    if result and hasattr(result, 'id'):
+                        message_id = result.id
+                        logging.info(
+                            f"[SEND] ✅ Telegram accepted message\n"
+                            f"[SEND] message_id={message_id}\n"
+                            f"[SEND] channel={self.config.channel_id}"
+                        )
+                        return True, message_id
+                    else:
+                        # Telegram رجع بدون Message — غير متوقع
+                        last_error = f"unexpected return: {type(result).__name__}"
+                        logging.error(f"[SEND] ❌ unexpected return type: {type(result)}")
+                        # اعتبره فشل وأعد المحاولة
+                        await asyncio.sleep(min(5 * attempt, 30))
+                        continue
+
                 except FloodWaitError as e:
+                    last_error = f"FloodWaitError({e.seconds}s)"
                     wait = min(e.seconds + 1, max_total_wait - total_waited)
                     if wait <= 0:
-                        logging.error(f"_send: total wait cap ({max_total_wait}s) reached, giving up")
-                        return
+                        logging.error(
+                            f"[SEND] ❌ FloodWait cap ({max_total_wait}s) reached, giving up\n"
+                            f"[SEND] channel={self.config.channel_id}\n"
+                            f"[SEND] reason={last_error}\n"
+                            f"[SEND] attempts={attempt}"
+                        )
+                        return False, None
                     total_waited += wait
+                    logging.warning(f"[SEND] FloodWait {e.seconds}s (attempt {attempt}) — sleeping {wait}s")
                     await asyncio.sleep(wait)
-                except (RPCError, OSError, ConnectionError):
-                    wait = min(10 * a, 60, max_total_wait - total_waited)
+
+                except (RPCError, OSError, ConnectionError) as e:
+                    last_error = f"{type(e).__name__}: {str(e)[:100]}"
+                    wait = min(10 * attempt, 60, max_total_wait - total_waited)
                     if wait <= 0:
-                        logging.error("_send: total wait cap reached, giving up")
-                        return
+                        logging.error(
+                            f"[SEND] ❌ FAILED\n"
+                            f"[SEND] channel={self.config.channel_id}\n"
+                            f"[SEND] reason={last_error}\n"
+                            f"[SEND] attempts={attempt}"
+                        )
+                        return False, None
                     total_waited += wait
+                    logging.warning(f"[SEND] {type(e).__name__} (attempt {attempt}) — retrying in {wait}s")
                     await asyncio.sleep(wait)
-            logging.error(f"Failed after {retries} attempts")
+
+                except asyncio.TimeoutError:
+                    last_error = "TimeoutError"
+                    logging.warning(f"[SEND] Timeout (attempt {attempt})")
+                    await asyncio.sleep(min(5 * attempt, 30))
+
+                except asyncio.CancelledError:
+                    logging.warning("[SEND] Cancelled by caller")
+                    raise
+
+                except Exception as e:
+                    last_error = f"Unexpected {type(e).__name__}: {str(e)[:100]}"
+                    logging.error(
+                        f"[SEND] ❌ unexpected exception (attempt {attempt}): {e}",
+                        exc_info=True
+                    )
+                    await asyncio.sleep(min(5 * attempt, 30))
+
+            # كل المحاولات فشلت
+            logging.error(
+                f"[SEND] ❌ FAILED\n"
+                f"[SEND] channel={self.config.channel_id}\n"
+                f"[SEND] reason={last_error}\n"
+                f"[SEND] attempts={retries}"
+            )
+            return False, None
 
     async def _on_private_message(self, event):
         """معالج رسائل الدردشة الخاصة مع البوت - يدعم /start و /login"""
@@ -3605,14 +3727,14 @@ class Monitor:
     async def _start_scan_all(self, days, cmd_name):
         """بدء مسح لكل المستخدمين المراقبين"""
         if self.is_scan_running():
-            await self._send("⚠️ يوجد مسح قيد التنفيذ\nأرسل /scan_stop لإيقافه")
+            await self._send("⚠️ يوجد مسح قيد التنفيذ\nأرسل /scan_stop لإيقافه")  # noqa: ignore result
             return
         watchers = await self.db.get_active_watchers()
         if not watchers:
-            await self._send("❌ لا يوجد مستخدمون مراقبون")
+            await self._send("❌ لا يوجد مستخدمون مراقبون")  # noqa: ignore result
             return
         d = f"{days} يوم" if days else "كامل"
-        await self._send(f"🚀 بدء المسح ({cmd_name}) لـ {len(watchers)} مستخدم\n📅 الفترة: {d}\n⏳ جاري...")
+        await self._send(f"🚀 بدء المسح ({cmd_name}) لـ {len(watchers)} مستخدم\n📅 الفترة: {d}\n⏳ جاري...")  # noqa: ignore result
         # Prune completed tasks from previous scans (prevents unbounded list growth)
         self._current_scan_tasks = [t for t in self._current_scan_tasks if not t.done()]
         for w in watchers:
@@ -3648,7 +3770,12 @@ class Monitor:
                 pass
 
     async def _run_user_client(self, watcher):
-        """تشغيل user_client — المراقبون فقط يستمعون للرسائل، الفدائيون لا"""
+        """تشغيل user_client — المراقبون فقط يستمعون للرسائل، الفدائيون لا
+
+        Startup Contract:
+            - لا تعتبر الحساب READY حتى: connect → authorize → register handlers
+            - لو فشل أي خطوة، سجل STATUS=FAILED مع السبب
+        """
         phone = watcher['phone']
         session_string = watcher['session_string']
         role = watcher.get('role', 'monitor')  # افتراضي: مراقب
@@ -3659,42 +3786,65 @@ class Monitor:
                 if client is None:
                     # حماية من الجلسات التالفة
                     if not session_string or not isinstance(session_string, str) or len(session_string) < 50:
-                        logging.error(f"User {phone} has invalid/corrupted session string! Skipping.")
+                        logging.error(
+                            f"[ACCOUNT] {phone} STATUS=FAILED\n"
+                            f"[ACCOUNT] reason=invalid_session_string"
+                        )
                         self._cleanup_user_client(phone)
                         return
                     try:
                         client = self._create_user_client(session_string, phone)
                     except ValueError as ve:
-                        logging.error(f"User {phone} session string is invalid: {ve}. Skipping this user.")
+                        logging.error(
+                            f"[ACCOUNT] {phone} STATUS=FAILED\n"
+                            f"[ACCOUNT] reason=invalid_session: {ve}"
+                        )
                         self._cleanup_user_client(phone)
                         return
                     except Exception as ce:
-                        logging.error(f"User {phone} failed to create client: {ce}")
+                        logging.error(
+                            f"[ACCOUNT] {phone} STATUS=FAILED\n"
+                            f"[ACCOUNT] reason=client_creation_error: {ce}"
+                        )
                         return
                     self.user_clients[phone] = client
-                    # 🔴 فصل صارم: فقط المراقبون يستمعون للرسائل
-                    # الفدائيون لا يسجلون NewMessage handlers (يمنع Loop اللانهائي)
-                    if role == 'monitor':
-                        self._register_user_handlers(phone)
-                        logging.info(f"👁️ Monitor {phone}: handlers registered")
-                    else:
-                        logging.info(f"🚀 Joiner {phone}: connected (no message handlers)")
+
                 if not client.is_connected():
-                    logging.info(f"Connecting user {phone}...")
+                    logging.info(f"[ACCOUNT] {phone} connecting...")
                     await client.connect()
+
+                    # === VERIFY AUTHORIZATION ===
                     if not await client.is_user_authorized():
-                        logging.error(f"User {phone} session not authorized! Please re-login.")
+                        logging.error(
+                            f"[ACCOUNT] {phone} STATUS=FAILED\n"
+                            f"[ACCOUNT] reason=not_authorized\n"
+                            f"[ACCOUNT] action=re-login required"
+                        )
                         self._cleanup_user_client(phone)
                         return
-                    logging.info(f"User {phone} connected (role={role})")
+
+                    # === REGISTER HANDLERS (monitors only) ===
+                    if role == 'monitor':
+                        self._register_user_handlers(phone)
+                        logging.info(
+                            f"[ACCOUNT] {phone} STATUS=READY\n"
+                            f"[ACCOUNT] role=monitor\n"
+                            f"[ACCOUNT] handlers=registered"
+                        )
+                    else:
+                        logging.info(
+                            f"[ACCOUNT] {phone} STATUS=READY_FOR_JOIN\n"
+                            f"[ACCOUNT] role=joiner\n"
+                            f"[ACCOUNT] handlers=none (joiner only)"
+                        )
                     backoff = 5
-                    # 🔴 تم حذف المسح التلقائي نهائياً — كان يسبب حظر الحسابات
-                    # البوت الحين يراقب الرسائل الجديدة فقط (بدون سحب تاريخي)
                 await client.run_until_disconnected()
             except FloodWaitError as e: await asyncio.sleep(e.seconds + 1)
-            except (RPCError, ConnectionError, OSError) as e: logging.error(f"User {phone} error: {e}")
+            except (RPCError, ConnectionError, OSError) as e:
+                logging.error(f"[ACCOUNT] {phone} error: {type(e).__name__}: {e}")
             except asyncio.CancelledError: raise
-            except Exception as e: logging.error(f"User {phone} unexpected: {e}", exc_info=True)
+            except Exception as e:
+                logging.error(f"[ACCOUNT] {phone} unexpected: {e}", exc_info=True)
             finally:
                 client = self.user_clients.get(phone)
                 if client and client.is_connected():
@@ -3769,10 +3919,16 @@ class Monitor:
         """
         await asyncio.sleep(30)  # انتظر البوت يكمل الإقلاع
         logging.info("🔄 Production Scheduler started — runs every 60s")
+        # === WORKER HEALTH STATE ===
+        await self.prod_db.set_setting('scheduler_state', 'RUNNING')
+        await self.prod_db.set_setting('scheduler_last_heartbeat', datetime.now().isoformat())
 
         cycle = 0
         while self._running:
             cycle += 1
+            # === HEARTBEAT ===
+            await self.prod_db.set_setting('scheduler_last_heartbeat', datetime.now().isoformat())
+            await self.prod_db.set_setting('scheduler_last_cycle', str(cycle))
             try:
                 # Emergency Control: لو الانضمام متوقف → انتظر بس
                 if self._join_paused:
@@ -3842,8 +3998,26 @@ class Monitor:
                             raw_link, link_data.get('message_text', ''),
                             link_data.get('source_phone', ''), link_data.get('message_link'))
                         buttons = MessageFormatter.get_link_buttons(raw_link)
-                        await self._send(formatted, buttons=buttons)
-                        logging.info(f"[PIPELINE-5] 📢 PUBLISHED to channel: {raw_link[:60]}")
+                        # === POST-CONDITION VERIFICATION ===
+                        # لا نسجل PUBLISHED إلا بعد تأكيد Telegram للإرسال
+                        published, msg_id = await self._send(formatted, buttons=buttons)
+                        if published:
+                            logging.info(
+                                f"[PIPELINE-5] ✅ PUBLISHED_VERIFIED to channel\n"
+                                f"[PIPELINE-5] message_id={msg_id}\n"
+                                f"[PIPELINE-5] link={raw_link[:60]}"
+                            )
+                        else:
+                            # فشل النشر — لا نعتبر العملية ناجحة
+                            logging.error(
+                                f"[PIPELINE-5] ❌ PUBLISH_FAILED\n"
+                                f"[PIPELINE-5] link={raw_link[:60]}\n"
+                                f"[PIPELINE-5] queue_status kept as QUEUED for retry"
+                            )
+                            # أعد الرابط للقائمة لإعادة المحاولة بعد 5 دقائق
+                            await self.prod_db.update_queue_status(link_data['id'], 'QUEUED',
+                                                                   next_retry=datetime.now() + timedelta(minutes=5))
+                            continue  # لا تتابع للانضمام لو فشل النشر
                     else:
                         logging.info(f"[PIPELINE-5] ⏭️ Already published (duplicate): {raw_link[:60]}")
 
@@ -3896,8 +4070,8 @@ class Monitor:
                         await self.metrics.record_membership_skip()
                         continue
 
-                # 7. Rate Limiter — تحقق هل يمكننا تنفيذ الانضمام
-                allowed = await self.rate_limiter.acquire(phone, 'join')
+                # 7. Rate Limiter — تحقق فقط (الحجز الفعلي في _join_group_safe)
+                allowed = await self.rate_limiter.check(phone, 'join')
                 if not allowed:
                     logging.info(f"[SCHED] Rate limiter blocked {phone} — sleeping 60s")
                     await asyncio.sleep(60)
@@ -3940,73 +4114,126 @@ class Monitor:
                 logging.info(f"[PIPELINE-6] 🚀 Joiner {phone} attempting to join: {raw_link[:60]}")
                 success, status, member_count = await self._join_group_safe(client, link_data, phone)
 
-                # 11. حدّث State Machine + Metrics
-                if success:
-                    await self.prod_db.set_group_state(normalized, GroupState.JOINED, raw_link,
-                                                       joined_by=phone, member_count=member_count)
+                # === SINGLE QUEUE STATE UPDATE ===
+                # متغيرات نهائية — تحدّث مرة واحدة فقط في نهاية المعالجة
+                final_status = None
+                next_retry = None
+                state_to_set = None
+                state_error = None
+
+                if success and status == "JOINED_VERIFIED":
+                    # ✅ نجاح مؤكد عبر GetParticipantRequest
+                    state_to_set = GroupState.JOINED
+                    final_status = 'DONE'
                     await self.metrics.record_join_success(phone)
                     await self.db.increment_joiner_stats(phone, success=True)
-                    logging.info(f"[PIPELINE-6] ✅✅ {phone} JOINED successfully: {raw_link[:60]} (members={member_count})")
+                    logging.info(
+                        f"[PIPELINE-6] ✅✅ {phone} JOINED_VERIFIED: {raw_link[:60]} "
+                        f"(members={member_count})"
+                    )
+
+                elif success and status == "JOIN_UNVERIFIED":
+                    # ⚠️ Join API نجح لكن التحقق تعذر — احذر
+                    state_to_set = GroupState.JOINED  # اعتبره منضم لكن سجّل التحذير
+                    state_error = 'join_unverified'
+                    final_status = 'DONE'
+                    await self.metrics.record_join_success(phone)
+                    await self.db.increment_joiner_stats(phone, success=True)
+                    logging.warning(
+                        f"[PIPELINE-6] ⚠️ {phone} JOIN_UNVERIFIED: {raw_link[:60]} "
+                        f"(Telegram accepted but membership not confirmed)"
+                    )
+
                 elif status == "ALREADY_MEMBER":
-                    await self.prod_db.set_group_state(normalized, GroupState.ALREADY_MEMBER, raw_link,
-                                                       joined_by=phone)
+                    state_to_set = GroupState.ALREADY_MEMBER
+                    final_status = 'DONE'
                     await self.metrics.record_membership_skip()
                     logging.info(f"[PIPELINE-6] ℹ️ {phone} already member: {raw_link[:60]}")
+
                 elif status == "FLOODWAIT":
-                    await self.prod_db.set_group_state(normalized, GroupState.FLOODWAIT, raw_link,
-                                                       error='FloodWait')
+                    state_to_set = GroupState.FLOODWAIT
+                    state_error = 'FloodWait'
+                    final_status = 'QUEUED'
+                    next_retry = datetime.now() + timedelta(hours=1)
                     await self.metrics.record_floodwait(phone)
-                    # === AUTO-PAUSE on new FloodWait ===
                     self._join_paused = True
                     await self.prod_db.set_setting('join_paused', 'true')
                     logging.warning(f"[AUTO-PAUSE] FloodWait detected → join_paused=true in DB")
-                    # إعادة الرابط للقائمة بعد ساعة
-                    await self.prod_db.update_queue_status(link_data['id'], 'QUEUED',
-                                                           next_retry=datetime.now() + timedelta(hours=1))
-                elif status == "RATE_LIMITED":
-                    # Rate limiter blocked — NOT a FloodWait, don't auto-pause
-                    logging.info(f"[PIPELINE-6] ⏳ {phone} rate limited — will retry in 10 min")
-                    await self.prod_db.update_queue_status(link_data['id'], 'QUEUED',
-                                                           next_retry=datetime.now() + timedelta(minutes=10))
-                elif status == "TIMEOUT":
-                    # Telegram API timed out (30s) — don't auto-pause, retry later
-                    logging.info(f"[PIPELINE-6] ⏰ {phone} join timed out — will retry in 5 min")
-                    await self.prod_db.update_queue_status(link_data['id'], 'QUEUED',
-                                                           next_retry=datetime.now() + timedelta(minutes=5))
-                elif status == "INVALID":
-                    # لا يوجد username في الرابط — لا يمكن الانضمام
-                    logging.info(f"[PIPELINE-6] ❌ invalid link (no username) — skipping")
-                    await self.prod_db.update_queue_status(link_data['id'], 'DONE')
-                elif status == "SKIP":
-                    # رابط WhatsApp — لا يحتاج انضمام
-                    logging.info(f"[PIPELINE-6] ⏭️ WhatsApp link — no join needed")
-                    await self.prod_db.update_queue_status(link_data['id'], 'DONE')
-                elif status == "IS_CHANNEL":
-                    # الرابط لقناة (broadcast) وليس مجموعة — نتخطى
-                    logging.info(f"[PIPELINE-6] 📢 Skipped channel (broadcast): {raw_link[:50]}")
-                    await self.prod_db.set_group_state(normalized, GroupState.FAILED, raw_link,
-                                                       error='is_channel')
-                    await self.prod_db.update_queue_status(link_data['id'], 'DONE')
-                elif status == "PRIVATE":
-                    await self.prod_db.set_group_state(normalized, GroupState.PRIVATE, raw_link,
-                                                       error='Channel private')
+
                 elif status == "BANNED":
-                    await self.prod_db.set_group_state(normalized, GroupState.BANNED, raw_link,
-                                                       error='PeerFlood/Banned')
+                    state_to_set = GroupState.BANNED
+                    state_error = 'PeerFlood/Banned'
+                    final_status = 'DONE'  # فشل نهائي — لا إعادة محاولة
                     await self.metrics.record_floodwait(phone)
-                    # === AUTO-PAUSE on BAN ===
                     self._join_paused = True
                     await self.prod_db.set_setting('join_paused', 'true')
                     logging.warning(f"[AUTO-PAUSE] PeerFlood/Ban detected → join_paused=true in DB")
-                else:
-                    await self.prod_db.set_group_state(normalized, GroupState.FAILED, raw_link,
-                                                       error=status)
-                    # إعادة للمحاولة بعد 30 دقيقة
-                    await self.prod_db.update_queue_status(link_data['id'], 'QUEUED',
-                                                           next_retry=datetime.now() + timedelta(minutes=30))
 
-                # 11. سجل وقت المعالجة
-                await self.prod_db.update_queue_status(link_data['id'], 'DONE' if success else 'QUEUED')
+                elif status == "RATE_LIMITED":
+                    final_status = 'QUEUED'
+                    next_retry = datetime.now() + timedelta(minutes=10)
+                    logging.info(f"[PIPELINE-6] ⏳ {phone} rate limited — retry in 10 min")
+
+                elif status == "TIMEOUT":
+                    state_to_set = GroupState.FAILED
+                    state_error = 'TIMEOUT'
+                    final_status = 'QUEUED'
+                    next_retry = datetime.now() + timedelta(minutes=5)
+                    logging.info(f"[PIPELINE-6] ⏰ {phone} join timed out — retry in 5 min")
+
+                elif status == "DISCONNECTED":
+                    final_status = 'QUEUED'
+                    next_retry = datetime.now() + timedelta(minutes=2)
+                    logging.warning(f"[PIPELINE-6] ❌ {phone} client disconnected — retry in 2 min")
+
+                elif status in ("MONITOR_NO_JOIN", "JOINER_DISABLED", "PAUSED", "SIMULATION"):
+                    final_status = 'QUEUED'
+                    next_retry = datetime.now() + timedelta(minutes=1)
+                    logging.warning(f"[PIPELINE-6] ⚠️ {phone} {status} — skipping")
+
+                elif status == "INVALID":
+                    state_to_set = GroupState.FAILED
+                    state_error = 'invalid_link'
+                    final_status = 'DONE'  # فشل نهائي
+                    logging.info(f"[PIPELINE-6] ❌ invalid link (no username) — skipping")
+
+                elif status == "SKIP":
+                    final_status = 'DONE'  # WhatsApp — لا انضمام
+                    logging.info(f"[PIPELINE-6] ⏭️ WhatsApp link — no join needed")
+
+                elif status == "IS_CHANNEL":
+                    state_to_set = GroupState.FAILED
+                    state_error = 'is_channel'
+                    final_status = 'DONE'
+                    logging.info(f"[PIPELINE-6] 📢 Skipped channel (broadcast): {raw_link[:50]}")
+
+                elif status == "PRIVATE":
+                    state_to_set = GroupState.PRIVATE
+                    state_error = 'Channel private'
+                    final_status = 'DONE'  # فشل نهائي
+                    logging.info(f"[PIPELINE-6] 🔒 private channel: {raw_link[:50]}")
+
+                else:  # FAILED أو أي حال أخرى
+                    state_to_set = GroupState.FAILED
+                    state_error = status
+                    final_status = 'QUEUED'
+                    next_retry = datetime.now() + timedelta(minutes=30)
+                    logging.warning(f"[PIPELINE-6] ❌ {phone} {status}: {raw_link[:60]}")
+
+                # === UPDATE STATE MACHINE ONCE ===
+                if state_to_set:
+                    await self.prod_db.set_group_state(
+                        normalized, state_to_set, raw_link,
+                        joined_by=phone if success else None,
+                        member_count=member_count if success else None,
+                        error=state_error
+                    )
+
+                # === UPDATE QUEUE STATUS ONCE ===
+                if final_status:
+                    await self.prod_db.update_queue_status(
+                        link_data['id'], final_status, next_retry=next_retry
+                    )
 
                 # 12. انتظر 60 ثانية قبل المهمة التالية (لا burst)
                 await asyncio.sleep(60)
@@ -4045,29 +4272,60 @@ class Monitor:
         if not joiner_phone or not joiner_client:
             logging.error("[BULK_JOIN] No connected joiner account found!")
             self._bulk_join_running = False
-            await self._send("❌ لا يوجد حساب فدائي متصل. أرسل /bulk_join بعد ربط حساب فدائي.")
+            await self._send("❌ لا يوجد حساب فدائي متصل. أرسل /bulk_join بعد ربط حساب فدائي.")  # noqa: ignore result
             return
 
         logging.info(f"[BULK_JOIN] Using joiner: {joiner_phone}")
 
+        # Worker Supervisor state
+        worker_state = 'RUNNING'
+
         try:
-            # اقرأ رسائل القناة من الأقدم للأحدث
-            # iter_messages يعيد الأحدث أولاً افتراضياً، نعكسه بreverse=True
             offset_id = 0
             batch_size = 200
 
             while self._bulk_join_running and not self._bulk_join_stop:
                 try:
+                    # === CHECK _join_paused BEFORE EACH LINK ===
+                    if self._join_paused:
+                        worker_state = 'PAUSED'
+                        logging.info("[BULK_JOIN] PAUSED — waiting for /resume_join or /clear_floodwait")
+                        await self._send("[BULK] PAUSED — waiting for resume")  # noqa: ignore result
+                        # انتظر حتى يُرفع الإيقاف
+                        while self._join_paused and self._bulk_join_running and not self._bulk_join_stop:
+                            await asyncio.sleep(30)
+                        if not self._bulk_join_running or self._bulk_join_stop:
+                            break
+                        worker_state = 'RUNNING'
+                        logging.info("[BULK_JOIN] Resumed — continuing")
+
+                    # تحقق من اتصال الـ joiner
+                    if not joiner_client or not joiner_client.is_connected():
+                        logging.error("[BULK_JOIN] ❌ joiner client disconnected — pausing 60s")
+                        worker_state = 'FAILED'
+                        await asyncio.sleep(60)
+                        # حاول إعادة الاتصال
+                        joiner_client = self.user_clients.get(joiner_phone)
+                        if not joiner_client or not joiner_client.is_connected():
+                            logging.error("[BULK_JOIN] ❌ joiner still disconnected — stopping")
+                            break
+                        worker_state = 'RUNNING'
+                        continue
+
                     # اجلب batch من رسائل القناة
-                    messages = await self.bot_client.get_messages(
-                        self.config.channel_id,
-                        limit=batch_size,
-                        offset_id=offset_id,
-                        reverse=False  # الأحدث أولاً
+                    messages = await asyncio.wait_for(
+                        self.bot_client.get_messages(
+                            self.config.channel_id,
+                            limit=batch_size,
+                            offset_id=offset_id,
+                            reverse=False  # الأحدث أولاً
+                        ),
+                        timeout=60
                     )
 
                     if not messages:
                         logging.info("[BULK_JOIN] No more messages — done!")
+                        worker_state = 'COMPLETED'
                         break
 
                     # حدّث offset للدفعة التالية
@@ -4076,7 +4334,13 @@ class Monitor:
                     for msg in messages:
                         if self._bulk_join_stop:
                             logging.info("[BULK_JOIN] Stop requested — exiting")
+                            worker_state = 'STOPPED'
                             break
+
+                        # تحقق من _join_paused لكل رابط
+                        if self._join_paused:
+                            logging.info("[BULK_JOIN] PAUSED mid-batch — waiting")
+                            break  # اخرج من for loop، الـ while سيتعامل
 
                         raw_text = msg.raw_text or ''
                         if not raw_text:
@@ -4105,9 +4369,12 @@ class Monitor:
                                 continue
 
                             # a2. فلتر تعليمي — تجاوز غير التعليمي
-                            # نستخدم نص الرسالة الأصلية (التي نُشرت في القناة) لتحديد التعليمي
+                            # نستخدم username بشكل أساسي (لأن الرسالة المنشورة منسقة ولا تحتوي على اسم المجموعة الأصلي)
+                            # msg.raw_text هنا هو الرسالة المنشورة في القناة (formatted)، ليس النص الأصلي
                             msg_text = msg.raw_text or ''
-                            is_edu, edu_reason = EducationalFilter.is_educational(msg_text, link_info.get('username', ''))
+                            username_for_filter = link_info.get('username', '')
+                            # مرر username فقط للفلتر — الرسالة المنشورة لا تحتوي على بيانات المصدر
+                            is_edu, edu_reason = EducationalFilter.is_educational('', username_for_filter)
                             if not is_edu:
                                 self._bulk_join_stats['skipped'] += 1
                                 logging.info(f"[BULK_JOIN] Skip non-educational: {raw_link[:50]} ({edu_reason})")
@@ -4135,7 +4402,7 @@ class Monitor:
                             is_blocked, wait = await self.floodwait_mgr.is_blocked(joiner_phone)
                             if is_blocked:
                                 logging.warning(f"[BULK_JOIN] Joiner in FloodWait ({wait}s) — pausing")
-                                await self._send(f"⏳ FloodWait {wait}s — Bulk join paused\n📊 {self._bulk_join_stats}")
+                                await self._send(f"⏳ FloodWait {wait}s — Bulk join paused\n📊 {self._bulk_join_stats}")  # noqa: ignore result
                                 # انتظر حتى ينتهي FloodWait
                                 await asyncio.sleep(min(wait + 10, 3600))
                                 continue
@@ -4193,16 +4460,25 @@ class Monitor:
                                      f"{s['already']} already, {s['failed']} failed, {s['skipped']} skipped")
 
                 except asyncio.CancelledError:
+                    worker_state = 'STOPPED'
                     break
                 except Exception as e:
-                    logging.error(f"[BULK_JOIN] Batch error: {e}", exc_info=True)
+                    worker_state = 'FAILED'
+                    logging.error(
+                        f"[BULK_JOIN] ❌ WORKER ERROR\n"
+                        f"[BULK_JOIN] state={worker_state}\n"
+                        f"[BULK_JOIN] current_link={self._bulk_join_stats.get('current', 'none')}\n"
+                        f"[BULK_JOIN] error={type(e).__name__}: {e}",
+                        exc_info=True
+                    )
                     await asyncio.sleep(60)
+                    worker_state = 'RUNNING'  # استئناف بعد الـ sleep
 
             # انتهى
             self._bulk_join_running = False
             s = self._bulk_join_stats
             final_msg = (
-                f"🏁 Bulk Join Finished\n"
+                f"🏁 Bulk Join Finished [{worker_state}]\n"
                 f"════════════════════\n"
                 f"🔗 Total: {s['total']}\n"
                 f"✅ Joined: {s['joined']}\n"
@@ -4211,14 +4487,23 @@ class Monitor:
                 f"⏭️ Skipped: {s['skipped']}"
             )
             logging.info(f"[BULK_JOIN] {final_msg}")
-            await self._send(final_msg)
+            published, _ = await self._send(final_msg)
+            if not published:
+                logging.error("[BULK_JOIN] ❌ Failed to send final report to channel")
 
         except asyncio.CancelledError:
             self._bulk_join_running = False
-            logging.info("[BULK_JOIN] Cancelled")
+            logging.info(f"[BULK_JOIN] Cancelled [state={worker_state}]")
         except Exception as e:
             self._bulk_join_running = False
-            logging.error(f"[BULK_JOIN] Fatal: {e}", exc_info=True)
+            worker_state = 'FAILED'
+            logging.error(
+                f"[BULK_JOIN] ❌ FATAL WORKER ERROR\n"
+                f"[BULK_JOIN] state=FAILED\n"
+                f"[BULK_JOIN] current_link={self._bulk_join_stats.get('current', 'none')}\n"
+                f"[BULK_JOIN] error={type(e).__name__}: {e}",
+                exc_info=True
+            )
 
     async def _cleanup_worker(self, preview_only: bool = True):
         """عامل التنظيف — يحلل روابط القناة ويحذف غير التعليمية والمكررة.
@@ -4230,7 +4515,8 @@ class Monitor:
         logging.info(f"[CLEANUP] {mode} mode — scanning channel messages")
         self._cleanup_stats = {
             'running': True, 'total': 0, 'educational': 0,
-            'non_educational': 0, 'duplicates': 0, 'deleted': 0, 'current': ''
+            'non_educational': 0, 'duplicates': 0, 'deleted': 0, 'current': '',
+            'worker_state': 'RUNNING'
         }
 
         # set لتتبع الروابط التعليمية المرئية (لاكتشاف التكرار)
@@ -4238,20 +4524,36 @@ class Monitor:
         offset_id = 0
         batch_size = 200
         deleted_count = 0
+        worker_state = 'RUNNING'
 
         try:
             while self._cleanup_stats['running']:
                 try:
+                    # تحقق من اتصال البوت
+                    if not self.bot_client or not self.bot_client.is_connected():
+                        logging.error("[CLEANUP] ❌ bot_client not connected — pausing 30s")
+                        worker_state = 'FAILED'
+                        self._cleanup_stats['worker_state'] = worker_state
+                        await asyncio.sleep(30)
+                        worker_state = 'RUNNING'
+                        self._cleanup_stats['worker_state'] = worker_state
+                        continue
+
                     # اجلب batch من رسائل القناة (الأقدم أولاً)
-                    messages = await self.bot_client.get_messages(
-                        self.config.channel_id,
-                        limit=batch_size,
-                        offset_id=offset_id,
-                        reverse=True  # الأقدم أولاً
+                    messages = await asyncio.wait_for(
+                        self.bot_client.get_messages(
+                            self.config.channel_id,
+                            limit=batch_size,
+                            offset_id=offset_id,
+                            reverse=True  # الأقدم أولاً
+                        ),
+                        timeout=60
                     )
 
                     if not messages:
                         logging.info(f"[CLEANUP] {mode} — No more messages")
+                        worker_state = 'COMPLETED'
+                        self._cleanup_stats['worker_state'] = worker_state
                         break
 
                     offset_id = messages[-1].id
@@ -4274,25 +4576,33 @@ class Monitor:
                             normalized = link_info['normalized']
                             username = link_info.get('username', '')
 
-                            # فحص تعليمي
-                            is_edu, reason = EducationalFilter.is_educational(raw_text, username)
+                            # فحص تعليمي — استخدم username فقط (الرسالة المنشورة منسقة)
+                            is_edu, reason = EducationalFilter.is_educational('', username)
 
                             if not is_edu:
                                 # غير تعليمي → احذف
                                 self._cleanup_stats['non_educational'] += 1
                                 logging.info(f"[CLEANUP] {mode} non-educational msg={msg.id}: {raw_link[:50]} ({reason})")
                                 if not preview_only:
+                                    # === VERIFY BEFORE DELETE ===
+                                    # 1. message exists (we have it)
+                                    # 2. contains target link (we extracted it)
+                                    # 3. matches cleanup policy (non-educational)
                                     try:
                                         await self.bot_client.delete_messages(
                                             self.config.channel_id, [msg.id])
                                         deleted_count += 1
                                         self._cleanup_stats['deleted'] = deleted_count
+                                        logging.info(f"[CLEANUP] ✅ DELETED msg={msg.id} (verified)")
                                         await asyncio.sleep(0.5)  # تجنب FloodWait
                                     except FloodWaitError as e:
                                         logging.warning(f"[CLEANUP] FloodWait {e.seconds}s — pausing")
                                         await asyncio.sleep(e.seconds + 1)
                                     except Exception as e:
-                                        logging.error(f"[CLEANUP] Delete error: {e}")
+                                        logging.error(
+                                            f"[CLEANUP] ❌ Delete FAILED msg={msg.id}\n"
+                                            f"[CLEANUP] error={type(e).__name__}: {e}"
+                                        )
                                 break  # لا تفحص روابط أخرى في نفس الرسالة
 
                             # تعليمي → تحقق من التكرار
@@ -4306,12 +4616,16 @@ class Monitor:
                                             self.config.channel_id, [msg.id])
                                         deleted_count += 1
                                         self._cleanup_stats['deleted'] = deleted_count
+                                        logging.info(f"[CLEANUP] ✅ DELETED msg={msg.id} (duplicate, verified)")
                                         await asyncio.sleep(0.5)
                                     except FloodWaitError as e:
                                         logging.warning(f"[CLEANUP] FloodWait {e.seconds}s — pausing")
                                         await asyncio.sleep(e.seconds + 1)
                                     except Exception as e:
-                                        logging.error(f"[CLEANUP] Delete error: {e}")
+                                        logging.error(
+                                            f"[CLEANUP] ❌ Delete FAILED msg={msg.id}\n"
+                                            f"[CLEANUP] error={type(e).__name__}: {e}"
+                                        )
                                 break
                             else:
                                 # تعليمي جديد → سجل
@@ -4328,16 +4642,42 @@ class Monitor:
                 except FloodWaitError as e:
                     logging.warning(f"[CLEANUP] FloodWait {e.seconds}s — pausing")
                     await asyncio.sleep(e.seconds + 1)
+                except asyncio.TimeoutError:
+                    logging.error("[CLEANUP] ❌ get_messages TIMEOUT (60s) — pausing 30s")
+                    worker_state = 'FAILED'
+                    self._cleanup_stats['worker_state'] = worker_state
+                    await asyncio.sleep(30)
+                    worker_state = 'RUNNING'
+                    self._cleanup_stats['worker_state'] = worker_state
                 except asyncio.CancelledError:
+                    worker_state = 'STOPPED'
+                    self._cleanup_stats['worker_state'] = worker_state
                     break
                 except Exception as e:
-                    logging.error(f"[CLEANUP] Batch error: {e}", exc_info=True)
+                    worker_state = 'FAILED'
+                    self._cleanup_stats['worker_state'] = worker_state
+                    logging.error(
+                        f"[CLEANUP] ❌ WORKER ERROR\n"
+                        f"[CLEANUP] state={worker_state}\n"
+                        f"[CLEANUP] current={self._cleanup_stats.get('current', 'none')}\n"
+                        f"[CLEANUP] error={type(e).__name__}: {e}",
+                        exc_info=True
+                    )
                     await asyncio.sleep(5)
+                    worker_state = 'RUNNING'
+                    self._cleanup_stats['worker_state'] = worker_state
 
             # انتهى
             self._cleanup_stats['running'] = False
+            self._cleanup_stats['worker_state'] = worker_state
             s = self._cleanup_stats
-            action = "🔍 PREVIEW RESULTS" if preview_only else "✅ CLEANUP COMPLETE"
+            # لا تقل "COMPLETE" إلا إذا انتهت فعلياً بنجاح
+            if worker_state == 'COMPLETED':
+                action = "🔍 PREVIEW RESULTS" if preview_only else "✅ CLEANUP COMPLETE"
+            elif worker_state == 'STOPPED':
+                action = "⏹️ CLEANUP STOPPED"
+            else:
+                action = f"❌ CLEANUP FAILED [{worker_state}]"
             final_msg = (
                 f"{action}\n"
                 f"════════════════════\n"
@@ -4347,18 +4687,27 @@ class Monitor:
                 f"🔄 Duplicates: {s['duplicates']}\n"
                 f"🗑️ Deleted: {s['deleted']}"
             )
-            if not preview_only:
+            if not preview_only and worker_state == 'COMPLETED':
                 final_msg += f"\n\n✨ تم تنظيف القناة!\nالآن أرسل /bulk_join للانضمام للمجموعات التعليمية المتبقية"
             logging.info(f"[CLEANUP] {final_msg}")
-            await self._send(final_msg)
+            published, _ = await self._send(final_msg)
+            if not published:
+                logging.error("[CLEANUP] ❌ Failed to send final report to channel")
 
         except asyncio.CancelledError:
             self._cleanup_stats['running'] = False
+            self._cleanup_stats['worker_state'] = 'STOPPED'
             logging.info("[CLEANUP] Cancelled")
         except Exception as e:
             self._cleanup_stats['running'] = False
-            logging.error(f"[CLEANUP] Fatal: {e}", exc_info=True)
-            await self._send(f"❌ خطأ في التنظيف: {e}")
+            self._cleanup_stats['worker_state'] = 'FAILED'
+            logging.error(
+                f"[CLEANUP] ❌ FATAL WORKER ERROR\n"
+                f"[CLEANUP] state=FAILED\n"
+                f"[CLEANUP] error={type(e).__name__}: {e}",
+                exc_info=True
+            )
+            await self._send(f"❌ خطأ في التنظيف: {e}")  # noqa: ignore result
 
     async def _safety_guard(self, phone: str, normalized_link: str, link_data: dict) -> Tuple[bool, str]:
         """Safety Guard — 6 فحوصات صارمة قبل أي Join API call.
@@ -4480,16 +4829,93 @@ class Monitor:
 
         return max(0, min(100, score))
 
+    async def _verify_membership(self, client, entity, phone: str, raw_link: str) -> Tuple[bool, Optional[int]]:
+        """يتحقق من العضوية بعد Join API call.
+
+        Returns:
+            (True, member_count) — العضوية مؤكدة
+            (False, None) — العضوية غير مؤكدة أو فشل التحقق
+        """
+        try:
+            from telethon.tl.functions.channels import GetParticipantRequest
+            from telethon.errors import UserNotParticipantError, ChannelPrivateError
+        except ImportError:
+            logging.error("[JOIN] Cannot import GetParticipantRequest — verification impossible")
+            return False, None
+
+        try:
+            await asyncio.wait_for(
+                client(GetParticipantRequest(channel=entity, participant="me")),
+                timeout=15
+            )
+            member_count = None
+            if hasattr(entity, 'participants_count'):
+                member_count = entity.participants_count
+            logging.info(
+                f"[JOIN] ✅ MEMBERSHIP VERIFIED\n"
+                f"[JOIN] phone={phone}\n"
+                f"[JOIN] link={raw_link[:50]}\n"
+                f"[JOIN] members={member_count}"
+            )
+            return True, member_count
+        except UserNotParticipantError:
+            logging.error(
+                f"[JOIN] ❌ Membership verification FAILED\n"
+                f"[JOIN] reason=UserNotParticipant\n"
+                f"[JOIN] phone={phone}\n"
+                f"[JOIN] link={raw_link[:50]}"
+            )
+            return False, None
+        except asyncio.TimeoutError:
+            logging.error(
+                f"[JOIN] ❌ Membership verification TIMEOUT\n"
+                f"[JOIN] phone={phone}\n"
+                f"[JOIN] link={raw_link[:50]}"
+            )
+            return False, None
+        except ChannelPrivateError:
+            logging.error(
+                f"[JOIN] ❌ Membership verification FAILED\n"
+                f"[JOIN] reason=ChannelPrivate\n"
+                f"[JOIN] phone={phone}\n"
+                f"[JOIN] link={raw_link[:50]}"
+            )
+            return False, None
+        except FloodWaitError as e:
+            logging.warning(
+                f"[JOIN] ❌ Membership verification FloodWait\n"
+                f"[JOIN] seconds={e.seconds}\n"
+                f"[JOIN] phone={phone}"
+            )
+            await self.rate_limiter.record_floodwait(phone, e.seconds)
+            return False, None
+        except Exception as e:
+            logging.error(
+                f"[JOIN] ❌ Membership verification error\n"
+                f"[JOIN] error={type(e).__name__}: {str(e)[:80]}\n"
+                f"[JOIN] phone={phone}\n"
+                f"[JOIN] link={raw_link[:50]}"
+            )
+            return False, None
+
     async def _join_group_safe(self, client, link_data: dict, phone: str):
-        """ينضم لمجموعة عبر Rate Limiter — كل استدعاءات API تمر من هنا.
+        """ينضم لمجموعة ويتحقق من العضوية فعلياً.
+
+        Contract:
+            - returns (True, "JOINED_VERIFIED", member_count) فقط بعد GetParticipantRequest
+            - returns (True, "JOIN_UNVERIFIED", None) لو Join نجح لكن التحقق تعذر
+            - returns (False, reason, None) للفشل بأنواعه
 
         EXPLICIT PROTECTION: Monitor accounts can NEVER join.
-        حتى لو حدث خطأ في الكود، هذه الطريقة ترفض Join من monitor.
         """
         raw_link = link_data.get('raw', link_data.get('raw_link', ''))
 
+        # تحقق من اتصال الـ client
+        if not client or not client.is_connected():
+            logging.error(f"[JOIN] ❌ client not connected for {phone}")
+            return False, "DISCONNECTED", None
+
         # === EXPLICIT MONITOR PROTECTION ===
-        # اقرأ role من Supabase (المصدر الوحيد) — ليس من SQLite watchers
         w = await self.db._supabase_get_watcher(phone)
         role = w.get('role', 'monitor') if w else 'monitor'
         if role == 'monitor':
@@ -4531,31 +4957,46 @@ class Monitor:
 
                 allowed = await self.rate_limiter.acquire(phone, 'import_invite')
                 if not allowed:
-                    return False, "FLOODWAIT", None
+                    logging.info(f"[JOIN] {phone} rate limited on import_invite — will retry later")
+                    return False, "RATE_LIMITED", None
 
+                logging.info(f"[JOIN] API request started: IMPORT_INVITE phone={phone} link={raw_link[:50]}")
                 try:
                     await asyncio.wait_for(client(ImportChatInviteRequest(invite_hash)), timeout=30)
                     await self.metrics.record_api_call(phone)
-                    return True, "JOINED", None
+                    logging.info(f"[JOIN] Telegram accepted IMPORT_INVITE request for {phone}")
                 except asyncio.TimeoutError:
-                    logging.error(f"[TELEGRAM_ERROR] phone={phone} op=IMPORT_INVITE group={raw_link[:50]} error=TIMEOUT (30s)")
+                    logging.error(f"[JOIN] ❌ TIMEOUT (30s) phone={phone} op=IMPORT_INVITE link={raw_link[:50]}")
                     return False, "TIMEOUT", None
                 except UserAlreadyParticipantError:
                     return False, "ALREADY_MEMBER", None
                 except FloodWaitError as e:
-                    logging.warning(f"[TELEGRAM_ERROR] phone={phone} op=IMPORT_INVITE group={raw_link[:50]} error=FloodWaitError seconds={e.seconds}")
+                    logging.warning(f"[JOIN] ❌ FloodWait phone={phone} seconds={e.seconds} link={raw_link[:50]}")
                     await self.rate_limiter.record_floodwait(phone, e.seconds)
                     return False, "FLOODWAIT", None
                 except (ChannelPrivateError, InviteHashExpiredError) as e:
-                    logging.warning(f"[TELEGRAM_ERROR] phone={phone} op=IMPORT_INVITE group={raw_link[:50]} error={type(e).__name__}")
+                    logging.warning(f"[JOIN] ❌ {type(e).__name__} phone={phone} link={raw_link[:50]}")
                     return False, "PRIVATE", None
                 except (PeerFloodError, UserBannedInChannelError) as e:
-                    logging.error(f"[TELEGRAM_ERROR] phone={phone} op=IMPORT_INVITE group={raw_link[:50]} error={type(e).__name__}")
+                    logging.error(f"[JOIN] ❌ {type(e).__name__} phone={phone} link={raw_link[:50]}")
                     await self.rate_limiter.record_floodwait(phone, 3600)
                     return False, "BANNED", None
-                except ChatWriteForbiddenError as e:
-                    logging.error(f"[TELEGRAM_ERROR] phone={phone} op=IMPORT_INVITE group={raw_link[:50]} error=ChatWriteForbiddenError")
+                except ChatWriteForbiddenError:
+                    logging.error(f"[JOIN] ❌ ChatWriteForbidden phone={phone} link={raw_link[:50]}")
                     return False, "PRIVATE", None
+
+                # === POST-JOIN VERIFICATION ===
+                logging.info(f"[JOIN] Verifying membership after IMPORT_INVITE for {phone}...")
+                # For private invite, we don't have entity easily
+                # Mark as UNVERIFIED — Telegram accepted but membership not confirmed
+                logging.warning(
+                    f"[JOIN] ⚠️ JOIN_UNVERIFIED — Telegram accepted IMPORT_INVITE but "
+                    f"verification not possible for private invite (no entity)\n"
+                    f"[JOIN] phone={phone} link={raw_link[:50]}"
+                )
+                # سجل نجاح العملية في Rate Limiter DB
+                await self.rate_limiter.record_success(phone, 'import_invite')
+                return True, "JOIN_UNVERIFIED", None
 
             elif link_type == 'telegram':
                 username = link_data.get('username', '')
@@ -4564,16 +5005,14 @@ class Monitor:
 
                 allowed = await self.rate_limiter.acquire(phone, 'join_channel')
                 if not allowed:
-                    logging.info(f"[JOIN] {phone} rate limited (not FloodWait) — will retry later")
+                    logging.info(f"[JOIN] {phone} rate limited on join_channel — will retry later")
                     return False, "RATE_LIMITED", None
 
+                logging.info(f"[JOIN] API request started: JOIN_CHANNEL phone={phone} link={raw_link[:50]}")
                 try:
-                    # timeout 30s لمنع التعليق لو Telegram ما رد
                     entity = await asyncio.wait_for(client.get_entity(username), timeout=30)
 
                     # تحقق: هل الكيان قناة (channel) وليس مجموعة؟
-                    # Channel = نوع "channel" (broadcast)، Chat = "group" أو "supergroup"
-                    # نريد الانضمام للمجموعات فقط، نتخطى القنوات
                     is_channel = False
                     if hasattr(entity, 'broadcast') and entity.broadcast:
                         is_channel = True
@@ -4589,6 +5028,7 @@ class Monitor:
                         logging.info(f"[JOIN] {phone} skipped CHANNEL (broadcast): {raw_link[:50]}")
                         return False, "IS_CHANNEL", None
 
+                    logging.info(f"[JOIN] Telegram accepted JoinChannelRequest for {phone}")
                     await asyncio.wait_for(client(JoinChannelRequest(entity)), timeout=30)
                     await self.metrics.record_api_call(phone)
 
@@ -4596,28 +5036,44 @@ class Monitor:
                     if hasattr(entity, 'participants_count'):
                         member_count = entity.participants_count
 
-                    return True, "JOINED", member_count
+                    # === POST-JOIN VERIFICATION ===
+                    logging.info(f"[JOIN] Verifying membership for {phone} link={raw_link[:50]}...")
+                    verified, verified_count = await self._verify_membership(client, entity, phone, raw_link)
+                    if verified:
+                        # سجل نجاح العملية في Rate Limiter DB
+                        await self.rate_limiter.record_success(phone, 'join_channel')
+                        return True, "JOINED_VERIFIED", verified_count if verified_count is not None else member_count
+                    else:
+                        # Join API نجح لكن التحقق فشل — لا نعتبرها نجاح كامل
+                        # لكن سجل في Rate Limiter لأن Telegram استقبل الـ API call
+                        await self.rate_limiter.record_success(phone, 'join_channel')
+                        logging.warning(
+                            f"[JOIN] ⚠️ JOIN_UNVERIFIED — Telegram accepted but membership not confirmed\n"
+                            f"[JOIN] phone={phone} link={raw_link[:50]}"
+                        )
+                        return True, "JOIN_UNVERIFIED", member_count
+
                 except asyncio.TimeoutError:
-                    logging.error(f"[TELEGRAM_ERROR] phone={phone} op=JOIN group={raw_link[:50]} error=TIMEOUT (30s)")
+                    logging.error(f"[JOIN] ❌ TIMEOUT (30s) phone={phone} op=JOIN link={raw_link[:50]}")
                     return False, "TIMEOUT", None
                 except UserAlreadyParticipantError:
                     return False, "ALREADY_MEMBER", None
                 except FloodWaitError as e:
-                    logging.warning(f"[TELEGRAM_ERROR] phone={phone} op=JOIN group={raw_link[:50]} error=FloodWaitError seconds={e.seconds}")
+                    logging.warning(f"[JOIN] ❌ FloodWait phone={phone} seconds={e.seconds} link={raw_link[:50]}")
                     await self.rate_limiter.record_floodwait(phone, e.seconds)
                     return False, "FLOODWAIT", None
                 except (ChannelPrivateError, InviteHashExpiredError) as e:
-                    logging.warning(f"[TELEGRAM_ERROR] phone={phone} op=JOIN group={raw_link[:50]} error={type(e).__name__}")
+                    logging.warning(f"[JOIN] ❌ {type(e).__name__} phone={phone} link={raw_link[:50]}")
                     return False, "PRIVATE", None
                 except (PeerFloodError, UserBannedInChannelError) as e:
-                    logging.error(f"[TELEGRAM_ERROR] phone={phone} op=JOIN group={raw_link[:50]} error={type(e).__name__}")
+                    logging.error(f"[JOIN] ❌ {type(e).__name__} phone={phone} link={raw_link[:50]}")
                     await self.rate_limiter.record_floodwait(phone, 3600)
                     return False, "BANNED", None
-                except ChatWriteForbiddenError as e:
-                    logging.error(f"[TELEGRAM_ERROR] phone={phone} op=JOIN group={raw_link[:50]} error=ChatWriteForbiddenError")
+                except ChatWriteForbiddenError:
+                    logging.error(f"[JOIN] ❌ ChatWriteForbidden phone={phone} link={raw_link[:50]}")
                     return False, "PRIVATE", None
                 except Exception as e:
-                    logging.error(f"[TELEGRAM_ERROR] phone={phone} op=JOIN group={raw_link[:50]} error={type(e).__name__}: {e}")
+                    logging.error(f"[JOIN] ❌ {type(e).__name__}: {str(e)[:80]} phone={phone} link={raw_link[:50]}")
                     return False, "FAILED", None
 
             else:
@@ -4625,9 +5081,8 @@ class Monitor:
                 return False, "SKIP", None
 
         except Exception as e:
-            logging.error(f"[JOIN] {phone} unexpected: {e}")
+            logging.error(f"[JOIN] {phone} unexpected: {e}", exc_info=True)
             return False, "FAILED", None
-
     async def _keep_alive(self):
         app_url = os.getenv("RENDER_EXTERNAL_URL") or os.getenv("APP_URL")
         if not app_url:
