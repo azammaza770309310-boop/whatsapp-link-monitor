@@ -186,8 +186,63 @@ class RateLimiter:
             return self.OP_LIMITS['join']
         return self.OP_LIMITS.get(operation, self.OP_LIMITS['generic'])
 
+    async def check(self, phone: str, operation: str = 'generic') -> bool:
+        """تحقق فقط هل يمكن تنفيذ العملية بدون حجز أو تسجيل.
+
+        على عكس acquire()، هذه لا تضيف timestamp للذاكرة ولا تسجل في DB.
+        تستخدم للفحص المسبق قبل استدعاء acquire() الفعلي.
+        """
+        async with self._global_lock:
+            if phone not in self._locks:
+                self._locks[phone] = asyncio.Lock()
+
+        async with self._locks[phone]:
+            now = time.time()
+
+            # 1. Check FloodWait from DB
+            floodwait = await self.db.get_floodwait(phone)
+            if floodwait and floodwait > now:
+                wait = int(floodwait - now)
+                logging.warning(f"[RATE] {phone} FloodWait active ({wait}s left) — blocked {operation}")
+                return False
+
+            # 2. Determine limit
+            limit = self._get_limit(operation)
+            max_count = limit['max']
+            window = limit['window']
+
+            # 3. For join operations: check Memory + DB
+            if operation in ('join', 'join_channel', 'import_invite'):
+                all_join_times = []
+                for join_op in ('join', 'join_channel', 'import_invite'):
+                    key = (phone, join_op)
+                    if key in self._requests:
+                        all_join_times.extend([t for t in self._requests[key] if now - t < window])
+                mem_count = len(all_join_times)
+                db_count = await self.db.count_operations(phone, 'join', window)
+                total_count = max(mem_count, db_count)
+
+                if total_count >= max_count:
+                    logging.warning(f"[RATE] {phone} join limit ({total_count}/{max_count} in {window}s) — blocked (check)")
+                    return False
+                return True
+            else:
+                key = (phone, operation)
+                if key in self._requests:
+                    self._requests[key] = [t for t in self._requests[key] if now - t < window]
+                else:
+                    self._requests[key] = []
+                if len(self._requests[key]) >= max_count:
+                    logging.warning(f"[RATE] {phone} {operation} limit ({max_count}/{window}s) — blocked (check)")
+                    return False
+                return True
+
     async def acquire(self, phone: str, operation: str = 'generic') -> bool:
-        """تحقق هل يمكن تنفيذ استدعاء الآن. إذا نعم، سجله.
+        """تحقق هل يمكن تنفيذ استدعاء الآن. يحجز العملية لكن لا يسجلها كنجاح.
+
+        IMPORTANT: هذه الطريقة تحجز (reserve) العملية فقط.
+        لتسجيل العملية كنجاح فعلي، استخدم record_success() بعد نجاح API.
+
         يستخدم Memory + DB للتتبع (يستمر بعد إعادة التشغيل).
         """
         async with self._global_lock:
@@ -210,9 +265,9 @@ class RateLimiter:
             window = limit['window']
             min_delay = limit['min_delay']
 
-            # 3. For join operations: check Memory + DB
+            # 3. For join operations: check Memory + DB (with reserved but not confirmed)
             if operation in ('join', 'join_channel', 'import_invite'):
-                # Memory count
+                # Memory count (includes reserved timestamps)
                 all_join_times = []
                 for join_op in ('join', 'join_channel', 'import_invite'):
                     key = (phone, join_op)
@@ -220,8 +275,9 @@ class RateLimiter:
                         all_join_times.extend([t for t in self._requests[key] if now - t < window])
                 mem_count = len(all_join_times)
 
-                # DB count (survives restart)
+                # DB count (confirmed operations only)
                 db_count = await self.db.count_operations(phone, 'join', window)
+                # Use max of both — reserved count includes pending
                 total_count = max(mem_count, db_count)
 
                 if total_count >= max_count:
@@ -238,8 +294,8 @@ class RateLimiter:
                         logging.debug(f"[RATE] {phone} join cooldown {wait:.0f}s")
                         await asyncio.sleep(wait)
 
-                # Log to DB
-                await self.db.log_operation(phone, 'join')
+                # === RESERVE ONLY — do NOT log_operation yet ===
+                # Will be confirmed by record_success() after API succeeds
             else:
                 # Non-join: Memory only (less critical)
                 key = (phone, operation)
@@ -261,16 +317,30 @@ class RateLimiter:
                         logging.debug(f"[RATE] {phone} waiting {wait:.1f}s before {operation}")
                         await asyncio.sleep(wait)
 
-                # Log membership_check to DB too
+                # Log membership_check to DB (these are read-only, safe to count immediately)
                 if operation == 'membership_check':
                     await self.db.log_operation(phone, 'membership_check')
 
-            # 4. Record in Memory
+            # 4. Record reservation in Memory (timestamp marks attempt)
             key = (phone, operation)
             if key not in self._requests:
                 self._requests[key] = []
             self._requests[key].append(time.time())
             return True
+
+    async def record_success(self, phone: str, operation: str = 'generic'):
+        """سجل نجاح العملية في DB — استدعِها فقط بعد نجاح Telegram API.
+
+        هذا يفصل بين "reservation" (acquire) و "confirmation" (record_success).
+        العمليات الفاشلة لا تُسجل في DB، فلا تضخم العدادات.
+        """
+        if operation in ('join', 'join_channel', 'import_invite'):
+            # سجل كـ 'join' موحد — كل أنواع الانضمام تشترك في الحد
+            try:
+                await self.db.log_operation(phone, 'join')
+                logging.debug(f"[RATE] {phone} recorded successful {operation}")
+            except Exception as e:
+                logging.error(f"[RATE] Failed to record operation: {e}")
 
     async def record_floodwait(self, phone: str, seconds: int):
         """سجل FloodWait في قاعدة البيانات."""
@@ -394,9 +464,24 @@ class MembershipCache:
             # Get entity (1 API call)
             entity = await client.get_entity(username)
 
-            # Check if it's a user (not a group/channel)
-            if hasattr(entity, 'first_name') and not hasattr(entity, 'megagroup') and not hasattr(entity, 'broadcast'):
-                return True  # User, treat as member
+            # === DISTINGUISH ENTITY TYPES ===
+            # User: has first_name, no broadcast, no megagroup → NOT a joinable target
+            # Channel: broadcast=True → broadcast channel
+            # Megagroup: megagroup=True → supergroup (joinable)
+            # Gigagroup: gigagroup=True → broadcast-style group (joinable)
+            # Regular Chat: no broadcast, no megagroup → basic group
+
+            is_user = (
+                hasattr(entity, 'first_name') and entity.first_name
+                and not hasattr(entity, 'megagroup')
+                and not hasattr(entity, 'broadcast')
+                and not hasattr(entity, 'gigagroup')
+            )
+
+            if is_user:
+                # Entity is a USER, not a group/channel — cannot be "member" of a user
+                logging.debug(f"[CACHE] {phone} → {normalized_link} = USER (not a group)")
+                return None  # Not applicable, don't cache
 
             # Check membership (1 API call)
             try:
@@ -407,14 +492,15 @@ class MembershipCache:
             except FloodWaitError as e:
                 await self.rate_limiter.record_floodwait(phone, e.seconds)
                 return None
-            except Exception:
+            except Exception as e:
+                logging.debug(f"[CACHE] GetParticipant failed for {phone}: {type(e).__name__}: {e}")
                 return None
 
         except FloodWaitError as e:
             await self.rate_limiter.record_floodwait(phone, e.seconds)
             return None
         except Exception as e:
-            logging.debug(f"[CACHE] API check failed for {phone}: {e}")
+            logging.debug(f"[CACHE] API check failed for {phone}: {type(e).__name__}: {e}")
             return None
 
     def invalidate(self, phone: str = None, normalized_link: str = None):
