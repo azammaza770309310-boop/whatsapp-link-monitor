@@ -306,7 +306,7 @@ async def test_f_publish_failure():
 
         # Verify queue status kept as QUEUED on publish failure
         record("F4: Queue kept as QUEUED on publish failure",
-               "queue_status kept as QUEUED for retry" in source,
+               "queue kept as QUEUED for retry" in source,
                "queue not marked DONE on publish failure")
 
         # Verify continue (no join attempt after publish failure)
