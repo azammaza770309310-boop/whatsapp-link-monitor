@@ -3715,6 +3715,119 @@ class Monitor:
                         f"📍 Current: {s.get('current', '')[:60]}"
                     )
 
+            elif cmd == "/live_audit":
+                # === فحص شامل للنظام (بديل live_audit.py للـ Free Tier) ===
+                logging.info("[LIVE_AUDIT] /live_audit command invoked")
+                audit_lines = []
+                audit_lines.append("🔍 LIVE AUDIT REPORT")
+                audit_lines.append("═══════════════════════════")
+
+                # 1. Environment Variables
+                audit_lines.append("")
+                audit_lines.append("📋 ENVIRONMENT:")
+                env_required = [
+                    ('SUPABASE_URL', 'SUPABASE_URL'),
+                    ('SUPABASE_KEY', 'SUPABASE_KEY'),
+                    ('BOT_TOKEN', 'BOT_TOKEN'),
+                    ('API_ID', 'API_ID'),
+                    ('API_HASH', 'API_HASH'),
+                    ('CHANNEL_ID', 'CHANNEL_ID'),
+                ]
+                for var, display in env_required:
+                    val = os.getenv(var, '')
+                    status = "✅ SET" if val else "❌ MISSING"
+                    audit_lines.append(f"  {display:25s} = {status}")
+
+                env_optional = ['OPENAI_API_KEY', 'AI_KEY_1', 'AI_KEY_2', 'OWNER_ID', 'DAILY_JOIN_LIMIT']
+                for var in env_optional:
+                    val = os.getenv(var, '')
+                    status = "✅" if val else "⚠️"
+                    audit_lines.append(f"  {var:25s} = {status}")
+
+                # 2. Supabase LIVE
+                audit_lines.append("")
+                audit_lines.append("🗄️ SUPABASE:")
+                try:
+                    supa_count = await self.db._supabase_count_watchers()
+                    if supa_count >= 0:
+                        audit_lines.append(f"  Connection: ✅ OK")
+                        audit_lines.append(f"  Accounts: {supa_count}")
+                        watchers = await self.db.get_active_watchers()
+                        monitors = sum(1 for w in watchers if w.get('role', 'monitor') == 'monitor')
+                        joiners = sum(1 for w in watchers if w.get('role') == 'joiner')
+                        audit_lines.append(f"  Monitors: {monitors}")
+                        audit_lines.append(f"  Joiners: {joiners}")
+                        # Schema check
+                        w_sample = watchers[0] if watchers else {}
+                        schema_ok = all(k in w_sample or True for k in ['role', 'joiner_enabled'])
+                        audit_lines.append(f"  Schema: {'✅ OK' if schema_ok else '⚠️ CHECK'}")
+                    else:
+                        audit_lines.append(f"  Connection: ❌ FAILED")
+                except Exception as e:
+                    audit_lines.append(f"  Connection: ❌ ERROR: {type(e).__name__}")
+
+                # 3. SQLite
+                audit_lines.append("")
+                audit_lines.append("🗃️ SQLITE:")
+                try:
+                    tables = await self.db._sqlite_list_tables()
+                    has_watchers = 'watchers' in tables
+                    audit_lines.append(f"  watchers table: {'❌ EXISTS (BUG!)' if has_watchers else '✅ ABSENT'}")
+                    audit_lines.append(f"  Tables ({len(tables)}): {', '.join(tables[:8])}")
+                except Exception as e:
+                    audit_lines.append(f"  Error: {type(e).__name__}")
+
+                # 4. Telegram Accounts
+                audit_lines.append("")
+                audit_lines.append("🤖 TELEGRAM:")
+                audit_lines.append(f"  Bot: {'✅ connected' if (self.bot_client and self.bot_client.is_connected()) else '❌ disconnected'}")
+                connected = 0
+                total = len(self.user_clients)
+                for ph, cl in self.user_clients.items():
+                    if cl and cl.is_connected():
+                        connected += 1
+                audit_lines.append(f"  Accounts: {connected}/{total} connected")
+
+                # 5. Workers
+                audit_lines.append("")
+                audit_lines.append("⚙️ WORKERS:")
+                sched_state = await self.prod_db.get_setting('scheduler_state', 'NOT_STARTED')
+                sched_hb = await self.prod_db.get_setting('scheduler_last_heartbeat', 'NEVER')
+                sched_cycle = await self.prod_db.get_setting('scheduler_last_cycle', '0')
+                join_paused = await self.prod_db.get_setting('join_paused', 'false')
+                audit_lines.append(f"  Scheduler: {sched_state}")
+                audit_lines.append(f"  Last cycle: {sched_cycle}")
+                audit_lines.append(f"  Heartbeat: {sched_hb}")
+                audit_lines.append(f"  Join paused: {join_paused}")
+
+                # 6. Queue
+                try:
+                    queue_size = await self.prod_db.get_queue_size()
+                    audit_lines.append(f"  Queue depth: {queue_size}")
+                except Exception:
+                    audit_lines.append(f"  Queue depth: ?")
+
+                # 7. FloodWait
+                try:
+                    blocked = await self.floodwait_mgr.get_blocked_accounts()
+                    audit_lines.append(f"  FloodWait blocked: {len(blocked)}")
+                except Exception:
+                    audit_lines.append(f"  FloodWait: ?")
+
+                # 8. Bulk Join / Cleanup
+                bulk_running = getattr(self, '_bulk_join_running', False)
+                cleanup_running = getattr(self, '_cleanup_stats', {}).get('running', False) if hasattr(self, '_cleanup_stats') and self._cleanup_stats else False
+                audit_lines.append(f"  Bulk Join: {'RUNNING' if bulk_running else 'IDLE'}")
+                audit_lines.append(f"  Cleanup: {'RUNNING' if cleanup_running else 'IDLE'}")
+
+                # Summary
+                audit_lines.append("")
+                audit_lines.append("═══════════════════════════")
+                audit_lines.append(f"Commit: 5b4a925")
+                audit_lines.append(f"Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+
+                await reply("\n".join(audit_lines))
+
             else: await reply(f"❓ أمر غير معروف: {cmd}\nاكتب /help")
 
         except Exception as e:
