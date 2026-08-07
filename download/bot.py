@@ -3770,11 +3770,13 @@ class Monitor:
         await asyncio.sleep(30)  # انتظر البوت يكمل الإقلاع
         logging.info("🔄 Production Scheduler started — runs every 60s")
 
+        cycle = 0
         while self._running:
+            cycle += 1
             try:
                 # Emergency Control: لو الانضمام متوقف → انتظر بس
                 if self._join_paused:
-                    logging.debug("[SCHED] Join paused (/pause_join) — sleeping 60s")
+                    logging.info(f"[SCHED] cycle={cycle} ⏸️ Join PAUSED — sleeping 60s (send /resume_join or /clear_floodwait)")
                     await asyncio.sleep(60)
                     continue
 
@@ -3785,6 +3787,7 @@ class Monitor:
                 # 1. اجلب رابط QUEUED واحد (لا burst)
                 queued = await self.prod_db.get_queued_links(limit=1)
                 if not queued:
+                    logging.info(f"[SCHED] cycle={cycle} Queue empty (size=0) — sleeping 60s")
                     await asyncio.sleep(60)
                     continue
 
@@ -3794,7 +3797,7 @@ class Monitor:
                 link_type = link_data['link_type']
 
                 # === PIPELINE STAGE 3: Scheduler read link from queue ===
-                logging.info(f"[PIPELINE-3] 🔄 Scheduler picked link from queue: {raw_link[:60]} (id={link_data.get('id')}, type={link_type})")
+                logging.info(f"[PIPELINE-3] 🔄 cycle={cycle} Scheduler picked link from queue: {raw_link[:60]} (id={link_data.get('id')}, type={link_type})")
 
                 # 2. تحقق من حالة المجموعة في State Machine
                 state = await self.prod_db.get_group_state(normalized)
@@ -3850,7 +3853,7 @@ class Monitor:
                 # 5. اختر حساب فدائي: غير محظور + ضمن Daily Budget
                 joiners = await self.db.get_watchers_by_role("joiner")
                 if not joiners:
-                    logging.warning("[SCHED] ⚠️ No joiner accounts! Use /set_role <phone> joiner to designate one")
+                    logging.warning(f"[SCHED] cycle={cycle} ⚠️ No joiner accounts! Use /set_role <phone> joiner to designate one")
                     await asyncio.sleep(60)
                     continue
 
@@ -3859,19 +3862,19 @@ class Monitor:
                     jphone = joiner['phone']
                     is_blocked, wait = await self.floodwait_mgr.is_blocked(jphone)
                     if is_blocked:
-                        logging.debug(f"[SCHED] {jphone} blocked for {wait}s more")
+                        logging.info(f"[SCHED] cycle={cycle} {jphone} blocked for {wait}s more (FloodWait)")
                         continue
                     await self.db.reset_daily_joins_if_needed(jphone)
                     daily_joins = await self.db.get_daily_join_count(jphone)
                     daily_limit = await self._get_daily_limit(jphone)
                     if daily_joins >= daily_limit:
-                        logging.debug(f"[SCHED] {jphone} daily limit ({daily_joins}/{daily_limit})")
+                        logging.info(f"[SCHED] cycle={cycle} {jphone} daily limit ({daily_joins}/{daily_limit})")
                         continue
                     selected_joiner = joiner
                     break
 
                 if not selected_joiner:
-                    logging.info("[SCHED] All joiners blocked/limited — sleeping 60s")
+                    logging.info(f"[SCHED] cycle={cycle} All joiners blocked/limited — sleeping 60s")
                     await asyncio.sleep(60)
                     continue
 
