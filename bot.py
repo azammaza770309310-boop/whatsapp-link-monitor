@@ -2890,6 +2890,54 @@ class Monitor:
                 await self._handle_login_step(event, sender, text)
                 return
 
+            # === الأوامر الإدارية (تعمل في الخاص والقناة) ===
+            # Owner only — تحقق من الصلاحية
+            is_owner = (self.config.owner_id is None or sender_id == self.config.owner_id)
+
+            if is_owner:
+                # إنشاء event صناعي ليتم معالجته بواسطة _on_command
+                # (يحتوي على نفس خصائص event القناة)
+                cmd = text.split()[0] if text.split() else ''
+                logging.info(f"[PRIVATE CMD] {sender_id}: {cmd}")
+
+                async def private_reply(t):
+                    try: await event.reply(t)
+                    except Exception as e:
+                        logging.error(f"[PRIVATE CMD] reply failed: {e}")
+
+                # إعادة توجيه الأوامر الإدارية لمعالج القناة
+                admin_commands = [
+                    '/pause_join', '/resume_join', '/set_role',
+                    '/enable_joiner', '/disable_joiner', '/join_status',
+                    '/verify', '/sqlite_check', '/clear_floodwait',
+                    '/bulk_join', '/bulk_join_status', '/bulk_join_stop',
+                    '/cleanup_preview', '/cleanup_links', '/cleanup_status',
+                    '/live_audit', '/status', '/watchers', '/help',
+                ]
+
+                if cmd in admin_commands:
+                    # معالجة مباشرة — استدعِ _on_command مع event معدّل
+                    # أنشئ كائن يشبه event القناة
+                    class FakeEvent:
+                        def __init__(self, orig_event, text):
+                            self.raw_text = text
+                            self.text = text
+                            self.message = orig_event.message
+                            self.chat_id = orig_event.chat_id
+                            self.sender_id = orig_event.sender_id
+                            self._sender = None
+                        async def get_sender(self):
+                            return sender
+                        async def reply(self, t):
+                            await event.reply(t)
+                        async def answer(self, msg='', alert=False):
+                            try: await event.reply(msg)
+                            except: pass
+
+                    fake_event = FakeEvent(event, text)
+                    await self._on_command(fake_event)
+                    return
+
             # رسالة غير معروفة
             await event.reply(
                 "🤖 أهلاً!\n\n"
@@ -2897,7 +2945,8 @@ class Monitor:
                 "• /start - البدء\n"
                 "• /login - تسجيل الدخول بحسابك\n"
                 "• /status - حالتك\n"
-                "• /cancel - إلغاء العملية"
+                "• /cancel - إلغاء العملية\n\n"
+                "💡 اكتب Boot لفتح القائمة الرئيسية"
             )
 
         except Exception as e:
