@@ -53,3 +53,5 @@ server.log
 # Skills directory
 /skills/__pycache__/
 *.pyc
+.secrets/
+accounts.env
