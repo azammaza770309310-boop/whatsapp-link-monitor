@@ -3247,8 +3247,10 @@ class Monitor:
                 except FloodWaitError as e:
                     await asyncio.sleep(e.seconds + 1)
                     try: await self.bot_client.send_message(self.config.channel_id, t)
-                    except Exception: pass
-                except Exception: pass
+                    except Exception as e2:
+                        logging.error(f"[CMD] reply failed after FloodWait: {type(e2).__name__}: {e2}")
+                except Exception as e:
+                    logging.error(f"[CMD] reply failed: {type(e).__name__}: {e}")
 
             if cmd == "/help": await reply(MessageFormatter.format_help())
 
@@ -3953,18 +3955,19 @@ class Monitor:
                 link_type = link_data['link_type']
 
                 # === PIPELINE STAGE 3: Scheduler read link from queue ===
-                logging.info(f"[PIPELINE-3] 🔄 cycle={cycle} Scheduler picked link from queue: {raw_link[:60]} (id={link_data.get('id')}, type={link_type})")
+                link_id = link_data.get('id', '?')
+                logging.info(f"[LINK id={link_id}] [PIPELINE-3] 🔄 cycle={cycle} Scheduler picked link: {raw_link[:60]} (type={link_type})")
 
                 # 2. تحقق من حالة المجموعة في State Machine
                 state = await self.prod_db.get_group_state(normalized)
                 if state in (GroupState.JOINED, GroupState.ALREADY_MEMBER):
-                    logging.info(f"[PIPELINE-3] ⏭️ {normalized[:50]} already {state} — skipping")
+                    logging.info(f"[LINK id={link_id}] [PIPELINE-3] ⏭️ already {state} — skipping")
                     await self.prod_db.update_queue_status(link_data['id'], 'DONE')
                     await self.metrics.record_skip('already_joined')
                     continue
 
                 if state == GroupState.BANNED:
-                    logging.info(f"[PIPELINE-3] ⏭️ {normalized[:50]} is BANNED — skipping")
+                    logging.info(f"[LINK id={link_id}] [PIPELINE-3] ⏭️ BANNED — skipping")
                     await self.prod_db.update_queue_status(link_data['id'], 'DONE')
                     await self.metrics.record_skip('banned')
                     continue
@@ -3972,15 +3975,15 @@ class Monitor:
                 # 3. AI فحص الرابط (فقط لو DISCOVERED ولم يُفحص سابقاً)
                 if state == GroupState.DISCOVERED or state is None:
                     # === PIPELINE STAGE 4: AI verification ===
-                    logging.info(f"[PIPELINE-4] 🤖 AI verifying link: {raw_link[:60]}")
+                    logging.info(f"[LINK id={link_id}] [PIPELINE-4] 🤖 AI verifying link: {raw_link[:60]}")
                     ai_result = await self.ai_analyzer.analyze_message(link_data.get('message_text', ''))
                     if not ai_result.get('should_save', False):
-                        logging.info(f"[PIPELINE-4] ❌ AI REJECTED link: {raw_link[:60]} (reason: {ai_result.get('reason', 'unknown')})")
+                        logging.info(f"[LINK id={link_id}] [PIPELINE-4] ❌ AI REJECTED (reason: {ai_result.get('reason', 'unknown')})")
                         await self.prod_db.set_group_state(normalized, GroupState.INVALID, raw_link, error='AI rejected')
                         await self.prod_db.update_queue_status(link_data['id'], 'REJECTED')
                         await self.metrics.record_skip('ai_rejected')
                         continue
-                    logging.info(f"[PIPELINE-4] ✅ AI APPROVED link: {raw_link[:60]}")
+                    logging.info(f"[LINK id={link_id}] [PIPELINE-4] ✅ AI APPROVED")
                     await self.prod_db.set_group_state(normalized, GroupState.QUEUED, raw_link)
 
                     # === PIPELINE STAGE 5: Publish to channel ===
@@ -4003,23 +4006,19 @@ class Monitor:
                         published, msg_id = await self._send(formatted, buttons=buttons)
                         if published:
                             logging.info(
-                                f"[PIPELINE-5] ✅ PUBLISHED_VERIFIED to channel\n"
-                                f"[PIPELINE-5] message_id={msg_id}\n"
-                                f"[PIPELINE-5] link={raw_link[:60]}"
+                                f"[LINK id={link_id}] [PIPELINE-5] ✅ PUBLISHED_VERIFIED message_id={msg_id}"
                             )
                         else:
                             # فشل النشر — لا نعتبر العملية ناجحة
                             logging.error(
-                                f"[PIPELINE-5] ❌ PUBLISH_FAILED\n"
-                                f"[PIPELINE-5] link={raw_link[:60]}\n"
-                                f"[PIPELINE-5] queue_status kept as QUEUED for retry"
+                                f"[LINK id={link_id}] [PIPELINE-5] ❌ PUBLISH_FAILED — queue kept as QUEUED for retry"
                             )
                             # أعد الرابط للقائمة لإعادة المحاولة بعد 5 دقائق
                             await self.prod_db.update_queue_status(link_data['id'], 'QUEUED',
                                                                    next_retry=datetime.now() + timedelta(minutes=5))
                             continue  # لا تتابع للانضمام لو فشل النشر
                     else:
-                        logging.info(f"[PIPELINE-5] ⏭️ Already published (duplicate): {raw_link[:60]}")
+                        logging.info(f"[LINK id={link_id}] [PIPELINE-5] ⏭️ Already published (duplicate)")
 
                 # 4. Group Reputation — تم إزالته (تخفيف)
                 # كان يمنع الانضمام للمجموعات الجديدة، الآن مسموح للجميع
@@ -4079,10 +4078,10 @@ class Monitor:
 
                 # 8. Safety Guard — 6 فحوصات صارمة قبل أي API call
                 # === PIPELINE STAGE 6: Safety Guard + Joiner attempt ===
-                logging.info(f"[PIPELINE-6] 🛡️ Safety Guard checking {phone} for {raw_link[:60]}")
+                logging.info(f"[LINK id={link_id}] [PIPELINE-6] 🛡️ Safety Guard checking {phone} for {raw_link[:60]}")
                 guard_ok, guard_reason = await self._safety_guard(phone, normalized, link_data)
                 if not guard_ok:
-                    logging.info(f"[PIPELINE-6] 🚫 Safety Guard BLOCKED {phone} from joining {raw_link[:60]}: {guard_reason}")
+                    logging.info(f"[LINK id={link_id}] [PIPELINE-6] 🚫 Safety Guard BLOCKED {phone} from joining {raw_link[:60]}: {guard_reason}")
                     await self.metrics.record_skip(f'guard_{guard_reason}')
                     # لو الحظر بسبب FloodWait → استخدم next_retry_at من DB (مو 30 دقيقة ثابتة)
                     if 'floodwait' in guard_reason:
@@ -4091,7 +4090,7 @@ class Monitor:
                             next_retry_dt = datetime.fromtimestamp(floodwait_until)
                             await self.prod_db.update_queue_status(link_data['id'], 'QUEUED',
                                                                    next_retry=next_retry_dt)
-                            logging.info(f"[PIPELINE-6] FloodWait retry after {next_retry_dt.strftime('%H:%M:%S')}")
+                            logging.info(f"[LINK id={link_id}] [PIPELINE-6] FloodWait retry after {next_retry_dt.strftime('%H:%M:%S')}")
                         else:
                             await self.prod_db.update_queue_status(link_data['id'], 'QUEUED',
                                                                    next_retry=datetime.now() + timedelta(minutes=30))
@@ -4101,7 +4100,7 @@ class Monitor:
                                                                next_retry=datetime.now() + timedelta(minutes=30))
                     await asyncio.sleep(60)
                     continue
-                logging.info(f"[PIPELINE-6] ✅ Safety Guard PASSED for {phone}")
+                logging.info(f"[LINK id={link_id}] [PIPELINE-6] ✅ Safety Guard PASSED for {phone}")
 
                 # 9. سجل محاولة الانضمام
                 await self.metrics.record_join_attempt(phone)
@@ -4111,7 +4110,7 @@ class Monitor:
                 await self.prod_db.update_queue_status(link_data['id'], 'PROCESSING')
 
                 # 11. انضمام
-                logging.info(f"[PIPELINE-6] 🚀 Joiner {phone} attempting to join: {raw_link[:60]}")
+                logging.info(f"[LINK id={link_id}] [PIPELINE-6] 🚀 Joiner {phone} attempting to join: {raw_link[:60]}")
                 success, status, member_count = await self._join_group_safe(client, link_data, phone)
 
                 # === SINGLE QUEUE STATE UPDATE ===
@@ -4128,7 +4127,7 @@ class Monitor:
                     await self.metrics.record_join_success(phone)
                     await self.db.increment_joiner_stats(phone, success=True)
                     logging.info(
-                        f"[PIPELINE-6] ✅✅ {phone} JOINED_VERIFIED: {raw_link[:60]} "
+                        f"[LINK id={link_id}] [PIPELINE-6] ✅✅ {phone} JOINED_VERIFIED: {raw_link[:60]} "
                         f"(members={member_count})"
                     )
 
@@ -4140,7 +4139,7 @@ class Monitor:
                     await self.metrics.record_join_success(phone)
                     await self.db.increment_joiner_stats(phone, success=True)
                     logging.warning(
-                        f"[PIPELINE-6] ⚠️ {phone} JOIN_UNVERIFIED: {raw_link[:60]} "
+                        f"[LINK id={link_id}] [PIPELINE-6] ⚠️ {phone} JOIN_UNVERIFIED: {raw_link[:60]} "
                         f"(Telegram accepted but membership not confirmed)"
                     )
 
@@ -4148,7 +4147,7 @@ class Monitor:
                     state_to_set = GroupState.ALREADY_MEMBER
                     final_status = 'DONE'
                     await self.metrics.record_membership_skip()
-                    logging.info(f"[PIPELINE-6] ℹ️ {phone} already member: {raw_link[:60]}")
+                    logging.info(f"[LINK id={link_id}] [PIPELINE-6] ℹ️ {phone} already member: {raw_link[:60]}")
 
                 elif status == "FLOODWAIT":
                     state_to_set = GroupState.FLOODWAIT
@@ -4172,53 +4171,53 @@ class Monitor:
                 elif status == "RATE_LIMITED":
                     final_status = 'QUEUED'
                     next_retry = datetime.now() + timedelta(minutes=10)
-                    logging.info(f"[PIPELINE-6] ⏳ {phone} rate limited — retry in 10 min")
+                    logging.info(f"[LINK id={link_id}] [PIPELINE-6] ⏳ {phone} rate limited — retry in 10 min")
 
                 elif status == "TIMEOUT":
                     state_to_set = GroupState.FAILED
                     state_error = 'TIMEOUT'
                     final_status = 'QUEUED'
                     next_retry = datetime.now() + timedelta(minutes=5)
-                    logging.info(f"[PIPELINE-6] ⏰ {phone} join timed out — retry in 5 min")
+                    logging.info(f"[LINK id={link_id}] [PIPELINE-6] ⏰ {phone} join timed out — retry in 5 min")
 
                 elif status == "DISCONNECTED":
                     final_status = 'QUEUED'
                     next_retry = datetime.now() + timedelta(minutes=2)
-                    logging.warning(f"[PIPELINE-6] ❌ {phone} client disconnected — retry in 2 min")
+                    logging.warning(f"[LINK id={link_id}] [PIPELINE-6] ❌ {phone} client disconnected — retry in 2 min")
 
                 elif status in ("MONITOR_NO_JOIN", "JOINER_DISABLED", "PAUSED", "SIMULATION"):
                     final_status = 'QUEUED'
                     next_retry = datetime.now() + timedelta(minutes=1)
-                    logging.warning(f"[PIPELINE-6] ⚠️ {phone} {status} — skipping")
+                    logging.warning(f"[LINK id={link_id}] [PIPELINE-6] ⚠️ {phone} {status} — skipping")
 
                 elif status == "INVALID":
                     state_to_set = GroupState.FAILED
                     state_error = 'invalid_link'
                     final_status = 'DONE'  # فشل نهائي
-                    logging.info(f"[PIPELINE-6] ❌ invalid link (no username) — skipping")
+                    logging.info(f"[LINK id={link_id}] [PIPELINE-6] ❌ invalid link (no username) — skipping")
 
                 elif status == "SKIP":
                     final_status = 'DONE'  # WhatsApp — لا انضمام
-                    logging.info(f"[PIPELINE-6] ⏭️ WhatsApp link — no join needed")
+                    logging.info(f"[LINK id={link_id}] [PIPELINE-6] ⏭️ WhatsApp link — no join needed")
 
                 elif status == "IS_CHANNEL":
                     state_to_set = GroupState.FAILED
                     state_error = 'is_channel'
                     final_status = 'DONE'
-                    logging.info(f"[PIPELINE-6] 📢 Skipped channel (broadcast): {raw_link[:50]}")
+                    logging.info(f"[LINK id={link_id}] [PIPELINE-6] 📢 Skipped channel (broadcast): {raw_link[:50]}")
 
                 elif status == "PRIVATE":
                     state_to_set = GroupState.PRIVATE
                     state_error = 'Channel private'
                     final_status = 'DONE'  # فشل نهائي
-                    logging.info(f"[PIPELINE-6] 🔒 private channel: {raw_link[:50]}")
+                    logging.info(f"[LINK id={link_id}] [PIPELINE-6] 🔒 private channel: {raw_link[:50]}")
 
                 else:  # FAILED أو أي حال أخرى
                     state_to_set = GroupState.FAILED
                     state_error = status
                     final_status = 'QUEUED'
                     next_retry = datetime.now() + timedelta(minutes=30)
-                    logging.warning(f"[PIPELINE-6] ❌ {phone} {status}: {raw_link[:60]}")
+                    logging.warning(f"[LINK id={link_id}] [PIPELINE-6] ❌ {phone} {status}: {raw_link[:60]}")
 
                 # === UPDATE STATE MACHINE ONCE ===
                 if state_to_set:
@@ -4425,7 +4424,8 @@ class Monitor:
                                 self._bulk_join_stats['joined'] += 1
                                 await self.prod_db.set_group_state(normalized, GroupState.JOINED, raw_link,
                                                                    joined_by=joiner_phone, member_count=member_count)
-                                logging.info(f"[BULK_JOIN] ✅ JOINED: {raw_link[:50]}")
+                                # استخدم الحالة الفعلية (JOINED_VERIFIED أو JOIN_UNVERIFIED)
+                                logging.info(f"[BULK_JOIN] ✅ {status}: {raw_link[:50]}")
                             elif status == "ALREADY_MEMBER":
                                 self._bulk_join_stats['already'] += 1
                                 await self.prod_db.set_group_state(normalized, GroupState.ALREADY_MEMBER, raw_link,
@@ -5410,7 +5410,16 @@ async def main():
     await monitor.start()
     http_runner = await start_http_server(monitor=monitor, db=db)
 
-    logging.info("✅ Monitor started. Send /help to channel.")
+    # انتظر قليلاً ثم تحقق من الاتصال الفعلي
+    await asyncio.sleep(5)
+    connected_count = sum(1 for c in monitor.user_clients.values() if c and c.is_connected())
+    total_accounts = len(monitor.user_clients)
+    if connected_count == total_accounts and total_accounts > 0:
+        logging.info(f"✅ Monitor started — {connected_count}/{total_accounts} accounts connected")
+    elif connected_count > 0:
+        logging.warning(f"⚠️ Monitor started — {connected_count}/{total_accounts} accounts connected (some failed)")
+    else:
+        logging.error(f"❌ Monitor started but 0 accounts connected — check sessions")
 
     shutdown = asyncio.Event()
     def sh(): shutdown.set()
