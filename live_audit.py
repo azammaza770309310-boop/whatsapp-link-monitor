@@ -137,7 +137,8 @@ async def check_supabase_live():
                     role = w.get('role', 'monitor')
                     enabled = w.get('joiner_enabled', 1)
                     health = w.get('health_score', 100)
-                    print(f"    → {phone} (role={role}, joiner_enabled={enabled}, health={health})")
+                    masked = phone[:4] + '***' + phone[-4:] if len(phone) > 8 else phone
+                    print(f"    → {masked} (role={role}, joiner_enabled={enabled}, health={health})")
             else:
                 text = await resp.text()
                 print(f"  ❌ Supabase fetch failed: {resp.status} - {text[:100]}")
@@ -272,7 +273,8 @@ async def check_telegram_accounts():
             role = w.get('role', 'monitor')
             session_string = w.get('session_string', '')
 
-            print(f"\n  [ACCOUNT] {phone} role={role}")
+            masked_phone = phone[:4] + '***' + phone[-4:] if len(phone) > 8 else phone
+            print(f"\n  [ACCOUNT] {masked_phone} role={role}")
 
             if not session_string or len(session_string) < 50:
                 print(f"    ❌ STATUS=FAILED reason=invalid_session")
@@ -315,7 +317,7 @@ async def check_telegram_accounts():
                 # IDENTITY VERIFICATION
                 # Verify the phone matches what we expect
                 # (Telegram doesn't always expose phone, but we can check user_id)
-                print(f"    IDENTITY phone={phone} telegram_id={me.id}")
+                print(f"    IDENTITY phone={masked_phone} telegram_id={me.id}")
 
                 # HANDLERS (monitors only)
                 if role == 'monitor':
@@ -388,7 +390,8 @@ async def check_worker_health():
             print(f"  [FLOODWAIT] {len(blocked)} accounts blocked:")
             for b in blocked:
                 wait = int(b['next_retry_at'] - __import__('time').time())
-                print(f"    → {b['phone']}: {wait}s remaining")
+                masked_b = b['phone'][:4] + '***' + b['phone'][-4:] if len(b['phone']) > 8 else b['phone']
+                print(f"    → {masked_b}: {wait}s remaining")
         else:
             print(f"  [FLOODWAIT] 0 accounts blocked ✅")
 
