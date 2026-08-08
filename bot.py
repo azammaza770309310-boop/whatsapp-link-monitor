@@ -5448,6 +5448,141 @@ async def health_handler(request):
     return web.Response(text="✅ Bot is running", status=200)
 
 
+async def api_joined_groups_handler(request):
+    """API endpoint: returns all joined groups from SQLite group_states.
+
+    This is the REAL data source for the dashboard — not Supabase target_groups.
+    The bot stores join results in SQLite group_states table.
+    """
+    monitor = request.app.get("monitor")
+    db = request.app.get("db")
+    if not monitor or not db:
+        return web.json_response({"error": "not ready"}, status=503)
+
+    try:
+        conn = await db._ensure_conn()
+
+        # Joined groups
+        cursor = await conn.execute(
+            "SELECT normalized_link, raw_link, joined_by, member_count, last_seen, last_error, state "
+            "FROM group_states WHERE state IN ('JOINED', 'ALREADY_MEMBER') ORDER BY last_seen DESC LIMIT 100")
+        joined_rows = await cursor.fetchall()
+
+        groups = []
+        for r in joined_rows:
+            groups.append({
+                "id": len(groups) + 1,
+                "group_title": r[0] or '',
+                "group_link": r[1] or '',
+                "status": r[6] or 'JOINED',
+                "joined_by_phone": r[2] or '',
+                "join_date": r[4] or '',
+                "member_count": r[3] or 0,
+            })
+
+        # Stats
+        cursor = await conn.execute(
+            "SELECT COUNT(*) FROM group_states WHERE state = 'JOINED'")
+        total_joined = (await cursor.fetchone())[0]
+
+        cursor = await conn.execute(
+            "SELECT COUNT(*) FROM link_queue WHERE status = 'QUEUED'")
+        pending = (await cursor.fetchone())[0]
+
+        # Active joiners from Supabase
+        try:
+            joiners = await db.get_watchers_by_role("joiner")
+            active_joiners = len(joiners)
+        except Exception:
+            active_joiners = 0
+
+        return web.json_response({
+            "joined_groups": groups,
+            "stats": {
+                "total_joined": total_joined,
+                "pending_groups": pending,
+                "active_joiners": active_joiners,
+            }
+        }, status=200, headers={"Access-Control-Allow-Origin": "*"})
+
+    except Exception as e:
+        logging.error(f"[API] joined_groups error: {e}")
+        return web.json_response({"error": str(e)}, status=500,
+                                 headers={"Access-Control-Allow-Origin": "*"})
+
+
+async def api_links_handler(request):
+    """API endpoint: returns recent published links from Supabase."""
+    db = request.app.get("db")
+    if not db:
+        return web.json_response({"error": "not ready"}, status=503)
+
+    try:
+        limit = int(request.query.get("limit", "50"))
+        offset = int(request.query.get("offset", "0"))
+
+        if not db.supabase_url or not db.supabase_key:
+            return web.json_response({"links": [], "error": "supabase not configured"},
+                                     status=200, headers={"Access-Control-Allow-Origin": "*"})
+
+        import aiohttp as _aiohttp
+        session = await db._get_supabase_session()
+        headers = {**session.headers, "Range": f"{offset}-{offset + limit - 1}"}
+
+        async with session.get(
+            f"{db.supabase_url}/rest/v1/links?order=created_at.desc&limit={limit}",
+            headers=headers
+        ) as resp:
+            if resp.status == 200:
+                data = await resp.json()
+                return web.json_response({"links": data},
+                                        status=200, headers={"Access-Control-Allow-Origin": "*"})
+            else:
+                return web.json_response({"links": [], "error": f"supabase {resp.status}"},
+                                        status=200, headers={"Access-Control-Allow-Origin": "*"})
+    except Exception as e:
+        return web.json_response({"links": [], "error": str(e)},
+                                status=200, headers={"Access-Control-Allow-Origin": "*"})
+
+
+async def api_stats_handler(request):
+    """API endpoint: returns system stats for dashboard."""
+    monitor = request.app.get("monitor")
+    db = request.app.get("db")
+    if not monitor or not db:
+        return web.json_response({"error": "not ready"}, status=503)
+
+    try:
+        # Total links from Supabase
+        total_links = await db.count_requests() if db else 0
+
+        # Watchers
+        watchers = await db.get_active_watchers()
+        active_watchers = len(watchers)
+
+        # Telegram links vs whatsapp
+        wa_count = 0
+        tg_count = 0
+        for w in watchers:
+            pass  # counts from links table
+
+        # Connected accounts
+        connected = sum(1 for c in monitor.user_clients.values() if c and c.is_connected())
+
+        return web.json_response({
+            "total_links": total_links,
+            "whatsapp_links": 0,
+            "telegram_links": 0,
+            "active_watchers": active_watchers,
+            "connected_accounts": connected,
+            "bot_connected": bool(monitor.bot_client and monitor.bot_client.is_connected()),
+        }, status=200, headers={"Access-Control-Allow-Origin": "*"})
+
+    except Exception as e:
+        return web.json_response({"error": str(e)}, status=500,
+                                 headers={"Access-Control-Allow-Origin": "*"})
+
+
 async def ready_handler(request):
     """Readiness probe — returns 200 only if DB is reachable AND bot is connected.
 
@@ -5550,11 +5685,14 @@ async def start_http_server(monitor=None, db=None):
     app.router.add_get("/health", health_handler)      # liveness
     app.router.add_get("/ready", ready_handler)        # readiness
     app.router.add_get("/metrics", metrics_handler)    # Prometheus metrics
+    app.router.add_get("/api/joined_groups", api_joined_groups_handler)
+    app.router.add_get("/api/links", api_links_handler)
+    app.router.add_get("/api/stats", api_stats_handler)
     runner = web.AppRunner(app)
     await runner.setup()
     site = web.TCPSite(runner, "0.0.0.0", port)
     await site.start()
-    logging.info(f"HTTP server listening on port {port} (endpoints: /health /ready /metrics)")
+    logging.info(f"HTTP server listening on port {port} (endpoints: /health /ready /metrics /api/joined_groups /api/links /api/stats)")
     return runner
 
 
