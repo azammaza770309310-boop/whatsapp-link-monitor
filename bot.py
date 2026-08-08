@@ -4026,8 +4026,20 @@ class Monitor:
             logging.info(f"[CLEANUP] Removed user_client for {phone}")
         # Also invalidate dialog cache for this phone
         self.db.invalidate_dialogs_cache(phone)
-        # Remove from startup scan tracking (so a re-login can re-scan)
-        self._startup_scan_done.discard(phone)
+
+    def _get_any_user_client(self):
+        """يجلب أي user_client متصل (للاستخدام في عمليات get_messages/delete_messages).
+
+        Bot API لا يدعم get_messages (GetHistoryRequest) على القنوات.
+        نحتاج حساب User حقيقي لقراءة وحذف رسائل القناة.
+
+        Returns:
+            TelegramClient متصل، أو None لو لا يوجد
+        """
+        for phone, client in self.user_clients.items():
+            if client and client.is_connected():
+                return client
+        return None
 
     async def _run_startup_scan(self, watcher):
         try:
@@ -4473,9 +4485,14 @@ class Monitor:
                         worker_state = 'RUNNING'
                         continue
 
-                    # اجلب batch من رسائل القناة
+                    # اجلب batch من رسائل القناة — استخدم user_client (Bot API لا يدعم get_messages)
+                    history_client = self._get_any_user_client()
+                    if not history_client:
+                        logging.error("[BULK_JOIN] ❌ No connected user client for get_messages — pausing 60s")
+                        await asyncio.sleep(60)
+                        continue
                     messages = await asyncio.wait_for(
-                        self.bot_client.get_messages(
+                        history_client.get_messages(
                             self.config.channel_id,
                             limit=batch_size,
                             offset_id=offset_id,
@@ -4689,9 +4706,18 @@ class Monitor:
                         self._cleanup_stats['worker_state'] = worker_state
                         continue
 
-                    # اجلب batch من رسائل القناة (الأقدم أولاً)
+                    # اجلب batch من رسائل القناة — استخدم user_client (Bot API لا يدعم get_messages)
+                    history_client = self._get_any_user_client()
+                    if not history_client:
+                        logging.error("[CLEANUP] ❌ No connected user client for get_messages — pausing 30s")
+                        worker_state = 'FAILED'
+                        self._cleanup_stats['worker_state'] = worker_state
+                        await asyncio.sleep(30)
+                        worker_state = 'RUNNING'
+                        self._cleanup_stats['worker_state'] = worker_state
+                        continue
                     messages = await asyncio.wait_for(
-                        self.bot_client.get_messages(
+                        history_client.get_messages(
                             self.config.channel_id,
                             limit=batch_size,
                             offset_id=offset_id,
@@ -4739,7 +4765,7 @@ class Monitor:
                                     # 2. contains target link (we extracted it)
                                     # 3. matches cleanup policy (non-educational)
                                     try:
-                                        await self.bot_client.delete_messages(
+                                        await history_client.delete_messages(
                                             self.config.channel_id, [msg.id])
                                         deleted_count += 1
                                         self._cleanup_stats['deleted'] = deleted_count
@@ -4762,7 +4788,7 @@ class Monitor:
                                 logging.info(f"[CLEANUP] {mode} duplicate msg={msg.id}: {raw_link[:50]}")
                                 if not preview_only:
                                     try:
-                                        await self.bot_client.delete_messages(
+                                        await history_client.delete_messages(
                                             self.config.channel_id, [msg.id])
                                         deleted_count += 1
                                         self._cleanup_stats['deleted'] = deleted_count
