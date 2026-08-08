@@ -2913,6 +2913,7 @@ class Monitor:
                     '/bulk_join', '/bulk_join_status', '/bulk_join_stop',
                     '/cleanup_preview', '/cleanup_links', '/cleanup_status',
                     '/live_audit', '/status', '/watchers', '/help',
+                    '/joined_groups', '/queue',
                 ]
 
                 if cmd in admin_commands:
@@ -3876,6 +3877,107 @@ class Monitor:
                 audit_lines.append(f"Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
 
                 await reply("\n".join(audit_lines))
+
+            elif cmd == "/joined_groups":
+                # === عرض كل المجموعات المنضم إليها فعلياً ===
+                logging.info("[JOINED_GROUPS] /joined_groups command invoked")
+                try:
+                    conn = await self.db._ensure_conn()
+                    # المجموعات المنضم إليها (state = JOINED)
+                    cursor = await conn.execute(
+                        "SELECT normalized_link, raw_link, joined_by, member_count, last_seen, last_error "
+                        "FROM group_states WHERE state = ? ORDER BY last_seen DESC LIMIT 50",
+                        (GroupState.JOINED,))
+                    joined_rows = await cursor.fetchall()
+
+                    # المجموعات المنضم إليها سابقاً (state = ALREADY_MEMBER)
+                    cursor = await conn.execute(
+                        "SELECT normalized_link, raw_link, joined_by, last_seen "
+                        "FROM group_states WHERE state = ? ORDER BY last_seen DESC LIMIT 50",
+                        (GroupState.ALREADY_MEMBER,))
+                    already_rows = await cursor.fetchall()
+
+                    # إحصائيات
+                    cursor = await conn.execute(
+                        "SELECT state, COUNT(*) FROM group_states GROUP BY state")
+                    state_counts = await cursor.fetchall()
+
+                    lines = [
+                        f"📊 المجموعات المنضم إليها",
+                        f"═══════════════════════════",
+                        f"",
+                    ]
+
+                    # إحصائيات الحالات
+                    lines.append("📈 توزيع الحالات:")
+                    for s, c in state_counts:
+                        lines.append(f"  • {s}: {c}")
+                    lines.append("")
+
+                    # المجموعات المنضم إليها
+                    if joined_rows:
+                        lines.append(f"✅ منضم إليها ({len(joined_rows)}):")
+                        for i, r in enumerate(joined_rows, 1):
+                            raw = r[1] or r[0] or '?'
+                            joined_by = r[2] or '?'
+                            masked = joined_by[:4] + '***' + joined_by[-4:] if len(joined_by) > 8 else joined_by
+                            members = r[3] or '?'
+                            when = r[4][:19] if r[4] else '?'
+                            lines.append(f"  {i}. {raw[:60]}")
+                            lines.append(f"     by={masked} members={members} at={when}")
+                    else:
+                        lines.append("❌ لا توجد مجموعات منضم إليها بعد")
+                    lines.append("")
+
+                    # المجموعات المنضم إليها سابقاً
+                    if already_rows:
+                        lines.append(f"ℹ️ عضو سابقاً ({len(already_rows)}):")
+                        for i, r in enumerate(already_rows[:10], 1):
+                            raw = r[1] or r[0] or '?'
+                            lines.append(f"  {i}. {raw[:60]}")
+                        if len(already_rows) > 10:
+                            lines.append(f"  ... و {len(already_rows) - 10} أخرى")
+
+                    lines.append("")
+                    lines.append("═══════════════════════════")
+
+                    await reply("\n".join(lines))
+                except Exception as e:
+                    logging.error(f"[JOINED_GROUPS] Error: {e}", exc_info=True)
+                    await reply(f"❌ خطأ: {e}")
+
+            elif cmd == "/queue":
+                # === عرض محتويات القائمة ===
+                logging.info("[QUEUE] /queue command invoked")
+                try:
+                    conn = await self.db._ensure_conn()
+                    cursor = await conn.execute(
+                        "SELECT id, raw_link, status, enqueued_at, next_retry_at, attempt_count, last_error "
+                        "FROM link_queue ORDER BY id DESC LIMIT 20")
+                    rows = await cursor.fetchall()
+
+                    queue_size = await self.prod_db.get_queue_size()
+
+                    lines = [
+                        f"📋 Queue (depth={queue_size})",
+                        f"═══════════════════════════",
+                    ]
+
+                    if rows:
+                        for r in rows:
+                            lines.append(f"  id={r[0]} status={r[2]}")
+                            lines.append(f"    link={r[1][:50]}")
+                            lines.append(f"    attempts={r[5]} enqueued={r[3][:19] if r[3] else '?'}")
+                            if r[4]:
+                                lines.append(f"    next_retry={r[4][:19]}")
+                            if r[6]:
+                                lines.append(f"    error={r[6][:50]}")
+                    else:
+                        lines.append("  (فارغة)")
+
+                    await reply("\n".join(lines))
+                except Exception as e:
+                    await reply(f"❌ خطأ: {e}")
 
             else: await reply(f"❓ أمر غير معروف: {cmd}\nاكتب /help")
 
