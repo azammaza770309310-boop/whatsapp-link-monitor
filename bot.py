@@ -4529,28 +4529,16 @@ class Monitor:
                                 logging.debug(f"[BULK_JOIN] Skip non-telegram: {raw_link[:50]}")
                                 continue
 
-                            # a2. فلتر تعليمي — تجاوز غير التعليمي
-                            # نستخدم username بشكل أساسي (لأن الرسالة المنشورة منسقة ولا تحتوي على اسم المجموعة الأصلي)
-                            # msg.raw_text هنا هو الرسالة المنشورة في القناة (formatted)، ليس النص الأصلي
-                            msg_text = msg.raw_text or ''
-                            username_for_filter = link_info.get('username', '')
-                            # مرر username فقط للفلتر — الرسالة المنشورة لا تحتوي على بيانات المصدر
-                            is_edu, edu_reason = EducationalFilter.is_educational('', username_for_filter)
-                            if not is_edu:
-                                self._bulk_join_stats['skipped'] += 1
-                                logging.info(f"[BULK_JOIN] Skip non-educational: {raw_link[:50]} ({edu_reason})")
-                                # سجل في group_states لتخطيه مستقبلاً
-                                await self.prod_db.set_group_state(normalized, GroupState.FAILED, raw_link,
-                                                                   error=f'non_educational_{edu_reason}')
-                                continue
+                            # a2. فلتر تعليمي — معطّل في bulk_join
+                            # السبب: الرسالة المنشورة في القناة لا تحتوي على اسم المجموعة الأصلي،
+                            # و username فقط لا يكفي للحكم التعليمي.
+                            # بدلاً من ذلك: نحاول الانضمام لكل رابط Telegram،
+                            # والـ Scheduler سيتخطى المنضم إليه سابقاً عبر group_states.
+                            # EducationalFilter سيُطبق فقط على الروابط الجديدة في _on_user_message.
 
                             # a3. تجاوز القنوات (broadcast) — نريد المجموعات فقط
-                            if EducationalFilter.is_likely_channel(msg_text, link_info.get('username', '')):
-                                self._bulk_join_stats['skipped'] += 1
-                                logging.info(f"[BULK_JOIN] Skip likely channel: {raw_link[:50]}")
-                                await self.prod_db.set_group_state(normalized, GroupState.FAILED, raw_link,
-                                                                   error='likely_channel')
-                                continue
+                            # معطّل أيضاً: سنكتشف نوع الكيان فعلياً عبر get_entity في _join_group_safe
+                            # (is_channel check يعتمد على entity.broadcast)
 
                             # b. تجاوز لو الحالة معروفة في group_states
                             state = await self.prod_db.get_group_state(normalized)
