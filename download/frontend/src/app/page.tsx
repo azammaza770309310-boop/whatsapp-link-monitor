@@ -39,6 +39,9 @@ interface CountryStat {
   percentage: number
 }
 
+// API base URL — البوت يخدم API endpoints على Render
+const API_URL = process.env.NEXT_PUBLIC_API_URL || 'https://whatsapp-userbot-0xwu.onrender.com'
+// Supabase fallback (للقراءة المباشرة لو API غير متاح)
 const SUPABASE_URL = process.env.NEXT_PUBLIC_SUPABASE_URL
 const SUPABASE_KEY = process.env.NEXT_PUBLIC_SUPABASE_KEY
 
@@ -87,6 +90,26 @@ export default function Home() {
   const [usingMockData, setUsingMockData] = useState(false)
 
   const fetchLinks = useCallback(async () => {
+    // استخدم API endpoint أولاً (المصدر الحقيقي)
+    try {
+      const response = await fetch(`${API_URL}/api/links?limit=200`, {
+        headers: { 'Accept': 'application/json' }
+      })
+      if (response.ok) {
+        const data = await response.json()
+        const links = data.links || data || []
+        if (Array.isArray(links) && links.length > 0) {
+          setAllLinks(links)
+          setLoading(false)
+          setError(null)
+          setUsingMockData(false)
+          return
+        }
+      }
+    } catch {
+      // API غير متاح، جرب Supabase مباشرة
+    }
+    // Fallback: Supabase مباشرة
     if (!SUPABASE_URL || !SUPABASE_KEY) {
       setAllLinks(mockLinks)
       setLinks(mockLinks)
@@ -112,8 +135,6 @@ export default function Home() {
     } catch (e) {
       setError(e instanceof Error ? e.message : 'Failed to load links')
       setLoading(false)
-      // Don't silently fall back to mock data — show the real error
-      // and only use mock as the very last resort for UI demo purposes
       if (allLinks.length === 0) {
         setAllLinks(mockLinks)
         setUsingMockData(true)
@@ -122,6 +143,27 @@ export default function Home() {
   }, [allLinks.length])
 
   const fetchStats = useCallback(async () => {
+    // استخدم API endpoint أولاً
+    try {
+      const response = await fetch(`${API_URL}/api/stats`, {
+        headers: { 'Accept': 'application/json' }
+      })
+      if (response.ok) {
+        const data = await response.json()
+        setStats({
+          total_links: data.total_links || 0,
+          whatsapp_links: data.whatsapp_links || 0,
+          telegram_links: data.telegram_links || 0,
+          active_watchers: data.active_watchers || 0
+        })
+        setError(null)
+        setUsingMockData(false)
+        return
+      }
+    } catch {
+      // API غير متاح
+    }
+    // Fallback: Supabase
     if (!SUPABASE_URL || !SUPABASE_KEY) {
       setStats(mockStats)
       setUsingMockData(true)
@@ -156,7 +198,6 @@ export default function Home() {
       setUsingMockData(false)
     } catch (e) {
       setError(e instanceof Error ? e.message : 'Failed to load stats')
-      // Only fall back to mock if we have nothing to show
       if (!stats) {
         setStats(mockStats)
         setUsingMockData(true)
@@ -500,18 +541,36 @@ function JoinerDashboard() {
   const [loading, setLoading] = useState(true)
 
   const fetchJoinerData = useCallback(async () => {
+    // استخدم API endpoint أولاً (المصدر الحقيقي من SQLite group_states)
+    try {
+      const response = await fetch(`${API_URL}/api/joined_groups`, {
+        headers: { 'Accept': 'application/json' }
+      })
+      if (response.ok) {
+        const data = await response.json()
+        const groups = data.joined_groups || []
+        const stats = data.stats || {}
+        setJoinedGroups(groups)
+        setJoinerStats({
+          total_joined: stats.total_joined || 0,
+          pending_groups: stats.pending_groups || 0,
+          active_joiners: stats.active_joiners || 0
+        })
+        setLoading(false)
+        return
+      }
+    } catch {
+      // API غير متاح، جرب Supabase
+    }
+    // Fallback: Supabase target_groups
     if (!SUPABASE_URL || !SUPABASE_KEY) {
-      setJoinerStats({ total_joined: 12, pending_groups: 5, active_joiners: 1 })
-      setJoinedGroups([
-        { id: 1, group_title: 'جامعة الملك سعود', group_link: 'https://t.me/ksu_group', status: 'JOINED', joined_by_phone: '+967770309310', join_date: new Date(Date.now() - 1000 * 60 * 30).toISOString(), member_count: 1200 },
-        { id: 2, group_title: 'الجامعة السعودية الإلكترونية', group_link: 'https://t.me/seu_archive', status: 'ALREADY_MEMBER', joined_by_phone: '+967770309310', join_date: new Date(Date.now() - 1000 * 60 * 60).toISOString(), member_count: 850 },
-      ])
+      setJoinerStats({ total_joined: 0, pending_groups: 0, active_joiners: 0 })
+      setJoinedGroups([])
       setLoading(false)
       return
     }
     try {
       const headers = { 'apikey': SUPABASE_KEY, 'Authorization': `Bearer ${SUPABASE_KEY}` }
-      // جلب المجموعات المنضم إليها (مع timeout لمنع التعليق)
       const controller = new AbortController()
       const timeout = setTimeout(() => controller.abort(), 10000)
 
@@ -522,9 +581,7 @@ function JoinerDashboard() {
       ])
       clearTimeout(timeout)
 
-      // التحقق من الاستجابات — أي خطأ = بيانات فارغة (ما ينهار)
       const joined = joinedRes.ok ? ((await joinedRes.json()) || []) : []
-      // ضمان أن joined مصفوفة (مو كائن خطأ)
       const joinedArray = Array.isArray(joined) ? joined : []
 
       const pendingCount = parseInt(pendingRes.headers.get('content-range')?.split('/')[1] || '0')
@@ -534,7 +591,6 @@ function JoinerDashboard() {
       setJoinerStats({ total_joined: joinedArray.length, pending_groups: isNaN(pendingCount) ? 0 : pendingCount, active_joiners: isNaN(joinerCount) ? 0 : joinerCount })
       setLoading(false)
     } catch {
-      // أي خطأ = بيانات فارغة (ما ينهار الـ UI)
       setJoinerStats({ total_joined: 0, pending_groups: 0, active_joiners: 0 })
       setJoinedGroups([])
       setLoading(false)

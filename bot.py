@@ -2913,7 +2913,7 @@ class Monitor:
                     '/bulk_join', '/bulk_join_status', '/bulk_join_stop',
                     '/cleanup_preview', '/cleanup_links', '/cleanup_status',
                     '/live_audit', '/status', '/watchers', '/help',
-                    '/joined_groups', '/queue',
+                    '/joined_groups', '/queue', '/debug_pipeline',
                 ]
 
                 if cmd in admin_commands:
@@ -3877,6 +3877,109 @@ class Monitor:
                 audit_lines.append(f"Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
 
                 await reply("\n".join(audit_lines))
+
+            elif cmd == "/debug_pipeline":
+                # === تشخيص مشكلة توقف السحب ===
+                logging.info("[DEBUG_PIPELINE] /debug_pipeline command invoked")
+                try:
+                    conn = await self.db._ensure_conn()
+                    lines = ["🔧 Pipeline Debug", "═══════════════════════════"]
+
+                    # 1. Scheduler state
+                    sched_state = await self.prod_db.get_setting('scheduler_state', 'NOT_STARTED')
+                    sched_cycle = await self.prod_db.get_setting('scheduler_last_cycle', '0')
+                    sched_hb = await self.prod_db.get_setting('scheduler_last_heartbeat', 'NEVER')
+                    join_paused = await self.prod_db.get_setting('join_paused', 'false')
+                    lines.append(f"⚙️ Scheduler:")
+                    lines.append(f"  state={sched_state}")
+                    lines.append(f"  cycle={sched_cycle}")
+                    lines.append(f"  heartbeat={sched_hb}")
+                    lines.append(f"  join_paused={join_paused}")
+                    lines.append("")
+
+                    # 2. Queue items
+                    cursor = await conn.execute(
+                        "SELECT id, raw_link, status, enqueued_at, next_retry_at, attempt_count, last_error "
+                        "FROM link_queue ORDER BY id DESC LIMIT 10")
+                    queue_rows = await cursor.fetchall()
+                    lines.append(f"📋 Queue ({len(queue_rows)} items):")
+                    for r in queue_rows:
+                        lines.append(f"  id={r[0]} status={r[2]} attempts={r[5]}")
+                        lines.append(f"    link={r[1][:50]}")
+                        if r[4]:
+                            lines.append(f"    next_retry={r[4][:19]}")
+                        if r[6]:
+                            lines.append(f"    error={r[6][:60]}")
+                    lines.append("")
+
+                    # 3. Group states distribution
+                    cursor = await conn.execute(
+                        "SELECT state, COUNT(*) as cnt FROM group_states GROUP BY state ORDER BY cnt DESC")
+                    state_rows = await cursor.fetchall()
+                    lines.append(f"📊 Group States:")
+                    for s, c in state_rows:
+                        lines.append(f"  {s}: {c}")
+                    lines.append("")
+
+                    # 4. Recent group_states (last 5)
+                    cursor = await conn.execute(
+                        "SELECT normalized_link, state, last_error, last_seen "
+                        "FROM group_states ORDER BY last_seen DESC LIMIT 5")
+                    recent_states = await cursor.fetchall()
+                    lines.append(f"📊 Recent group_states (last 5):")
+                    for r in recent_states:
+                        lines.append(f"  {r[1]:15s} {r[0][:40]}")
+                        if r[2]:
+                            lines.append(f"    error={r[2][:50]}")
+                    lines.append("")
+
+                    # 5. AI analyzer status
+                    ai_keys = sum(1 for i in range(1, 9) if os.getenv(f"AI_KEY_{i}", "") or (i == 1 and os.getenv("OPENAI_API_KEY", "")))
+                    lines.append(f"🤖 AI Analyzer:")
+                    lines.append(f"  keys_available={ai_keys}")
+                    lines.append(f"  simulation_mode={self.simulation_mode}")
+                    lines.append("")
+
+                    # 6. Connected accounts
+                    connected = sum(1 for c in self.user_clients.values() if c and c.is_connected())
+                    total = len(self.user_clients)
+                    lines.append(f"🤖 Telegram:")
+                    lines.append(f"  accounts={connected}/{total} connected")
+                    lines.append(f"  bot={'✅' if (self.bot_client and self.bot_client.is_connected()) else '❌'}")
+                    lines.append("")
+
+                    # 7. FloodWait
+                    blocked = await self.floodwait_mgr.get_blocked_accounts()
+                    lines.append(f"⚠️ FloodWait: {len(blocked)} blocked")
+                    lines.append("")
+
+                    # 8. Diagnosis
+                    lines.append("═══════════════════════════")
+                    lines.append("🔍 Diagnosis:")
+                    if join_paused == 'true':
+                        lines.append("  ❌ Join PAUSED — send /resume_join")
+                    if sched_state != 'RUNNING':
+                        lines.append("  ❌ Scheduler NOT RUNNING")
+                    if connected == 0:
+                        lines.append("  ❌ No accounts connected")
+                    if ai_keys == 0:
+                        lines.append("  ❌ No AI keys configured")
+                    if len(queue_rows) == 0:
+                        lines.append("  ℹ️ Queue empty — no links waiting")
+                    elif any(r[2] == 'QUEUED' for r in queue_rows):
+                        queued_count = sum(1 for r in queue_rows if r[2] == 'QUEUED')
+                        lines.append(f"  ⚠️ {queued_count} links in QUEUED state — check Scheduler")
+                    # Check for REJECTED links (AI rejecting)
+                    cursor = await conn.execute(
+                        "SELECT COUNT(*) FROM link_queue WHERE status = 'REJECTED'")
+                    rejected = (await cursor.fetchone())[0]
+                    if rejected > 0:
+                        lines.append(f"  ⚠️ {rejected} links REJECTED by AI — check AI keys/config")
+
+                    await reply("\n".join(lines))
+                except Exception as e:
+                    logging.error(f"[DEBUG_PIPELINE] Error: {e}", exc_info=True)
+                    await reply(f"❌ خطأ: {e}")
 
             elif cmd == "/joined_groups":
                 # === عرض كل المجموعات المنضم إليها فعلياً ===
