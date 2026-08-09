@@ -4304,6 +4304,26 @@ class Monitor:
         await self.prod_db.set_setting('scheduler_state', 'RUNNING')
         await self.prod_db.set_setting('scheduler_last_heartbeat', datetime.now().isoformat())
 
+        # === CLEANUP STUCK JOINING STATES ===
+        # روابط تركت في حالة JOINING من تشغيل سابق — أعد للقائمة
+        try:
+            conn = await self.db._ensure_conn()
+            # روابط في group_states بحالة JOINING — أعد لـ QUEUED
+            cursor = await conn.execute(
+                "UPDATE group_states SET state = 'QUEUED' WHERE state = 'JOINING'")
+            stuck_count = cursor.rowcount
+            if stuck_count > 0:
+                logging.warning(f"[SCHED] Reset {stuck_count} stuck JOINING states to QUEUED")
+            # روابط في link_queue بحالة PROCESSING — أعد لـ QUEUED
+            cursor = await conn.execute(
+                "UPDATE link_queue SET status = 'QUEUED' WHERE status = 'PROCESSING'")
+            stuck_queue = cursor.rowcount
+            if stuck_queue > 0:
+                logging.warning(f"[SCHED] Reset {stuck_queue} stuck PROCESSING queue items to QUEUED")
+            await conn.commit()
+        except Exception as e:
+            logging.error(f"[SCHED] Cleanup stuck states error: {e}")
+
         cycle = 0
         while self._running:
             cycle += 1
@@ -5127,7 +5147,9 @@ class Monitor:
 
         # 5. Attempt history — تم تخفيف (فقط لو انضم بالفعل)
         state = await self.prod_db.get_group_state(normalized_link)
-        if state in (GroupState.JOINING, GroupState.JOINED, GroupState.ALREADY_MEMBER):
+        # JOINING = محاولة حالية (هذا الـ Scheduler نفسه)، لا ترفض
+        # فقط JOINED و ALREADY_MEMBER تعني أننا انضممنا سابقاً
+        if state in (GroupState.JOINED, GroupState.ALREADY_MEMBER):
             return False, f'already_attempted_{state}'
         # تم إزالة فحص attempt_count >= 3 (تخفيف)
 
