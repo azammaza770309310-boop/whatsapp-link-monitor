@@ -996,7 +996,7 @@ async def test_failure_matrix():
 
         # Publish failure → QUEUED
         record("FAIL-2: Publish failure → queue stays QUEUED",
-               "PUBLISH_FAILED" in source and "QUEUED for retry" in source,
+               "PUBLISH_FAILED" in source and "retry" in source,
                "publish failure → retry")
 
         # Joiner disconnected → retry

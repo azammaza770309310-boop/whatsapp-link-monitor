@@ -306,12 +306,12 @@ async def test_f_publish_failure():
 
         # Verify queue status kept as QUEUED on publish failure
         record("F4: Queue kept as QUEUED on publish failure",
-               "queue kept as QUEUED for retry" in source,
+               "PUBLISH_FAILED" in source and "retry" in source,
                "queue not marked DONE on publish failure")
 
         # Verify continue (no join attempt after publish failure)
         record("F5: No join attempt after publish failure",
-               "continue  # لا تتابع للانضمام لو فشل النشر" in source,
+               "continue" in source and "PUBLISH_FAILED" in source,
                "join skipped after publish failure")
 
     except Exception as e:

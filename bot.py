@@ -454,7 +454,9 @@ class AIAnalyzer:
             return self._fallback_analysis(text)
 
         prompt = f"""أنت مساعد ذكي لتحليل رسائل المجموعات الجامعية.
-حلل هذه الرسالة بدقة كأنك إنسان:
+هذه الرسالة تم سحبها من مجموعة يراقبها حساب مراقب — أي أنها من بيئة جامعية.
+
+حلل هذه الرسالة:
 
 الرسالة: "{text[:1500]}"
 
@@ -469,17 +471,19 @@ class AIAnalyzer:
     "description": "وصف مختصر في 5 كلمات"
 }}
 
-القواعد الصارمة:
-- should_save = true فقط إذا كان الرابط لمجموعة أو قناة تعليمية جامعية
-- should_save = false إذا كان الرابط غير تعليمي (تسوق، ترفيه، أخبار، إلخ)
-- should_save = false إذا كان دردشة مباشرة (wa.me/رقم بدون /message)
-- is_advertisement = true إذا كانت الرسالة ترويج لخدمات مدفوعة أو إعلان
-- is_advertisement = true إذا كان الرابط لخدمة مدفوعة (مكتب، مركز، شركة)
-- sender_contact = رقم الهاتف أو @اليوزر المذكور في الرسالة
+القواعد:
+- should_save = true إذا كان في الرسالة رابط واتساب أو تيليجرام لمجموعة طلابية
+- should_save = true حتى لو الرسالة تحتوي فقط على رابط بدون نص
+- should_save = false فقط إذا لم يوجد أي رابط واتساب أو تيليجرام
+- should_save = false إذا كان الرابط لخدمة مدفوعة (مكتب، مركز، شركة، خدمات طلابية)
+- should_save = false إذا كان الرابط لحل واجبات أو تسليم مشاريع مدفوعة
+- should_save = false إذا كان دردشة مباشرة (wa.me/رقم بدون كلمة message)
+- should_save = false إذا كانت الرسالة ترويج لأعذار طبية أو خدمات صحية
+- is_advertisement = true إذا كانت الرسالة ترويج لخدمات مدفوعة
+- is_advertisement = true إذا ذكر: مكتب، مركز، شركة، خدمات، اشتراك، مدفوع
 - استخرج الرابط الكامل بشكل صحيح من أي صيغة
 - فحص كل أنواع الروابط: chat.whatsapp.com, wa.me, t.me, telegram.me
-- إذا لم يوجد رابط واتساب أو تيليجرام، should_save = false
-- country: حدد الدولة بدقة من سياق الرسالة"""
+- country: حدد الدولة من سياق الرسالة أو من اسم المجموعة"""
 
         # محاولة مع كل المفاتيح - نقفل فقط تبديل المفتاح، ليس الاستدعاء HTTP
         # (otherwise all AI calls are serialized → bottleneck with multi-user traffic)
@@ -2319,39 +2323,61 @@ class Monitor:
 
             # === أوامر الانضمام الجماعي ===
             if data == "bulk_join":
-                await event.answer("بدء الانضمام الجماعي...")
-                if hasattr(self, '_bulk_join_running') and self._bulk_join_running:
-                    await event.reply("⚠️ البوك جون يعمل بالفعل!\nأرسل /bulk_join_status لرؤية التقدم")
+                await event.answer("بدء الانضمام...")
+                # Scheduler يبدأ تلقائياً — هذا الزر لاستئناف/إعادة تشغيل يدوي
+                if hasattr(self, '_joiner_task') and self._joiner_task and not self._joiner_task.done():
+                    if self._join_paused:
+                        # Worker يعمل لكن متوقف — استأنف
+                        self._join_paused = False
+                        await self.prod_db.set_setting('join_paused', 'false')
+                        await event.reply("▶️ تم استئناف الانضمام تلقائياً")
+                    else:
+                        await event.reply("✅ الانضمام يعمل تلقائياً\nأرسل /bulk_join_status لرؤية التقدم")
                 else:
+                    # Worker متوقف — أعد تشغيله
                     self._bulk_join_running = True
                     self._bulk_join_stop = False
                     self._bulk_join_stats = {'total': 0, 'joined': 0, 'already': 0, 'failed': 0, 'skipped': 0, 'current': ''}
                     self._bulk_join_task = asyncio.create_task(self._bulk_join_worker())
                     await event.reply(
-                        "🚀 بدأ الانضمام الجماعي\n\n"
-                        "📝 سيقرأ البوت كل روابط القناة ويحاول الانضمام لكل واحد.\n"
-                        "🎓 فلتر تعليمي: ينضم فقط للمجموعات الجامعية\n"
-                        "📢 يتخطى القنوات (broadcast)\n"
-                        "⏱️ معدل آمن: انضمام كل 2 دقيقة"
+                        "🚀 بدأ الانضمام\n\n"
+                        "📝 سيقرأ روابط من القائمة ويحاول الانضمام.\n"
+                        "⏱️ معدل آمن: انضمام كل دقيقة"
                     )
                 return
 
             if data == "bulk_join_status":
                 await event.answer()
-                if not hasattr(self, '_bulk_join_running') or not self._bulk_join_running:
-                    await event.reply("ℹ️ البوك جون لا يعمل. أرسل /bulk_join للبدء")
-                else:
-                    s = getattr(self, '_bulk_join_stats', {})
-                    await event.reply(
-                        f"📊 Bulk Join Status\n"
-                        f"════════════════════\n"
-                        f"🔗 Total processed: {s.get('total', 0)}\n"
-                        f"✅ Joined: {s.get('joined', 0)}\n"
-                        f"ℹ️ Already member: {s.get('already', 0)}\n"
-                        f"❌ Failed: {s.get('failed', 0)}\n"
-                        f"⏭️ Skipped: {s.get('skipped', 0)}\n"
-                        f"📍 Current: {s.get('current', '')[:60]}"
-                    )
+                # Scheduler يبدأ تلقائياً — اعرض حالته دائماً
+                s = getattr(self, '_bulk_join_stats', {'total': 0, 'joined': 0, 'already': 0, 'failed': 0, 'skipped': 0, 'current': ''})
+                scheduler_state = await self.prod_db.get_setting('scheduler_state', 'NOT_STARTED')
+                scheduler_cycle = await self.prod_db.get_setting('scheduler_last_cycle', '0')
+                join_paused = await self.prod_db.get_setting('join_paused', 'false')
+                queue_size = await self.prod_db.get_queue_size()
+                bulk_running = getattr(self, '_bulk_join_running', False)
+
+                worker_status = "AUTO (Scheduler)"
+                if bulk_running:
+                    worker_status = "MANUAL (Bulk Join)"
+                if join_paused == 'true':
+                    worker_status = "⏸️ PAUSED"
+
+                await event.reply(
+                    f"📊 Join Worker Status\n"
+                    f"════════════════════\n"
+                    f"⚙️ Worker: {worker_status}\n"
+                    f"⚙️ Scheduler: {scheduler_state} (cycle={scheduler_cycle})\n"
+                    f"🔒 Join paused: {join_paused}\n"
+                    f"📋 Queue depth: {queue_size}\n"
+                    f"\n"
+                    f"Stats:\n"
+                    f"  🔗 Total: {s.get('total', 0)}\n"
+                    f"  ✅ Joined: {s.get('joined', 0)}\n"
+                    f"  ℹ️ Already: {s.get('already', 0)}\n"
+                    f"  ❌ Failed: {s.get('failed', 0)}\n"
+                    f"  ⏭️ Skipped: {s.get('skipped', 0)}\n"
+                    f"  📍 Current: {s.get('current', '')[:60]}"
+                )
                 return
 
             if data == "bulk_join_stop":
@@ -2696,6 +2722,43 @@ class Monitor:
 
             # الخطوة 2: enqueue كل رابط (صفر API calls)
             for link_info in links:
+                # === فلتر صارم قبل الـ Queue — يرفض الخدمات الطلابية والإعلانات ===
+                link_raw = link_info['raw'].lower()
+                username_raw = (link_info.get('username') or '').lower()
+                full_text_check = f"{raw_text} {link_raw} {username_raw}".lower()
+
+                # قائمة كلمات ترفض الرابط فوراً (خدمات مدفوعة فقط)
+                REJECT_KEYWORDS = [
+                    # خدمات مدفوعة واضحة
+                    'مكتب حل', 'مكتب واجب', 'مكتب دراسي',
+                    'خدمات طلابية مدفوعة', 'شركة توصيل',
+                    # حل واجبات مدفوع
+                    'حل واجب بمقابل', 'حل واجبات مدفوع', 'حل بحث مدفوع',
+                    'توصيل مشروع مدفوع', 'تسليم واجب بمقابل',
+                    'خدمة اونلاين مدفوع', 'حل واجب فوري',
+                    'خدمات اكاديمية مدفوع',
+                    # أعذار طبية
+                    'اعذار طبية', 'عذر طبي', 'في صحتي',
+                    # إعلانات صريحة
+                    'بأسعار مناسبة', 'احجز الآن', 'سارع قبل',
+                    'الدفع عند الاستلام', 'دفع مسبق',
+                ]
+
+                is_rejected = False
+                reject_reason = ''
+                for kw in REJECT_KEYWORDS:
+                    if kw in full_text_check:
+                        is_rejected = True
+                        reject_reason = kw
+                        break
+
+                if is_rejected:
+                    logging.info(
+                        f"[PIPELINE-1] 🚫 REJECTED link (keyword={reject_reason}): {link_info['raw'][:50]}"
+                    )
+                    await self.metrics.record_skip(f'reject_keyword_{reject_reason}')
+                    continue  # لا تدخله للقائمة
+
                 link_data = {
                     **link_info,
                     'group_name': group_name,
@@ -3696,39 +3759,87 @@ class Monitor:
                     await reply(f"❌ خطأ: {e}")
 
             elif cmd == "/bulk_join":
-                # === البدء بالانضمام الجماعي لروابط القناة ===
+                # === بدء/استئناف الانضمام الجماعي ===
+                # Worker الأساسي يبدأ تلقائياً عند Startup — هذا الزر اختياري لإعادة التشغيل
                 if hasattr(self, '_bulk_join_running') and self._bulk_join_running:
-                    await reply("⚠️ البوك جون يعمل بالفعل!\nأرسل /bulk_join_status لرؤية التقدم")
+                    await reply("⚠️ Bulk Join يعمل بالفعل!\nأرسل /bulk_join_status لرؤية التقدم")
+                elif hasattr(self, '_joiner_task') and self._joiner_task and not self._joiner_task.done():
+                    # Joiner Worker الأساسي يعمل — اعرض حالته
+                    if self._join_paused:
+                        await reply("🔒 Joiner Worker يعمل لكن PAUSED\nأرسل /resume_join للاستئناف")
+                    else:
+                        await reply("✅ Joiner Worker يعمل تلقائياً\nأرسل /debug_pipeline لرؤية الحالة")
                 else:
+                    # Worker متوقف — أعد تشغيله
                     self._bulk_join_running = True
                     self._bulk_join_stop = False
                     self._bulk_join_stats = {'total': 0, 'joined': 0, 'already': 0, 'failed': 0, 'skipped': 0, 'current': ''}
                     self._bulk_join_task = asyncio.create_task(self._bulk_join_worker())
                     await reply(
                         "🚀 بدأ الانضمام الجماعي\n\n"
-                        "📝 سيقرأ البوت كل روابط القناة ويحاول الانضمام لكل واحد.\n"
+                        "📝 سيقرأ البوت روابط من القائمة ويحاول الانضمام.\n"
                         "⏱️ معدل آمن: انضمام كل 2 دقيقة\n"
                         "📊 أرسل /bulk_join_status للتقدم\n"
                         "⏹️ أرسل /bulk_join_stop للإيقاف"
                     )
 
             elif cmd == "/bulk_join_status":
-                # === تقدم الانضمام الجماعي ===
-                if not hasattr(self, '_bulk_join_running') or not self._bulk_join_running:
-                    await reply("ℹ️ البوك جون لا يعمل. أرسل /bulk_join للبدء")
-                else:
-                    s = getattr(self, '_bulk_join_stats', {})
-                    current = s.get('current', 'none')
-                    await reply(
-                        f"📊 Bulk Join Status\n"
-                        f"════════════════════\n"
-                        f"🔗 Total processed: {s.get('total', 0)}\n"
-                        f"✅ Joined: {s.get('joined', 0)}\n"
-                        f"ℹ️ Already member: {s.get('already', 0)}\n"
-                        f"❌ Failed: {s.get('failed', 0)}\n"
-                        f"⏭️ Skipped: {s.get('skipped', 0)}\n"
-                        f"📍 Current: {current[:60]}"
-                    )
+                # === تقدم الانضمام (Scheduler + Bulk Join) ===
+                # اقرأ إحصائيات الـ Scheduler الحقيقية من metrics
+                metrics = await self.metrics.get_summary()
+                s = getattr(self, '_bulk_join_stats', {'total': 0, 'joined': 0, 'already': 0, 'failed': 0, 'skipped': 0, 'current': ''})
+
+                # حالة Worker
+                scheduler_state = await self.prod_db.get_setting('scheduler_state', 'NOT_STARTED')
+                scheduler_cycle = await self.prod_db.get_setting('scheduler_last_cycle', '0')
+                scheduler_hb = await self.prod_db.get_setting('scheduler_last_heartbeat', 'NEVER')
+                join_paused = await self.prod_db.get_setting('join_paused', 'false')
+                queue_size = await self.prod_db.get_queue_size()
+                bulk_running = getattr(self, '_bulk_join_running', False)
+
+                worker_status = "AUTO (Scheduler)"
+                if bulk_running:
+                    worker_status = "MANUAL (Bulk Join)"
+                if join_paused == 'true':
+                    worker_status = "⏸️ PAUSED"
+
+                # إحصائيات skips
+                skip_reasons = metrics.get('skip_reasons', {})
+                skip_lines = ""
+                if skip_reasons:
+                    skip_lines = "\nSkips by reason:\n"
+                    for reason, count in sorted(skip_reasons.items(), key=lambda x: -x[1])[:5]:
+                        skip_lines += f"  • {reason}: {count}\n"
+
+                # عدد المجموعات المنضم إليها
+                conn = await self.db._ensure_conn()
+                cursor = await conn.execute("SELECT COUNT(*) FROM group_states WHERE state = 'JOINED'")
+                joined_count = (await cursor.fetchone())[0]
+                cursor = await conn.execute("SELECT COUNT(*) FROM group_states WHERE state = 'ALREADY_MEMBER'")
+                already_count = (await cursor.fetchone())[0]
+
+                await reply(
+                    f"📊 Join Worker Status\n"
+                    f"════════════════════\n"
+                    f"⚙️ Worker: {worker_status}\n"
+                    f"⚙️ Scheduler: {scheduler_state} (cycle={scheduler_cycle})\n"
+                    f"⏰ Heartbeat: {scheduler_hb[:19] if scheduler_hb != 'NEVER' else 'NEVER'}\n"
+                    f"🔒 Join paused: {join_paused}\n"
+                    f"📋 Queue depth: {queue_size}\n"
+                    f"\n"
+                    f"📈 Scheduler Stats (REAL):\n"
+                    f"  ✅ Joined (DB): {joined_count}\n"
+                    f"  ℹ️ Already member (DB): {already_count}\n"
+                    f"  🔗 Total joins (metrics): {metrics.get('total_joins', 0)}\n"
+                    f"  ⏭️ Total skips: {metrics.get('total_skips', 0)}\n"
+                    f"  ⚠️ FloodWait: {metrics.get('total_floodwait', 0)}\n"
+                    f"  🔄 Duplicates: {metrics.get('total_duplicates', 0)}\n"
+                    f"{skip_lines}"
+                    f"Bulk Join Stats (manual):\n"
+                    f"  🔗 Total: {s.get('total', 0)}\n"
+                    f"  ✅ Joined: {s.get('joined', 0)}\n"
+                    f"  📍 Current: {s.get('current', '')[:60]}"
+                )
 
             elif cmd == "/bulk_join_stop":
                 # === إيقاف الانضمام الجماعي ===
@@ -4094,16 +4205,21 @@ class Monitor:
         for s in self._current_scanners.values(): s.cancel()
 
     async def _start_scan_all(self, days, cmd_name):
-        """بدء مسح لكل المستخدمين المراقبين"""
+        """بدء مسح لكل المستخدمين المراقبين فقط (وليس الفدائيين)"""
         if self.is_scan_running():
             await self._send("⚠️ يوجد مسح قيد التنفيذ\nأرسل /scan_stop لإيقافه")  # noqa: ignore result
             return
-        watchers = await self.db.get_active_watchers()
+        all_watchers = await self.db.get_active_watchers()
+        # فلترة: monitors فقط — Joiner لا يجب أن يُمسح
+        watchers = [w for w in all_watchers if w.get('role', 'monitor') == 'monitor']
         if not watchers:
             await self._send("❌ لا يوجد مستخدمون مراقبون")  # noqa: ignore result
             return
         d = f"{days} يوم" if days else "كامل"
-        await self._send(f"🚀 بدء المسح ({cmd_name}) لـ {len(watchers)} مستخدم\n📅 الفترة: {d}\n⏳ جاري...")  # noqa: ignore result
+        await self._send(f"🚀 بدء المسح ({cmd_name}) لـ {len(watchers)} مراقب\n📅 الفترة: {d}\n⏳ جاري...")  # noqa: ignore result
+        logging.info(f"[SCAN] Starting scan for {len(watchers)} monitors (filtered from {len(all_watchers)} total accounts)")
+        for w in watchers:
+            logging.info(f"[SCAN] Will scan: {w['phone']} (role={w.get('role', 'monitor')})")
         # Prune completed tasks from previous scans (prevents unbounded list growth)
         self._current_scan_tasks = [t for t in self._current_scan_tasks if not t.done()]
         for w in watchers:
@@ -4303,26 +4419,7 @@ class Monitor:
         # === WORKER HEALTH STATE ===
         await self.prod_db.set_setting('scheduler_state', 'RUNNING')
         await self.prod_db.set_setting('scheduler_last_heartbeat', datetime.now().isoformat())
-
-        # === CLEANUP STUCK JOINING STATES ===
-        # روابط تركت في حالة JOINING من تشغيل سابق — أعد للقائمة
-        try:
-            conn = await self.db._ensure_conn()
-            # روابط في group_states بحالة JOINING — أعد لـ QUEUED
-            cursor = await conn.execute(
-                "UPDATE group_states SET state = 'QUEUED' WHERE state = 'JOINING'")
-            stuck_count = cursor.rowcount
-            if stuck_count > 0:
-                logging.warning(f"[SCHED] Reset {stuck_count} stuck JOINING states to QUEUED")
-            # روابط في link_queue بحالة PROCESSING — أعد لـ QUEUED
-            cursor = await conn.execute(
-                "UPDATE link_queue SET status = 'QUEUED' WHERE status = 'PROCESSING'")
-            stuck_queue = cursor.rowcount
-            if stuck_queue > 0:
-                logging.warning(f"[SCHED] Reset {stuck_queue} stuck PROCESSING queue items to QUEUED")
-            await conn.commit()
-        except Exception as e:
-            logging.error(f"[SCHED] Cleanup stuck states error: {e}")
+        # ملاحظة: STARTUP RECOVERY تم نقله إلى start() — لا حاجة لتكراره هنا
 
         cycle = 0
         while self._running:
@@ -4344,7 +4441,7 @@ class Monitor:
                 # 1. اجلب رابط QUEUED واحد (لا burst)
                 queued = await self.prod_db.get_queued_links(limit=1)
                 if not queued:
-                    logging.info(f"[SCHED] cycle={cycle} Queue empty (size=0) — sleeping 60s")
+                    logging.debug(f"[SCHED] cycle={cycle} Queue empty — sleeping 60s")
                     await asyncio.sleep(60)
                     continue
 
@@ -4400,32 +4497,24 @@ class Monitor:
                             raw_link, link_data.get('message_text', ''),
                             link_data.get('source_phone', ''), link_data.get('message_link'))
                         buttons = MessageFormatter.get_link_buttons(raw_link)
-                        # === POST-CONDITION VERIFICATION ===
-                        # لا نسجل PUBLISHED إلا بعد تأكيد Telegram للإرسال
                         published, msg_id = await self._send(formatted, buttons=buttons)
                         if published:
-                            logging.info(
-                                f"[LINK id={link_id}] [PIPELINE-5] ✅ PUBLISHED_VERIFIED message_id={msg_id}"
-                            )
+                            logging.info(f"[LINK id={link_id}] [PIPELINE-5] ✅ PUBLISHED_VERIFIED message_id={msg_id}")
                         else:
-                            # فشل النشر — لا نعتبر العملية ناجحة
-                            logging.error(
-                                f"[LINK id={link_id}] [PIPELINE-5] ❌ PUBLISH_FAILED — queue kept as QUEUED for retry"
-                            )
-                            # أعد الرابط للقائمة لإعادة المحاولة بعد 5 دقائق
+                            logging.error(f"[LINK id={link_id}] [PIPELINE-5] ❌ PUBLISH_FAILED — retry in 5 min")
                             await self.prod_db.update_queue_status(link_data['id'], 'QUEUED',
                                                                    next_retry=datetime.now() + timedelta(minutes=5))
-                            continue  # لا تتابع للانضمام لو فشل النشر
+                            continue
                     else:
                         logging.info(f"[LINK id={link_id}] [PIPELINE-5] ⏭️ Already published (duplicate)")
 
-                # 4. Group Reputation — تم إزالته (تخفيف)
-                # كان يمنع الانضمام للمجموعات الجديدة، الآن مسموح للجميع
-
-                # 5. اختر حساب فدائي: غير محظور + ضمن Daily Budget
+                # 4. اختر حساب فدائي
+                logging.info(f"[LINK id={link_id}] [PIPELINE-6] Selecting joiner...")
                 joiners = await self.db.get_watchers_by_role("joiner")
                 if not joiners:
-                    logging.warning(f"[SCHED] cycle={cycle} ⚠️ No joiner accounts! Use /set_role <phone> joiner to designate one")
+                    logging.warning(f"[SCHED] cycle={cycle} ⚠️ No joiner accounts!")
+                    await self.prod_db.update_queue_status(link_data['id'], 'QUEUED',
+                                                           next_retry=datetime.now() + timedelta(minutes=5))
                     await asyncio.sleep(60)
                     continue
 
@@ -4434,7 +4523,7 @@ class Monitor:
                     jphone = joiner['phone']
                     is_blocked, wait = await self.floodwait_mgr.is_blocked(jphone)
                     if is_blocked:
-                        logging.info(f"[SCHED] cycle={cycle} {jphone} blocked for {wait}s more (FloodWait)")
+                        logging.info(f"[SCHED] cycle={cycle} {jphone} blocked for {wait}s (FloodWait)")
                         continue
                     await self.db.reset_daily_joins_if_needed(jphone)
                     daily_joins = await self.db.get_daily_join_count(jphone)
@@ -4447,6 +4536,8 @@ class Monitor:
 
                 if not selected_joiner:
                     logging.info(f"[SCHED] cycle={cycle} All joiners blocked/limited — sleeping 60s")
+                    await self.prod_db.update_queue_status(link_data['id'], 'QUEUED',
+                                                           next_retry=datetime.now() + timedelta(minutes=5))
                     await asyncio.sleep(60)
                     continue
 
@@ -4454,61 +4545,58 @@ class Monitor:
                 client = self.user_clients.get(phone)
                 if not client or not client.is_connected():
                     logging.warning(f"[SCHED] {phone} not connected — skipping")
+                    await self.prod_db.update_queue_status(link_data['id'], 'QUEUED',
+                                                           next_retry=datetime.now() + timedelta(minutes=2))
                     await asyncio.sleep(60)
                     continue
 
-                # 6. Membership Cache Check (بعد اختيار الفدائي — يحتاج client)
+                # 5. Membership Cache Check
                 if link_type == 'telegram':
+                    logging.info(f"[LINK id={link_id}] [PIPELINE-6] Checking membership for {phone}...")
                     is_member = await self.membership_cache.check_membership(phone, normalized, client)
                     if is_member is True:
-                        logging.info(f"[SCHED] {phone} already member — skipping {raw_link[:50]}")
+                        logging.info(f"[LINK id={link_id}] [PIPELINE-6] {phone} already member — skipping")
                         await self.prod_db.set_group_state(normalized, GroupState.ALREADY_MEMBER, raw_link, joined_by=phone)
                         await self.prod_db.update_queue_status(link_data['id'], 'DONE')
                         await self.metrics.record_skip('already_member')
-                        await self.metrics.record_membership_skip()
                         continue
 
-                # 7. Rate Limiter — تحقق فقط (الحجز الفعلي في _join_group_safe)
+                # 6. Rate Limiter
+                logging.info(f"[LINK id={link_id}] [PIPELINE-6] Rate limiter check for {phone}...")
                 allowed = await self.rate_limiter.check(phone, 'join')
                 if not allowed:
                     logging.info(f"[SCHED] Rate limiter blocked {phone} — sleeping 60s")
+                    await self.prod_db.update_queue_status(link_data['id'], 'QUEUED',
+                                                           next_retry=datetime.now() + timedelta(minutes=5))
                     await asyncio.sleep(60)
                     continue
 
-                # 8. Safety Guard — 6 فحوصات صارمة قبل أي API call
-                # === PIPELINE STAGE 6: Safety Guard + Joiner attempt ===
-                logging.info(f"[LINK id={link_id}] [PIPELINE-6] 🛡️ Safety Guard checking {phone} for {raw_link[:60]}")
+                # 7. Safety Guard
+                logging.info(f"[LINK id={link_id}] [PIPELINE-6] 🛡️ Safety Guard checking {phone}...")
                 guard_ok, guard_reason = await self._safety_guard(phone, normalized, link_data)
                 if not guard_ok:
-                    logging.info(f"[LINK id={link_id}] [PIPELINE-6] 🚫 Safety Guard BLOCKED {phone} from joining {raw_link[:60]}: {guard_reason}")
+                    logging.info(f"[LINK id={link_id}] [PIPELINE-6] 🚫 Safety Guard BLOCKED: {guard_reason}")
                     await self.metrics.record_skip(f'guard_{guard_reason}')
-                    # لو الحظر بسبب FloodWait → استخدم next_retry_at من DB (مو 30 دقيقة ثابتة)
                     if 'floodwait' in guard_reason:
                         floodwait_until = await self.prod_db.get_floodwait(phone)
                         if floodwait_until:
                             next_retry_dt = datetime.fromtimestamp(floodwait_until)
-                            await self.prod_db.update_queue_status(link_data['id'], 'QUEUED',
-                                                                   next_retry=next_retry_dt)
-                            logging.info(f"[LINK id={link_id}] [PIPELINE-6] FloodWait retry after {next_retry_dt.strftime('%H:%M:%S')}")
+                            await self.prod_db.update_queue_status(link_data['id'], 'QUEUED', next_retry=next_retry_dt)
                         else:
                             await self.prod_db.update_queue_status(link_data['id'], 'QUEUED',
                                                                    next_retry=datetime.now() + timedelta(minutes=30))
                     else:
-                        # أسباب أخرى → 30 دقيقة
                         await self.prod_db.update_queue_status(link_data['id'], 'QUEUED',
-                                                               next_retry=datetime.now() + timedelta(minutes=30))
+                                                               next_retry=datetime.now() + timedelta(minutes=5))
                     await asyncio.sleep(60)
                     continue
                 logging.info(f"[LINK id={link_id}] [PIPELINE-6] ✅ Safety Guard PASSED for {phone}")
 
-                # 9. سجل محاولة الانضمام
+                # 8. Join attempt
                 await self.metrics.record_join_attempt(phone)
-
-                # 10. حدّث الحالة لـ JOINING
                 await self.prod_db.set_group_state(normalized, GroupState.JOINING, raw_link)
                 await self.prod_db.update_queue_status(link_data['id'], 'PROCESSING')
 
-                # 11. انضمام
                 logging.info(f"[LINK id={link_id}] [PIPELINE-6] 🚀 Joiner {phone} attempting to join: {raw_link[:60]}")
                 success, status, member_count = await self._join_group_safe(client, link_data, phone)
 
@@ -5108,8 +5196,8 @@ class Monitor:
 
         # 3. Hourly Join Limit (DB-backed, survives restart) — conservative: 1/hour
         hourly_joins = await self.prod_db.count_operations(phone, 'join', 3600)
-        if hourly_joins >= 5:  # 5/hour max (تخفيف)
-            return False, f'hourly_limit_{hourly_joins}/5'
+        if hourly_joins >= 15:  # 15/hour max
+            return False, f'hourly_limit_{hourly_joins}/15'
 
         # 4. Group Reputation — تم إزالته (تخفيف)
         # كان يمنع الانضمام للمجموعات الجديدة، الآن مسموح
@@ -5130,8 +5218,8 @@ class Monitor:
                 last_join_ts = w['last_join_timestamp']
                 last_join = datetime.fromisoformat(str(last_join_ts).replace('Z', '+00:00')) if isinstance(last_join_ts, str) else last_join_ts
                 elapsed = (datetime.now() - last_join.replace(tzinfo=None)).total_seconds()
-                if elapsed < 600:  # 10 min cooldown (تخفيف من ساعة إلى 10 دقائق)
-                    return False, f'join_cooldown_{int(600-elapsed)}s'
+                if elapsed < 120:  # 2 min cooldown (تخفيف ليسمح بمعالجة أسرع)
+                    return False, f'join_cooldown_{int(120-elapsed)}s'
             except Exception:
                 pass
 
@@ -5489,9 +5577,49 @@ class Monitor:
             logging.info(f"  → {w['phone']} (role={role})")
             self._user_tasks[w['phone']] = asyncio.create_task(self._run_user_client(w))
         self._keep_alive_task = asyncio.create_task(self._keep_alive())
-        # بدء محرك الانضمام التدريجي
-        self._joiner_task = asyncio.create_task(self._joiner_worker())
-        logging.info("🚀 Joiner worker started")
+
+        # === STARTUP RECOVERY: إعادة الروابط العالقة ===
+        try:
+            conn = await self.db._ensure_conn()
+            # روابط في group_states بحالة JOINING — أعد لـ QUEUED
+            cursor = await conn.execute(
+                "UPDATE group_states SET state = 'QUEUED' WHERE state = 'JOINING'")
+            stuck_joining = cursor.rowcount
+            # روابط في link_queue بحالة PROCESSING — أعد لـ QUEUED
+            cursor = await conn.execute(
+                "UPDATE link_queue SET status = 'QUEUED' WHERE status = 'PROCESSING'")
+            stuck_processing = cursor.rowcount
+            await conn.commit()
+            if stuck_joining or stuck_processing:
+                logging.warning(
+                    f"[STARTUP RECOVERY] Reset {stuck_joining} JOINING + {stuck_processing} PROCESSING → QUEUED"
+                )
+        except Exception as e:
+            logging.error(f"[STARTUP RECOVERY] Error: {e}")
+
+        # === AUTO-START JOIN WORKER ===
+        # اقرأ join_paused من DB — لو paused، Worker يبدأ لكن يبقى PAUSED
+        db_paused = await self.prod_db.get_setting('join_paused', 'false')
+        self._join_paused = (db_paused == 'true')
+        if self._join_paused:
+            # تحقق: هل في FloodWait حقيقي؟ لو لا، auto-resume
+            blocked = await self.floodwait_mgr.get_blocked_accounts()
+            if not blocked:
+                logging.info("▶️ Auto-resume: join_paused was true but no FloodWait — resuming")
+                self._join_paused = False
+                await self.prod_db.set_setting('join_paused', 'false')
+            else:
+                logging.info("🔒 Join PAUSED — accounts in FloodWait, Worker will wait")
+
+        # ابدأ Join Worker تلقائياً ( Independent Task)
+        if not hasattr(self, '_joiner_task') or self._joiner_task is None or self._joiner_task.done():
+            self._joiner_task = asyncio.create_task(self._joiner_worker())
+            if self._join_paused:
+                logging.info("🚀 Join Worker started (PAUSED — waiting for /resume_join)")
+            else:
+                logging.info("🚀 Join Worker started (AUTO — will process QUEUED links)")
+        else:
+            logging.info("🚀 Join Worker already running — skip duplicate")
 
     async def stop(self):
         """إيقاف نظيف لمنع تسريب الذاكرة
@@ -5840,21 +5968,8 @@ async def main():
 
     monitor = Monitor(config, db)
 
-    # ===== Recovery Mode Startup =====
-    # 1. اقرأ join_paused من DB
-    db_paused = await monitor.prod_db.get_setting('join_paused', 'false')  # افتراضي: يعمل تلقائياً
-    monitor._join_paused = (db_paused == 'true')
-    if monitor._join_paused:
-        # تحقق: هل في حسابات فعلاً في FloodWait؟ لو لا، أعد التفعيل تلقائياً
-        blocked = await monitor.floodwait_mgr.get_blocked_accounts()
-        if not blocked:
-            logging.info("▶️ Auto-resume: join_paused was true but no accounts in FloodWait — resuming")
-            monitor._join_paused = False
-            await monitor.prod_db.set_setting('join_paused', 'false')
-        else:
-            logging.info("🔒 Recovery Mode: JOIN PAUSED (accounts in FloodWait)")
-    else:
-        logging.info("▶️ Join enabled (from DB setting)")
+    # ملاحظة: Recovery Mode و join_paused تم نقلهما إلى monitor.start()
+    # حيث تتم معالجتها بشكل صحيح بعد تشغيل الحسابات
 
     # 2. اقرأ floodwait_tracker — سجل الحسابات المحظورة
     blocked = await monitor.floodwait_mgr.get_blocked_accounts()
