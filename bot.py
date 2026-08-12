@@ -4640,11 +4640,11 @@ class Monitor:
                     state_to_set = GroupState.FLOODWAIT
                     state_error = 'FloodWait'
                     final_status = 'QUEUED'
-                    next_retry = datetime.now() + timedelta(hours=1)
+                    next_retry = datetime.now() + timedelta(minutes=30)
                     await self.metrics.record_floodwait(phone)
-                    self._join_paused = True
-                    await self.prod_db.set_setting('join_paused', 'true')
-                    logging.warning(f"[AUTO-PAUSE] FloodWait detected → join_paused=true in DB")
+                    # لا توقف النظام كامل — فقط أوقف هذا الحساب مؤقتاً
+                    # FloodWait لرابط واحد لا يوقف 127 رابط آخر
+                    logging.warning(f"[FLOODWAIT] {phone} got FloodWait — link requeued in 30 min (system continues)")
 
                 elif status == "BANNED":
                     state_to_set = GroupState.BANNED
