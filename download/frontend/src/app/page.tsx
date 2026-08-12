@@ -40,10 +40,11 @@ interface CountryStat {
 }
 
 // API base URL — البوت يخدم API endpoints على Render
+// هذا هو المصدر الوحيد للبيانات — لا نستخدم Supabase مباشرة (RLS مفعّل)
 const API_URL = process.env.NEXT_PUBLIC_API_URL || 'https://whatsapp-userbot-0xwu.onrender.com'
-// Supabase fallback (للقراءة المباشرة لو API غير متاح)
-const SUPABASE_URL = process.env.NEXT_PUBLIC_SUPABASE_URL
-const SUPABASE_KEY = process.env.NEXT_PUBLIC_SUPABASE_KEY
+// Supabase معطّل — RLS يمنع الوصول المباشر من الواجهة
+const SUPABASE_URL = ''
+const SUPABASE_KEY = ''
 
 const COUNTRY_KEYWORDS: Record<string, string[]> = {
   'السعودية': ['السعودية', 'saudi', 'ksa', 'السعودي', 'الاهلية', 'الأهلية', 'دار الحكمة', 'اليمامة', 'ابن رشد', 'الملك', 'KAU', 'KSU', 'KFU', 'KFUPM', 'PSAU', 'UQU', 'JU', 'TAU', 'BAU', 'NU', 'IMAMU'],
