@@ -5196,8 +5196,8 @@ class Monitor:
 
         # 3. Hourly Join Limit (DB-backed, survives restart) — conservative: 1/hour
         hourly_joins = await self.prod_db.count_operations(phone, 'join', 3600)
-        if hourly_joins >= 30:  # 30/hour max
-            return False, f'hourly_limit_{hourly_joins}/30'
+        if hourly_joins >= 50:  # 50/hour max
+            return False, f'hourly_limit_{hourly_joins}/50'
 
         # 4. Group Reputation — تم إزالته (تخفيف)
         # كان يمنع الانضمام للمجموعات الجديدة، الآن مسموح
@@ -5218,8 +5218,8 @@ class Monitor:
                 last_join_ts = w['last_join_timestamp']
                 last_join = datetime.fromisoformat(str(last_join_ts).replace('Z', '+00:00')) if isinstance(last_join_ts, str) else last_join_ts
                 elapsed = (datetime.now() - last_join.replace(tzinfo=None)).total_seconds()
-                if elapsed < 60:  # 1 min cooldown
-                    return False, f'join_cooldown_{int(60-elapsed)}s'
+                if elapsed < 30:  # 30s cooldown
+                    return False, f'join_cooldown_{int(30-elapsed)}s'
             except Exception:
                 pass
 
@@ -5235,7 +5235,7 @@ class Monitor:
         role = w.get('role', 'monitor') if w else 'monitor'
 
         if role == 'joiner':
-            return int(os.getenv('DAILY_JOIN_LIMIT', '50'))  # 50/day
+            return int(os.getenv('DAILY_JOIN_LIMIT', '200'))  # 200/day
         elif role == 'backup':
             return int(os.getenv('DAILY_BACKUP_LIMIT', '5'))  # 5/day (تخفيف)
         else:
