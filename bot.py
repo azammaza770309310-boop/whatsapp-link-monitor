@@ -5951,11 +5951,11 @@ async def main():
     else:
         logging.info("📡 Production Mode: Real Telegram API calls enabled")
 
-    # 4. Conservative post-FloodWait limits
-    daily_limit = os.getenv('DAILY_JOIN_LIMIT', '15')
+    # 4. Join limits (optimized for batch processing)
+    daily_limit = os.getenv('DAILY_JOIN_LIMIT', '200')
     logging.info(f"📊 Daily Join Limit: {daily_limit}/day")
-    logging.info(f"📊 Hourly Join Limit: 5/hour")
-    logging.info(f"📊 Join Cooldown: 600s (10 min)")
+    logging.info(f"📊 Hourly Join Limit: 50/hour")
+    logging.info(f"📊 Join Cooldown: 15s")
 
     # ===== Startup Verification — تأكد من وجود حسابات في Supabase =====
     logging.info("━" * 60)
