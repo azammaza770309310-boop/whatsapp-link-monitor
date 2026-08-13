@@ -4439,18 +4439,11 @@ class Monitor:
                     await self.metrics.record_skip('banned')
                     continue
 
-                # 3. AI فحص الرابط (فقط لو DISCOVERED ولم يُفحص سابقاً)
+                # 3. AI فحص الرابط — معطل مؤقتاً للسرعة (الروابط كلها من مجموعات طلابية)
                 if state == GroupState.DISCOVERED or state is None:
-                    # === PIPELINE STAGE 4: AI verification ===
-                    logging.info(f"[LINK id={link_id}] [PIPELINE-4] 🤖 AI verifying link: {raw_link[:60]}")
-                    ai_result = await self.ai_analyzer.analyze_message(link_data.get('message_text', ''))
-                    if not ai_result.get('should_save', False):
-                        logging.info(f"[LINK id={link_id}] [PIPELINE-4] ❌ AI REJECTED (reason: {ai_result.get('reason', 'unknown')})")
-                        await self.prod_db.set_group_state(normalized, GroupState.INVALID, raw_link, error='AI rejected')
-                        await self.prod_db.update_queue_status(link_data['id'], 'REJECTED')
-                        await self.metrics.record_skip('ai_rejected')
-                        continue
-                    logging.info(f"[LINK id={link_id}] [PIPELINE-4] ✅ AI APPROVED")
+                    # تخطي AI — كل الروابط في القائمة جاءت من مجموعات يراقبها Monitor
+                    # AI سيُعاد تفعيله لاحقاً بعد معالجة القائمة المتراكمة
+                    logging.info(f"[LINK id={link_id}] [PIPELINE-4] ⏭️ AI SKIPPED (batch mode)")
                     await self.prod_db.set_group_state(normalized, GroupState.QUEUED, raw_link)
 
                     # === PIPELINE STAGE 5: Publish to channel ===
