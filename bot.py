@@ -1430,160 +1430,48 @@ class HelpRequestDetector:
 # -------------------------------------------------------------------
 
 
-class EducationalFilter:
-    """فلتر ذكي لتمييز الروابط التعليمية.
+class GulfFilter:
+    """فلتر ذكي متعدد الطبقات لمجموعات الخليج الأكاديمية.
 
-    المعايير الإيجابية (كلمات في اسم المجموعة أو وصفها):
-    - جامعة/كلية/معهد/روضة/مدرسة
-    - تخصص/قسم/شعبة/فرقة
-    - طلاب/طالبات/تجمع
-    - أسماء جامعات سعودية معروفة
+    يدمج أفضل ما في:
+    - EducationalFilter (السابق): قوائم شاملة + is_educational + is_likely_channel
+    - GulfFilter (DeepSeek): تنظيم منطقي + regex قوي + فصل _find_* methods
 
-    المعايير السلبية (تستبعد الرسالة):
-    - إعلانات/متاجر/تسوق
-    - قنوات إخبارية/ترفيهية
-    - ربح مال/استثمار
-    - محتوى غير لائق
+    ترتيب الفحص (من الأقوى للأضعف):
+        1. HARD_BLACKLIST → رفض فوري (حتى لو المصدر خليجي)
+        2. GULF_WHITELIST → قبول فوري
+        3. مصدر خليجي → قبول (البوت يراقب خليجيين أصلاً)
+        4. سياق أكاديمي → قبول (مستوى/ترم/دفعة/1446...)
+        5. مصدر أكاديمي → قبول
+        6. is_educational عام → قبول
+        7. رفض احتياطي (fail-safe)
     """
 
-    # كلمات إيجابية قوية (تعليمية مؤكدة)
-    STRONG_POSITIVE = [
-        # أنواع المؤسسات التعليمية
-        'جامعة', 'كلية', 'معهد', 'روضة', 'مدرسة', 'مدراس',
-        'university', 'college', 'institute', 'school', 'academy',
-        # مستويات دراسية
-        'تخصص', 'قسم', 'شعبة', 'فرقة', 'مستوى', 'ترم', 'فصل دراسي',
-        'بكالوريوس', 'ماجستير', 'دكتوراه', 'دبلوم', 'ماجستير',
-        'bachelor', 'master', 'phd', 'diploma', 'degree',
-        # مجموعات طلابية
-        'طلاب', 'طالبات', 'تجمع', 'دفع', 'دفعة', 'cohort', 'students',
-        # أنشطة دراسية
-        'محاضرة', 'سكشن', 'واجب', 'بحث', 'مشروع', 'تقرير', 'عرض',
-        'ميدتيرم', 'فاينل', 'اختبار', 'امتحان', 'كويز', 'واجبات',
-        'lecture', 'section', 'assignment', 'exam', 'quiz', ' midterm', 'final',
-        # أنظمة جامعية
-        'تسجيل', 'add drop', 'withdraw', 'معدل', 'gpa', 'credit',
-        'blackboard', 'بلاك بورد', 'moodle', 'مودل',
-        # مواد دراسية
-        'مادة', 'مواد', 'منهج', 'كتاب', 'ملخص', 'شرائح', 'slides',
-        'course', 'subject', 'curriculum',
-    ]
-
-    # أسماء جامعات سعودية معروفة (مطابقة قوية)
-    SAUDI_UNIVERSITIES = [
-        'الملك سعود', 'الملك عبدالعزيز', 'الملك فيصل', 'الملك خالد',
-        'الملك فهد', 'الملك عبدالله', 'الملك سلمان',
-        'أم القرى', 'ام القرى', 'الطائف', 'الباحة', 'جازان', 'نجران',
-        'الجوف', 'الحدود الشمالية', 'حائل', 'تبوك', 'القصيم',
-        'الإمام محمد بن سعود', 'الإمام', 'النعيرية', 'شقراء',
-        'المجمعة', 'رماح', 'الخرج', 'الدوادمي', 'الأفلاج',
-        ' Prince Sattam', 'سطام', 'الإمام عبدالرحمن', 'الإمام',
-        'جدة', 'طيبة', 'حائل', 'تبوك',
-        # اختصارات
-        'ksu', 'kau', 'kfu', 'kku', 'uqu', 'taibahu', 'iau', 'ju',
-        'pnu', 'nu', 'su', 'bu', 'qu', 'ha il',
-        # جامعات أجنبية شائعة
-        'pnu1445', 'noracom', 'fonnorasakn', 'majeedseu', 'uqucc',
-        'qassim_u', 'ngran4',
-    ]
-
-    # كلمات سلبية قوية (تستبعد الرسالة)
-    STRONG_NEGATIVE = [
-        # إعلانات ومتاجر
-        'متجر', 'متاجر', 'تسوق', 'شراء', 'بيع', 'سعر', 'خصم', 'عرض خاص',
-        'store', 'shop', 'buy', 'sell', 'price', 'discount', 'offer',
-        'متوفر', 'للبيع', 'للإيجار', 'توصيل', 'شحن',
-        # ربح مال واستثمار
-        'ربح', 'ارباح', 'استثمار', 'تداول', 'فوركس', 'كريبتو', 'بيتكوين',
-        'earn money', 'make money', 'profit', 'investment', 'crypto', 'forex',
-        'ايرد المبلغ', 'هديه مجاني', 'ربح مال', 'ربح سريع',
-        # ترفيه وغير تعليمي
-        'افلام', 'أنمي', 'أنمي', 'روايات', 'شعر', 'خواطر',
-        'movies', 'anime', 'novels', 'poetry',
-        'ألعاب', 'العاب', 'ببجي', 'فورتنايت', 'minecraft',
-        'games', 'gaming', 'pubg', 'fortnite',
-        # قنوات إخبارية وإعلامية
-        'أخبار', 'اخبار', 'عاجل', 'خبر', 'news', 'breaking',
-        'قناة إخبارية', 'صحيفة', 'جريدة',
-        # محتوى غير لائق
-        'porn', 'xxx', 'adult', '18+', 'محتوى للكبار',
-        # تواصل اجتماعي (متابعين/لايكات)
-        'sub4sub', 'follow4follow', 'like4like', 'متابعين', 'لايكات',
-        'followers', 'subscribers', 'تيك توك', 'يوتيوب', 'سناب',
-    ]
-
-    # كلمات تشير لأن الرابط لقناة وليس مجموعة
-    CHANNEL_INDICATORS = [
-        'قناة', 'channel', 'telegram channel', 'قناة تيليجرام',
-        'اخبار', 'news', 'إعلام', 'broadcast', 'اذاعة',
-    ]
-
-    # ====================================================================
-    # سياق أكاديمي عام — كلمات تشير لبيئة جامعية بدون ذكر دولة محددة
-    # لو ظهرت بدون blacklist match → اقبل (لأن البوت يراقب مجموعات خليجية أصلاً)
-    # ====================================================================
-    ACADEMIC_CONTEXT = [
-        # مستويات دراسية
-        'مستوى', 'مستوى أول', 'مستوى ثاني', 'مستوى ثالث', 'مستوى رابع',
-        'مستوى خامس', 'مستوى سادس', 'مستوى سابع', 'مستوى ثامن',
-        'level 1', 'level 2', 'level1', 'level2',
-        # فصول وترامس
-        'ترم', 'ترم أول', 'ترم ثاني', 'ترم صيفي', 'فصل دراسي', 'فصل أول',
-        'semester', 'term', 'fall', 'spring', 'summer',
-        # دفعات (السنة الهجرية السعودية شائعة جداً)
-        'دفعة', 'دفعه', 'دفعة 144', '1444', '1445', '1446', '1447', '1448',
-        'cohort', 'batch',
-        # أنشطة دراسية
-        'محاضرة', 'سكشن', 'واجب', 'واجبات', 'بحث', 'مشروع', 'تقرير', 'عرض',
-        'ميدتيرم', 'فاينل', 'اختبار', 'امتحان', 'كويز', 'quiz', 'midterm', 'final',
-        'lecture', 'section', 'assignment', 'exam',
-        # مواد دراسية
-        'مادة', 'مواد', 'منهج', 'كتاب', 'ملخص', 'شرائح', 'slides',
-        'course', 'subject', 'curriculum', 'syllabus',
-        # أنظمة جامعية
-        'تسجيل', 'add drop', 'withdraw', 'معدل', 'gpa', 'credit',
-        'blackboard', 'بلاك بورد', 'moodle', 'مودل', 'tudris', 'تودرس',
-        'registration', 'enrollment',
-        # أقسام وتخصصات (كلمات عامة)
-        'تخصص', 'قسم', 'شعبة', 'فرقة', 'major', 'department', 'section',
-        # تجمعات طلابية
-        'طلاب', 'طالبات', 'تجمع', 'طلابي', 'طالبة', 'students', 'student',
-        # مستويات جامعية
-        'بكالوريوس', 'ماجستير', 'دكتوراه', 'دبلوم',
-        'bachelor', 'master', 'phd', 'diploma', 'degree',
-        # إرشاد أكاديمي
-        'مرشد', 'إرشاد', 'إرشاد أكاديمي', 'ساعات معتمدة', 'تخصص ثانٍ',
-        'academic', 'advisor', 'credit hours',
-        # مناسبات جامعية
-        'جدول', 'جدول المحاضرات', 'تقويم', 'تقويم جامعي',
-        'orientation', 'تعريف', 'يوم تعريفي',
-        # رموز سعودية/خليجية شائعة في السياق الأكاديمي
-        'سنة تحضيرية', 'سنة تحضيري', 'تحضيري', 'preparatory', 'foundation',
-        'انتساب', 'تعليم عن بعد', 'distance learning',
-    ]
-
-    # ====================================================================
-    # قائمة سوداء صارمة — تستبعد الرابط قبل الانضمام مباشرة
-    # هذه الكلمات لو ظهرت في username الرابط أو نص الرسالة → رفض فوري
-    # ====================================================================
-    HARD_BLACKLIST = [
-        # === كريبتو / بيتكوين / استثمار ===
+    # ==================================================================
+    # القوائم السوداء — مقسّمة لفئات منطقية (من DeepSeek + توسعات)
+    # ==================================================================
+    BLACKLIST_CRYPTO_INVEST = [
+        # إنجليزي
         'bitcoin', 'btc', 'crypto', 'cryptocurrency', 'blockchain',
-        'بيتكوين', 'بيتكوين', 'كريبتو', 'عملة رقمية', 'عملات رقمية',
-        'blockchain', 'mining', 'mining', 'هايف لي.', 'هيفي',
-        'استثمار', 'استثماري', 'استثمار', 'تداول', 'فوركس', 'forex',
-        'trade', 'trading', 'stocks', 'stock', 'بورصة', 'اسهم', 'سهم',
-        'ربح', 'ارباح', 'ارباح', 'مال', 'دولار', 'دولارات',
-        'profit', 'money', 'earn', 'income', 'passive',
-        'airdrop', 'ايردروب', 'ايردروب', 'nft', 'binance', 'بينانس',
+        'forex', 'trading', 'stocks', 'stock', 'profit', 'money',
+        'earn', 'income', 'passive', 'airdrop', 'nft', 'binance',
         'coinbase', 'coin', 'token', 'tokens', 'defi', 'web3',
-        'pump', 'pump', 'dump', 'signal', 'signals', 'اشارات',
-        'trade_signals', 'fx', 'cfd', 'leverage', 'رافعة',
-        # === مقامرة / يانصيب ===
-        'casino', 'gambling', 'bet', 'betting', 'رهان', 'مراهنات',
-        'lottery', 'يانصيب', 'حظ', 'قمار', 'لعبة قمار',
-        # === جامعات عراقية / غير خليجية ===
-        # العراق
+        'pump', 'dump', 'signal', 'signals', 'fx', 'cfd', 'leverage',
+        'trade', 'investment', 'mining',
+        # عربي
+        'بيتكوين', 'كريبتو', 'عملة رقمية', 'عملات رقمية',
+        'استثمار', 'استثماري', 'تداول', 'فوركس', 'بورصة', 'اسهم', 'سهم',
+        'ربح', 'ارباح', 'دولار', 'دولارات', 'ايردروب',
+        'بينانس', 'اشارات', 'رافعة', 'هايف', 'هيفي',
+    ]
+
+    BLACKLIST_GAMBLING = [
+        'casino', 'gambling', 'bet', 'betting', 'lottery',
+        'رهان', 'مراهنات', 'يانصيب', 'حظ', 'قمار', 'لعبة قمار',
+    ]
+
+    BLACKLIST_IRAQI_UNIS = [
+        # مدن عراقية
         'بغداد', 'baghdad', 'المصلا', 'mosul', 'البصرة', 'basra',
         'كربلاء', 'karbala', 'نجف', 'najaf', 'كوفة', 'kufa',
         'ميسان', 'maysan', 'واسط', 'wasit', 'ديالى', 'diyala',
@@ -1592,10 +1480,14 @@ class EducationalFilter:
         'القادسية', 'qadisiyyah', 'ذي قار', 'dhiqar', 'مثنى', 'muthanna',
         'erbil', 'أربيل', 'دهوك', 'dohuk', 'سليمانية', 'sulaymaniyah',
         'kirkuk', 'كركوك',
+        # إشارات عامة للعراق
         'iraq', 'iraqi', 'عراقي', 'عراق', 'العراق',
+    ]
+
+    BLACKLIST_NON_GULF_COUNTRIES = [
         # مصر
-        'cairo', 'القاهرة', 'alexandria', 'اسكندرية', 'اسكندرية',
-        'egypt', 'مصري', 'مصر', 'gafer', 'جامعة مصر',
+        'cairo', 'القاهرة', 'alexandria', 'اسكندرية',
+        'egypt', 'مصري', 'مصر',
         # الأردن
         'jordan', 'أردني', 'الاردن', 'عمّان', 'amman',
         # سوريا
@@ -1604,63 +1496,80 @@ class EducationalFilter:
         'lebanon', 'لبناني', 'لبنان', 'beirut', 'بيروت',
         # السودان
         'sudan', 'سوداني', 'السودان', 'خرطوم', 'khartoum',
-        # اليمن (جامعات يمنية عامة)
+        # اليمن
         'yemen', 'يمني', 'اليمن', 'صنعاء', 'sanaa', 'عدن', 'aden',
         # المغرب
-        'morocco', 'مغربي', 'المغرب', 'rabat', 'الرباط', 'casablanca', 'الدار البيضاء',
+        'morocco', 'مغربي', 'المغرب', 'rabat', 'الرباط', 'casablanca',
         # الجزائر
-        'algeria', 'جزائري', 'الجزائر', 'algiers', 'الجزائر',
+        'algeria', 'جزائري', 'الجزائر', 'algiers',
         # تونس
         'tunisia', 'تونسي', 'تونس',
         # ليبيا
         'libya', 'ليبي', 'ليبيا', 'tripoli', 'طرابلس',
         # فلسطين
-        'palestine', 'فلسطيني', 'فلسطين', 'gaza', 'غزة', 'ramallah', 'رام الله',
-        # === محتوى غير لائق ===
+        'palestine', 'فلسطيني', 'فلسطين', 'gaza', 'غزة', 'ramallah',
+    ]
+
+    BLACKLIST_ADULT = [
         'porn', 'xxx', 'adult', '18+', 'محتوى للكبار', 'nsfw',
         'sex', 'dating', 'تعارف', 'زواج', 'متعارف',
-        # === تواصل اجتماعي (متابعين/لايكات) ===
+    ]
+
+    BLACKLIST_SOCIAL = [
         'sub4sub', 'follow4follow', 'like4like', 'متابعين', 'لايكات',
         'followers', 'subscribers', 'تيك توك', 'يوتيوب', 'سناب',
         'tiktok', 'youtube', 'snapchat', 'instagram', 'انستقرام',
-        # === متاجر / خدمات مدفوعة ===
+    ]
+
+    BLACKLIST_SHOPS = [
         'متجر', 'متاجر', 'تسوق', 'شراء', 'بيع', 'سعر', 'خصم', 'عرض خاص',
         'store', 'shop', 'buy', 'sell', 'price', 'discount',
         'متوفر', 'للبيع', 'للإيجار', 'توصيل', 'شحن',
         'خدمات', 'باقات', 'باقة', 'اشتراك', 'مدفوع',
     ]
 
-    # ====================================================================
-    # قائمة بيضاء — جامعات خليجية مستهدفة (السعودية، الكويت، قطر، البحرين، الإمارات)
-    # لو ظهرت أي منها في username → قبول فوري (حتى لو فيه كلمات سلبية)
-    # ====================================================================
+    # القائمة السوداء الموحدة (للفحص السريع)
+    HARD_BLACKLIST = (
+        BLACKLIST_CRYPTO_INVEST +
+        BLACKLIST_GAMBLING +
+        BLACKLIST_IRAQI_UNIS +
+        BLACKLIST_NON_GULF_COUNTRIES +
+        BLACKLIST_ADULT +
+        BLACKLIST_SOCIAL +
+        BLACKLIST_SHOPS
+    )
+
+    # ==================================================================
+    # القائمة البيضاء الخليجية (جامعات سعودية + خليجية)
+    # ==================================================================
     GULF_WHITELIST = [
         # === السعودية ===
         'السعودية', 'saudi', 'ksa', 'السعودي',
         'الملك سعود', 'ksu', 'الملك عبدالعزيز', 'kau', 'الملك فيصل', 'kfu',
-        'الملك خالد', 'kku', 'الملك فهد', 'kfupm', 'kfupm',
+        'الملك خالد', 'kku', 'الملك فهد', 'kfupm',
         'الملك عبدالله', 'kaust', 'الملك سلمان',
-        'أم القرى', 'uqu', 'ام القرى', 'الطائف', 'tu', 'taibahu',
+        'أم القرى', 'uqu', 'ام القرى', 'الطائف', 'taibahu',
         'الباحة', 'جازان', 'نجران', 'ngran', 'الجوف',
         'الحدود الشمالية', 'حائل', 'hail', 'تبوك',
-        'القصيم', 'qassim', 'qu',
+        'القصيم', 'qassim',
         'الإمام', 'imamu', 'الإمام محمد',
         'النعيرية', 'شقراء', 'المجمعة', 'رماح', 'الخرج',
         'الدوادمي', 'الأفلاج',
         'sattam', 'prince sattam', 'psau',
         'الإمام عبدالرحمن', 'iau', 'الدمام',
-        'جدة', 'uj', 'University of Jeddah',
-        'دار الحكمة', 'اليمامة', 'ابن رشد', 'الDar AlUloom',
+        'جدة', 'uj',
+        'دار الحكمة', 'اليمامة', 'ابن رشد',
         'pnu', 'norah', 'nora', 'الأميرة نورة',
         'seu', 'السعودية الإلكترونية',
-        'majmaah', 'shaqra', 'shagra', 'شقراء',
-        'taibahu', 'taif', 'الطائف',
+        'majmaah', 'shaqra',
+        'taif', 'طيبة',
         # === الكويت ===
         'الكويت', 'kuwait', 'الكويتي',
-        'ku', 'الكويت', 'AUM', 'AUK', 'GUST', 'الكندي',
-        'PAAET', 'الهيئة', 'السعودية الكويت',
+        'ku', 'AUM', 'AUK', 'GUST', 'الكندي',
+        'PAAET', 'الهيئة',
         # === قطر ===
-        'قطر', 'qatar', 'القطري', 'qu', 'qatar university',
+        'قطر', 'qatar', 'القطري',
+        'qu', 'qatar university',
         'Carnegie', 'Georgetown', 'HBKU', 'جامعة حمد بن خليفة',
         # === البحرين ===
         'البحرين', 'bahrain', 'البحريني',
@@ -1671,126 +1580,170 @@ class EducationalFilter:
         'UAEU', 'UOS', 'AUS', 'NYUAD',
     ]
 
-    @classmethod
-    def is_academic_context(cls, text: str, link_username: str = '') -> bool:
-        """فحص هل النص يحتوي على سياق أكاديمي عام.
+    # ==================================================================
+    # السياق الأكاديمي العام (من غير ذكر جامعة)
+    # ==================================================================
+    ACADEMIC_CONTEXT = [
+        # مستويات دراسية
+        'مستوى', 'مستوى أول', 'مستوى ثاني', 'مستوى ثالث', 'مستوى رابع',
+        'مستوى خامس', 'مستوى سادس', 'مستوى سابع', 'مستوى ثامن',
+        'level 1', 'level 2', 'level1', 'level2',
+        # فصول وترامس
+        'ترم', 'ترم أول', 'ترم ثاني', 'ترم صيفي', 'فصل دراسي', 'فصل أول',
+        'semester', 'term', 'fall', 'spring', 'summer',
+        # دفعات (السنة الهجرية السعودية)
+        'دفعة', 'دفعه', '1444', '1445', '1446', '1447', '1448',
+        'cohort', 'batch',
+        # أنشطة دراسية
+        'محاضرة', 'سكشن', 'واجب', 'واجبات', 'بحث', 'مشروع', 'تقرير', 'عرض',
+        'ميدتيرم', 'فاينل', 'اختبار', 'امتحان', 'كويز',
+        'quiz', 'midterm', 'final', 'lecture', 'section', 'assignment', 'exam',
+        # مواد دراسية
+        'مادة', 'مواد', 'منهج', 'كتاب', 'ملخص', 'شرائح', 'slides',
+        'course', 'subject', 'curriculum', 'syllabus',
+        # أنظمة جامعية
+        'تسجيل', 'add drop', 'withdraw', 'معدل', 'gpa', 'credit',
+        'blackboard', 'بلاك بورد', 'moodle', 'مودل', 'tudris', 'تودرس',
+        'registration', 'enrollment',
+        # أقسام وتخصصات
+        'تخصص', 'قسم', 'شعبة', 'فرقة', 'major', 'department',
+        # تجمعات طلابية
+        'طلاب', 'طالبات', 'تجمع', 'طلابي', 'طالبة', 'students', 'student',
+        # مستويات جامعية
+        'بكالوريوس', 'ماجستير', 'دكتوراه', 'دبلوم',
+        'bachelor', 'master', 'phd', 'diploma', 'degree',
+        # إرشاد أكاديمي
+        'مرشد', 'إرشاد', 'ساعات معتمدة', 'تخصص ثانٍ',
+        'academic', 'advisor', 'credit hours',
+        # مناسبات جامعية
+        'جدول', 'جدول المحاضرات', 'تقويم', 'تقويم جامعي',
+        'orientation', 'تعريف', 'يوم تعريفي',
+        # رموز سعودية/خليجية
+        'سنة تحضيرية', 'سنة تحضيري', 'تحضيري', 'preparatory', 'foundation',
+        'انتساب', 'تعليم عن بعد', 'distance learning',
+    ]
 
-        السياق الأكاديمي = كلمات تشير لبيئة جامعية بدون ذكر دولة محددة:
-        مستوى، ترم، دفعة، محاضرة، سكشن، واجب، 1446، gpa، blackboard...
+    # كلمات تشير لمصدر أكاديمي (حتى لو ما فيه اسم جامعة)
+    ACADEMIC_SOURCE_KEYWORDS = [
+        'جامعة', 'كلية', 'معهد', 'أكاديمية', 'مدرسة',
+        'دراسة', 'تعليم', 'محاضرة', 'مستوى', 'ترم', 'دفعة',
+        'طلاب', 'طالبات', 'طلابي', 'بنات', 'بنين',
+    ]
+
+    # كلمات إيجابية قوية (تعليمية مؤكدة) — من EducationalFilter السابق
+    STRONG_POSITIVE = [
+        'جامعة', 'كلية', 'معهد', 'روضة', 'مدرسة',
+        'university', 'college', 'institute', 'school', 'academy',
+    ]
+
+    # مؤشرات أن الرابط لقناة (وليس مجموعة)
+    CHANNEL_INDICATORS = [
+        'قناة', 'channel', 'telegram channel', 'قناة تيليجرام',
+        'اخبار', 'news', 'إعلام', 'broadcast', 'اذاعة',
+    ]
+
+    # ==================================================================
+    # دوال مساعدة
+    # ==================================================================
+    @classmethod
+    def _normalize(cls, text: str) -> str:
+        """ترجيع النص lowercase مع إزالة المسافات الجانبية."""
+        return (text or '').lower().strip()
+
+    @classmethod
+    def _extract_username(cls, link: str) -> str:
+        """استخراج username من رابط Telegram أو WhatsApp.
+
+        يدعم:
+          - https://t.me/username
+          - https://telegram.me/username
+          - @username
+          - https://chat.whatsapp.com/ABC123 (يرجع ABC123)
 
         Returns:
-            True لو فيه سياق أكاديمي واضح
+            username المستخرج أو '' لو ما فيه
         """
-        combined = f"{text or ''} {link_username or ''}".lower()
-        if not combined.strip():
-            return False
+        if not link:
+            return ''
 
-        for ctx in cls.ACADEMIC_CONTEXT:
-            if ctx.lower() in combined:
-                return True
+        # t.me/username أو telegram.me/username
+        m = re.search(r'(?:https?://)?t(?:elegram)?\.me/([A-Za-z0-9_]+)',
+                      link, re.IGNORECASE)
+        if m:
+            return m.group(1)
 
-        return False
+        # @username
+        m = re.search(r'(?<![A-Za-z0-9_])@([A-Za-z0-9_]+)', link)
+        if m:
+            return m.group(1)
+
+        # WhatsApp: chat.whatsapp.com/ABC123 — نرجع الـ token (للفحص)
+        m = re.search(r'chat\.whatsapp\.com/([A-Za-z0-9]+)', link, re.IGNORECASE)
+        if m:
+            return m.group(1)
+
+        return ''
 
     @classmethod
-    def is_blacklisted(cls, text: str, link_username: str = '') -> Tuple[bool, str]:
-        """فحص القائمة السوداء الصارمة.
+    def _contains_any_term(cls, text: str, term_list: List[str]) -> Optional[str]:
+        """فحص هل يحتوي النص على أي مصطلح من القائمة.
 
         Returns:
-            (True, reason) لو الرابط مرفوض (فيه كلمة سلبية)
-            (False, '') لو الرابط نظيف
-
-        هذا الفحص يسبق كل شيء — حتى لو AI وافق، القائمة السوداء ترفض.
+            أول مصطلح مطابق أو None
         """
-        combined = f"{text or ''} {link_username or ''}".lower()
-        if not combined.strip():
-            return False, ''
+        text_lower = cls._normalize(text)
+        if not text_lower:
+            return None
 
-        for bad in cls.HARD_BLACKLIST:
-            if bad.lower() in combined:
-                return True, f'blacklist_{bad}'
+        for term in term_list:
+            if term.lower() in text_lower:
+                return term
+        return None
 
+    # ==================================================================
+    # فحوصات مستقلة (كل واحدة ترجع Tuple[bool, reason])
+    # ==================================================================
+    @classmethod
+    def is_blacklisted(cls, text: str, link_username: str = '',
+                       link: str = '', source_group_name: str = '') -> Tuple[bool, str]:
+        """فحص القائمة السوداء في كل الحقول.
+
+        Returns:
+            (True, reason) لو فيه كلمة سلبية
+            (False, '') لو نظيف
+        """
+        combined = ' '.join([
+            text or '', link_username or '',
+            link or '', source_group_name or ''
+        ])
+        term = cls._contains_any_term(combined, cls.HARD_BLACKLIST)
+        if term:
+            return True, f'blacklist_{term}'
         return False, ''
 
     @classmethod
-    def is_gulf_target(cls, text: str, link_username: str = '') -> bool:
-        """فحص هل الرابط يستهدف جامعة خليجية (السعودية، الكويت، قطر، البحرين، الإمارات).
-
-        Returns:
-            True لو فيه إشارة خليجية واضحة
-            False لو ما فيه إشارة (يفحص بدقة — لا يقبل أي شيء)
-        """
-        combined = f"{text or ''} {link_username or ''}".lower()
-        if not combined.strip():
-            return False
-
-        for good in cls.GULF_WHITELIST:
-            if good.lower() in combined:
-                return True
-
-        return False
+    def is_gulf_target(cls, text: str, link_username: str = '',
+                       link: str = '') -> Tuple[bool, str]:
+        """فحص هل فيه إشارة خليجية أكاديمية واضحة."""
+        combined = ' '.join([text or '', link_username or '', link or ''])
+        term = cls._contains_any_term(combined, cls.GULF_WHITELIST)
+        if term:
+            return True, f'gulf_{term}'
+        return False, ''
 
     @classmethod
-    def should_join(cls, text: str, link_username: str = '', link: str = '',
-                    source_group_name: str = '', source_phone: str = '') -> Tuple[bool, str]:
-        """الفحص الشامل قبل الانضمام — يجمع كل الفلاتر.
-
-        الترتيب (من الأقوى للأضعف):
-        1. القائمة السوداء → رفض فوري (حتى لو المصدر خليجي)
-        2. القائمة البيضاء الخليجية → قبول فوري
-        3. مصدر الرسالة خليجي (group_name المصدر) → قبول (البوت يراقك مجموعات خليجية)
-        4. سياق أكاديمي عام (مستوى/ترم/دفعة/1446...) → قبول
-        5. الفلتر التعليمي العام → قبول/رفض
-        6. لو ما في مطابقة → رفض (احتياطي — لا تنضم لشيء مجهول)
-
-        Args:
-            text: نص الرسالة اللي فيها الرابط
-            link_username: username المستخرج من الرابط (مثلاً KFUPM_students)
-            link: الرابط الكامل
-            source_group_name: اسم المجموعة المصدر (اللي جاء منها الرابط)
-            source_phone: رقم المراقب اللي سحب الرابط
-
-        Returns:
-            (True, reason) لو ينضم
-            (False, reason) لو يرفض
-        """
-        combined_text = f"{text or ''} {link_username or ''} {link or ''}"
-
-        # 1. القائمة السوداء (أقوى رفض) — تفحص كل النصوص المتاحة
-        # نفحص: text + link_username + link + source_group_name
-        all_text_for_blacklist = f"{combined_text} {source_group_name or ''}"
-        is_bad, bad_reason = cls.is_blacklisted(all_text_for_blacklist, link_username)
-        if is_bad:
-            return False, bad_reason
-
-        # 2. القائمة البيضاء الخليجية (أقوى قبول)
-        if cls.is_gulf_target(text, link_username):
-            return True, 'gulf_target'
-
-        # 3. مصدر الرسالة خليجي؟
-        # البوت يراقب مجموعات خليجية أصلاً — لو المجموعة المصدر فيها إشارة خليجية، اقبل
-        if source_group_name and cls.is_gulf_target(source_group_name, ''):
-            return True, 'gulf_source_group'
-
-        # 4. سياق أكاديمي عام (مستوى/ترم/دفعة/1446...)
-        # هذا يغطي مجموعات مثل "طلاب المستوى الأول" بدون ذكر جامعة
-        if cls.is_academic_context(text, link_username):
-            return True, 'academic_context'
-
-        # 4ب. لو المصدر فيه سياق أكاديمي → اقبل (الرسالة جاءت من بيئة جامعية)
-        if source_group_name and cls.is_academic_context(source_group_name, ''):
-            return True, 'academic_source_group'
-
-        # 5. الفلتر التعليمي العام
-        is_edu, edu_reason = cls.is_educational(text, link_username)
-        if is_edu:
-            return True, edu_reason
-
-        # 6. احتياطي — لو ما عرفنا، لا تنضم
-        return False, f'not_confirmed_{edu_reason}'
+    def is_academic_context(cls, text: str, link_username: str = '',
+                            link: str = '') -> Tuple[bool, str]:
+        """فحص هل فيه سياق أكاديمي عام (مستوى/ترم/دفعة/1446...)."""
+        combined = ' '.join([text or '', link_username or '', link or ''])
+        term = cls._contains_any_term(combined, cls.ACADEMIC_CONTEXT)
+        if term:
+            return True, f'academic_{term}'
+        return False, ''
 
     @classmethod
     def is_educational(cls, text: str, link_username: str = '') -> Tuple[bool, str]:
-        """يتحقق هل النص/الرابط تعليمي.
+        """فحص تعليمي عام (من EducationalFilter السابق — للحالات الضعيفة).
 
         Returns:
             (True, reason) لو تعليمي
@@ -1799,39 +1752,119 @@ class EducationalFilter:
         if not text and not link_username:
             return False, 'empty_text'
 
-        combined = f"{text or ''} {link_username or ''}".lower()
+        combined = f'{text or ""} {link_username or ""}'.lower()
 
-        # 1. فحص سلبي أولاً (الأقوى)
-        for neg in cls.STRONG_NEGATIVE:
-            if neg.lower() in combined:
-                return False, f'negative_{neg}'
-
-        # 2. فحص الجامعات السعودية (مطابقة قوية جداً)
-        for uni in cls.SAUDI_UNIVERSITIES:
+        # فحص الجامعات السعودية (مطابقة قوية)
+        for uni in cls.GULF_WHITELIST:
             if uni.lower() in combined:
                 return True, f'saudi_uni_{uni}'
 
-        # 3. فحص الكلمات الإيجابية
-        positive_matches = []
+        # فحص الكلمات الإيجابية القوية
         for pos in cls.STRONG_POSITIVE:
             if pos.lower() in combined:
-                positive_matches.append(pos)
+                return True, f'positive_{pos}'
 
-        if len(positive_matches) >= 1:
-            return True, f'positive_{positive_matches[0]}'
-
-        # 4. لو ما في مطابقة، اعتبره غير تعليمي (احتياط)
         return False, 'no_educational_keywords'
 
     @classmethod
     def is_likely_channel(cls, text: str, link_username: str = '') -> bool:
         """يتحقق هل الرابط غالباً لقناة (وليس مجموعة)."""
-        combined = f"{text or ''} {link_username or ''}".lower()
+        combined = f'{text or ""} {link_username or ""}'.lower()
         for ind in cls.CHANNEL_INDICATORS:
             if ind.lower() in combined:
                 return True
         return False
 
+    @classmethod
+    def _is_source_academic_gulf(cls, source_group_name: str) -> Tuple[bool, str]:
+        """فحص هل المصدر خليجي أو أكاديمي حسب اسمه.
+
+        Returns:
+            (True, reason) لو خليجي/أكاديمي
+            (False, '') لو غير ذلك
+        """
+        if not source_group_name:
+            return False, ''
+
+        # 1. خليجي صريح
+        is_gulf, gulf_reason = cls.is_gulf_target(source_group_name, '', '')
+        if is_gulf:
+            return True, f'source_{gulf_reason}'
+
+        # 2. سياق أكاديمي
+        is_acad, acad_reason = cls.is_academic_context(source_group_name, '', '')
+        if is_acad:
+            return True, f'source_{acad_reason}'
+
+        # 3. كلمات أكاديمية عامة (جامعة، كلية، معهد...)
+        term = cls._contains_any_term(source_group_name, cls.ACADEMIC_SOURCE_KEYWORDS)
+        if term:
+            return True, f'source_keyword_{term}'
+
+        return False, ''
+
+    # ==================================================================
+    # الفحص الرئيسي — يجمع كل الفلاتر
+    # ==================================================================
+    @classmethod
+    def should_join(cls, text: str, link_username: str = '', link: str = '',
+                    source_group_name: str = '',
+                    source_phone: str = '') -> Tuple[bool, str]:
+        """الفحص الشامل قبل الانضمام.
+
+        الترتيب (من الأقوى للأضعف):
+            1. HARD_BLACKLIST → رفض فوري (حتى لو المصدر خليجي)
+            2. GULF_WHITELIST → قبول فوري
+            3. مصدر خليجي/أكاديمي → قبول
+            4. سياق أكاديمي → قبول
+            5. is_educational عام → قبول
+            6. رفض احتياطي (fail-safe)
+
+        Args:
+            text: نص الرسالة اللي فيها الرابط
+            link_username: username المستخرج من الرابط (مثلاً KFUPM_students)
+            link: الرابط الكامل
+            source_group_name: اسم المجموعة المصدر
+            source_phone: رقم المراقب (احتياطي — غير مستخدم حالياً)
+
+        Returns:
+            (True, reason) لو ينضم
+            (False, reason) لو يرفض
+        """
+        # استخراج username تلقائياً لو ما مرر
+        if not link_username:
+            link_username = cls._extract_username(link)
+
+        # 1. القائمة السوداء (أقوى رفض) — تفوز دائماً
+        is_bad, bad_reason = cls.is_blacklisted(text, link_username, link, source_group_name)
+        if is_bad:
+            return False, bad_reason
+
+        # 2. القائمة البيضاء الخليجية (أقوى قبول)
+        is_gulf, gulf_reason = cls.is_gulf_target(text, link_username, link)
+        if is_gulf:
+            return True, gulf_reason
+
+        # 3. مصدر خليجي/أكاديمي
+        is_source_ok, source_reason = cls._is_source_academic_gulf(source_group_name)
+        if is_source_ok:
+            return True, source_reason
+
+        # 4. سياق أكاديمي
+        is_acad, acad_reason = cls.is_academic_context(text, link_username, link)
+        if is_acad:
+            return True, acad_reason
+
+        # 5. فلتر تعليمي عام
+        is_edu, edu_reason = cls.is_educational(text, link_username)
+        if is_edu:
+            return True, edu_reason
+
+        # 6. احتياطي — لا تنضم لمجهول
+        return False, f'not_confirmed_{edu_reason}'
+
+# Alias — EducationalFilter هو الاسم القديم المستخدم في باقي الكود
+EducationalFilter = GulfFilter
 
 # -------------------------------------------------------------------
 # Message Formatter
@@ -4117,7 +4150,7 @@ class Monitor:
 
                             # فحص: هل المجموعة سيئة؟
                             is_bad, bad_reason = EducationalFilter.is_blacklisted(group_name, group_username)
-                            is_gulf = EducationalFilter.is_gulf_target(group_name, group_username)
+                            is_gulf, _ = EducationalFilter.is_gulf_target(group_name, group_username)
 
                             if is_bad or (not is_gulf and not EducationalFilter.is_educational(group_name, group_username)[0]):
                                 bad_groups += 1
