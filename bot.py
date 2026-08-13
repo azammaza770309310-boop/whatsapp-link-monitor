@@ -1518,6 +1518,187 @@ class EducationalFilter:
         'اخبار', 'news', 'إعلام', 'broadcast', 'اذاعة',
     ]
 
+    # ====================================================================
+    # قائمة سوداء صارمة — تستبعد الرابط قبل الانضمام مباشرة
+    # هذه الكلمات لو ظهرت في username الرابط أو نص الرسالة → رفض فوري
+    # ====================================================================
+    HARD_BLACKLIST = [
+        # === كريبتو / بيتكوين / استثمار ===
+        'bitcoin', 'btc', 'crypto', 'cryptocurrency', 'blockchain',
+        'بيتكوين', 'بيتكوين', 'كريبتو', 'عملة رقمية', 'عملات رقمية',
+        'blockchain', 'mining', 'mining', 'هايف لي.', 'هيفي',
+        'استثمار', 'استثماري', 'استثمار', 'تداول', 'فوركس', 'forex',
+        'trade', 'trading', 'stocks', 'stock', 'بورصة', 'اسهم', 'سهم',
+        'ربح', 'ارباح', 'ارباح', 'مال', 'دولار', 'دولارات',
+        'profit', 'money', 'earn', 'income', 'passive',
+        'airdrop', 'ايردروب', 'ايردروب', 'nft', 'binance', 'بينانس',
+        'coinbase', 'coin', 'token', 'tokens', 'defi', 'web3',
+        'pump', 'pump', 'dump', 'signal', 'signals', 'اشارات',
+        'trade_signals', 'fx', 'cfd', 'leverage', 'رافعة',
+        # === مقامرة / يانصيب ===
+        'casino', 'gambling', 'bet', 'betting', 'رهان', 'مراهنات',
+        'lottery', 'يانصيب', 'حظ', 'قمار', 'لعبة قمار',
+        # === جامعات عراقية / غير خليجية ===
+        # العراق
+        'بغداد', 'baghdad', 'المصلا', 'mosul', 'البصرة', 'basra',
+        'كربلاء', 'karbala', 'نجف', 'najaf', 'كوفة', 'kufa',
+        'ميسان', 'maysan', 'واسط', 'wasit', 'ديالى', 'diyala',
+        'الأنبار', 'anbar', 'صلاح الدين', 'salahaddin', 'تكريت',
+        'سامراء', 'samaraa', 'الحلة', 'babil', 'بابل',
+        'القادسية', 'qadisiyyah', 'ذي قار', 'dhiqar', 'مثنى', 'muthanna',
+        'erbil', 'أربيل', 'دهوك', 'dohuk', 'سليمانية', 'sulaymaniyah',
+        'kirkuk', 'كركوك',
+        'iraq', 'iraqi', 'عراقي', 'عراق', 'العراق',
+        # مصر
+        'cairo', 'القاهرة', 'alexandria', 'اسكندرية', 'اسكندرية',
+        'egypt', 'مصري', 'مصر', 'gafer', 'جامعة مصر',
+        # الأردن
+        'jordan', 'أردني', 'الاردن', 'عمّان', 'amman',
+        # سوريا
+        'syria', 'سوري', 'سوريا', 'damascus', 'دمشق', 'حلب', 'aleppo',
+        # لبنان
+        'lebanon', 'لبناني', 'لبنان', 'beirut', 'بيروت',
+        # السودان
+        'sudan', 'سوداني', 'السودان', 'خرطوم', 'khartoum',
+        # اليمن (جامعات يمنية عامة)
+        'yemen', 'يمني', 'اليمن', 'صنعاء', 'sanaa', 'عدن', 'aden',
+        # المغرب
+        'morocco', 'مغربي', 'المغرب', 'rabat', 'الرباط', 'casablanca', 'الدار البيضاء',
+        # الجزائر
+        'algeria', 'جزائري', 'الجزائر', 'algiers', 'الجزائر',
+        # تونس
+        'tunisia', 'تونسي', 'تونس',
+        # ليبيا
+        'libya', 'ليبي', 'ليبيا', 'tripoli', 'طرابلس',
+        # فلسطين
+        'palestine', 'فلسطيني', 'فلسطين', 'gaza', 'غزة', 'ramallah', 'رام الله',
+        # === محتوى غير لائق ===
+        'porn', 'xxx', 'adult', '18+', 'محتوى للكبار', 'nsfw',
+        'sex', 'dating', 'تعارف', 'زواج', 'متعارف',
+        # === تواصل اجتماعي (متابعين/لايكات) ===
+        'sub4sub', 'follow4follow', 'like4like', 'متابعين', 'لايكات',
+        'followers', 'subscribers', 'تيك توك', 'يوتيوب', 'سناب',
+        'tiktok', 'youtube', 'snapchat', 'instagram', 'انستقرام',
+        # === متاجر / خدمات مدفوعة ===
+        'متجر', 'متاجر', 'تسوق', 'شراء', 'بيع', 'سعر', 'خصم', 'عرض خاص',
+        'store', 'shop', 'buy', 'sell', 'price', 'discount',
+        'متوفر', 'للبيع', 'للإيجار', 'توصيل', 'شحن',
+        'خدمات', 'باقات', 'باقة', 'اشتراك', 'مدفوع',
+    ]
+
+    # ====================================================================
+    # قائمة بيضاء — جامعات خليجية مستهدفة (السعودية، الكويت، قطر، البحرين، الإمارات)
+    # لو ظهرت أي منها في username → قبول فوري (حتى لو فيه كلمات سلبية)
+    # ====================================================================
+    GULF_WHITELIST = [
+        # === السعودية ===
+        'السعودية', 'saudi', 'ksa', 'السعودي',
+        'الملك سعود', 'ksu', 'الملك عبدالعزيز', 'kau', 'الملك فيصل', 'kfu',
+        'الملك خالد', 'kku', 'الملك فهد', 'kfupm', 'kfupm',
+        'الملك عبدالله', 'kaust', 'الملك سلمان',
+        'أم القرى', 'uqu', 'ام القرى', 'الطائف', 'tu', 'taibahu',
+        'الباحة', 'جازان', 'نجران', 'ngran', 'الجوف',
+        'الحدود الشمالية', 'حائل', 'hail', 'تبوك',
+        'القصيم', 'qassim', 'qu',
+        'الإمام', 'imamu', 'الإمام محمد',
+        'النعيرية', 'شقراء', 'المجمعة', 'رماح', 'الخرج',
+        'الدوادمي', 'الأفلاج',
+        'sattam', 'prince sattam', 'psau',
+        'الإمام عبدالرحمن', 'iau', 'الدمام',
+        'جدة', 'uj', 'University of Jeddah',
+        'دار الحكمة', 'اليمامة', 'ابن رشد', 'الDar AlUloom',
+        'pnu', 'norah', 'nora', 'الأميرة نورة',
+        'seu', 'السعودية الإلكترونية',
+        'majmaah', 'shaqra', 'shagra', 'شقراء',
+        'taibahu', 'taif', 'الطائف',
+        # === الكويت ===
+        'الكويت', 'kuwait', 'الكويتي',
+        'ku', 'الكويت', 'AUM', 'AUK', 'GUST', 'الكندي',
+        'PAAET', 'الهيئة', 'السعودية الكويت',
+        # === قطر ===
+        'قطر', 'qatar', 'القطري', 'qu', 'qatar university',
+        'Carnegie', 'Georgetown', 'HBKU', 'جامعة حمد بن خليفة',
+        # === البحرين ===
+        'البحرين', 'bahrain', 'البحريني',
+        'Ahlia', 'AMA', 'المنامة', 'university of bahrain', 'uob',
+        # === الإمارات ===
+        'الإمارات', 'UAE', 'الإماراتي', 'امارات',
+        'Khalifa', 'Zayed', 'Sharjah', 'دبي', 'أبوظبي', 'الشارقة',
+        'UAEU', 'UOS', 'AUS', 'NYUAD',
+    ]
+
+    @classmethod
+    def is_blacklisted(cls, text: str, link_username: str = '') -> Tuple[bool, str]:
+        """فحص القائمة السوداء الصارمة.
+
+        Returns:
+            (True, reason) لو الرابط مرفوض (فيه كلمة سلبية)
+            (False, '') لو الرابط نظيف
+
+        هذا الفحص يسبق كل شيء — حتى لو AI وافق، القائمة السوداء ترفض.
+        """
+        combined = f"{text or ''} {link_username or ''}".lower()
+        if not combined.strip():
+            return False, ''
+
+        for bad in cls.HARD_BLACKLIST:
+            if bad.lower() in combined:
+                return True, f'blacklist_{bad}'
+
+        return False, ''
+
+    @classmethod
+    def is_gulf_target(cls, text: str, link_username: str = '') -> bool:
+        """فحص هل الرابط يستهدف جامعة خليجية (السعودية، الكويت، قطر، البحرين، الإمارات).
+
+        Returns:
+            True لو فيه إشارة خليجية واضحة
+            False لو ما فيه إشارة (يفحص بدقة — لا يقبل أي شيء)
+        """
+        combined = f"{text or ''} {link_username or ''}".lower()
+        if not combined.strip():
+            return False
+
+        for good in cls.GULF_WHITELIST:
+            if good.lower() in combined:
+                return True
+
+        return False
+
+    @classmethod
+    def should_join(cls, text: str, link_username: str = '', link: str = '') -> Tuple[bool, str]:
+        """الفحص الشامل قبل الانضمام — يجمع كل الفلاتر.
+
+        الترتيب:
+        1. القائمة السوداء → رفض فوري
+        2. القائمة البيضاء الخليجية → قبول فوري
+        3. الفلتر التعليمي العام → قبول/رفض
+        4. لو ما في مطابقة → رفض (احتياطي — لا تنضم لشيء مجهول)
+
+        Returns:
+            (True, reason) لو ينضم
+            (False, reason) لو يرفض
+        """
+        # ادمج كل النصوص المتاحة
+        combined_text = f"{text or ''} {link_username or ''} {link or ''}"
+
+        # 1. القائمة السوداء (أقوى رفض)
+        is_bad, bad_reason = cls.is_blacklisted(text, link_username)
+        if is_bad:
+            return False, bad_reason
+
+        # 2. القائمة البيضاء الخليجية (أقوى قبول)
+        if cls.is_gulf_target(text, link_username):
+            return True, 'gulf_target'
+
+        # 3. الفلتر التعليمي العام
+        is_edu, edu_reason = cls.is_educational(text, link_username)
+        if is_edu:
+            return True, edu_reason
+
+        # 4. احتياطي — لو ما عرفنا، لا تنضم
+        return False, f'not_confirmed_gulf_{edu_reason}'
+
     @classmethod
     def is_educational(cls, text: str, link_username: str = '') -> Tuple[bool, str]:
         """يتحقق هل النص/الرابط تعليمي.
@@ -1754,7 +1935,8 @@ class MessageFormatter:
             "• /bulk_join_status — تقدم الانضمام الجماعي\n"
             "• /bulk_join_stop — إيقاف الانضمام الجماعي\n"
             "• /clear_floodwait — مسح FloodWait وإعادة تفعيل الانضمام\n"
-            "• /ai_mode — عرض/تبديل فحص الذكاء الاصطناعي (on/off)\n\n"
+            "• /ai_mode — عرض/تبديل فحص الذكاء الاصطناعي (on/off)\n"
+            "• /leave_bad_groups — مغادرة المجموعات السيئة (بيتكوين/عراقية/غير خليجية)\n\n"
             "📌 أوامر تنظيف القناة:\n"
             "• /cleanup_preview — معاينة ما سيُحذف (بدون حذف فعلي)\n"
             "• /cleanup_links — حذف الروابط غير التعليمية والمكررة\n"
@@ -3014,6 +3196,7 @@ class Monitor:
                     '/pause_join', '/resume_join', '/set_role',
                     '/enable_joiner', '/disable_joiner', '/join_status',
                     '/verify', '/sqlite_check', '/clear_floodwait', '/ai_mode',
+                    '/leave_bad_groups',
                     '/bulk_join', '/bulk_join_status', '/bulk_join_stop',
                     '/cleanup_preview', '/cleanup_links', '/cleanup_status',
                     '/live_audit', '/status', '/watchers', '/help',
@@ -3798,6 +3981,94 @@ class Monitor:
                 except Exception as e:
                     logging.error(f"[CLEAR_FLOODWAIT] Error: {e}")
                     await reply(f"❌ خطأ: {e}")
+
+            elif cmd == "/leave_bad_groups":
+                # === مغادرة المجموعات السيئة (بيتكوين/عراقية/غير خليجية) ===
+                # يفحص كل المجموعات اللي انضم لها الفدائي، ويغادر السيئة منها
+                parts = text.split()
+                dry_run = len(parts) < 2 or parts[1] != 'confirm'
+
+                joiners = await self.db.get_watchers_by_role("joiner")
+                if not joiners:
+                    await reply("❌ ما في حساب فدائي متاح")
+                    return
+
+                await reply(
+                    f"🔍 {'معاينة' if dry_run else 'تنفيذ'} — فحص المجموعات المنضم إليها...\n"
+                    f"📱 الحساب الفدائي: {joiners[0]['phone']}"
+                )
+
+                total_groups = 0
+                bad_groups = 0
+                left_groups = 0
+                errors = 0
+                bad_list = []
+
+                for joiner in joiners:
+                    phone = joiner['phone']
+                    client = self.user_clients.get(phone)
+                    if not client or not client.is_connected():
+                        continue
+
+                    try:
+                        # اجلب كل الـ dialogs (محادثات) للحساب
+                        async for dialog in client.iter_dialogs():
+                            if not dialog.is_group:
+                                continue
+                            total_groups += 1
+
+                            # فحص المجموعة بالفلتر
+                            group_name = dialog.name or ''
+                            group_username = ''
+                            try:
+                                if dialog.entity and hasattr(dialog.entity, 'username') and dialog.entity.username:
+                                    group_username = dialog.entity.username
+                            except Exception:
+                                pass
+
+                            # فحص: هل المجموعة سيئة؟
+                            is_bad, bad_reason = EducationalFilter.is_blacklisted(group_name, group_username)
+                            is_gulf = EducationalFilter.is_gulf_target(group_name, group_username)
+
+                            if is_bad or (not is_gulf and not EducationalFilter.is_educational(group_name, group_username)[0]):
+                                bad_groups += 1
+                                bad_list.append(f"  • {group_name[:40]} (@{group_username or '?'}) — {bad_reason or 'غير خليجي'}")
+
+                                if not dry_run:
+                                    try:
+                                        await client.delete_dialog(dialog.entity)
+                                        left_groups += 1
+                                        logging.info(f"[LEAVE_BAD] {phone} left: {group_name[:40]} ({bad_reason})")
+                                        await asyncio.sleep(2)  # تجنب FloodWait
+                                    except FloodWaitError as fe:
+                                        logging.warning(f"[LEAVE_BAD] FloodWait {fe.seconds}s — pausing")
+                                        await asyncio.sleep(fe.seconds + 1)
+                                    except Exception as e:
+                                        errors += 1
+                                        logging.error(f"[LEAVE_BAD] Error leaving {group_name[:30]}: {e}")
+                    except Exception as e:
+                        logging.error(f"[LEAVE_BAD] Error iterating {phone}: {e}")
+                        errors += 1
+
+                # تقرير نهائي
+                report = (
+                    f"{'🔍 معاينة' if dry_run else '✅ تنفيذ'} — مغادرة المجموعات السيئة\n\n"
+                    f"📊 الإحصائيات:\n"
+                    f"  • إجمالي المجموعات: {total_groups}\n"
+                    f"  • مجموعات سيئة: {bad_groups}\n"
+                )
+                if not dry_run:
+                    report += f"  • تم مغادرتها: {left_groups}\n"
+                    report += f"  • أخطاء: {errors}\n"
+                report += f"\n📋 المجموعات السيئة المكتشفة:\n"
+                report += '\n'.join(bad_list[:20]) if bad_list else '  (لا يوجد)'
+                if len(bad_list) > 20:
+                    report += f"\n  + {len(bad_list) - 20} أخرى..."
+
+                if dry_run and bad_groups > 0:
+                    report += "\n\n💡 للتأكيد والمغادرة الفعلية:\n/leave_bad_groups confirm"
+
+                await reply(report)
 
             elif cmd == "/ai_mode":
                 # === عرض/تبديل وضع AI Batch Mode ===
@@ -4623,6 +4894,43 @@ class Monitor:
 
                 # 4. اختر حساب فدائي
                 logging.info(f"[LINK id={link_id}] [PIPELINE-6] Selecting joiner...")
+
+                # === GULF FILTER — فحص صارم قبل اختيار الفدائي ===
+                # نستخرج username من الرابط لفحصه
+                filter_username = ''
+                filter_text = ''
+                try:
+                    # استخراج username من t.me/username أو @username
+                    import re as _re
+                    m = _re.search(r'(?:t\.me/|@)([A-Za-z0-9_]{3,})', raw_link or '')
+                    if m:
+                        filter_username = m.group(1)
+                    filter_text = (link_data.get('message_text') or '') + ' ' + (link_data.get('group_name') or '')
+                except Exception:
+                    pass
+
+                should_join, filter_reason = EducationalFilter.should_join(
+                    filter_text, filter_username, raw_link
+                )
+
+                if not should_join:
+                    # الرابط مرفوض — لا تنضم
+                    logging.warning(
+                        f"[LINK id={link_id}] [PIPELINE-6] 🚫 GULF FILTER REJECTED: "
+                        f"{raw_link[:60]} (reason={filter_reason}, username={filter_username})"
+                    )
+                    await self.prod_db.set_group_state(
+                        normalized, GroupState.BANNED, raw_link, error=f'gulf_filter_{filter_reason}'
+                    )
+                    await self.prod_db.update_queue_status(link_data['id'], 'DONE')
+                    await self.metrics.record_skip(f'gulf_filter_{filter_reason}')
+                    continue
+
+                logging.info(
+                    f"[LINK id={link_id}] [PIPELINE-6] ✅ GULF FILTER PASSED: "
+                    f"{raw_link[:60]} (reason={filter_reason})"
+                )
+
                 joiners = await self.db.get_watchers_by_role("joiner")
                 if not joiners:
                     logging.warning(f"[SCHED] cycle={cycle} ⚠️ No joiner accounts!")
