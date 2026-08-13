@@ -106,14 +106,45 @@ export default function Home() {
   // AI links fetched on-demand when user clicks an AI stat card
   const [aiFilterLinks, setAiFilterLinks] = useState<LinkItem[] | null>(null)
   const [aiFilterLoading, setAiFilterLoading] = useState(false)
+  const [deployCheck, setDeployCheck] = useState<Record<string, unknown> | null>(null)
+
+  // ===== Resilient fetch helper =====
+  // يحاول الاتصال 3 مرات بفاصل 1.5 ثانية، مع timeout 10 ثوانٍ لكل محاولة.
+  // يعيد null عند الفشل (لا يرمي استثناء) حتى لا يكسر الـ Promise.all.
+  const fetchWithRetry = useCallback(async (url: string, maxRetries = 3): Promise<Response | null> => {
+    for (let attempt = 1; attempt <= maxRetries; attempt++) {
+      try {
+        const controller = new AbortController()
+        const timeout = setTimeout(() => controller.abort(), 10000)
+        const response = await fetch(url, {
+          headers: { 'Accept': 'application/json' },
+          signal: controller.signal,
+        })
+        clearTimeout(timeout)
+        if (response.ok || response.status === 400) return response
+        // 404 / 500 → حاول مرة ثانية
+        if (attempt < maxRetries) {
+          await new Promise(r => setTimeout(r, 1500))
+          continue
+        }
+        return response
+      } catch (err) {
+        // abort timeout أو network error
+        if (attempt === maxRetries) {
+          console.warn(`[fetch] ${url} failed after ${maxRetries} attempts:`, err)
+          return null
+        }
+        await new Promise(r => setTimeout(r, 1500))
+      }
+    }
+    return null
+  }, [])
 
   const fetchLinks = useCallback(async () => {
     // استخدم API endpoint أولاً (المصدر الحقيقي)
     try {
-      const response = await fetch(`${API_URL}/api/links?limit=200`, {
-        headers: { 'Accept': 'application/json' }
-      })
-      if (response.ok) {
+      const response = await fetchWithRetry(`${API_URL}/api/links?limit=200`)
+      if (response && response.ok) {
         const data = await response.json()
         const links = data.links || data || []
         if (Array.isArray(links) && links.length > 0) {
@@ -123,50 +154,33 @@ export default function Home() {
           setUsingMockData(false)
           return
         }
+        // لو القائمة فاضية لكن الـ API شغال
+        if (Array.isArray(links) && links.length === 0) {
+          setAllLinks([])
+          setLoading(false)
+          setError(null)
+          setUsingMockData(false)
+          return
+        }
+      } else if (response && !response.ok) {
+        // API رجع خطأ
+        setError(`API error: ${response.status}`)
       }
     } catch {
-      // API غير متاح، جرب Supabase مباشرة
+      // API غير متاح
     }
-    // Fallback: Supabase مباشرة
-    if (!SUPABASE_URL || !SUPABASE_KEY) {
-      setAllLinks(mockLinks)
-      setLinks(mockLinks)
-      setLoading(false)
-      setUsingMockData(true)
-      return
-    }
-    try {
-      const response = await fetch(`${SUPABASE_URL}/rest/v1/links?order=created_at.desc&limit=200`, {
-        headers: {
-          'apikey': SUPABASE_KEY,
-          'Authorization': `Bearer ${SUPABASE_KEY}`
-        }
-      })
-      if (!response.ok) {
-        throw new Error(`Supabase returned ${response.status}`)
-      }
-      const data = await response.json()
-      setAllLinks(data || [])
-      setLoading(false)
-      setError(null)
-      setUsingMockData(false)
-    } catch (e) {
-      setError(e instanceof Error ? e.message : 'Failed to load links')
-      setLoading(false)
-      if (allLinks.length === 0) {
-        setAllLinks(mockLinks)
-        setUsingMockData(true)
-      }
-    }
-  }, [allLinks.length])
+    // Fallback: لا يوجد Supabase مباشر (RLS معطل) — استخدم mock
+    setAllLinks(mockLinks)
+    setLinks(mockLinks)
+    setLoading(false)
+    setUsingMockData(true)
+  }, [fetchWithRetry])
 
   const fetchStats = useCallback(async () => {
     // استخدم API endpoint أولاً
     try {
-      const response = await fetch(`${API_URL}/api/stats`, {
-        headers: { 'Accept': 'application/json' }
-      })
-      if (response.ok) {
+      const response = await fetchWithRetry(`${API_URL}/api/stats`)
+      if (response && response.ok) {
         const data = await response.json()
         setStats({
           total_links: data.total_links || 0,
@@ -188,70 +202,44 @@ export default function Home() {
     } catch {
       // API غير متاح
     }
-    // Fallback: Supabase
-    if (!SUPABASE_URL || !SUPABASE_KEY) {
+    // Fallback: لا يوجد Supabase مباشر
+    if (!stats) {
       setStats(mockStats)
       setUsingMockData(true)
-      return
     }
+  }, [fetchWithRetry, stats])
+
+  // ===== Deploy check — تشخيص شامل للحالة =====
+  const fetchDeployCheck = useCallback(async () => {
     try {
-      const headers = {
-        'apikey': SUPABASE_KEY,
-        'Authorization': `Bearer ${SUPABASE_KEY}`,
-        'Prefer': 'count=exact'
+      const response = await fetchWithRetry(`${API_URL}/api/deploy_check`)
+      if (response && response.ok) {
+        const data = await response.json()
+        setDeployCheck(data)
       }
-      const [totalRes, waRes, tgRes, watchRes] = await Promise.all([
-        fetch(`${SUPABASE_URL}/rest/v1/links?select=id&limit=1`, { headers }),
-        fetch(`${SUPABASE_URL}/rest/v1/links?link_type=eq.whatsapp&select=id&limit=1`, { headers }),
-        fetch(`${SUPABASE_URL}/rest/v1/links?link_type=eq.telegram&select=id&limit=1`, { headers }),
-        fetch(`${SUPABASE_URL}/rest/v1/watchers?is_active=eq.true&select=id&limit=1`, { headers })
-      ])
-      if (!totalRes.ok) {
-        throw new Error(`Supabase stats returned ${totalRes.status}`)
-      }
-      const getCount = (res: Response) => {
-        const range = res.headers.get('content-range') || '0/0'
-        return parseInt(range.split('/')[1] || '0')
-      }
-      setStats({
-        total_links: getCount(totalRes),
-        whatsapp_links: getCount(waRes),
-        telegram_links: getCount(tgRes),
-        active_watchers: getCount(watchRes)
-      })
-      setError(null)
-      setUsingMockData(false)
-    } catch (e) {
-      setError(e instanceof Error ? e.message : 'Failed to load stats')
-      if (!stats) {
-        setStats(mockStats)
-        setUsingMockData(true)
-      }
+    } catch {
+      // silent — deploy check is optional
     }
-  }, [stats])
+  }, [fetchWithRetry])
 
   const fetchCountryStats = useCallback(async () => {
-    if (!SUPABASE_URL || !SUPABASE_KEY) {
-      setCountryStats(mockCountryStats)
-      setUsingMockData(true)
-      return
-    }
+    // احسب إحصائيات الدول من allLinks المحلية (ما يحتاج Supabase مباشر)
+    // هذا أسرع ويتجنب مشاكل RLS
     try {
-      const response = await fetch(`${SUPABASE_URL}/rest/v1/links?select=message_text,group_name&limit=1000`, {
-        headers: {
-          'apikey': SUPABASE_KEY,
-          'Authorization': `Bearer ${SUPABASE_KEY}`
-        }
-      })
-      if (!response.ok) {
-        throw new Error(`Supabase country stats returned ${response.status}`)
-      }
-      const data = await response.json() || []
       const counts: Record<string, number> = {}
       let total = 0
-      for (const item of data) {
-        const text = `${item.message_text || ''} ${item.group_name || ''}`
-        const country = detectCountry(text)
+      // نستخدم allLinks لو موجودة، وإلا نجلب من API
+      let dataToAnalyze: LinkItem[] = allLinks
+      if (dataToAnalyze.length === 0) {
+        const response = await fetchWithRetry(`${API_URL}/api/links?limit=500`)
+        if (response && response.ok) {
+          const data = await response.json()
+          dataToAnalyze = data.links || []
+        }
+      }
+      for (const item of dataToAnalyze) {
+        const text = `${item.message_text || ''} ${item.group_name || ''} ${item.ai_country || ''}`
+        const country = item.ai_country || detectCountry(text)
         if (country) {
           counts[country] = (counts[country] || 0) + 1
           total++
@@ -263,25 +251,22 @@ export default function Home() {
         percentage: total > 0 ? Math.round((count / total) * 100) : 0
       })).sort((a, b) => b.count - a.count)
       setCountryStats(result)
-      setError(null)
-      setUsingMockData(false)
-    } catch (e) {
-      setError(e instanceof Error ? e.message : 'Failed to load country stats')
+    } catch {
       if (countryStats.length === 0) {
         setCountryStats(mockCountryStats)
         setUsingMockData(true)
       }
     }
-  }, [countryStats.length])
+  }, [allLinks, fetchWithRetry, countryStats.length])
 
   useEffect(() => {
     const load = async () => {
-      await Promise.all([fetchLinks(), fetchStats(), fetchCountryStats()])
+      await Promise.all([fetchLinks(), fetchStats(), fetchCountryStats(), fetchDeployCheck()])
     }
     load()
     const interval = setInterval(load, 30000)
     return () => clearInterval(interval)
-  }, [fetchLinks, fetchStats, fetchCountryStats])
+  }, [fetchLinks, fetchStats, fetchCountryStats, fetchDeployCheck])
 
   // فلترة الروابط حسب العرض الحالي
   useEffect(() => {
@@ -410,6 +395,10 @@ export default function Home() {
         {/* عرض الكل - الإحصائيات والتبويبات */}
         {currentView === 'all' && (
           <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }}>
+            {/* Deploy Check Banner — يعرض حالة النشر والمشاكل */}
+            {deployCheck && (
+              <DeployCheckBanner report={deployCheck} />
+            )}
             {/* Error banner — surface real errors instead of silently using mock data */}
             {error && (
               <div className="mb-4 p-3 rounded-lg bg-red-500/10 border border-red-500/30 text-red-300 text-sm">
@@ -877,3 +866,120 @@ const mockCountryStats: CountryStat[] = [
   { country: 'قطر', count: 18, percentage: 11 },
   { country: 'البحرين', count: 10, percentage: 7 }
 ]
+
+// ===== Deploy Check Banner — يعرض تقرير صحة النشر =====
+function DeployCheckBanner({ report }: { report: Record<string, unknown> }) {
+  const verdict = (report.verdict as string) || 'UNKNOWN'
+  const issues = (report.issues as string[]) || []
+  const supabase = (report.supabase as Record<string, unknown>) || {}
+  const telegram = (report.telegram as Record<string, unknown>) || {}
+  const ai = (report.ai as Record<string, unknown>) || {}
+  const envVars = (report.env_vars as Record<string, string>) || {}
+  const queue = (report.queue as Record<string, number>) || {}
+
+  const isHealthy = verdict === 'HEALTHY'
+  const supabaseKeyType = supabase.key_type as string | undefined
+  const supabaseReachable = supabase.reachable as boolean | undefined
+  const botConnected = telegram.bot_connected as boolean | undefined
+  const monitorsCount = telegram.monitors_count as number | undefined
+  const joinersCount = telegram.joiners_count as number | undefined
+
+  return (
+    <Card className={`mb-4 backdrop-blur-sm border ${
+      isHealthy
+        ? 'bg-emerald-500/5 border-emerald-500/30'
+        : 'bg-amber-500/5 border-amber-500/30'
+    }`}>
+      <CardHeader className="pb-2">
+        <CardTitle className="flex items-center justify-between text-sm">
+          <span className="flex items-center gap-2">
+            <span className="text-lg">{isHealthy ? '✅' : '⚠️'}</span>
+            تقرير النشر ({verdict})
+          </span>
+          <span className="text-xs text-slate-400">
+            {issues.length > 0 ? `${issues.length} مشاكل` : 'كل شيء سليم'}
+          </span>
+        </CardTitle>
+      </CardHeader>
+      <CardContent className="pt-2">
+        <div className="grid grid-cols-2 md:grid-cols-4 gap-2 text-xs">
+          {/* Supabase status */}
+          <div className={`p-2 rounded ${supabaseReachable ? 'bg-emerald-500/10' : 'bg-red-500/10'}`}>
+            <p className="text-slate-400">Supabase</p>
+            <p className={supabaseReachable ? 'text-emerald-400' : 'text-red-400'}>
+              {supabaseReachable ? '✅ متصل' : '❌ غير متصل'}
+            </p>
+            {supabaseKeyType && (
+              <p className={`text-[10px] mt-0.5 ${supabaseKeyType === 'service_role' ? 'text-emerald-400' : 'text-red-400'}`}>
+                {supabaseKeyType === 'service_role' ? '🔑 service_role' : '🚨 anon (خطأ!)'}
+              </p>
+            )}
+          </div>
+          {/* Telegram bot */}
+          <div className={`p-2 rounded ${botConnected ? 'bg-emerald-500/10' : 'bg-red-500/10'}`}>
+            <p className="text-slate-400">Telegram Bot</p>
+            <p className={botConnected ? 'text-emerald-400' : 'text-red-400'}>
+              {botConnected ? '✅ متصل' : '❌ غير متصل'}
+            </p>
+          </div>
+          {/* Monitors + Joiners */}
+          <div className="p-2 rounded bg-slate-700/30">
+            <p className="text-slate-400">الحسابات</p>
+            <p className="text-slate-200">
+              👁️ {monitorsCount ?? 0} مراقب
+            </p>
+            <p className="text-slate-200">
+              🚀 {joinersCount ?? 0} فدائي
+            </p>
+          </div>
+          {/* Queue */}
+          <div className="p-2 rounded bg-slate-700/30">
+            <p className="text-slate-400">قاعدة البيانات</p>
+            <p className="text-slate-200">{queue.total_links ?? 0} رابط</p>
+            <p className="text-amber-400">{queue.pending_links ?? 0} معلق</p>
+          </div>
+        </div>
+
+        {/* AI status */}
+        {ai.analyzer_enabled !== undefined && (
+          <div className="mt-2 p-2 rounded bg-slate-700/30 text-xs">
+            <span className="text-slate-400">🤖 AI: </span>
+            <span className={ai.analyzer_enabled ? 'text-emerald-400' : 'text-slate-500'}>
+              {ai.analyzer_enabled ? `مفعّل (${ai.providers_count} مفاتيح)` : 'غير مفعّل'}
+            </span>
+            <span className="text-slate-400 mr-3"> | الوضع: </span>
+            <span className={ai.batch_mode ? 'text-amber-400' : 'text-emerald-400'}>
+              {ai.batch_mode ? '⏭️ Batch (متخطّي)' : '🔍 فحص كامل'}
+            </span>
+          </div>
+        )}
+
+        {/* Issues list */}
+        {issues.length > 0 && (
+          <div className="mt-2 p-2 rounded bg-red-500/5 border border-red-500/20">
+            <p className="text-red-300 text-xs font-semibold mb-1">⚠️ المشاكل المكتشفة:</p>
+            <ul className="text-xs text-red-200/80 space-y-0.5">
+              {issues.slice(0, 5).map((issue, i) => (
+                <li key={i} className="leading-relaxed">• {issue}</li>
+              ))}
+              {issues.length > 5 && (
+                <li className="text-red-400/60">+ {issues.length - 5} مشاكل أخرى...</li>
+              )}
+            </ul>
+          </div>
+        )}
+
+        {/* Missing env vars (compact) */}
+        {Object.values(envVars).some(v => v.includes('MISSING')) && (
+          <div className="mt-2 text-xs text-amber-300">
+            <span className="font-semibold">متغيرات بيئية مفقودة: </span>
+            {Object.entries(envVars)
+              .filter(([, v]) => v.includes('MISSING'))
+              .map(([k]) => k)
+              .join(', ')}
+          </div>
+        )}
+      </CardContent>
+    </Card>
+  )
+}

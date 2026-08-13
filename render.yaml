@@ -1,0 +1,49 @@
+# Render Blueprint — WhatsApp & Telegram Link Monitor
+# مستند: https://render.com/docs/blueprint-spec
+# هذا الملف يعرّف خدمة واحدة (Background Worker) تشغّل bot.py
+# Render سيقرأ هذا الملف تلقائياً عند النشر.
+
+services:
+  - type: worker
+    name: whatsapp-link-monitor
+    runtime: python
+    region: oregon  # أو frankfurt حسب الأقرب لمستخدميك
+    plan: free  # أو starter للإنتاج
+    branch: main
+    rootDir: .
+    buildCommand: pip install -r requirements.txt
+    startCommand: python bot.py
+    healthCheckPath: /ready
+    autoDeploy: true
+    envVars:
+      # === متغيرات مطلوبة (أدخل قيمها من لوحة Render) ===
+      - key: API_ID
+        sync: false
+      - key: API_HASH
+        sync: false
+      - key: BOT_TOKEN
+        sync: false
+      - key: CHANNEL_ID
+        sync: false
+      # === Supabase ===
+      - key: SUPABASE_URL
+        sync: false
+      - key: SUPABASE_KEY
+        # ⚠️ مهم: استخدم service_role secret (وليس anon key)
+        # Supabase Dashboard → Settings → API → "service_role secret"
+        sync: false
+      # === AI (اختياري) ===
+      - key: OPENAI_API_KEY
+        sync: false
+      - key: AI_BATCH_MODE
+        value: "true"  # true = تخطّي AI للسرعة | false = فحص كامل
+      # === اختياري ===
+      - key: OWNER_ID
+        sync: false
+      - key: STARTUP_SCAN_DAYS
+        sync: false
+      # === Render يضبط PORT تلقائياً ===
+      - key: PORT
+        value: "10000"
+      - key: PYTHON_VERSION
+        value: "3.11.9"

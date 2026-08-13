@@ -676,9 +676,45 @@ class DatabaseManager:
         self._conn = None
         self._lock = asyncio.Lock()
         # إعدادات Supabase
-        self.supabase_url = os.getenv("SUPABASE_URL", "")
+        self.supabase_url = os.getenv("SUPABASE_URL", "").rstrip("/")
         self.supabase_key = os.getenv("SUPABASE_KEY", "")
         self._supabase_session = None
+        # فحص ذكي: anon key vs service_role key
+        # service_role JWT يحتوي على "role":"service_role" في payload
+        # anon key يحتوي على "role":"anon"
+        self._supabase_key_is_service_role = self._detect_service_role_key(self.supabase_key)
+        if self.supabase_key and not self._supabase_key_is_service_role:
+            logging.error(
+                "🚨 [SUPABASE] أنت تستخدم ANON key بدلاً من service_role!\n"
+                "   هذا سيؤدي إلى 401 Unauthorized عند الكتابة لجدول links.\n"
+                "   الحل: Supabase Dashboard → Settings → API → نسخ 'service_role secret'\n"
+                "   ثم حدّث SUPABASE_KEY في Render Environment Variables."
+            )
+        elif self.supabase_key and self._supabase_key_is_service_role:
+            logging.info("✅ [SUPABASE] service_role key detected — RLS will be bypassed")
+
+    @staticmethod
+    def _detect_service_role_key(key: str) -> bool:
+        """فحص ما إذا كان مفتاح Supabase هو service_role أو anon.
+        مفاتيح Supabase JWT تحتوي على 'role' في payload.
+        - service_role: 'role':'service_role' → يتجاوز RLS
+        - anon: 'role':'anon' → يخضع لـ RLS
+        """
+        if not key or not key.startswith("eyJ"):
+            return False
+        try:
+            # JWT = header.payload.signature (base64url)
+            parts = key.split(".")
+            if len(parts) < 2:
+                return False
+            # فك ترميز payload (base64url) — أضف padding إذا لزم
+            import base64
+            payload_b64 = parts[1] + "=" * (4 - len(parts[1]) % 4)
+            payload_json = base64.urlsafe_b64decode(payload_b64).decode("utf-8")
+            return '"role":"service_role"' in payload_json.replace(" ", "")
+        except Exception as e:
+            logging.debug(f"Could not decode Supabase JWT: {e}")
+            return False
 
     async def _get_supabase_session(self):
         if self._supabase_session is None or self._supabase_session.closed:
@@ -6044,6 +6080,165 @@ monitor_login_sessions {login_sessions}
     return web.Response(text=metrics, content_type="text/plain")
 
 
+async def api_deploy_check_handler(request):
+    """Diagnostic endpoint: full deployment health check.
+
+    Returns the status of every critical dependency:
+      - Python version
+      - Environment variables presence (not values)
+      - Supabase key type (anon vs service_role)
+      - Supabase connectivity (live ping)
+      - SQLite tables
+      - Telegram bot connection
+      - User clients (monitor vs joiner)
+      - Recent link count + queue size
+    Useful for debugging "why is dashboard empty / 401 errors".
+    """
+    monitor = request.app.get("monitor")
+    db = request.app.get("db")
+    if not monitor or not db:
+        return web.json_response({"error": "not ready"}, status=503,
+                                 headers={"Access-Control-Allow-Origin": "*"})
+
+    import sys as _sys
+    report = {
+        "timestamp": datetime.now().isoformat(),
+        "python_version": _sys.version.split()[0],
+        "env_vars": {},
+        "supabase": {},
+        "sqlite": {},
+        "telegram": {},
+        "queue": {},
+        "issues": [],
+    }
+
+    # 1. Environment variables — presence only (mask values for security)
+    required_envs = ["API_ID", "API_HASH", "BOT_TOKEN", "CHANNEL_ID",
+                     "SUPABASE_URL", "SUPABASE_KEY", "OPENAI_API_KEY",
+                     "AI_BATCH_MODE", "OWNER_ID", "STARTUP_SCAN_DAYS"]
+    for var in required_envs:
+        val = os.getenv(var, "")
+        if not val:
+            report["env_vars"][var] = "❌ MISSING"
+            if var in ("API_ID", "API_HASH", "BOT_TOKEN", "CHANNEL_ID", "SUPABASE_URL", "SUPABASE_KEY"):
+                report["issues"].append(f"Missing required env var: {var}")
+        else:
+            # إظهار أول 4 أحرف فقط للأمان
+            masked = val[:4] + "..." + val[-2:] if len(val) > 8 else "***"
+            report["env_vars"][var] = f"✅ set ({masked})"
+
+    # 2. Supabase key type + connectivity test
+    if db.supabase_url and db.supabase_key:
+        report["supabase"]["url"] = db.supabase_url
+        report["supabase"]["key_type"] = "service_role" if db._supabase_key_is_service_role else "anon"
+        if not db._supabase_key_is_service_role:
+            report["issues"].append(
+                "🚨 SUPABASE_KEY is anon role — will cause 401 on writes. "
+                "Replace with service_role secret."
+            )
+        # Live ping — try to fetch 1 row from links table
+        try:
+            session = await db._get_supabase_session()
+            test_headers = {**session.headers, "Range": "0-0"}
+            async with session.get(
+                f"{db.supabase_url}/rest/v1/links?select=id&limit=1",
+                headers=test_headers
+            ) as resp:
+                report["supabase"]["ping_status"] = resp.status
+                if resp.status == 200:
+                    report["supabase"]["reachable"] = True
+                elif resp.status == 401:
+                    report["supabase"]["reachable"] = False
+                    report["issues"].append("Supabase returned 401 — key lacks permission (RLS blocking)")
+                elif resp.status == 404:
+                    report["supabase"]["reachable"] = False
+                    report["issues"].append("Supabase returned 404 — table 'links' does not exist")
+                else:
+                    report["supabase"]["reachable"] = False
+                    report["issues"].append(f"Supabase ping returned {resp.status}")
+        except Exception as e:
+            report["supabase"]["reachable"] = False
+            report["supabase"]["error"] = str(e)[:200]
+            report["issues"].append(f"Supabase connection error: {e}")
+    else:
+        report["supabase"]["configured"] = False
+        report["issues"].append("Supabase not configured (SUPABASE_URL or SUPABASE_KEY missing)")
+
+    # 3. SQLite tables
+    try:
+        conn = await db._ensure_conn()
+        cursor = await conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name"
+        )
+        tables = [r[0] for r in await cursor.fetchall()]
+        report["sqlite"]["tables"] = tables
+        report["sqlite"]["has_watchers_table"] = "watchers" in tables
+        if "watchers" in tables:
+            report["issues"].append(
+                "🚨 SQLite has 'watchers' table — should be Supabase-only! "
+                "Architecture violation detected."
+            )
+    except Exception as e:
+        report["sqlite"]["error"] = str(e)[:200]
+        report["issues"].append(f"SQLite error: {e}")
+
+    # 4. Telegram status
+    report["telegram"]["bot_connected"] = bool(
+        monitor.bot_client and monitor.bot_client.is_connected()
+    )
+    report["telegram"]["user_clients"] = {}
+    for phone, client in monitor.user_clients.items():
+        report["telegram"]["user_clients"][phone] = {
+            "connected": bool(client and client.is_connected()),
+        }
+    if not report["telegram"]["bot_connected"]:
+        report["issues"].append("Bot client not connected to Telegram")
+    active_monitors = 0
+    active_joiners = 0
+    try:
+        watchers = await db.get_active_watchers() if hasattr(db, 'get_active_watchers') else []
+        for w in watchers:
+            role = w.get('role', 'monitor') if isinstance(w, dict) else getattr(w, 'role', 'monitor')
+            if role == 'joiner':
+                active_joiners += 1
+            else:
+                active_monitors += 1
+    except Exception:
+        pass
+    report["telegram"]["monitors_count"] = active_monitors
+    report["telegram"]["joiners_count"] = active_joiners
+    if active_joiners == 0:
+        report["issues"].append("No joiner accounts — links won't be auto-joined")
+
+    # 5. Queue + link count
+    try:
+        total_links = await db.count_requests()
+        report["queue"]["total_links"] = total_links
+    except Exception:
+        report["queue"]["total_links"] = -1
+    try:
+        queue_size = await monitor.prod_db.get_queue_size()
+        report["queue"]["pending_links"] = queue_size
+    except Exception:
+        report["queue"]["pending_links"] = -1
+
+    # 6. AI batch mode status
+    ai_batch_mode = os.getenv("AI_BATCH_MODE", "true").lower() in ("true", "1", "yes")
+    report["ai"] = {
+        "batch_mode": ai_batch_mode,
+        "analyzer_enabled": bool(getattr(monitor, 'ai_analyzer', None) and monitor.ai_analyzer.enabled),
+        "providers_count": len(monitor.ai_analyzer.providers) if hasattr(monitor, 'ai_analyzer') and monitor.ai_analyzer else 0,
+    }
+
+    # 7. Final verdict
+    report["verdict"] = "HEALTHY" if not report["issues"] else "ISSUES_FOUND"
+    report["issues_count"] = len(report["issues"])
+
+    status_code = 200 if report["verdict"] == "HEALTHY" else 200  # always 200 so dashboard can show it
+    return web.json_response(report, status=status_code,
+                             headers={"Access-Control-Allow-Origin": "*"})
+
+
 async def start_http_server(monitor=None, db=None):
     port = int(os.getenv("PORT", "10000"))
     app = web.Application()
@@ -6059,11 +6254,12 @@ async def start_http_server(monitor=None, db=None):
     app.router.add_get("/api/joined_groups", api_joined_groups_handler)
     app.router.add_get("/api/links", api_links_handler)
     app.router.add_get("/api/stats", api_stats_handler)
+    app.router.add_get("/api/deploy_check", api_deploy_check_handler)  # diagnostic
     runner = web.AppRunner(app)
     await runner.setup()
     site = web.TCPSite(runner, "0.0.0.0", port)
     await site.start()
-    logging.info(f"HTTP server listening on port {port} (endpoints: /health /ready /metrics /api/joined_groups /api/links /api/stats)")
+    logging.info(f"HTTP server listening on port {port} (endpoints: /health /ready /metrics /api/joined_groups /api/links /api/stats /api/deploy_check)")
     return runner
 
 
