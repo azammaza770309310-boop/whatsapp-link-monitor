@@ -175,3 +175,50 @@ Stage Summary:
   - `/home/z/my-project/download/bot.py` (نسخة mirror)
   - `/home/z/my-project/download/frontend/src/app/page.tsx` (985 سطر)
   - `/home/z/my-project/render.yaml` (49 سطر)
+
+---
+Task ID: SECURITY-GULF-FILTER-13e5e9c
+Agent: main (Super Z)
+Task: إضافة فلتر صارم قبل الانضمام — يرفض مجموعات بيتكوين والجامعات العراقية وغير الخليجية.
+
+Work Log:
+- المشكلة: البوت الفدائي كان ينضم لمجموعات استثمار بيتكوين وجامعات عراقية.
+- السبب الجذري: EducationalFilter كان يُطبَّق فقط في /cleanup_links، مو في الـ scheduler قبل الانضمام. AI كان في batch mode (متخطّى). ما كان في أي فلتر قبل استدعاء Join API.
+- إضافة HARD_BLACKLIST (100+ كلمة):
+  * كريبتو/بيتكوين/استثمار (bitcoin, btc, crypto, forex, airdrop, binance...)
+  * مقامرة (casino, betting, lottery...)
+  * جامعات عراقية (بغداد, البصرة, كربلاء, نجف, كوفة, المصلا...)
+  * دول غير خليجية (مصر, الأردن, سوريا, لبنان, السودان, اليمن, المغرب, الجزائر, تونس, ليبيا, فلسطين)
+  * محتوى للكبار، متابعات، متاجر
+- إضافة GULF_WHITELIST (50+ كلمة):
+  * جامعات سعودية (KSU, KAU, KFU, KFUPM, PNU, IAU, UQU, PSU...)
+  * كويت (KU, AUM, AUK, GUST)
+  * قطر (QU, HBKU, Carnegie, Georgetown)
+  * بحرين (UOB, Ahlia, AMA)
+  * إمارات (UAEU, Khalifa, Zayed, AUS, NYUAD)
+- إضافة method should_join(text, username, link):
+  1. رفض لو HARD_BLACKLIST تطابق
+  2. قبول لو GULF_WHITELIST تطابق
+  3. قبول لو is_educational يوافق
+  4. رفض احتياطي (ما ينضم لمجهول)
+- تطبيق في scheduler قبل "اختر حساب فدائي":
+  * يستخرج username من t.me/username
+  * ينفّذ should_join()
+  * رفض → BANNED + skip + continue
+  * قبول → يكمل PIPELINE-6
+- إضافة /leave_bad_groups command:
+  * /leave_bad_groups → معاينة (dry run)
+  * /leave_bad_groups confirm → مغادرة فعلية
+  * يفحص كل dialogs للحساب الفدائي
+  * يغادر السيئة بفاصل 2 ثانية
+- إصلاح syntax error: 'ha'il' → 'hail'
+- رفع لـ GitHub: 13e5e9c
+
+Stage Summary:
+- البوت الحين يرفض تلقائياً أي رابط فيه:
+  * bitcoin/btc/crypto/forex/binance/airdrop...
+  * بغداد/البصرة/كربلاء/نجف/كوفة...
+  * مصر/الأردن/سوريا/لبنان...
+- يقبل فقط لو فيه إشارة خليجية واضحة (جامعة سعودية/كويتية/قطرية/بحرينية/إماراتية).
+- /leave_bad_groups يمسح المجموعات السيئة اللي انضم لها سابقاً.
+- الملفات: bot.py (6633 سطر), download/bot.py (mirror)
