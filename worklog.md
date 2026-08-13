@@ -125,3 +125,53 @@ Stage Summary:
   3. Vercel: ارفع (push) مجلد frontend أو أعد النشر.
   4. للتفعيل: أرسل `/ai_mode on` للبوت @Azzamntheer2026_bot.
   5. ستظهر شارات AI في لوحة التحكم خلال 30 ثانية (interval التحديث).
+
+---
+Task ID: STRENGTHEN-115911d
+Agent: main (Super Z)
+Task: العودة للنسخة 557aea1 (AI integration) + تقوية الكود بأربع تحسينات رئيسية.
+
+Work Log:
+- تم `git reset --hard 557aea1` للرجوع للنسخة الكاملة.
+- إضافة `_detect_service_role_key()` في DatabaseManager:
+  - يفك ترميز JWT payload (base64url)
+  - يبحث عن `"role":"service_role"` لتأكيد المفتاح الصحيح
+  - يسجل خطأ واضح لو anon key مكتشف
+- إضافة endpoint جديد `/api/deploy_check`:
+  - يفحص 10 متغيرات بيئية (masked للأمان)
+  - يختبر Supabase live (200/401/404)
+  - يعرض key_type (service_role vs anon)
+  - يفحص SQLite tables (يكشف watchers table violation)
+  - يعرض Telegram bot + user_clients + monitors/joiners count
+  - يعرض queue size + total links + AI status
+  - يرجع issues list + verdict (HEALTHY/ISSUES_FOUND)
+- تقوية Frontend:
+  - `fetchWithRetry()`: 3 محاولات + 10s timeout + 1.5s backoff
+  - `DeployCheckBanner`: مكون يعرض تقرير النشر في أعلى الـ dashboard
+    * Supabase status + key type
+    * Telegram bot status
+    * Monitors/Joiners count
+    * AI mode + providers
+    * Issues list بالعربي
+  - `fetchCountryStats`: يحسب من allLinks محلياً (ما يحتاج Supabase مباشر)
+  - إزالة كل استدعاءات Supabase المباشرة من الـ frontend
+- إضافة `render.yaml` (Render Blueprint):
+  - worker service (python runtime)
+  - buildCommand: pip install -r requirements.txt
+  - startCommand: python bot.py
+  - healthCheckPath: /ready
+  - PYTHON_VERSION: 3.11.9
+  - كل env vars موثقة مع sync:false
+- تم رفع التحديث لـ GitHub: `115911d` (force push).
+
+Stage Summary:
+- الكود الآن على `115911d` = نسخة 557aea1 + 4 تحسينات قوية.
+- الفحص الذكي للمفتاح يكشف anon vs service_role تلقائياً.
+- endpoint /api/deploy_check يعطي صورة كاملة للنشر.
+- الـ dashboard صار resilient (retry + timeout + fallback).
+- render.yaml يسمح بنشر موحد بضغطة زر.
+- الملفات المُنتجة:
+  - `/home/z/my-project/bot.py` (6413 سطر)
+  - `/home/z/my-project/download/bot.py` (نسخة mirror)
+  - `/home/z/my-project/download/frontend/src/app/page.tsx` (985 سطر)
+  - `/home/z/my-project/render.yaml` (49 سطر)
