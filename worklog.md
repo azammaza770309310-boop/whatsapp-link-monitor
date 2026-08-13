@@ -266,3 +266,37 @@ Stage Summary:
 - يرفض بيتكوين/عراقي/مصري حتى لو جاءت من مصدر خليجي.
 - يقبل "طلاب المستوى الأول" و "دفعة 1446" لأنها سياق أكاديمي.
 - الملفات: bot.py, download/bot.py, scripts/test_filter.py
+
+---
+Task ID: FILTER-V2-MERGE-92cd709
+Agent: main (Super Z)
+Task: دمج GulfFilter (DeepSeek) + EducationalFilter (الحالي) في كلاس واحد محسّن.
+
+Work Log:
+- مقارنة الكودين:
+  * DeepSeek GulfFilter: تنظيم أفضل، regex أقوى، _find_* methods نظيفة
+  * EducationalFilter الحالي: قوائم شاملة (100+ كلمة)، is_educational، is_likely_channel
+- إنشاء scripts/gulf_filter_v2.py بالكلاس المدمج:
+  * تبني هيكل DeepSeek (BLACKLIST_CRYPTO_INVEST, BLACKLIST_GAMBLING, ...)
+  * الحفاظ على القوائم الشاملة من EducationalFilter
+  * إضافة دعم WhatsApp links في _extract_username
+  * كل methods ترجع Tuple[bool, str] بشكل متسق
+- اختبارات: 24/24 نجح (مقارنة بـ 13 سابقاً):
+  * بيتكوين بالعربي والإنجليزي → رفض
+  * جامعات عراقية/مصرية/أردنية/لبنانية → رفض
+  * WhatsApp links مع اسم خليجي → قبول
+  * telegram.me/ (مش بس t.me/) → قبول
+  * @username مباشر → قبول
+  * blackboard، تحضيري، تجمع طلاب → قبول
+- استبدال EducationalFilter في bot.py (17076 chars → 16391 chars):
+  * EducationalFilter = GulfFilter (alias) — لا تغيير في الاستدعاءات
+  * إصلاح 1 call site: is_gulf_target صارت ترجع tuple
+- رفع لـ GitHub: 92cd709
+
+Stage Summary:
+- الكلاس المدمج يجمع أفضل ما في الكودين:
+  * هيكل DeepSeek النظيف + قوائم EducationalFilter الشاملة
+  * دعم WhatsApp + Telegram + @username
+  * كل methods متسقة (Tuple[bool, str])
+  * 24 اختبار ناجح
+- الملفات: bot.py, download/bot.py, scripts/gulf_filter_v2.py, scripts/replace_filter.py
