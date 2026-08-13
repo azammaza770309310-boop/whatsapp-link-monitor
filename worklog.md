@@ -53,3 +53,75 @@ Stage Summary:
   - `/home/z/my-project/download/e2e_test/E2E_PROOF_GUIDE.md`
   - `/home/z/my-project/download/e2e_test/migration_supabase.sql`
   - `/home/z/my-project/download/e2e_test/verify_code.py`
+
+---
+Task ID: AI-DASHBOARD-FINAL
+Agent: main (Super Z)
+Task: تحديث لوحة التحكم لعرض حقول AI الجديدة من Supabase + إعادة تفعيل AI في المجدول عبر مفتاح بيئي + إضافة أمر /ai_mode للتحكم.
+
+Work Log:
+- فحص `bot.py` (6217 سطر) و `page.tsx` (872 سطر بعد التحديث).
+- وجد أن `/api/links` كان يجلب كل الأعمدة افتراضياً لكن بدون دعم فلترة AI — تم تحديثه.
+- وجد أن `/api/stats` لم يكن يرجع أي إحصائيات AI (whatsapp_links=0, telegram_links=0 ثابتة).
+- وجد أن المجدول `_joiner_worker` كان يتخطى AI دائماً (hardcoded batch mode) بدون إمكانية التبديل.
+- تحديث `api_links_handler` في bot.py:
+  - استخدام `select=` صريح لضمان إرجاع ai_approved, ai_description, ai_country, ai_is_ad.
+  - دعم فلترة عبر query params: `?ai_approved=true`, `?ai_approved=false`, `?ai_is_ad=true`, `?link_type=whatsapp`.
+  - إضافة logging للأخطاء.
+- تحديث `api_stats_handler` في bot.py:
+  - إضافة جلب إحصائيات AI من Supabase عبر `Prefer: count=exact` headers.
+  - 4 عدّادات جديدة: ai_approved, ai_rejected, ai_ads, ai_pending.
+  - إضافة `ai_batch_mode` (boolean) لعرض حالة وضع المعالجة المجمّعة.
+  - إصلاح عداد whatsapp_links و telegram_links (كانت hardcoded=0).
+- تحديث المجدول `_joiner_worker` في bot.py (PIPELINE-4):
+  - إضافة `AI_BATCH_MODE` env var (افتراضي=true).
+  - لو `AI_BATCH_MODE=false` AND `ai_analyzer.enabled` → ينفّذ AI فحص كامل.
+  - يستخرج: should_save, description, country, is_advertisement.
+  - لو AI رفض الرابط (should_save=false) → يحوّل الحالة BANNED ويتجاوزه بدون نشر.
+  - تمرير بيانات AI إلى `insert_request` ليتم حفظها في Supabase.
+  - لو `AI_BATCH_MODE=true` (افتراضي) → يتخطى AI تماماً (السلوك السابق).
+- إضافة أمر `/ai_mode` جديد في bot.py:
+  - `/ai_mode` → عرض الحالة الحالية + عدد مفاتيح AI.
+  - `/ai_mode on` → تفعيل AI (تعطيل batch mode).
+  - `/ai_mode off` → تعطيل AI (تفعيل batch mode — الافتراضي).
+  - مُسجّل في `admin_commands` list ليُعالج من الرسائل الخاصة أيضاً.
+  - مُوثّق في رسالة /help.
+- تحديث `page.tsx` (الواجهة الأمامية):
+  - إضافة حقول AI إلى `LinkItem` interface: ai_approved, ai_description, ai_country, ai_is_ad.
+  - إضافة `AIStats` interface وحقنه داخل `Stats`.
+  - تحديث `fetchStats` لقراءة `ai_stats` من `/api/stats`.
+  - إضافة state جديد: `aiFilterLinks` (قائمة AI محمّلة عند الطلب) و `aiFilterLoading`.
+  - إضافة `fetchAiLinks(mode)` لتحميل روابط AI مُصفّاة من `/api/links?ai_approved=true` إلخ.
+  - إضافة `useEffect` لتشغيل fetchAiLinks عند التبديل لعرض AI + reset عند المغادرة.
+  - تحديث `LinkCard` لعرض:
+    * شارة "✅ AI موافق" (أخضر) لو ai_approved=true.
+    * شارة "❌ AI مرفوض" (أحمر) لو ai_approved=false.
+    * شارة "⏳ لم يُفحص" (رمادي) لو ai_approved=null.
+    * شارة "⚠️ إعلان" (كهرماني) لو ai_is_ad=true.
+    * صندوق وصف AI (أخضر) لو ai_description موجودة.
+    * أولوية لـ ai_country على detectCountry المحلي.
+  - إضافة "AI Stats Card" في الصفحة الرئيسية:
+    * 4 أزرار قابلة للضغط: موافق عليه / مرفوض / إعلان / لم يُفحص.
+    * badge يعرض حالة Batch Mode أو AI Active.
+    * رسالة توعية تشرح كيفية إعادة تفعيل AI عبر `/ai_mode on`.
+  - إضافة 3 views جديدة: 'ai_approved', 'ai_rejected', 'ai_ads' مع عناوين عربية مناسبة.
+  - تحديث loading state ليتعامل مع aiFilterLoading.
+- التحقق من صحة syntax: `python -c "import ast; ast.parse(open('bot.py').read())"` → OK.
+- نسخ bot.py المحدّث إلى `/home/z/my-project/download/bot.py`.
+
+Stage Summary:
+- `/api/links` الآن يرجع كل حقول AI + يدعم الفلترة عبر query params.
+- `/api/stats` الآن يرجع إحصائيات AI كاملة (ai_approved/rejected/ads/pending + ai_batch_mode).
+- المجدول يحترم `AI_BATCH_MODE` env var — يمكن تفعيل/تعطيل AI بدون إعادة نشر الكود.
+- أمر `/ai_mode` يسمح بالتبديل الديناميكي من تيليجرام بدون لمس Render.
+- الواجهة الأمامية تعرض شارات AI + صندوق وصف + لوحة إحصائيات AI تفاعلية + 3 views للفلترة.
+- الملفات المُنتجة:
+  - `/home/z/my-project/bot.py` (6217 سطر)
+  - `/home/z/my-project/download/bot.py` (نسخة mirror)
+  - `/home/z/my-project/download/frontend/src/app/page.tsx` (872 سطر)
+- الخطوات التالية للمستخدم:
+  1. اضغط (commit) + ارفع (push) التغييرات إلى GitHub.
+  2. Render سيعيد النشر تلقائياً.
+  3. Vercel: ارفع (push) مجلد frontend أو أعد النشر.
+  4. للتفعيل: أرسل `/ai_mode on` للبوت @Azzamntheer2026_bot.
+  5. ستظهر شارات AI في لوحة التحكم خلال 30 ثانية (interval التحديث).

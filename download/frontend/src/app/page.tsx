@@ -24,6 +24,19 @@ interface LinkItem {
   source_phone: string | null
   message_link: string | null
   created_at: string
+  // AI fields (from Supabase — may be null if not yet analyzed)
+  ai_approved?: boolean | null
+  ai_description?: string | null
+  ai_country?: string | null
+  ai_is_ad?: boolean | null
+}
+
+interface AIStats {
+  ai_approved: number
+  ai_rejected: number
+  ai_ads: number
+  ai_pending: number
+  ai_batch_mode: boolean
 }
 
 interface Stats {
@@ -31,6 +44,7 @@ interface Stats {
   whatsapp_links: number
   telegram_links: number
   active_watchers: number
+  ai_stats?: AIStats
 }
 
 interface CountryStat {
@@ -77,7 +91,7 @@ function safeUrl(url: string | null | undefined): string | null {
   return null
 }
 
-type ViewType = 'all' | 'whatsapp' | 'telegram' | string // string = country name
+type ViewType = 'all' | 'whatsapp' | 'telegram' | 'ai_approved' | 'ai_rejected' | 'ai_ads' | string // string = country name
 
 export default function Home() {
   const [links, setLinks] = useState<LinkItem[]>([])
@@ -89,6 +103,9 @@ export default function Home() {
   const [allLinks, setAllLinks] = useState<LinkItem[]>([])
   const [error, setError] = useState<string | null>(null)
   const [usingMockData, setUsingMockData] = useState(false)
+  // AI links fetched on-demand when user clicks an AI stat card
+  const [aiFilterLinks, setAiFilterLinks] = useState<LinkItem[] | null>(null)
+  const [aiFilterLoading, setAiFilterLoading] = useState(false)
 
   const fetchLinks = useCallback(async () => {
     // استخدم API endpoint أولاً (المصدر الحقيقي)
@@ -155,7 +172,14 @@ export default function Home() {
           total_links: data.total_links || 0,
           whatsapp_links: data.whatsapp_links || 0,
           telegram_links: data.telegram_links || 0,
-          active_watchers: data.active_watchers || 0
+          active_watchers: data.active_watchers || 0,
+          ai_stats: data.ai_stats ? {
+            ai_approved: data.ai_stats.ai_approved || 0,
+            ai_rejected: data.ai_stats.ai_rejected || 0,
+            ai_ads: data.ai_stats.ai_ads || 0,
+            ai_pending: data.ai_stats.ai_pending || 0,
+            ai_batch_mode: !!data.ai_stats.ai_batch_mode,
+          } : undefined
         })
         setError(null)
         setUsingMockData(false)
@@ -261,6 +285,23 @@ export default function Home() {
 
   // فلترة الروابط حسب العرض الحالي
   useEffect(() => {
+    // حالات AI: نستخدم قائمة منفصلة محمّلة عند الطلب من الـ API
+    if (currentView === 'ai_approved' || currentView === 'ai_rejected' || currentView === 'ai_ads') {
+      // القائمة محمّلة بالفعل في aiFilterLinks — فقط فلترة البحث محلياً
+      let filtered = [...(aiFilterLinks || [])]
+      if (searchQuery) {
+        const q = searchQuery.toLowerCase()
+        filtered = filtered.filter(l =>
+          l.link?.toLowerCase().includes(q) ||
+          l.message_text?.toLowerCase().includes(q) ||
+          l.group_name?.toLowerCase().includes(q) ||
+          l.sender_name?.toLowerCase().includes(q)
+        )
+      }
+      setLinks(filtered)
+      return
+    }
+
     let filtered = [...allLinks]
 
     if (currentView === 'whatsapp') {
@@ -286,7 +327,48 @@ export default function Home() {
     }
 
     setLinks(filtered)
-  }, [currentView, searchQuery, allLinks])
+  }, [currentView, searchQuery, allLinks, aiFilterLinks])
+
+  // تحميل روابط AI عند اختيار عرض AI
+  const fetchAiLinks = useCallback(async (mode: 'ai_approved' | 'ai_rejected' | 'ai_ads') => {
+    setAiFilterLoading(true)
+    setAiFilterLinks(null)
+    try {
+      const params = new URLSearchParams({ limit: '200' })
+      if (mode === 'ai_approved') params.set('ai_approved', 'true')
+      else if (mode === 'ai_rejected') params.set('ai_approved', 'false')
+      else if (mode === 'ai_ads') params.set('ai_is_ad', 'true')
+
+      const response = await fetch(`${API_URL}/api/links?${params.toString()}`, {
+        headers: { 'Accept': 'application/json' }
+      })
+      if (response.ok) {
+        const data = await response.json()
+        setAiFilterLinks(data.links || [])
+      } else {
+        setAiFilterLinks([])
+      }
+    } catch {
+      setAiFilterLinks([])
+    } finally {
+      setAiFilterLoading(false)
+    }
+  }, [])
+
+  // when user navigates to an AI view, fetch the matching links
+  useEffect(() => {
+    if (currentView === 'ai_approved') {
+      fetchAiLinks('ai_approved')
+    } else if (currentView === 'ai_rejected') {
+      fetchAiLinks('ai_rejected')
+    } else if (currentView === 'ai_ads') {
+      fetchAiLinks('ai_ads')
+    } else if (aiFilterLinks !== null) {
+      // reset when leaving AI view — guarded by null check to avoid loop
+      setAiFilterLinks(null)
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [currentView])
 
   const countryColors: Record<string, string> = {
     'السعودية': 'from-emerald-500 to-green-400',
@@ -384,6 +466,63 @@ export default function Home() {
               </Card>
             )}
 
+            {/* ===== AI Stats Card ===== */}
+            <Card className="bg-slate-800/30 border-slate-700/50 backdrop-blur-sm mb-6">
+              <CardHeader>
+                <CardTitle className="flex items-center justify-between text-lg">
+                  <span className="flex items-center gap-2">
+                    <span className="text-2xl">🤖</span>
+                    تحليل الذكاء الاصطناعي
+                  </span>
+                  {stats?.ai_stats && (
+                    <Badge variant="outline" className={
+                      stats.ai_stats.ai_batch_mode
+                        ? 'border-amber-500/40 text-amber-400 bg-amber-500/10'
+                        : 'border-emerald-500/40 text-emerald-400 bg-emerald-500/10'
+                    }>
+                      {stats.ai_stats.ai_batch_mode ? '⏭️ Batch Mode' : '🤖 AI Active'}
+                    </Badge>
+                  )}
+                </CardTitle>
+              </CardHeader>
+              <CardContent>
+                <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
+                  {/* AI Approved */}
+                  <button onClick={() => setCurrentView('ai_approved')} className="text-right hover:scale-105 transition-transform">
+                    <div className="bg-emerald-500/10 border border-emerald-500/30 rounded-lg p-3 text-center">
+                      <p className="text-2xl font-bold text-emerald-400">{stats?.ai_stats?.ai_approved ?? 0}</p>
+                      <p className="text-xs text-slate-400 mt-1">✅ موافق عليه</p>
+                    </div>
+                  </button>
+                  {/* AI Rejected */}
+                  <button onClick={() => setCurrentView('ai_rejected')} className="text-right hover:scale-105 transition-transform">
+                    <div className="bg-red-500/10 border border-red-500/30 rounded-lg p-3 text-center">
+                      <p className="text-2xl font-bold text-red-400">{stats?.ai_stats?.ai_rejected ?? 0}</p>
+                      <p className="text-xs text-slate-400 mt-1">❌ مرفوض</p>
+                    </div>
+                  </button>
+                  {/* AI Ads */}
+                  <button onClick={() => setCurrentView('ai_ads')} className="text-right hover:scale-105 transition-transform">
+                    <div className="bg-amber-500/10 border border-amber-500/30 rounded-lg p-3 text-center">
+                      <p className="text-2xl font-bold text-amber-400">{stats?.ai_stats?.ai_ads ?? 0}</p>
+                      <p className="text-xs text-slate-400 mt-1">⚠️ إعلان</p>
+                    </div>
+                  </button>
+                  {/* AI Pending */}
+                  <div className="bg-slate-700/30 border border-slate-700 rounded-lg p-3 text-center">
+                    <p className="text-2xl font-bold text-slate-300">{stats?.ai_stats?.ai_pending ?? 0}</p>
+                    <p className="text-xs text-slate-400 mt-1">⏳ لم يُفحص</p>
+                  </div>
+                </div>
+                {stats?.ai_stats?.ai_batch_mode && (
+                  <p className="text-xs text-slate-500 mt-3 leading-relaxed">
+                    💡 وضع المعالجة المجمّعة (Batch Mode) مُفعّل — يتم نشر الروابط بدون فحص AI لتسريع معالجة القائمة المتراكمة.
+                    أرسل <code className="bg-slate-700/50 px-1.5 py-0.5 rounded text-blue-300">/ai_mode on</code> للبوت لإعادة تفعيل الفحص.
+                  </p>
+                )}
+              </CardContent>
+            </Card>
+
             {/* البحث */}
             <div className="relative mb-4">
               <Search className="absolute right-3 top-1/2 -translate-y-1/2 w-4 h-4 text-slate-400" />
@@ -396,7 +535,7 @@ export default function Home() {
           </motion.div>
         )}
 
-        {/* عرض مخصص (واتساب/تيليجرام/دولة) */}
+        {/* عرض مخصص (واتساب/تيليجرام/دولة/AI) */}
         {currentView !== 'all' && (
           <motion.div initial={{ opacity: 0, x: 20 }} animate={{ opacity: 1, x: 0 }} className="mb-6">
             <div className="flex items-center gap-3 mb-4">
@@ -408,9 +547,15 @@ export default function Home() {
               <h2 className="text-xl font-bold">
                 {currentView === 'whatsapp' && '🟢 روابط واتساب'}
                 {currentView === 'telegram' && '🔵 روابط تيليجرام'}
-                {currentView !== 'whatsapp' && currentView !== 'telegram' && `🌐 روابط ${currentView}`}
+                {currentView === 'ai_approved' && '✅ روابط موافق عليها (AI)'}
+                {currentView === 'ai_rejected' && '❌ روابط مرفوضة (AI)'}
+                {currentView === 'ai_ads' && '⚠️ روابط مُصنّفة كإعلانات (AI)'}
+                {currentView !== 'whatsapp' && currentView !== 'telegram' &&
+                 currentView !== 'ai_approved' && currentView !== 'ai_rejected' && currentView !== 'ai_ads' && `🌐 روابط ${currentView}`}
               </h2>
-              <Badge className="bg-slate-700 text-white border-0">{links.length}</Badge>
+              <Badge className="bg-slate-700 text-white border-0">
+                {aiFilterLoading ? '...' : links.length}
+              </Badge>
             </div>
             <div className="relative mb-4">
               <Search className="absolute right-3 top-1/2 -translate-y-1/2 w-4 h-4 text-slate-400" />
@@ -422,11 +567,13 @@ export default function Home() {
 
         {/* قائمة الروابط */}
         <div className="mb-4 flex items-center justify-between">
-          <p className="text-sm text-slate-400">عرض {links.length} رابط</p>
+          <p className="text-sm text-slate-400">
+            {aiFilterLoading ? '⏳ جارٍ تحميل روابط AI...' : `عرض ${links.length} رابط`}
+          </p>
         </div>
 
         <ScrollArea className="h-[500px] pr-4">
-          {loading ? (
+          {loading || aiFilterLoading ? (
             <div className="space-y-4">{[...Array(5)].map((_, i) => <Skeleton key={i} className="h-32 w-full bg-slate-800/50 rounded-xl" />)}</div>
           ) : links.length === 0 ? (
             <div className="text-center py-20">
@@ -472,8 +619,17 @@ function LinkCard({ link }: { link: LinkItem }) {
   const isWhatsapp = link.link_type === 'whatsapp'
   const date = new Date(link.created_at)
   const timeStr = date.toLocaleString('ar-SA', { year: 'numeric', month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' })
-  const country = detectCountry(`${link.message_text || ''} ${link.group_name || ''}`)
+  const country = link.ai_country || detectCountry(`${link.message_text || ''} ${link.group_name || ''}`)
   const href = safeUrl(link.link)
+
+  // AI badge rendering
+  // ai_approved === true  → ✅ موافق عليه
+  // ai_approved === false → ❌ مرفوض
+  // ai_approved === null  → ⏳ لم يُفحص
+  const aiApproved = link.ai_approved
+  const aiIsAd = link.ai_is_ad === true
+  const aiDescription = link.ai_description
+
   return (
     <Card className="mb-3 bg-slate-800/30 border-slate-700/50 backdrop-blur-sm hover:bg-slate-800/50 transition-all duration-300 overflow-hidden">
       <CardContent className="p-4">
@@ -484,6 +640,27 @@ function LinkCard({ link }: { link: LinkItem }) {
               {isWhatsapp ? '🟢 واتساب' : '🔵 تيليجرام'}
             </Badge>
             {country && <Badge variant="outline" className="border-purple-500/30 text-purple-400">{country}</Badge>}
+            {/* AI verification badges */}
+            {aiApproved === true && (
+              <Badge variant="outline" className="border-emerald-500/40 text-emerald-400 bg-emerald-500/10">
+                ✅ AI موافق
+              </Badge>
+            )}
+            {aiApproved === false && (
+              <Badge variant="outline" className="border-red-500/40 text-red-400 bg-red-500/10">
+                ❌ AI مرفوض
+              </Badge>
+            )}
+            {aiApproved === null && (
+              <Badge variant="outline" className="border-slate-600/40 text-slate-500">
+                ⏳ لم يُفحص
+              </Badge>
+            )}
+            {aiIsAd && (
+              <Badge variant="outline" className="border-amber-500/40 text-amber-400 bg-amber-500/10">
+                ⚠️ إعلان
+              </Badge>
+            )}
           </div>
           <div className="flex items-center gap-1 text-slate-500 text-xs"><Clock className="w-3 h-3" />{timeStr}</div>
         </div>
@@ -500,6 +677,12 @@ function LinkCard({ link }: { link: LinkItem }) {
               <ExternalLink className="w-4 h-4 text-slate-500 shrink-0" />
               <span className="text-sm text-slate-400 truncate font-mono">{link.link || '(no URL)'}</span>
             </div>
+          </div>
+        )}
+        {/* AI description — show prominently if available */}
+        {aiDescription && (
+          <div className="mb-2 bg-emerald-500/5 border border-emerald-500/20 rounded-lg p-2 text-xs text-emerald-300/90">
+            <span className="font-semibold">🤖 وصف AI:</span> {aiDescription}
           </div>
         )}
         <div className="grid grid-cols-2 gap-2 text-xs">

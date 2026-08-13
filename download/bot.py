@@ -91,47 +91,25 @@ TELEGRAM_LINK_PATTERN = re.compile(
 
 # كلمات إعلانية - إذا وجدت في الرسالة، يتم استبعاد الرابط
 ADVERTISER_KEYWORDS = [
-    # تواصل وخدمات
-    "للتواصل", "عبر حسابنا", "مكتبنا", "خدمات طلابية", "بأسعار مناسبة",
-    "تواصل خاص", "تواصل واتساب", "عرض احتياجك", "سجل طلبك",
-    "اعذار ولقيت", "اعذار طبية جاهزة", "في صحتي",
-    "يكلمني ويبشر", "سكليف اجازه مرضيه معتمدة بصحتي",
-    "رقم للتواصل", "ارسال رسالة", "عرض خدمات", "طلب خدمة",
-    "حساب شخصي", "رقم جوال", "مراسلة", "سجل طلبك هنا",
-    "خدمة مدرسية", "حل واجبات", "طلب تدريبي", "تواصل معانا",
-    "خدمات تعليمية", "project service", "study help",
-    "دعم دراسي", "توصيل مشروع", "تسليم واجب",
-    "خدمة اونلاين", "حل واجب فوري", "حل بحث سريع",
-    "طلب مشروع", "تسليم مشروع", "خدمات اكاديمية",
-    "مراسلة عبر واتساب", "رقم واتساب", "تواصل شخصي",
-    # أرقام هواتف
-    "+966", "056", "053", "050", "054", "055", "058", "059",
-    # كلمات تسويقية
-    "promotion", "announcement", "اعلان", "اعلانات",
-    "خصم", "عروض", "تخفيض", "خصومات", "عروض خاصة",
-    "عرض محدود", "عرض لفترة محدودة", "استفد الآن",
-    "احجز الآن", "اطلب الآن", "سارع", "بسرعة",
-    "فرصة", "فرصه", "محدودة", "العدد محدود",
-    "أماكن محدودة", "مقاعد محدودة", "حجز", "احجز",
-    "حجوزات", "حجز مسبق", "حجز الآن",
-    # دفع
-    "دفع", "الدفع", "دفع اونلاين", "الدفع اونلاين",
-    "سداد", "السداد", "الدفع المسبق", "دفع مسبق",
-    "الدفع عند الاستلام", "دفع عند الاستلام",
-    # ضمانات تسويقية
-    "ضمان", "ضمان استرجاع", "ضمان الجودة",
-    "جودة عالية", "عالية الجودة", "مضمون",
-    "نتيجة مضمونة", "نتائج مضمونة", "ضمان النتيجة",
-    "خبرة طويلة", "سنوات من الخبرة",
-    "كفاءة عالية", "سرعة في التنفيذ", "تنفيذ سريع",
-    "انجاز سريع", "انجاز في وقت قياسي",
-    "سرية تامة", "خصوصية تامة",
-    # مؤسسات تعليمية (إعلانات)
-    "مكتب خدمات", "مركز تعليمي", "مركز تدريب",
+    # خدمات مدفوعة واضحة فقط
+    "مكتبنا", "مكتب خدمات", "مركز تعليمي", "مركز تدريب",
     "معهد تعليمي", "معهد تدريب", "أكاديمية تعليمية",
     "أكاديمية تدريب", "مؤسسة تعليمية", "مؤسسة تدريب",
-    "شركة تعليمية", "شركة تدريب", "مجموعة تعليمية",
-    "مجموعة تدريب", "فريق تعليمي", "فريق تدريب",
+    "شركة تعليمية", "شركة تدريب",
+    # حل واجبات مدفوع
+    "حل واجبات", "حل واجب فوري", "حل بحث سريع",
+    "توصيل مشروع", "تسليم واجب", "تسليم مشروع",
+    "خدمة اونلاين", "خدمات اكاديمية", "خدمات تعليمية",
+    "project service", "study help", "دعم دراسي",
+    # أعذار طبية
+    "اعذار طبية جاهزة", "اعذار ولقيت", "في صحتي",
+    "سكليف اجازه مرضيه معتمدة",
+    # تسويق صريح
+    "promotion", "announcement", "اعلان", "اعلانات",
+    "ضمان استرجاع", "ضمان الجودة", "ضمان النتيجة",
+    "نتيجة مضمونة", "نتائج مضمونة",
+    "سرية تامة", "خصوصية تامة",
+    "انجاز في وقت قياسي",
 ]
 
 # كلمات للتجاهل التام (رسائل قصيرة/ترحيبية)
@@ -454,7 +432,9 @@ class AIAnalyzer:
             return self._fallback_analysis(text)
 
         prompt = f"""أنت مساعد ذكي لتحليل رسائل المجموعات الجامعية.
-حلل هذه الرسالة بدقة كأنك إنسان:
+هذه الرسالة تم سحبها من مجموعة يراقبها حساب مراقب — أي أنها من بيئة جامعية.
+
+حلل هذه الرسالة:
 
 الرسالة: "{text[:1500]}"
 
@@ -469,17 +449,19 @@ class AIAnalyzer:
     "description": "وصف مختصر في 5 كلمات"
 }}
 
-القواعد الصارمة:
-- should_save = true فقط إذا كان الرابط لمجموعة أو قناة تعليمية جامعية
-- should_save = false إذا كان الرابط غير تعليمي (تسوق، ترفيه، أخبار، إلخ)
-- should_save = false إذا كان دردشة مباشرة (wa.me/رقم بدون /message)
-- is_advertisement = true إذا كانت الرسالة ترويج لخدمات مدفوعة أو إعلان
-- is_advertisement = true إذا كان الرابط لخدمة مدفوعة (مكتب، مركز، شركة)
-- sender_contact = رقم الهاتف أو @اليوزر المذكور في الرسالة
+القواعد:
+- should_save = true إذا كان في الرسالة رابط واتساب أو تيليجرام لمجموعة طلابية
+- should_save = true حتى لو الرسالة تحتوي فقط على رابط بدون نص
+- should_save = false فقط إذا لم يوجد أي رابط واتساب أو تيليجرام
+- should_save = false إذا كان الرابط لخدمة مدفوعة (مكتب، مركز، شركة، خدمات طلابية)
+- should_save = false إذا كان الرابط لحل واجبات أو تسليم مشاريع مدفوعة
+- should_save = false إذا كان دردشة مباشرة (wa.me/رقم بدون كلمة message)
+- should_save = false إذا كانت الرسالة ترويج لأعذار طبية أو خدمات صحية
+- is_advertisement = true إذا كانت الرسالة ترويج لخدمات مدفوعة
+- is_advertisement = true إذا ذكر: مكتب، مركز، شركة، خدمات، اشتراك، مدفوع
 - استخرج الرابط الكامل بشكل صحيح من أي صيغة
 - فحص كل أنواع الروابط: chat.whatsapp.com, wa.me, t.me, telegram.me
-- إذا لم يوجد رابط واتساب أو تيليجرام، should_save = false
-- country: حدد الدولة بدقة من سياق الرسالة"""
+- country: حدد الدولة من سياق الرسالة أو من اسم المجموعة"""
 
         # محاولة مع كل المفاتيح - نقفل فقط تبديل المفتاح، ليس الاستدعاء HTTP
         # (otherwise all AI calls are serialized → bottleneck with multi-user traffic)
@@ -709,8 +691,9 @@ class DatabaseManager:
         return self._supabase_session
 
     async def _supabase_insert_link(self, link, link_type, message_text, group_name,
-                                     sender_name, sender_contact, source_phone, message_link):
-        """إرسال الرابط إلى Supabase"""
+                                     sender_name, sender_contact, source_phone, message_link,
+                                     ai_approved=None, ai_description=None, ai_country=None, ai_is_ad=None):
+        """إرسال الرابط إلى Supabase مع بيانات AI"""
         if not self.supabase_url or not self.supabase_key:
             return
         try:
@@ -723,13 +706,42 @@ class DatabaseManager:
                 "sender_name": sender_name,
                 "sender_contact": sender_contact,
                 "source_phone": source_phone,
-                "message_link": message_link
+                "message_link": message_link,
             }
+            # أضف بيانات AI لو موجودة
+            if ai_approved is not None:
+                data["ai_approved"] = ai_approved
+            if ai_description:
+                data["ai_description"] = ai_description[:200]
+            if ai_country:
+                data["ai_country"] = ai_country
+            if ai_is_ad is not None:
+                data["ai_is_ad"] = ai_is_ad
+
             async with session.post(f"{self.supabase_url}/rest/v1/links", json=data) as resp:
                 if resp.status not in (200, 201):
                     text = await resp.text()
                     if "duplicate" not in text.lower():
                         logging.error(f"Supabase link insert: {resp.status} - {text[:100]}")
+                    else:
+                        # لو مكرر، حدّث بيانات AI
+                        safe_link = url_quote(link, safe='')
+                        update_data = {}
+                        if ai_approved is not None:
+                            update_data["ai_approved"] = ai_approved
+                        if ai_description:
+                            update_data["ai_description"] = ai_description[:200]
+                        if ai_country:
+                            update_data["ai_country"] = ai_country
+                        if ai_is_ad is not None:
+                            update_data["ai_is_ad"] = ai_is_ad
+                        if update_data:
+                            async with session.patch(
+                                f"{self.supabase_url}/rest/v1/links?link=eq.{safe_link}",
+                                json=update_data
+                            ) as patch_resp:
+                                if patch_resp.status in (200, 204):
+                                    logging.info(f"[SUPABASE] Updated AI data for: {link[:50]}")
         except Exception as e:
             logging.error(f"Supabase insert exception: {e}")
 
@@ -1199,7 +1211,8 @@ class DatabaseManager:
     async def insert_request(self, link: str, message_date: datetime,
                               group_name: str, sender_name: str, source_phone: str,
                               message_link: str = None, message_text: str = None,
-                              sender_contact: str = None, link_type: str = None) -> bool:
+                              sender_contact: str = None, link_type: str = None,
+                              ai_approved=None, ai_description=None, ai_country=None, ai_is_ad=None) -> bool:
         """إدراج رابط جديد - يتحقق من التكرار أولاً ثم يحفظ
 
         Race-safe: uses SQLite UNIQUE constraint as the authoritative check.
@@ -1255,7 +1268,9 @@ class DatabaseManager:
         # 2. حفظ في Supabase (فقط بعد نجاح الإدراج المحلي)
         await self._supabase_insert_link(
             link, link_type, message_text, group_name,
-            sender_name, sender_contact, source_phone, message_link)
+            sender_name, sender_contact, source_phone, message_link,
+            ai_approved=ai_approved, ai_description=ai_description,
+            ai_country=ai_country, ai_is_ad=ai_is_ad)
         return True
 
     async def count_requests(self, source_phone: str = None) -> int:
@@ -1702,7 +1717,8 @@ class MessageFormatter:
             "• /bulk_join — الانضمام لكل روابط القناة (22 ألف+)\n"
             "• /bulk_join_status — تقدم الانضمام الجماعي\n"
             "• /bulk_join_stop — إيقاف الانضمام الجماعي\n"
-            "• /clear_floodwait — مسح FloodWait وإعادة تفعيل الانضمام\n\n"
+            "• /clear_floodwait — مسح FloodWait وإعادة تفعيل الانضمام\n"
+            "• /ai_mode — عرض/تبديل فحص الذكاء الاصطناعي (on/off)\n\n"
             "📌 أوامر تنظيف القناة:\n"
             "• /cleanup_preview — معاينة ما سيُحذف (بدون حذف فعلي)\n"
             "• /cleanup_links — حذف الروابط غير التعليمية والمكررة\n"
@@ -1880,44 +1896,62 @@ class HistoryScanner:
                     item['group'], item['sender'], item.get('contact', ''), item['date'],
                     item['link'], item['text'], self.source_phone, item.get('msg_link'))
                 buttons = MessageFormatter.get_link_buttons(item['link'])
-                # Use Monitor._send for retry logic + FloodWait cap + lock
-                # (prevents retry storms and concurrent batch flooding)
-                # We need to access it via the bot_client's parent monitor...
-                # But HistoryScanner doesn't have a reference to Monitor.
-                # Instead, replicate the same retry pattern with cap.
-                await self._send_with_retry(formatted, buttons)
+                # === POST-CONDITION VERIFICATION ===
+                published, msg_id = await self._send_with_retry(formatted, buttons)
+                if not published:
+                    logging.error(
+                        f"[SCAN] ❌ PUBLISH_FAILED for link: {item['link'][:50]}\n"
+                        f"[SCAN] item not counted as published"
+                    )
             except Exception as e:
                 logging.error(f"[SCAN] send error: {e}")
 
-    async def _send_with_retry(self, formatted, buttons, retries=3):
-        """Send with retry + FloodWait cap (mirrors Monitor._send logic)."""
+    async def _send_with_retry(self, formatted, buttons, retries=3) -> Tuple[bool, Optional[int]]:
+        """Send with retry + FloodWait cap. Returns (success, message_id)."""
         total_waited = 0.0
         max_total_wait = 120.0
+        last_error = "unknown"
         for a in range(1, retries + 1):
             try:
-                await self.bot_client.send_message(
+                if not self.bot_client or not self.bot_client.is_connected():
+                    last_error = "bot_client not connected"
+                    await asyncio.sleep(min(5 * a, 30))
+                    continue
+                result = await self.bot_client.send_message(
                     self.channel_id, formatted,
                     parse_mode='html',
                     buttons=buttons,
                     link_preview=False
                 )
-                await asyncio.sleep(0.5)  # تجنب الفلو
-                return
+                if result and hasattr(result, 'id'):
+                    logging.info(f"[SCAN] ✅ PUBLISHED_VERIFIED message_id={result.id}")
+                    await asyncio.sleep(0.5)  # تجنب الفلو
+                    return True, result.id
+                else:
+                    last_error = f"unexpected return: {type(result).__name__}"
+                    await asyncio.sleep(min(5 * a, 30))
             except FloodWaitError as e:
+                last_error = f"FloodWaitError({e.seconds}s)"
                 wait = min(e.seconds + 1, max_total_wait - total_waited)
                 if wait <= 0:
-                    return
+                    logging.error(f"[SCAN] ❌ FAILED reason={last_error}")
+                    return False, None
                 total_waited += wait
                 await asyncio.sleep(wait)
-            except (RPCError, OSError, ConnectionError):
+            except (RPCError, OSError, ConnectionError) as e:
+                last_error = f"{type(e).__name__}: {str(e)[:80]}"
                 wait = min(10 * a, 60, max_total_wait - total_waited)
                 if wait <= 0:
-                    return
+                    logging.error(f"[SCAN] ❌ FAILED reason={last_error}")
+                    return False, None
                 total_waited += wait
                 await asyncio.sleep(wait)
             except Exception as e:
+                last_error = f"Unexpected {type(e).__name__}: {str(e)[:80]}"
                 logging.error(f"[SCAN] send retry error: {e}")
-                return
+                await asyncio.sleep(min(5 * a, 30))
+        logging.error(f"[SCAN] ❌ FAILED after {retries} attempts reason={last_error}")
+        return False, None
 
     async def _send_summary(self, period, dur):
         if self.new_count == 0 and self.total_scanned == 0: return
@@ -2301,39 +2335,61 @@ class Monitor:
 
             # === أوامر الانضمام الجماعي ===
             if data == "bulk_join":
-                await event.answer("بدء الانضمام الجماعي...")
-                if hasattr(self, '_bulk_join_running') and self._bulk_join_running:
-                    await event.reply("⚠️ البوك جون يعمل بالفعل!\nأرسل /bulk_join_status لرؤية التقدم")
+                await event.answer("بدء الانضمام...")
+                # Scheduler يبدأ تلقائياً — هذا الزر لاستئناف/إعادة تشغيل يدوي
+                if hasattr(self, '_joiner_task') and self._joiner_task and not self._joiner_task.done():
+                    if self._join_paused:
+                        # Worker يعمل لكن متوقف — استأنف
+                        self._join_paused = False
+                        await self.prod_db.set_setting('join_paused', 'false')
+                        await event.reply("▶️ تم استئناف الانضمام تلقائياً")
+                    else:
+                        await event.reply("✅ الانضمام يعمل تلقائياً\nأرسل /bulk_join_status لرؤية التقدم")
                 else:
+                    # Worker متوقف — أعد تشغيله
                     self._bulk_join_running = True
                     self._bulk_join_stop = False
                     self._bulk_join_stats = {'total': 0, 'joined': 0, 'already': 0, 'failed': 0, 'skipped': 0, 'current': ''}
                     self._bulk_join_task = asyncio.create_task(self._bulk_join_worker())
                     await event.reply(
-                        "🚀 بدأ الانضمام الجماعي\n\n"
-                        "📝 سيقرأ البوت كل روابط القناة ويحاول الانضمام لكل واحد.\n"
-                        "🎓 فلتر تعليمي: ينضم فقط للمجموعات الجامعية\n"
-                        "📢 يتخطى القنوات (broadcast)\n"
-                        "⏱️ معدل آمن: انضمام كل 2 دقيقة"
+                        "🚀 بدأ الانضمام\n\n"
+                        "📝 سيقرأ روابط من القائمة ويحاول الانضمام.\n"
+                        "⏱️ معدل آمن: انضمام كل دقيقة"
                     )
                 return
 
             if data == "bulk_join_status":
                 await event.answer()
-                if not hasattr(self, '_bulk_join_running') or not self._bulk_join_running:
-                    await event.reply("ℹ️ البوك جون لا يعمل. أرسل /bulk_join للبدء")
-                else:
-                    s = getattr(self, '_bulk_join_stats', {})
-                    await event.reply(
-                        f"📊 Bulk Join Status\n"
-                        f"════════════════════\n"
-                        f"🔗 Total processed: {s.get('total', 0)}\n"
-                        f"✅ Joined: {s.get('joined', 0)}\n"
-                        f"ℹ️ Already member: {s.get('already', 0)}\n"
-                        f"❌ Failed: {s.get('failed', 0)}\n"
-                        f"⏭️ Skipped: {s.get('skipped', 0)}\n"
-                        f"📍 Current: {s.get('current', '')[:60]}"
-                    )
+                # Scheduler يبدأ تلقائياً — اعرض حالته دائماً
+                s = getattr(self, '_bulk_join_stats', {'total': 0, 'joined': 0, 'already': 0, 'failed': 0, 'skipped': 0, 'current': ''})
+                scheduler_state = await self.prod_db.get_setting('scheduler_state', 'NOT_STARTED')
+                scheduler_cycle = await self.prod_db.get_setting('scheduler_last_cycle', '0')
+                join_paused = await self.prod_db.get_setting('join_paused', 'false')
+                queue_size = await self.prod_db.get_queue_size()
+                bulk_running = getattr(self, '_bulk_join_running', False)
+
+                worker_status = "AUTO (Scheduler)"
+                if bulk_running:
+                    worker_status = "MANUAL (Bulk Join)"
+                if join_paused == 'true':
+                    worker_status = "⏸️ PAUSED"
+
+                await event.reply(
+                    f"📊 Join Worker Status\n"
+                    f"════════════════════\n"
+                    f"⚙️ Worker: {worker_status}\n"
+                    f"⚙️ Scheduler: {scheduler_state} (cycle={scheduler_cycle})\n"
+                    f"🔒 Join paused: {join_paused}\n"
+                    f"📋 Queue depth: {queue_size}\n"
+                    f"\n"
+                    f"Stats:\n"
+                    f"  🔗 Total: {s.get('total', 0)}\n"
+                    f"  ✅ Joined: {s.get('joined', 0)}\n"
+                    f"  ℹ️ Already: {s.get('already', 0)}\n"
+                    f"  ❌ Failed: {s.get('failed', 0)}\n"
+                    f"  ⏭️ Skipped: {s.get('skipped', 0)}\n"
+                    f"  📍 Current: {s.get('current', '')[:60]}"
+                )
                 return
 
             if data == "bulk_join_stop":
@@ -2639,11 +2695,34 @@ class Monitor:
             # === PIPELINE STAGE 1: Event Handler received message ===
             logging.info(f"[PIPELINE-1] 📨 Event Handler received message from source={source_phone} chat_id={chat_id} (len={len(raw_text)})")
 
-            # اسم المجموعة — من chat_id فقط (بدون API)
-            group_name = f"chat_{chat_id}"
+            # اسم المجموعة — حاول العنوان من event.chat (بدون API إضافي) وإلا chat_id
+            try:
+                chat_obj = event.chat
+                if chat_obj and hasattr(chat_obj, 'title') and chat_obj.title:
+                    group_name = chat_obj.title
+                else:
+                    group_name = f"chat_{chat_id}"
+            except Exception:
+                group_name = f"chat_{chat_id}"
 
-            # اسم المرسل — من sender_id فقط (بدون API)
-            sender_name = f"user_{sender_id}"
+            # اسم المرسل — حاول الاسم من event.sender (بدون API إضافي) وإلا sender_id
+            try:
+                sender_obj = event.sender
+                if sender_obj:
+                    if hasattr(sender_obj, 'first_name') and sender_obj.first_name:
+                        sender_name = sender_obj.first_name
+                        if hasattr(sender_obj, 'last_name') and sender_obj.last_name:
+                            sender_name += f" {sender_obj.last_name}"
+                    elif hasattr(sender_obj, 'title') and sender_obj.title:
+                        sender_name = sender_obj.title
+                    elif hasattr(sender_obj, 'username') and sender_obj.username:
+                        sender_name = f"@{sender_obj.username}"
+                    else:
+                        sender_name = f"user_{sender_id}"
+                else:
+                    sender_name = f"user_{sender_id}"
+            except Exception:
+                sender_name = f"user_{sender_id}"
 
             # الخطوة 1: استخراج الروابط محلياً (صفر API calls)
             links = LinkNormalizer.extract_links(raw_text)
@@ -2655,6 +2734,36 @@ class Monitor:
 
             # الخطوة 2: enqueue كل رابط (صفر API calls)
             for link_info in links:
+                # === فلتر صارم قبل الـ Queue — يرفض الخدمات الطلابية والإعلانات ===
+                link_raw = link_info['raw'].lower()
+                username_raw = (link_info.get('username') or '').lower()
+                full_text_check = f"{raw_text} {link_raw} {username_raw}".lower()
+
+                # قائمة كلمات ترفض الرابط فوراً (خدمات مدفوعة فقط — قائمة محددة جداً)
+                REJECT_KEYWORDS = [
+                    'مكتب حل', 'مكتب واجب', 'مكتب دراسي',
+                    'خدمات طلابية مدفوعة',
+                    'حل واجب بمقابل', 'حل واجبات مدفوع', 'حل بحث مدفوع',
+                    'توصيل مشروع مدفوع', 'تسليم واجب بمقابل',
+                    'خدمة اونلاين مدفوع',
+                    'اعذار طبية جاهزة',
+                ]
+
+                is_rejected = False
+                reject_reason = ''
+                for kw in REJECT_KEYWORDS:
+                    if kw in full_text_check:
+                        is_rejected = True
+                        reject_reason = kw
+                        break
+
+                if is_rejected:
+                    logging.info(
+                        f"[PIPELINE-1] 🚫 REJECTED link (keyword={reject_reason}): {link_info['raw'][:50]}"
+                    )
+                    await self.metrics.record_skip(f'reject_keyword_{reject_reason}')
+                    continue  # لا تدخله للقائمة
+
                 link_data = {
                     **link_info,
                     'group_name': group_name,
@@ -2682,40 +2791,121 @@ class Monitor:
         except Exception as e:
             logging.error(f"Event handler error: {e}", exc_info=True)
 
-    async def _send(self, text, retries=3, buttons=None, parse_mode='html'):
-        """إرسال رسالة للقناة مع دعم HTML والأزرار
+    async def _send(self, text, retries=3, buttons=None, parse_mode='html') -> Tuple[bool, Optional[int]]:
+        """يرسل رسالة للقناة ويتحقق من قبولها.
 
-        Caps total wait time at 120s to prevent retry storms under
-        sustained FloodWait. If Telegram keeps asking us to wait, we
-        give up rather than blocking the bot indefinitely.
+        Contract:
+            - يرجع (True, message_id) فقط إذا Telegram أكد الإرسال وأرجع Message.id
+            - يرجع (False, None) إذا فشلت كل المحاولات
+            - لا يرجع None أبداً
+            - يلتقط: FloodWaitError, RPCError, OSError, ConnectionError, Timeout,
+                      disconnected client, unexpected Exception
+
+        Args:
+            text: نص الرسالة
+            retries: عدد المحاولات
+            buttons: أزرار اختيارية
+            parse_mode: html أو md
+
+        Returns:
+            (success: bool, message_id: Optional[int])
         """
         async with self._send_lock:
             total_waited = 0.0
             max_total_wait = 120.0  # 2 minutes hard cap
-            for a in range(1, retries + 1):
+            last_error = "unknown"
+
+            for attempt in range(1, retries + 1):
                 try:
-                    await self.bot_client.send_message(
+                    # تحقق من اتصال البوت
+                    if not self.bot_client or not self.bot_client.is_connected():
+                        last_error = "bot_client not connected"
+                        logging.error(f"[SEND] ❌ bot_client not connected (attempt {attempt}/{retries})")
+                        await asyncio.sleep(min(5 * attempt, 30))
+                        continue
+
+                    logging.debug(f"[SEND] attempt {attempt}/{retries} → channel={self.config.channel_id}")
+
+                    # استدعاء Telegram API
+                    result = await self.bot_client.send_message(
                         self.config.channel_id, text,
                         parse_mode=parse_mode,
                         buttons=buttons,
                         link_preview=False
                     )
-                    return
+
+                    # Telegram يرجع Message object عند النجاح
+                    if result and hasattr(result, 'id'):
+                        message_id = result.id
+                        logging.info(
+                            f"[SEND] ✅ Telegram accepted message\n"
+                            f"[SEND] message_id={message_id}\n"
+                            f"[SEND] channel={self.config.channel_id}"
+                        )
+                        return True, message_id
+                    else:
+                        # Telegram رجع بدون Message — غير متوقع
+                        last_error = f"unexpected return: {type(result).__name__}"
+                        logging.error(f"[SEND] ❌ unexpected return type: {type(result)}")
+                        # اعتبره فشل وأعد المحاولة
+                        await asyncio.sleep(min(5 * attempt, 30))
+                        continue
+
                 except FloodWaitError as e:
+                    last_error = f"FloodWaitError({e.seconds}s)"
                     wait = min(e.seconds + 1, max_total_wait - total_waited)
                     if wait <= 0:
-                        logging.error(f"_send: total wait cap ({max_total_wait}s) reached, giving up")
-                        return
+                        logging.error(
+                            f"[SEND] ❌ FloodWait cap ({max_total_wait}s) reached, giving up\n"
+                            f"[SEND] channel={self.config.channel_id}\n"
+                            f"[SEND] reason={last_error}\n"
+                            f"[SEND] attempts={attempt}"
+                        )
+                        return False, None
                     total_waited += wait
+                    logging.warning(f"[SEND] FloodWait {e.seconds}s (attempt {attempt}) — sleeping {wait}s")
                     await asyncio.sleep(wait)
-                except (RPCError, OSError, ConnectionError):
-                    wait = min(10 * a, 60, max_total_wait - total_waited)
+
+                except (RPCError, OSError, ConnectionError) as e:
+                    last_error = f"{type(e).__name__}: {str(e)[:100]}"
+                    wait = min(10 * attempt, 60, max_total_wait - total_waited)
                     if wait <= 0:
-                        logging.error("_send: total wait cap reached, giving up")
-                        return
+                        logging.error(
+                            f"[SEND] ❌ FAILED\n"
+                            f"[SEND] channel={self.config.channel_id}\n"
+                            f"[SEND] reason={last_error}\n"
+                            f"[SEND] attempts={attempt}"
+                        )
+                        return False, None
                     total_waited += wait
+                    logging.warning(f"[SEND] {type(e).__name__} (attempt {attempt}) — retrying in {wait}s")
                     await asyncio.sleep(wait)
-            logging.error(f"Failed after {retries} attempts")
+
+                except asyncio.TimeoutError:
+                    last_error = "TimeoutError"
+                    logging.warning(f"[SEND] Timeout (attempt {attempt})")
+                    await asyncio.sleep(min(5 * attempt, 30))
+
+                except asyncio.CancelledError:
+                    logging.warning("[SEND] Cancelled by caller")
+                    raise
+
+                except Exception as e:
+                    last_error = f"Unexpected {type(e).__name__}: {str(e)[:100]}"
+                    logging.error(
+                        f"[SEND] ❌ unexpected exception (attempt {attempt}): {e}",
+                        exc_info=True
+                    )
+                    await asyncio.sleep(min(5 * attempt, 30))
+
+            # كل المحاولات فشلت
+            logging.error(
+                f"[SEND] ❌ FAILED\n"
+                f"[SEND] channel={self.config.channel_id}\n"
+                f"[SEND] reason={last_error}\n"
+                f"[SEND] attempts={retries}"
+            )
+            return False, None
 
     async def _on_private_message(self, event):
         """معالج رسائل الدردشة الخاصة مع البوت - يدعم /start و /login"""
@@ -2768,6 +2958,55 @@ class Monitor:
                 await self._handle_login_step(event, sender, text)
                 return
 
+            # === الأوامر الإدارية (تعمل في الخاص والقناة) ===
+            # Owner only — تحقق من الصلاحية
+            is_owner = (self.config.owner_id is None or sender_id == self.config.owner_id)
+
+            if is_owner:
+                # إنشاء event صناعي ليتم معالجته بواسطة _on_command
+                # (يحتوي على نفس خصائص event القناة)
+                cmd = text.split()[0] if text.split() else ''
+                logging.info(f"[PRIVATE CMD] {sender_id}: {cmd}")
+
+                async def private_reply(t):
+                    try: await event.reply(t)
+                    except Exception as e:
+                        logging.error(f"[PRIVATE CMD] reply failed: {e}")
+
+                # إعادة توجيه الأوامر الإدارية لمعالج القناة
+                admin_commands = [
+                    '/pause_join', '/resume_join', '/set_role',
+                    '/enable_joiner', '/disable_joiner', '/join_status',
+                    '/verify', '/sqlite_check', '/clear_floodwait', '/ai_mode',
+                    '/bulk_join', '/bulk_join_status', '/bulk_join_stop',
+                    '/cleanup_preview', '/cleanup_links', '/cleanup_status',
+                    '/live_audit', '/status', '/watchers', '/help',
+                    '/joined_groups', '/queue', '/debug_pipeline',
+                ]
+
+                if cmd in admin_commands:
+                    # معالجة مباشرة — استدعِ _on_command مع event معدّل
+                    # أنشئ كائن يشبه event القناة
+                    class FakeEvent:
+                        def __init__(self, orig_event, text):
+                            self.raw_text = text
+                            self.text = text
+                            self.message = orig_event.message
+                            self.chat_id = orig_event.chat_id
+                            self.sender_id = orig_event.sender_id
+                            self._sender = None
+                        async def get_sender(self):
+                            return sender
+                        async def reply(self, t):
+                            await event.reply(t)
+                        async def answer(self, msg='', alert=False):
+                            try: await event.reply(msg)
+                            except: pass
+
+                    fake_event = FakeEvent(event, text)
+                    await self._on_command(fake_event)
+                    return
+
             # رسالة غير معروفة
             await event.reply(
                 "🤖 أهلاً!\n\n"
@@ -2775,7 +3014,8 @@ class Monitor:
                 "• /start - البدء\n"
                 "• /login - تسجيل الدخول بحسابك\n"
                 "• /status - حالتك\n"
-                "• /cancel - إلغاء العملية"
+                "• /cancel - إلغاء العملية\n\n"
+                "💡 اكتب Boot لفتح القائمة الرئيسية"
             )
 
         except Exception as e:
@@ -3125,8 +3365,10 @@ class Monitor:
                 except FloodWaitError as e:
                     await asyncio.sleep(e.seconds + 1)
                     try: await self.bot_client.send_message(self.config.channel_id, t)
-                    except Exception: pass
-                except Exception: pass
+                    except Exception as e2:
+                        logging.error(f"[CMD] reply failed after FloodWait: {type(e2).__name__}: {e2}")
+                except Exception as e:
+                    logging.error(f"[CMD] reply failed: {type(e).__name__}: {e}")
 
             if cmd == "/help": await reply(MessageFormatter.format_help())
 
@@ -3521,40 +3763,130 @@ class Monitor:
                     logging.error(f"[CLEAR_FLOODWAIT] Error: {e}")
                     await reply(f"❌ خطأ: {e}")
 
-            elif cmd == "/bulk_join":
-                # === البدء بالانضمام الجماعي لروابط القناة ===
-                if hasattr(self, '_bulk_join_running') and self._bulk_join_running:
-                    await reply("⚠️ البوك جون يعمل بالفعل!\nأرسل /bulk_join_status لرؤية التقدم")
+            elif cmd == "/ai_mode":
+                # === عرض/تبديل وضع AI Batch Mode ===
+                # الاستخدام:
+                #   /ai_mode         → عرض الحالة الحالية
+                #   /ai_mode on      → تفعيل AI (يعطل batch mode)
+                #   /ai_mode off     → تعطيل AI (يفعل batch mode — افتراضي)
+                parts = text.split()
+                ai_batch_mode = os.getenv("AI_BATCH_MODE", "true").lower() in ("true", "1", "yes")
+                if len(parts) >= 2:
+                    arg = parts[1].lower()
+                    if arg in ("on", "enable", "true"):
+                        os.environ["AI_BATCH_MODE"] = "false"
+                        await reply(
+                            "🤖 AI Verification: ENABLED\n\n"
+                            "ستتم فحص كل رابط جديد قبل النشر والانضمام.\n"
+                            "الروابط المرفوضة من AI ستتجاهل تلقائياً.\n\n"
+                            "⚠️ ملاحظة: قد يبطئ معالجة قائمة الانتظار."
+                        )
+                    elif arg in ("off", "disable", "false"):
+                        os.environ["AI_BATCH_MODE"] = "true"
+                        await reply(
+                            "⏭️ AI Verification: DISABLED (batch mode)\n\n"
+                            "سيتم نشر جميع الروابط بدون فحص AI.\n"
+                            "مفيد لمعالجة القائمة المتراكمة بسرعة.\n\n"
+                            "أرسل /ai_mode on لإعادة التفعيل."
+                        )
+                    else:
+                        await reply("❌ استخدام خاطئ\nالصيغة: /ai_mode on|off")
                 else:
+                    status = "⏭️ DISABLED (batch mode)" if ai_batch_mode else "🤖 ENABLED"
+                    ai_enabled = bool(self.ai_analyzer and self.ai_analyzer.enabled)
+                    providers = len(self.ai_analyzer.providers) if ai_enabled else 0
+                    await reply(
+                        f"🤖 AI Verification Status\n\n"
+                        f"الحالة: {status}\n"
+                        f"AI Provider: {'✅ متاح' if ai_enabled else '❌ غير متاح'}\n"
+                        f"عدد المفاتيح: {providers}\n\n"
+                        f"للتبديل:\n"
+                        f"  /ai_mode on  ← تفعيل الفحص\n"
+                        f"  /ai_mode off ← تعطيل (batch mode)"
+                    )
+
+            elif cmd == "/bulk_join":
+                # === بدء/استئناف الانضمام الجماعي ===
+                # Worker الأساسي يبدأ تلقائياً عند Startup — هذا الزر اختياري لإعادة التشغيل
+                if hasattr(self, '_bulk_join_running') and self._bulk_join_running:
+                    await reply("⚠️ Bulk Join يعمل بالفعل!\nأرسل /bulk_join_status لرؤية التقدم")
+                elif hasattr(self, '_joiner_task') and self._joiner_task and not self._joiner_task.done():
+                    # Joiner Worker الأساسي يعمل — اعرض حالته
+                    if self._join_paused:
+                        await reply("🔒 Joiner Worker يعمل لكن PAUSED\nأرسل /resume_join للاستئناف")
+                    else:
+                        await reply("✅ Joiner Worker يعمل تلقائياً\nأرسل /debug_pipeline لرؤية الحالة")
+                else:
+                    # Worker متوقف — أعد تشغيله
                     self._bulk_join_running = True
                     self._bulk_join_stop = False
                     self._bulk_join_stats = {'total': 0, 'joined': 0, 'already': 0, 'failed': 0, 'skipped': 0, 'current': ''}
                     self._bulk_join_task = asyncio.create_task(self._bulk_join_worker())
                     await reply(
                         "🚀 بدأ الانضمام الجماعي\n\n"
-                        "📝 سيقرأ البوت كل روابط القناة ويحاول الانضمام لكل واحد.\n"
+                        "📝 سيقرأ البوت روابط من القائمة ويحاول الانضمام.\n"
                         "⏱️ معدل آمن: انضمام كل 2 دقيقة\n"
                         "📊 أرسل /bulk_join_status للتقدم\n"
                         "⏹️ أرسل /bulk_join_stop للإيقاف"
                     )
 
             elif cmd == "/bulk_join_status":
-                # === تقدم الانضمام الجماعي ===
-                if not hasattr(self, '_bulk_join_running') or not self._bulk_join_running:
-                    await reply("ℹ️ البوك جون لا يعمل. أرسل /bulk_join للبدء")
-                else:
-                    s = getattr(self, '_bulk_join_stats', {})
-                    current = s.get('current', 'none')
-                    await reply(
-                        f"📊 Bulk Join Status\n"
-                        f"════════════════════\n"
-                        f"🔗 Total processed: {s.get('total', 0)}\n"
-                        f"✅ Joined: {s.get('joined', 0)}\n"
-                        f"ℹ️ Already member: {s.get('already', 0)}\n"
-                        f"❌ Failed: {s.get('failed', 0)}\n"
-                        f"⏭️ Skipped: {s.get('skipped', 0)}\n"
-                        f"📍 Current: {current[:60]}"
-                    )
+                # === تقدم الانضمام (Scheduler + Bulk Join) ===
+                # اقرأ إحصائيات الـ Scheduler الحقيقية من metrics
+                metrics = await self.metrics.get_summary()
+                s = getattr(self, '_bulk_join_stats', {'total': 0, 'joined': 0, 'already': 0, 'failed': 0, 'skipped': 0, 'current': ''})
+
+                # حالة Worker
+                scheduler_state = await self.prod_db.get_setting('scheduler_state', 'NOT_STARTED')
+                scheduler_cycle = await self.prod_db.get_setting('scheduler_last_cycle', '0')
+                scheduler_hb = await self.prod_db.get_setting('scheduler_last_heartbeat', 'NEVER')
+                join_paused = await self.prod_db.get_setting('join_paused', 'false')
+                queue_size = await self.prod_db.get_queue_size()
+                bulk_running = getattr(self, '_bulk_join_running', False)
+
+                worker_status = "AUTO (Scheduler)"
+                if bulk_running:
+                    worker_status = "MANUAL (Bulk Join)"
+                if join_paused == 'true':
+                    worker_status = "⏸️ PAUSED"
+
+                # إحصائيات skips
+                skip_reasons = metrics.get('skip_reasons', {})
+                skip_lines = ""
+                if skip_reasons:
+                    skip_lines = "\nSkips by reason:\n"
+                    for reason, count in sorted(skip_reasons.items(), key=lambda x: -x[1])[:5]:
+                        skip_lines += f"  • {reason}: {count}\n"
+
+                # عدد المجموعات المنضم إليها
+                conn = await self.db._ensure_conn()
+                cursor = await conn.execute("SELECT COUNT(*) FROM group_states WHERE state = 'JOINED'")
+                joined_count = (await cursor.fetchone())[0]
+                cursor = await conn.execute("SELECT COUNT(*) FROM group_states WHERE state = 'ALREADY_MEMBER'")
+                already_count = (await cursor.fetchone())[0]
+
+                await reply(
+                    f"📊 Join Worker Status\n"
+                    f"════════════════════\n"
+                    f"⚙️ Worker: {worker_status}\n"
+                    f"⚙️ Scheduler: {scheduler_state} (cycle={scheduler_cycle})\n"
+                    f"⏰ Heartbeat: {scheduler_hb[:19] if scheduler_hb != 'NEVER' else 'NEVER'}\n"
+                    f"🔒 Join paused: {join_paused}\n"
+                    f"📋 Queue depth: {queue_size}\n"
+                    f"\n"
+                    f"📈 Scheduler Stats (REAL):\n"
+                    f"  ✅ Joined (DB): {joined_count}\n"
+                    f"  ℹ️ Already member (DB): {already_count}\n"
+                    f"  🔗 Total joins (metrics): {metrics.get('total_joins', 0)}\n"
+                    f"  ⏭️ Total skips: {metrics.get('total_skips', 0)}\n"
+                    f"  ⚠️ FloodWait: {metrics.get('total_floodwait', 0)}\n"
+                    f"  🔄 Duplicates: {metrics.get('total_duplicates', 0)}\n"
+                    f"{skip_lines}"
+                    f"Bulk Join Stats (manual):\n"
+                    f"  🔗 Total: {s.get('total', 0)}\n"
+                    f"  ✅ Joined: {s.get('joined', 0)}\n"
+                    f"  📍 Current: {s.get('current', '')[:60]}"
+                )
 
             elif cmd == "/bulk_join_stop":
                 # === إيقاف الانضمام الجماعي ===
@@ -3591,6 +3923,323 @@ class Monitor:
                         f"📍 Current: {s.get('current', '')[:60]}"
                     )
 
+            elif cmd == "/live_audit":
+                # === فحص شامل للنظام (بديل live_audit.py للـ Free Tier) ===
+                logging.info("[LIVE_AUDIT] /live_audit command invoked")
+                audit_lines = []
+                audit_lines.append("🔍 LIVE AUDIT REPORT")
+                audit_lines.append("═══════════════════════════")
+
+                # 1. Environment Variables
+                audit_lines.append("")
+                audit_lines.append("📋 ENVIRONMENT:")
+                env_required = [
+                    ('SUPABASE_URL', 'SUPABASE_URL'),
+                    ('SUPABASE_KEY', 'SUPABASE_KEY'),
+                    ('BOT_TOKEN', 'BOT_TOKEN'),
+                    ('API_ID', 'API_ID'),
+                    ('API_HASH', 'API_HASH'),
+                    ('CHANNEL_ID', 'CHANNEL_ID'),
+                ]
+                for var, display in env_required:
+                    val = os.getenv(var, '')
+                    status = "✅ SET" if val else "❌ MISSING"
+                    audit_lines.append(f"  {display:25s} = {status}")
+
+                env_optional = ['OPENAI_API_KEY', 'AI_KEY_1', 'AI_KEY_2', 'OWNER_ID', 'DAILY_JOIN_LIMIT']
+                for var in env_optional:
+                    val = os.getenv(var, '')
+                    status = "✅" if val else "⚠️"
+                    audit_lines.append(f"  {var:25s} = {status}")
+
+                # 2. Supabase LIVE
+                audit_lines.append("")
+                audit_lines.append("🗄️ SUPABASE:")
+                try:
+                    supa_count = await self.db._supabase_count_watchers()
+                    if supa_count >= 0:
+                        audit_lines.append(f"  Connection: ✅ OK")
+                        audit_lines.append(f"  Accounts: {supa_count}")
+                        watchers = await self.db.get_active_watchers()
+                        monitors = sum(1 for w in watchers if w.get('role', 'monitor') == 'monitor')
+                        joiners = sum(1 for w in watchers if w.get('role') == 'joiner')
+                        audit_lines.append(f"  Monitors: {monitors}")
+                        audit_lines.append(f"  Joiners: {joiners}")
+                        # Schema check
+                        w_sample = watchers[0] if watchers else {}
+                        schema_ok = all(k in w_sample or True for k in ['role', 'joiner_enabled'])
+                        audit_lines.append(f"  Schema: {'✅ OK' if schema_ok else '⚠️ CHECK'}")
+                    else:
+                        audit_lines.append(f"  Connection: ❌ FAILED")
+                except Exception as e:
+                    audit_lines.append(f"  Connection: ❌ ERROR: {type(e).__name__}")
+
+                # 3. SQLite
+                audit_lines.append("")
+                audit_lines.append("🗃️ SQLITE:")
+                try:
+                    tables = await self.db._sqlite_list_tables()
+                    has_watchers = 'watchers' in tables
+                    audit_lines.append(f"  watchers table: {'❌ EXISTS (BUG!)' if has_watchers else '✅ ABSENT'}")
+                    audit_lines.append(f"  Tables ({len(tables)}): {', '.join(tables[:8])}")
+                except Exception as e:
+                    audit_lines.append(f"  Error: {type(e).__name__}")
+
+                # 4. Telegram Accounts
+                audit_lines.append("")
+                audit_lines.append("🤖 TELEGRAM:")
+                audit_lines.append(f"  Bot: {'✅ connected' if (self.bot_client and self.bot_client.is_connected()) else '❌ disconnected'}")
+                connected = 0
+                total = len(self.user_clients)
+                for ph, cl in self.user_clients.items():
+                    if cl and cl.is_connected():
+                        connected += 1
+                audit_lines.append(f"  Accounts: {connected}/{total} connected")
+
+                # 5. Workers
+                audit_lines.append("")
+                audit_lines.append("⚙️ WORKERS:")
+                sched_state = await self.prod_db.get_setting('scheduler_state', 'NOT_STARTED')
+                sched_hb = await self.prod_db.get_setting('scheduler_last_heartbeat', 'NEVER')
+                sched_cycle = await self.prod_db.get_setting('scheduler_last_cycle', '0')
+                join_paused = await self.prod_db.get_setting('join_paused', 'false')
+                audit_lines.append(f"  Scheduler: {sched_state}")
+                audit_lines.append(f"  Last cycle: {sched_cycle}")
+                audit_lines.append(f"  Heartbeat: {sched_hb}")
+                audit_lines.append(f"  Join paused: {join_paused}")
+
+                # 6. Queue
+                try:
+                    queue_size = await self.prod_db.get_queue_size()
+                    audit_lines.append(f"  Queue depth: {queue_size}")
+                except Exception:
+                    audit_lines.append(f"  Queue depth: ?")
+
+                # 7. FloodWait
+                try:
+                    blocked = await self.floodwait_mgr.get_blocked_accounts()
+                    audit_lines.append(f"  FloodWait blocked: {len(blocked)}")
+                except Exception:
+                    audit_lines.append(f"  FloodWait: ?")
+
+                # 8. Bulk Join / Cleanup
+                bulk_running = getattr(self, '_bulk_join_running', False)
+                cleanup_running = getattr(self, '_cleanup_stats', {}).get('running', False) if hasattr(self, '_cleanup_stats') and self._cleanup_stats else False
+                audit_lines.append(f"  Bulk Join: {'RUNNING' if bulk_running else 'IDLE'}")
+                audit_lines.append(f"  Cleanup: {'RUNNING' if cleanup_running else 'IDLE'}")
+
+                # Summary
+                audit_lines.append("")
+                audit_lines.append("═══════════════════════════")
+                audit_lines.append(f"Commit: 5b4a925")
+                audit_lines.append(f"Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+
+                await reply("\n".join(audit_lines))
+
+            elif cmd == "/debug_pipeline":
+                # === تشخيص مشكلة توقف السحب ===
+                logging.info("[DEBUG_PIPELINE] /debug_pipeline command invoked")
+                try:
+                    conn = await self.db._ensure_conn()
+                    lines = ["🔧 Pipeline Debug", "═══════════════════════════"]
+
+                    # 1. Scheduler state
+                    sched_state = await self.prod_db.get_setting('scheduler_state', 'NOT_STARTED')
+                    sched_cycle = await self.prod_db.get_setting('scheduler_last_cycle', '0')
+                    sched_hb = await self.prod_db.get_setting('scheduler_last_heartbeat', 'NEVER')
+                    join_paused = await self.prod_db.get_setting('join_paused', 'false')
+                    lines.append(f"⚙️ Scheduler:")
+                    lines.append(f"  state={sched_state}")
+                    lines.append(f"  cycle={sched_cycle}")
+                    lines.append(f"  heartbeat={sched_hb}")
+                    lines.append(f"  join_paused={join_paused}")
+                    lines.append("")
+
+                    # 2. Queue items
+                    cursor = await conn.execute(
+                        "SELECT id, raw_link, status, enqueued_at, next_retry_at, attempt_count, last_error "
+                        "FROM link_queue ORDER BY id DESC LIMIT 10")
+                    queue_rows = await cursor.fetchall()
+                    lines.append(f"📋 Queue ({len(queue_rows)} items):")
+                    for r in queue_rows:
+                        lines.append(f"  id={r[0]} status={r[2]} attempts={r[5]}")
+                        lines.append(f"    link={r[1][:50]}")
+                        if r[4]:
+                            lines.append(f"    next_retry={r[4][:19]}")
+                        if r[6]:
+                            lines.append(f"    error={r[6][:60]}")
+                    lines.append("")
+
+                    # 3. Group states distribution
+                    cursor = await conn.execute(
+                        "SELECT state, COUNT(*) as cnt FROM group_states GROUP BY state ORDER BY cnt DESC")
+                    state_rows = await cursor.fetchall()
+                    lines.append(f"📊 Group States:")
+                    for s, c in state_rows:
+                        lines.append(f"  {s}: {c}")
+                    lines.append("")
+
+                    # 4. Recent group_states (last 5)
+                    cursor = await conn.execute(
+                        "SELECT normalized_link, state, last_error, last_seen "
+                        "FROM group_states ORDER BY last_seen DESC LIMIT 5")
+                    recent_states = await cursor.fetchall()
+                    lines.append(f"📊 Recent group_states (last 5):")
+                    for r in recent_states:
+                        lines.append(f"  {r[1]:15s} {r[0][:40]}")
+                        if r[2]:
+                            lines.append(f"    error={r[2][:50]}")
+                    lines.append("")
+
+                    # 5. AI analyzer status
+                    ai_keys = sum(1 for i in range(1, 9) if os.getenv(f"AI_KEY_{i}", "") or (i == 1 and os.getenv("OPENAI_API_KEY", "")))
+                    lines.append(f"🤖 AI Analyzer:")
+                    lines.append(f"  keys_available={ai_keys}")
+                    lines.append(f"  simulation_mode={self.simulation_mode}")
+                    lines.append("")
+
+                    # 6. Connected accounts
+                    connected = sum(1 for c in self.user_clients.values() if c and c.is_connected())
+                    total = len(self.user_clients)
+                    lines.append(f"🤖 Telegram:")
+                    lines.append(f"  accounts={connected}/{total} connected")
+                    lines.append(f"  bot={'✅' if (self.bot_client and self.bot_client.is_connected()) else '❌'}")
+                    lines.append("")
+
+                    # 7. FloodWait
+                    blocked = await self.floodwait_mgr.get_blocked_accounts()
+                    lines.append(f"⚠️ FloodWait: {len(blocked)} blocked")
+                    lines.append("")
+
+                    # 8. Diagnosis
+                    lines.append("═══════════════════════════")
+                    lines.append("🔍 Diagnosis:")
+                    if join_paused == 'true':
+                        lines.append("  ❌ Join PAUSED — send /resume_join")
+                    if sched_state != 'RUNNING':
+                        lines.append("  ❌ Scheduler NOT RUNNING")
+                    if connected == 0:
+                        lines.append("  ❌ No accounts connected")
+                    if ai_keys == 0:
+                        lines.append("  ❌ No AI keys configured")
+                    if len(queue_rows) == 0:
+                        lines.append("  ℹ️ Queue empty — no links waiting")
+                    elif any(r[2] == 'QUEUED' for r in queue_rows):
+                        queued_count = sum(1 for r in queue_rows if r[2] == 'QUEUED')
+                        lines.append(f"  ⚠️ {queued_count} links in QUEUED state — check Scheduler")
+                    # Check for REJECTED links (AI rejecting)
+                    cursor = await conn.execute(
+                        "SELECT COUNT(*) FROM link_queue WHERE status = 'REJECTED'")
+                    rejected = (await cursor.fetchone())[0]
+                    if rejected > 0:
+                        lines.append(f"  ⚠️ {rejected} links REJECTED by AI — check AI keys/config")
+
+                    await reply("\n".join(lines))
+                except Exception as e:
+                    logging.error(f"[DEBUG_PIPELINE] Error: {e}", exc_info=True)
+                    await reply(f"❌ خطأ: {e}")
+
+            elif cmd == "/joined_groups":
+                # === عرض كل المجموعات المنضم إليها فعلياً ===
+                logging.info("[JOINED_GROUPS] /joined_groups command invoked")
+                try:
+                    conn = await self.db._ensure_conn()
+                    # المجموعات المنضم إليها (state = JOINED)
+                    cursor = await conn.execute(
+                        "SELECT normalized_link, raw_link, joined_by, member_count, last_seen, last_error "
+                        "FROM group_states WHERE state = ? ORDER BY last_seen DESC LIMIT 50",
+                        (GroupState.JOINED,))
+                    joined_rows = await cursor.fetchall()
+
+                    # المجموعات المنضم إليها سابقاً (state = ALREADY_MEMBER)
+                    cursor = await conn.execute(
+                        "SELECT normalized_link, raw_link, joined_by, last_seen "
+                        "FROM group_states WHERE state = ? ORDER BY last_seen DESC LIMIT 50",
+                        (GroupState.ALREADY_MEMBER,))
+                    already_rows = await cursor.fetchall()
+
+                    # إحصائيات
+                    cursor = await conn.execute(
+                        "SELECT state, COUNT(*) FROM group_states GROUP BY state")
+                    state_counts = await cursor.fetchall()
+
+                    lines = [
+                        f"📊 المجموعات المنضم إليها",
+                        f"═══════════════════════════",
+                        f"",
+                    ]
+
+                    # إحصائيات الحالات
+                    lines.append("📈 توزيع الحالات:")
+                    for s, c in state_counts:
+                        lines.append(f"  • {s}: {c}")
+                    lines.append("")
+
+                    # المجموعات المنضم إليها
+                    if joined_rows:
+                        lines.append(f"✅ منضم إليها ({len(joined_rows)}):")
+                        for i, r in enumerate(joined_rows, 1):
+                            raw = r[1] or r[0] or '?'
+                            joined_by = r[2] or '?'
+                            masked = joined_by[:4] + '***' + joined_by[-4:] if len(joined_by) > 8 else joined_by
+                            members = r[3] or '?'
+                            when = r[4][:19] if r[4] else '?'
+                            lines.append(f"  {i}. {raw[:60]}")
+                            lines.append(f"     by={masked} members={members} at={when}")
+                    else:
+                        lines.append("❌ لا توجد مجموعات منضم إليها بعد")
+                    lines.append("")
+
+                    # المجموعات المنضم إليها سابقاً
+                    if already_rows:
+                        lines.append(f"ℹ️ عضو سابقاً ({len(already_rows)}):")
+                        for i, r in enumerate(already_rows[:10], 1):
+                            raw = r[1] or r[0] or '?'
+                            lines.append(f"  {i}. {raw[:60]}")
+                        if len(already_rows) > 10:
+                            lines.append(f"  ... و {len(already_rows) - 10} أخرى")
+
+                    lines.append("")
+                    lines.append("═══════════════════════════")
+
+                    await reply("\n".join(lines))
+                except Exception as e:
+                    logging.error(f"[JOINED_GROUPS] Error: {e}", exc_info=True)
+                    await reply(f"❌ خطأ: {e}")
+
+            elif cmd == "/queue":
+                # === عرض محتويات القائمة ===
+                logging.info("[QUEUE] /queue command invoked")
+                try:
+                    conn = await self.db._ensure_conn()
+                    cursor = await conn.execute(
+                        "SELECT id, raw_link, status, enqueued_at, next_retry_at, attempt_count, last_error "
+                        "FROM link_queue ORDER BY id DESC LIMIT 20")
+                    rows = await cursor.fetchall()
+
+                    queue_size = await self.prod_db.get_queue_size()
+
+                    lines = [
+                        f"📋 Queue (depth={queue_size})",
+                        f"═══════════════════════════",
+                    ]
+
+                    if rows:
+                        for r in rows:
+                            lines.append(f"  id={r[0]} status={r[2]}")
+                            lines.append(f"    link={r[1][:50]}")
+                            lines.append(f"    attempts={r[5]} enqueued={r[3][:19] if r[3] else '?'}")
+                            if r[4]:
+                                lines.append(f"    next_retry={r[4][:19]}")
+                            if r[6]:
+                                lines.append(f"    error={r[6][:50]}")
+                    else:
+                        lines.append("  (فارغة)")
+
+                    await reply("\n".join(lines))
+                except Exception as e:
+                    await reply(f"❌ خطأ: {e}")
+
             else: await reply(f"❓ أمر غير معروف: {cmd}\nاكتب /help")
 
         except Exception as e:
@@ -3603,16 +4252,21 @@ class Monitor:
         for s in self._current_scanners.values(): s.cancel()
 
     async def _start_scan_all(self, days, cmd_name):
-        """بدء مسح لكل المستخدمين المراقبين"""
+        """بدء مسح لكل المستخدمين المراقبين فقط (وليس الفدائيين)"""
         if self.is_scan_running():
-            await self._send("⚠️ يوجد مسح قيد التنفيذ\nأرسل /scan_stop لإيقافه")
+            await self._send("⚠️ يوجد مسح قيد التنفيذ\nأرسل /scan_stop لإيقافه")  # noqa: ignore result
             return
-        watchers = await self.db.get_active_watchers()
+        all_watchers = await self.db.get_active_watchers()
+        # فلترة: monitors فقط — Joiner لا يجب أن يُمسح
+        watchers = [w for w in all_watchers if w.get('role', 'monitor') == 'monitor']
         if not watchers:
-            await self._send("❌ لا يوجد مستخدمون مراقبون")
+            await self._send("❌ لا يوجد مستخدمون مراقبون")  # noqa: ignore result
             return
         d = f"{days} يوم" if days else "كامل"
-        await self._send(f"🚀 بدء المسح ({cmd_name}) لـ {len(watchers)} مستخدم\n📅 الفترة: {d}\n⏳ جاري...")
+        await self._send(f"🚀 بدء المسح ({cmd_name}) لـ {len(watchers)} مراقب\n📅 الفترة: {d}\n⏳ جاري...")  # noqa: ignore result
+        logging.info(f"[SCAN] Starting scan for {len(watchers)} monitors (filtered from {len(all_watchers)} total accounts)")
+        for w in watchers:
+            logging.info(f"[SCAN] Will scan: {w['phone']} (role={w.get('role', 'monitor')})")
         # Prune completed tasks from previous scans (prevents unbounded list growth)
         self._current_scan_tasks = [t for t in self._current_scan_tasks if not t.done()]
         for w in watchers:
@@ -3648,7 +4302,12 @@ class Monitor:
                 pass
 
     async def _run_user_client(self, watcher):
-        """تشغيل user_client — المراقبون فقط يستمعون للرسائل، الفدائيون لا"""
+        """تشغيل user_client — المراقبون فقط يستمعون للرسائل، الفدائيون لا
+
+        Startup Contract:
+            - لا تعتبر الحساب READY حتى: connect → authorize → register handlers
+            - لو فشل أي خطوة، سجل STATUS=FAILED مع السبب
+        """
         phone = watcher['phone']
         session_string = watcher['session_string']
         role = watcher.get('role', 'monitor')  # افتراضي: مراقب
@@ -3659,42 +4318,65 @@ class Monitor:
                 if client is None:
                     # حماية من الجلسات التالفة
                     if not session_string or not isinstance(session_string, str) or len(session_string) < 50:
-                        logging.error(f"User {phone} has invalid/corrupted session string! Skipping.")
+                        logging.error(
+                            f"[ACCOUNT] {phone} STATUS=FAILED\n"
+                            f"[ACCOUNT] reason=invalid_session_string"
+                        )
                         self._cleanup_user_client(phone)
                         return
                     try:
                         client = self._create_user_client(session_string, phone)
                     except ValueError as ve:
-                        logging.error(f"User {phone} session string is invalid: {ve}. Skipping this user.")
+                        logging.error(
+                            f"[ACCOUNT] {phone} STATUS=FAILED\n"
+                            f"[ACCOUNT] reason=invalid_session: {ve}"
+                        )
                         self._cleanup_user_client(phone)
                         return
                     except Exception as ce:
-                        logging.error(f"User {phone} failed to create client: {ce}")
+                        logging.error(
+                            f"[ACCOUNT] {phone} STATUS=FAILED\n"
+                            f"[ACCOUNT] reason=client_creation_error: {ce}"
+                        )
                         return
                     self.user_clients[phone] = client
-                    # 🔴 فصل صارم: فقط المراقبون يستمعون للرسائل
-                    # الفدائيون لا يسجلون NewMessage handlers (يمنع Loop اللانهائي)
-                    if role == 'monitor':
-                        self._register_user_handlers(phone)
-                        logging.info(f"👁️ Monitor {phone}: handlers registered")
-                    else:
-                        logging.info(f"🚀 Joiner {phone}: connected (no message handlers)")
+
                 if not client.is_connected():
-                    logging.info(f"Connecting user {phone}...")
+                    logging.info(f"[ACCOUNT] {phone} connecting...")
                     await client.connect()
+
+                    # === VERIFY AUTHORIZATION ===
                     if not await client.is_user_authorized():
-                        logging.error(f"User {phone} session not authorized! Please re-login.")
+                        logging.error(
+                            f"[ACCOUNT] {phone} STATUS=FAILED\n"
+                            f"[ACCOUNT] reason=not_authorized\n"
+                            f"[ACCOUNT] action=re-login required"
+                        )
                         self._cleanup_user_client(phone)
                         return
-                    logging.info(f"User {phone} connected (role={role})")
+
+                    # === REGISTER HANDLERS (monitors only) ===
+                    if role == 'monitor':
+                        self._register_user_handlers(phone)
+                        logging.info(
+                            f"[ACCOUNT] {phone} STATUS=READY\n"
+                            f"[ACCOUNT] role=monitor\n"
+                            f"[ACCOUNT] handlers=registered"
+                        )
+                    else:
+                        logging.info(
+                            f"[ACCOUNT] {phone} STATUS=READY_FOR_JOIN\n"
+                            f"[ACCOUNT] role=joiner\n"
+                            f"[ACCOUNT] handlers=none (joiner only)"
+                        )
                     backoff = 5
-                    # 🔴 تم حذف المسح التلقائي نهائياً — كان يسبب حظر الحسابات
-                    # البوت الحين يراقب الرسائل الجديدة فقط (بدون سحب تاريخي)
                 await client.run_until_disconnected()
             except FloodWaitError as e: await asyncio.sleep(e.seconds + 1)
-            except (RPCError, ConnectionError, OSError) as e: logging.error(f"User {phone} error: {e}")
+            except (RPCError, ConnectionError, OSError) as e:
+                logging.error(f"[ACCOUNT] {phone} error: {type(e).__name__}: {e}")
             except asyncio.CancelledError: raise
-            except Exception as e: logging.error(f"User {phone} unexpected: {e}", exc_info=True)
+            except Exception as e:
+                logging.error(f"[ACCOUNT] {phone} unexpected: {e}", exc_info=True)
             finally:
                 client = self.user_clients.get(phone)
                 if client and client.is_connected():
@@ -3712,8 +4394,20 @@ class Monitor:
             logging.info(f"[CLEANUP] Removed user_client for {phone}")
         # Also invalidate dialog cache for this phone
         self.db.invalidate_dialogs_cache(phone)
-        # Remove from startup scan tracking (so a re-login can re-scan)
-        self._startup_scan_done.discard(phone)
+
+    def _get_any_user_client(self):
+        """يجلب أي user_client متصل (للاستخدام في عمليات get_messages/delete_messages).
+
+        Bot API لا يدعم get_messages (GetHistoryRequest) على القنوات.
+        نحتاج حساب User حقيقي لقراءة وحذف رسائل القناة.
+
+        Returns:
+            TelegramClient متصل، أو None لو لا يوجد
+        """
+        for phone, client in self.user_clients.items():
+            if client and client.is_connected():
+                return client
+        return None
 
     async def _run_startup_scan(self, watcher):
         try:
@@ -3769,10 +4463,17 @@ class Monitor:
         """
         await asyncio.sleep(30)  # انتظر البوت يكمل الإقلاع
         logging.info("🔄 Production Scheduler started — runs every 60s")
+        # === WORKER HEALTH STATE ===
+        await self.prod_db.set_setting('scheduler_state', 'RUNNING')
+        await self.prod_db.set_setting('scheduler_last_heartbeat', datetime.now().isoformat())
+        # ملاحظة: STARTUP RECOVERY تم نقله إلى start() — لا حاجة لتكراره هنا
 
         cycle = 0
         while self._running:
             cycle += 1
+            # === HEARTBEAT ===
+            await self.prod_db.set_setting('scheduler_last_heartbeat', datetime.now().isoformat())
+            await self.prod_db.set_setting('scheduler_last_cycle', str(cycle))
             try:
                 # Emergency Control: لو الانضمام متوقف → انتظر بس
                 if self._join_paused:
@@ -3787,7 +4488,7 @@ class Monitor:
                 # 1. اجلب رابط QUEUED واحد (لا burst)
                 queued = await self.prod_db.get_queued_links(limit=1)
                 if not queued:
-                    logging.info(f"[SCHED] cycle={cycle} Queue empty (size=0) — sleeping 60s")
+                    logging.debug(f"[SCHED] cycle={cycle} Queue empty — sleeping 60s")
                     await asyncio.sleep(60)
                     continue
 
@@ -3797,34 +4498,61 @@ class Monitor:
                 link_type = link_data['link_type']
 
                 # === PIPELINE STAGE 3: Scheduler read link from queue ===
-                logging.info(f"[PIPELINE-3] 🔄 cycle={cycle} Scheduler picked link from queue: {raw_link[:60]} (id={link_data.get('id')}, type={link_type})")
+                link_id = link_data.get('id', '?')
+                logging.info(f"[LINK id={link_id}] [PIPELINE-3] 🔄 cycle={cycle} Scheduler picked link: {raw_link[:60]} (type={link_type})")
 
                 # 2. تحقق من حالة المجموعة في State Machine
                 state = await self.prod_db.get_group_state(normalized)
                 if state in (GroupState.JOINED, GroupState.ALREADY_MEMBER):
-                    logging.info(f"[PIPELINE-3] ⏭️ {normalized[:50]} already {state} — skipping")
+                    logging.info(f"[LINK id={link_id}] [PIPELINE-3] ⏭️ already {state} — skipping")
                     await self.prod_db.update_queue_status(link_data['id'], 'DONE')
                     await self.metrics.record_skip('already_joined')
                     continue
 
                 if state == GroupState.BANNED:
-                    logging.info(f"[PIPELINE-3] ⏭️ {normalized[:50]} is BANNED — skipping")
+                    logging.info(f"[LINK id={link_id}] [PIPELINE-3] ⏭️ BANNED — skipping")
                     await self.prod_db.update_queue_status(link_data['id'], 'DONE')
                     await self.metrics.record_skip('banned')
                     continue
 
-                # 3. AI فحص الرابط (فقط لو DISCOVERED ولم يُفحص سابقاً)
+                # 3. AI فحص الرابط — يخضع لمتغير البيئة AI_BATCH_MODE
+                # AI_BATCH_MODE=true  (افتراضي): يتخطى الذكاء الاصطناعي لمعالجة قائمة الانتظار المتراكمة بسرعة
+                # AI_BATCH_MODE=false         : يعيد تفعيل فحص الذكاء الاصطناعي لكل رابط
+                ai_batch_mode = os.getenv("AI_BATCH_MODE", "true").lower() in ("true", "1", "yes")
                 if state == GroupState.DISCOVERED or state is None:
-                    # === PIPELINE STAGE 4: AI verification ===
-                    logging.info(f"[PIPELINE-4] 🤖 AI verifying link: {raw_link[:60]}")
-                    ai_result = await self.ai_analyzer.analyze_message(link_data.get('message_text', ''))
-                    if not ai_result.get('should_save', False):
-                        logging.info(f"[PIPELINE-4] ❌ AI REJECTED link: {raw_link[:60]} (reason: {ai_result.get('reason', 'unknown')})")
-                        await self.prod_db.set_group_state(normalized, GroupState.INVALID, raw_link, error='AI rejected')
-                        await self.prod_db.update_queue_status(link_data['id'], 'REJECTED')
-                        await self.metrics.record_skip('ai_rejected')
-                        continue
-                    logging.info(f"[PIPELINE-4] ✅ AI APPROVED link: {raw_link[:60]}")
+                    ai_approved = None
+                    ai_description = None
+                    ai_country = None
+                    ai_is_ad = None
+
+                    if not ai_batch_mode and self.ai_analyzer and self.ai_analyzer.enabled:
+                        # === PIPELINE STAGE 4: AI verification ===
+                        try:
+                            ai_text = (link_data.get('message_text') or '') + ' ' + (link_data.get('group_name') or '')
+                            ai_result = await self.ai_analyzer.analyze_message(ai_text[:1500])
+                            if ai_result:
+                                ai_approved = ai_result.get('should_save', True)
+                                ai_description = ai_result.get('description')
+                                ai_country = ai_result.get('country')
+                                ai_is_ad = ai_result.get('is_advertisement', False)
+                                logging.info(
+                                    f"[LINK id={link_id}] [PIPELINE-4] 🤖 AI verdict: "
+                                    f"approved={ai_approved} country={ai_country} ad={ai_is_ad} desc={ai_description}"
+                                )
+                                # إذا رفض الذكاء الاصطناعي الرابط، تخطي النشر والانضمام
+                                if ai_approved is False:
+                                    logging.info(f"[LINK id={link_id}] [PIPELINE-4] ❌ AI REJECTED — skipping link")
+                                    await self.prod_db.set_group_state(normalized, GroupState.BANNED, raw_link, error='ai_rejected')
+                                    await self.prod_db.update_queue_status(link_data['id'], 'DONE')
+                                    await self.metrics.record_skip('ai_rejected')
+                                    continue
+                            else:
+                                logging.info(f"[LINK id={link_id}] [PIPELINE-4] ⚠️ AI returned empty — treating as approved")
+                        except Exception as ai_err:
+                            logging.warning(f"[LINK id={link_id}] [PIPELINE-4] ⚠️ AI error: {ai_err} — proceeding without AI")
+                    else:
+                        logging.info(f"[LINK id={link_id}] [PIPELINE-4] ⏭️ AI SKIPPED (batch mode={ai_batch_mode})")
+
                     await self.prod_db.set_group_state(normalized, GroupState.QUEUED, raw_link)
 
                     # === PIPELINE STAGE 5: Publish to channel ===
@@ -3834,7 +4562,11 @@ class Monitor:
                         link_data.get('source_phone', ''), link_data.get('message_link'),
                         message_text=link_data.get('message_text', ''),
                         sender_contact=link_data.get('sender_contact', ''),
-                        link_type=link_data.get('link_type', 'other'))
+                        link_type=link_data.get('link_type', 'other'),
+                        ai_approved=ai_approved,
+                        ai_description=ai_description,
+                        ai_country=ai_country,
+                        ai_is_ad=ai_is_ad)
                     if inserted:
                         formatted = MessageFormatter.format_link_message(
                             link_data.get('group_name', ''), link_data.get('sender_name', ''),
@@ -3842,18 +4574,24 @@ class Monitor:
                             raw_link, link_data.get('message_text', ''),
                             link_data.get('source_phone', ''), link_data.get('message_link'))
                         buttons = MessageFormatter.get_link_buttons(raw_link)
-                        await self._send(formatted, buttons=buttons)
-                        logging.info(f"[PIPELINE-5] 📢 PUBLISHED to channel: {raw_link[:60]}")
+                        published, msg_id = await self._send(formatted, buttons=buttons)
+                        if published:
+                            logging.info(f"[LINK id={link_id}] [PIPELINE-5] ✅ PUBLISHED_VERIFIED message_id={msg_id}")
+                        else:
+                            logging.error(f"[LINK id={link_id}] [PIPELINE-5] ❌ PUBLISH_FAILED — retry in 5 min")
+                            await self.prod_db.update_queue_status(link_data['id'], 'QUEUED',
+                                                                   next_retry=datetime.now() + timedelta(minutes=5))
+                            continue
                     else:
-                        logging.info(f"[PIPELINE-5] ⏭️ Already published (duplicate): {raw_link[:60]}")
+                        logging.info(f"[LINK id={link_id}] [PIPELINE-5] ⏭️ Already published (duplicate)")
 
-                # 4. Group Reputation — تم إزالته (تخفيف)
-                # كان يمنع الانضمام للمجموعات الجديدة، الآن مسموح للجميع
-
-                # 5. اختر حساب فدائي: غير محظور + ضمن Daily Budget
+                # 4. اختر حساب فدائي
+                logging.info(f"[LINK id={link_id}] [PIPELINE-6] Selecting joiner...")
                 joiners = await self.db.get_watchers_by_role("joiner")
                 if not joiners:
-                    logging.warning(f"[SCHED] cycle={cycle} ⚠️ No joiner accounts! Use /set_role <phone> joiner to designate one")
+                    logging.warning(f"[SCHED] cycle={cycle} ⚠️ No joiner accounts!")
+                    await self.prod_db.update_queue_status(link_data['id'], 'QUEUED',
+                                                           next_retry=datetime.now() + timedelta(minutes=5))
                     await asyncio.sleep(60)
                     continue
 
@@ -3862,7 +4600,7 @@ class Monitor:
                     jphone = joiner['phone']
                     is_blocked, wait = await self.floodwait_mgr.is_blocked(jphone)
                     if is_blocked:
-                        logging.info(f"[SCHED] cycle={cycle} {jphone} blocked for {wait}s more (FloodWait)")
+                        logging.info(f"[SCHED] cycle={cycle} {jphone} blocked for {wait}s (FloodWait)")
                         continue
                     await self.db.reset_daily_joins_if_needed(jphone)
                     daily_joins = await self.db.get_daily_join_count(jphone)
@@ -3875,6 +4613,8 @@ class Monitor:
 
                 if not selected_joiner:
                     logging.info(f"[SCHED] cycle={cycle} All joiners blocked/limited — sleeping 60s")
+                    await self.prod_db.update_queue_status(link_data['id'], 'QUEUED',
+                                                           next_retry=datetime.now() + timedelta(minutes=5))
                     await asyncio.sleep(60)
                     continue
 
@@ -3882,134 +4622,184 @@ class Monitor:
                 client = self.user_clients.get(phone)
                 if not client or not client.is_connected():
                     logging.warning(f"[SCHED] {phone} not connected — skipping")
+                    await self.prod_db.update_queue_status(link_data['id'], 'QUEUED',
+                                                           next_retry=datetime.now() + timedelta(minutes=2))
                     await asyncio.sleep(60)
                     continue
 
-                # 6. Membership Cache Check (بعد اختيار الفدائي — يحتاج client)
+                # 5. Membership Cache Check
                 if link_type == 'telegram':
+                    logging.info(f"[LINK id={link_id}] [PIPELINE-6] Checking membership for {phone}...")
                     is_member = await self.membership_cache.check_membership(phone, normalized, client)
                     if is_member is True:
-                        logging.info(f"[SCHED] {phone} already member — skipping {raw_link[:50]}")
+                        logging.info(f"[LINK id={link_id}] [PIPELINE-6] {phone} already member — skipping")
                         await self.prod_db.set_group_state(normalized, GroupState.ALREADY_MEMBER, raw_link, joined_by=phone)
                         await self.prod_db.update_queue_status(link_data['id'], 'DONE')
                         await self.metrics.record_skip('already_member')
-                        await self.metrics.record_membership_skip()
                         continue
 
-                # 7. Rate Limiter — تحقق هل يمكننا تنفيذ الانضمام
-                allowed = await self.rate_limiter.acquire(phone, 'join')
+                # 6. Rate Limiter
+                logging.info(f"[LINK id={link_id}] [PIPELINE-6] Rate limiter check for {phone}...")
+                allowed = await self.rate_limiter.check(phone, 'join')
                 if not allowed:
                     logging.info(f"[SCHED] Rate limiter blocked {phone} — sleeping 60s")
+                    await self.prod_db.update_queue_status(link_data['id'], 'QUEUED',
+                                                           next_retry=datetime.now() + timedelta(minutes=5))
                     await asyncio.sleep(60)
                     continue
 
-                # 8. Safety Guard — 6 فحوصات صارمة قبل أي API call
-                # === PIPELINE STAGE 6: Safety Guard + Joiner attempt ===
-                logging.info(f"[PIPELINE-6] 🛡️ Safety Guard checking {phone} for {raw_link[:60]}")
+                # 7. Safety Guard
+                logging.info(f"[LINK id={link_id}] [PIPELINE-6] 🛡️ Safety Guard checking {phone}...")
                 guard_ok, guard_reason = await self._safety_guard(phone, normalized, link_data)
                 if not guard_ok:
-                    logging.info(f"[PIPELINE-6] 🚫 Safety Guard BLOCKED {phone} from joining {raw_link[:60]}: {guard_reason}")
+                    logging.info(f"[LINK id={link_id}] [PIPELINE-6] 🚫 Safety Guard BLOCKED: {guard_reason}")
                     await self.metrics.record_skip(f'guard_{guard_reason}')
-                    # لو الحظر بسبب FloodWait → استخدم next_retry_at من DB (مو 30 دقيقة ثابتة)
                     if 'floodwait' in guard_reason:
                         floodwait_until = await self.prod_db.get_floodwait(phone)
                         if floodwait_until:
                             next_retry_dt = datetime.fromtimestamp(floodwait_until)
-                            await self.prod_db.update_queue_status(link_data['id'], 'QUEUED',
-                                                                   next_retry=next_retry_dt)
-                            logging.info(f"[PIPELINE-6] FloodWait retry after {next_retry_dt.strftime('%H:%M:%S')}")
+                            await self.prod_db.update_queue_status(link_data['id'], 'QUEUED', next_retry=next_retry_dt)
                         else:
                             await self.prod_db.update_queue_status(link_data['id'], 'QUEUED',
                                                                    next_retry=datetime.now() + timedelta(minutes=30))
                     else:
-                        # أسباب أخرى → 30 دقيقة
                         await self.prod_db.update_queue_status(link_data['id'], 'QUEUED',
-                                                               next_retry=datetime.now() + timedelta(minutes=30))
+                                                               next_retry=datetime.now() + timedelta(minutes=5))
                     await asyncio.sleep(60)
                     continue
-                logging.info(f"[PIPELINE-6] ✅ Safety Guard PASSED for {phone}")
+                logging.info(f"[LINK id={link_id}] [PIPELINE-6] ✅ Safety Guard PASSED for {phone}")
 
-                # 9. سجل محاولة الانضمام
+                # 8. Join attempt
                 await self.metrics.record_join_attempt(phone)
-
-                # 10. حدّث الحالة لـ JOINING
                 await self.prod_db.set_group_state(normalized, GroupState.JOINING, raw_link)
                 await self.prod_db.update_queue_status(link_data['id'], 'PROCESSING')
 
-                # 11. انضمام
-                logging.info(f"[PIPELINE-6] 🚀 Joiner {phone} attempting to join: {raw_link[:60]}")
+                logging.info(f"[LINK id={link_id}] [PIPELINE-6] 🚀 Joiner {phone} attempting to join: {raw_link[:60]}")
                 success, status, member_count = await self._join_group_safe(client, link_data, phone)
 
-                # 11. حدّث State Machine + Metrics
-                if success:
-                    await self.prod_db.set_group_state(normalized, GroupState.JOINED, raw_link,
-                                                       joined_by=phone, member_count=member_count)
+                # === SINGLE QUEUE STATE UPDATE ===
+                # متغيرات نهائية — تحدّث مرة واحدة فقط في نهاية المعالجة
+                final_status = None
+                next_retry = None
+                state_to_set = None
+                state_error = None
+
+                if success and status == "JOINED_VERIFIED":
+                    # ✅ نجاح مؤكد عبر GetParticipantRequest
+                    state_to_set = GroupState.JOINED
+                    final_status = 'DONE'
                     await self.metrics.record_join_success(phone)
                     await self.db.increment_joiner_stats(phone, success=True)
-                    logging.info(f"[PIPELINE-6] ✅✅ {phone} JOINED successfully: {raw_link[:60]} (members={member_count})")
+                    logging.info(
+                        f"[LINK id={link_id}] [PIPELINE-6] ✅✅ {phone} JOINED_VERIFIED: {raw_link[:60]} "
+                        f"(members={member_count})"
+                    )
+
+                elif success and status == "JOIN_UNVERIFIED":
+                    # ⚠️ Join API نجح لكن التحقق تعذر — احذر
+                    state_to_set = GroupState.JOINED  # اعتبره منضم لكن سجّل التحذير
+                    state_error = 'join_unverified'
+                    final_status = 'DONE'
+                    await self.metrics.record_join_success(phone)
+                    await self.db.increment_joiner_stats(phone, success=True)
+                    logging.warning(
+                        f"[LINK id={link_id}] [PIPELINE-6] ⚠️ {phone} JOIN_UNVERIFIED: {raw_link[:60]} "
+                        f"(Telegram accepted but membership not confirmed)"
+                    )
+
                 elif status == "ALREADY_MEMBER":
-                    await self.prod_db.set_group_state(normalized, GroupState.ALREADY_MEMBER, raw_link,
-                                                       joined_by=phone)
+                    state_to_set = GroupState.ALREADY_MEMBER
+                    final_status = 'DONE'
                     await self.metrics.record_membership_skip()
-                    logging.info(f"[PIPELINE-6] ℹ️ {phone} already member: {raw_link[:60]}")
+                    logging.info(f"[LINK id={link_id}] [PIPELINE-6] ℹ️ {phone} already member: {raw_link[:60]}")
+
                 elif status == "FLOODWAIT":
-                    await self.prod_db.set_group_state(normalized, GroupState.FLOODWAIT, raw_link,
-                                                       error='FloodWait')
+                    state_to_set = GroupState.FLOODWAIT
+                    state_error = 'FloodWait'
+                    final_status = 'QUEUED'
+                    next_retry = datetime.now() + timedelta(minutes=30)
                     await self.metrics.record_floodwait(phone)
-                    # === AUTO-PAUSE on new FloodWait ===
-                    self._join_paused = True
-                    await self.prod_db.set_setting('join_paused', 'true')
-                    logging.warning(f"[AUTO-PAUSE] FloodWait detected → join_paused=true in DB")
-                    # إعادة الرابط للقائمة بعد ساعة
-                    await self.prod_db.update_queue_status(link_data['id'], 'QUEUED',
-                                                           next_retry=datetime.now() + timedelta(hours=1))
-                elif status == "RATE_LIMITED":
-                    # Rate limiter blocked — NOT a FloodWait, don't auto-pause
-                    logging.info(f"[PIPELINE-6] ⏳ {phone} rate limited — will retry in 10 min")
-                    await self.prod_db.update_queue_status(link_data['id'], 'QUEUED',
-                                                           next_retry=datetime.now() + timedelta(minutes=10))
-                elif status == "TIMEOUT":
-                    # Telegram API timed out (30s) — don't auto-pause, retry later
-                    logging.info(f"[PIPELINE-6] ⏰ {phone} join timed out — will retry in 5 min")
-                    await self.prod_db.update_queue_status(link_data['id'], 'QUEUED',
-                                                           next_retry=datetime.now() + timedelta(minutes=5))
-                elif status == "INVALID":
-                    # لا يوجد username في الرابط — لا يمكن الانضمام
-                    logging.info(f"[PIPELINE-6] ❌ invalid link (no username) — skipping")
-                    await self.prod_db.update_queue_status(link_data['id'], 'DONE')
-                elif status == "SKIP":
-                    # رابط WhatsApp — لا يحتاج انضمام
-                    logging.info(f"[PIPELINE-6] ⏭️ WhatsApp link — no join needed")
-                    await self.prod_db.update_queue_status(link_data['id'], 'DONE')
-                elif status == "IS_CHANNEL":
-                    # الرابط لقناة (broadcast) وليس مجموعة — نتخطى
-                    logging.info(f"[PIPELINE-6] 📢 Skipped channel (broadcast): {raw_link[:50]}")
-                    await self.prod_db.set_group_state(normalized, GroupState.FAILED, raw_link,
-                                                       error='is_channel')
-                    await self.prod_db.update_queue_status(link_data['id'], 'DONE')
-                elif status == "PRIVATE":
-                    await self.prod_db.set_group_state(normalized, GroupState.PRIVATE, raw_link,
-                                                       error='Channel private')
+                    # لا توقف النظام كامل — فقط أوقف هذا الحساب مؤقتاً
+                    # FloodWait لرابط واحد لا يوقف 127 رابط آخر
+                    logging.warning(f"[FLOODWAIT] {phone} got FloodWait — link requeued in 30 min (system continues)")
+
                 elif status == "BANNED":
-                    await self.prod_db.set_group_state(normalized, GroupState.BANNED, raw_link,
-                                                       error='PeerFlood/Banned')
+                    state_to_set = GroupState.BANNED
+                    state_error = 'PeerFlood/Banned'
+                    final_status = 'DONE'  # فشل نهائي — لا إعادة محاولة
                     await self.metrics.record_floodwait(phone)
-                    # === AUTO-PAUSE on BAN ===
                     self._join_paused = True
                     await self.prod_db.set_setting('join_paused', 'true')
                     logging.warning(f"[AUTO-PAUSE] PeerFlood/Ban detected → join_paused=true in DB")
-                else:
-                    await self.prod_db.set_group_state(normalized, GroupState.FAILED, raw_link,
-                                                       error=status)
-                    # إعادة للمحاولة بعد 30 دقيقة
-                    await self.prod_db.update_queue_status(link_data['id'], 'QUEUED',
-                                                           next_retry=datetime.now() + timedelta(minutes=30))
 
-                # 11. سجل وقت المعالجة
-                await self.prod_db.update_queue_status(link_data['id'], 'DONE' if success else 'QUEUED')
+                elif status == "RATE_LIMITED":
+                    final_status = 'QUEUED'
+                    next_retry = datetime.now() + timedelta(minutes=10)
+                    logging.info(f"[LINK id={link_id}] [PIPELINE-6] ⏳ {phone} rate limited — retry in 10 min")
 
-                # 12. انتظر 60 ثانية قبل المهمة التالية (لا burst)
-                await asyncio.sleep(60)
+                elif status == "TIMEOUT":
+                    state_to_set = GroupState.FAILED
+                    state_error = 'TIMEOUT'
+                    final_status = 'QUEUED'
+                    next_retry = datetime.now() + timedelta(minutes=5)
+                    logging.info(f"[LINK id={link_id}] [PIPELINE-6] ⏰ {phone} join timed out — retry in 5 min")
+
+                elif status == "DISCONNECTED":
+                    final_status = 'QUEUED'
+                    next_retry = datetime.now() + timedelta(minutes=2)
+                    logging.warning(f"[LINK id={link_id}] [PIPELINE-6] ❌ {phone} client disconnected — retry in 2 min")
+
+                elif status in ("MONITOR_NO_JOIN", "JOINER_DISABLED", "PAUSED", "SIMULATION"):
+                    final_status = 'QUEUED'
+                    next_retry = datetime.now() + timedelta(minutes=1)
+                    logging.warning(f"[LINK id={link_id}] [PIPELINE-6] ⚠️ {phone} {status} — skipping")
+
+                elif status == "INVALID":
+                    state_to_set = GroupState.FAILED
+                    state_error = 'invalid_link'
+                    final_status = 'DONE'  # فشل نهائي
+                    logging.info(f"[LINK id={link_id}] [PIPELINE-6] ❌ invalid link (no username) — skipping")
+
+                elif status == "SKIP":
+                    final_status = 'DONE'  # WhatsApp — لا انضمام
+                    logging.info(f"[LINK id={link_id}] [PIPELINE-6] ⏭️ WhatsApp link — no join needed")
+
+                elif status == "IS_CHANNEL":
+                    state_to_set = GroupState.FAILED
+                    state_error = 'is_channel'
+                    final_status = 'DONE'
+                    logging.info(f"[LINK id={link_id}] [PIPELINE-6] 📢 Skipped channel (broadcast): {raw_link[:50]}")
+
+                elif status == "PRIVATE":
+                    state_to_set = GroupState.PRIVATE
+                    state_error = 'Channel private'
+                    final_status = 'DONE'  # فشل نهائي
+                    logging.info(f"[LINK id={link_id}] [PIPELINE-6] 🔒 private channel: {raw_link[:50]}")
+
+                else:  # FAILED أو أي حال أخرى
+                    state_to_set = GroupState.FAILED
+                    state_error = status
+                    final_status = 'QUEUED'
+                    next_retry = datetime.now() + timedelta(minutes=30)
+                    logging.warning(f"[LINK id={link_id}] [PIPELINE-6] ❌ {phone} {status}: {raw_link[:60]}")
+
+                # === UPDATE STATE MACHINE ONCE ===
+                if state_to_set:
+                    await self.prod_db.set_group_state(
+                        normalized, state_to_set, raw_link,
+                        joined_by=phone if success else None,
+                        member_count=member_count if success else None,
+                        error=state_error
+                    )
+
+                # === UPDATE QUEUE STATUS ONCE ===
+                if final_status:
+                    await self.prod_db.update_queue_status(
+                        link_data['id'], final_status, next_retry=next_retry
+                    )
+
+                # 12. انتظر 10 ثواني قبل المهمة التالية (الـ Rate Limiter يتحكم بالسرعة الفعلية)
+                await asyncio.sleep(10)
 
             except asyncio.CancelledError:
                 break
@@ -4045,146 +4835,149 @@ class Monitor:
         if not joiner_phone or not joiner_client:
             logging.error("[BULK_JOIN] No connected joiner account found!")
             self._bulk_join_running = False
-            await self._send("❌ لا يوجد حساب فدائي متصل. أرسل /bulk_join بعد ربط حساب فدائي.")
+            await self._send("❌ لا يوجد حساب فدائي متصل. أرسل /bulk_join بعد ربط حساب فدائي.")  # noqa: ignore result
             return
 
         logging.info(f"[BULK_JOIN] Using joiner: {joiner_phone}")
 
+        # Worker Supervisor state
+        worker_state = 'RUNNING'
+
         try:
-            # اقرأ رسائل القناة من الأقدم للأحدث
-            # iter_messages يعيد الأحدث أولاً افتراضياً، نعكسه بreverse=True
+            # بدلاً من قراءة رسائل القناة، اقرأ من link_queue مباشرة
+            # هذا أسرع وأكثر موثوقية — الروابط موجودة بالفعل في القائمة
             offset_id = 0
-            batch_size = 200
+            batch_size = 50
 
             while self._bulk_join_running and not self._bulk_join_stop:
                 try:
-                    # اجلب batch من رسائل القناة
-                    messages = await self.bot_client.get_messages(
-                        self.config.channel_id,
-                        limit=batch_size,
-                        offset_id=offset_id,
-                        reverse=False  # الأحدث أولاً
-                    )
+                    # === CHECK _join_paused BEFORE EACH LINK ===
+                    if self._join_paused:
+                        worker_state = 'PAUSED'
+                        logging.info("[BULK_JOIN] PAUSED — waiting for /resume_join or /clear_floodwait")
+                        await self._send("[BULK] PAUSED — waiting for resume")  # noqa: ignore result
+                        # انتظر حتى يُرفع الإيقاف
+                        while self._join_paused and self._bulk_join_running and not self._bulk_join_stop:
+                            await asyncio.sleep(30)
+                        if not self._bulk_join_running or self._bulk_join_stop:
+                            break
+                        worker_state = 'RUNNING'
+                        logging.info("[BULK_JOIN] Resumed — continuing")
 
-                    if not messages:
-                        logging.info("[BULK_JOIN] No more messages — done!")
+                    # تحقق من اتصال الـ joiner
+                    if not joiner_client or not joiner_client.is_connected():
+                        logging.error("[BULK_JOIN] ❌ joiner client disconnected — pausing 60s")
+                        worker_state = 'FAILED'
+                        await asyncio.sleep(60)
+                        # حاول إعادة الاتصال
+                        joiner_client = self.user_clients.get(joiner_phone)
+                        if not joiner_client or not joiner_client.is_connected():
+                            logging.error("[BULK_JOIN] ❌ joiner still disconnected — stopping")
+                            break
+                        worker_state = 'RUNNING'
+                        continue
+
+                    # اقرأ روابط من link_queue (QUEUED فقط، بدون next_retry مستقبلي)
+                    conn = await self.db._ensure_conn()
+                    cursor = await conn.execute(
+                        """SELECT id, raw_link, normalized_link, link_type, username, invite_hash,
+                                  group_name, sender_name, message_text, message_link, source_phone
+                           FROM link_queue
+                           WHERE status = 'QUEUED'
+                           AND (next_retry_at IS NULL OR next_retry_at <= ?)
+                           ORDER BY id ASC LIMIT ?""",
+                        (datetime.now().isoformat(), batch_size))
+                    rows = await cursor.fetchall()
+
+                    if not rows:
+                        logging.info("[BULK_JOIN] No queued links — done!")
+                        worker_state = 'COMPLETED'
                         break
 
-                    # حدّث offset للدفعة التالية
-                    offset_id = messages[-1].id
+                    logging.info(f"[BULK_JOIN] Processing {len(rows)} queued links")
 
-                    for msg in messages:
+                    for row in rows:
                         if self._bulk_join_stop:
                             logging.info("[BULK_JOIN] Stop requested — exiting")
+                            worker_state = 'STOPPED'
                             break
 
-                        raw_text = msg.raw_text or ''
-                        if not raw_text:
+                        # تحقق من _join_paused لكل رابط
+                        if self._join_paused:
+                            logging.info("[BULK_JOIN] PAUSED mid-batch — waiting")
+                            break
+
+                        link_id = row[0]
+                        raw_link = row[1]
+                        normalized = row[2]
+                        link_type = row[3]
+
+                        self._bulk_join_stats['current'] = raw_link
+                        self._bulk_join_stats['total'] += 1
+
+                        # a. تجاوز غير Telegram
+                        if link_type not in ('telegram', 'telegram_private'):
+                            self._bulk_join_stats['skipped'] += 1
+                            await self.prod_db.update_queue_status(link_id, 'DONE')
                             continue
 
-                        # استخرج الروابط من نص الرسالة
-                        links = LinkNormalizer.extract_links(raw_text)
-                        if not links:
+                        # b. تجاوز لو الحالة معروفة في group_states
+                        state = await self.prod_db.get_group_state(normalized)
+                        if state in (GroupState.JOINED, GroupState.ALREADY_MEMBER, GroupState.BANNED, GroupState.PRIVATE):
+                            self._bulk_join_stats['skipped'] += 1
+                            await self.prod_db.update_queue_status(link_id, 'DONE')
                             continue
 
-                        for link_info in links:
-                            if self._bulk_join_stop:
-                                break
+                        # c. تحقق من FloodWait
+                        is_blocked, wait = await self.floodwait_mgr.is_blocked(joiner_phone)
+                        if is_blocked:
+                            logging.warning(f"[BULK_JOIN] Joiner in FloodWait ({wait}s) — pausing")
+                            await self._send(f"⏳ FloodWait {wait}s — Bulk join paused\n📊 {self._bulk_join_stats}")  # noqa: ignore result
+                            await asyncio.sleep(min(wait + 10, 3600))
+                            continue
 
-                            raw_link = link_info['raw']
-                            normalized = link_info['normalized']
-                            link_type = link_info.get('link_type', 'other')
+                        # d. حاول الانضمام
+                        logging.info(f"[BULK_JOIN] ({self._bulk_join_stats['total']}) Joining: {raw_link[:60]}")
+                        link_data = {
+                            'raw': raw_link,
+                            'raw_link': raw_link,
+                            'normalized_link': normalized,
+                            'link_type': link_type,
+                            'username': row[4] or '',
+                            'invite_hash': row[5] or '',
+                        }
 
-                            self._bulk_join_stats['current'] = raw_link
-                            self._bulk_join_stats['total'] += 1
+                        success, status, member_count = await self._join_group_safe(
+                            joiner_client, link_data, joiner_phone)
 
-                            # a. تجاوز غير Telegram
-                            if link_type not in ('telegram', 'telegram_private'):
-                                self._bulk_join_stats['skipped'] += 1
-                                logging.debug(f"[BULK_JOIN] Skip non-telegram: {raw_link[:50]}")
-                                continue
+                        if success:
+                            self._bulk_join_stats['joined'] += 1
+                            await self.prod_db.set_group_state(normalized, GroupState.JOINED, raw_link,
+                                                               joined_by=joiner_phone, member_count=member_count)
+                            logging.info(f"[BULK_JOIN] ✅ {status}: {raw_link[:50]}")
+                        elif status == "ALREADY_MEMBER":
+                            self._bulk_join_stats['already'] += 1
+                            await self.prod_db.set_group_state(normalized, GroupState.ALREADY_MEMBER, raw_link,
+                                                               joined_by=joiner_phone)
+                            logging.info(f"[BULK_JOIN] ℹ️ Already member: {raw_link[:50]}")
+                        elif status == "IS_CHANNEL":
+                            self._bulk_join_stats['skipped'] += 1
+                            await self.prod_db.set_group_state(normalized, GroupState.FAILED, raw_link,
+                                                               error='is_channel')
+                            logging.info(f"[BULK_JOIN] 📢 Skipped channel: {raw_link[:50]}")
+                            continue
+                        elif status == "FLOODWAIT":
+                            self._bulk_join_stats['failed'] += 1
+                            logging.warning(f"[BULK_JOIN] ⚠️ FloodWait — pausing")
+                            break
+                        else:
+                            self._bulk_join_stats['failed'] += 1
+                            await self.prod_db.set_group_state(normalized, GroupState.FAILED, raw_link,
+                                                               error=status)
+                            logging.warning(f"[BULK_JOIN] ❌ {status}: {raw_link[:50]}")
 
-                            # a2. فلتر تعليمي — تجاوز غير التعليمي
-                            # نستخدم نص الرسالة الأصلية (التي نُشرت في القناة) لتحديد التعليمي
-                            msg_text = msg.raw_text or ''
-                            is_edu, edu_reason = EducationalFilter.is_educational(msg_text, link_info.get('username', ''))
-                            if not is_edu:
-                                self._bulk_join_stats['skipped'] += 1
-                                logging.info(f"[BULK_JOIN] Skip non-educational: {raw_link[:50]} ({edu_reason})")
-                                # سجل في group_states لتخطيه مستقبلاً
-                                await self.prod_db.set_group_state(normalized, GroupState.FAILED, raw_link,
-                                                                   error=f'non_educational_{edu_reason}')
-                                continue
-
-                            # a3. تجاوز القنوات (broadcast) — نريد المجموعات فقط
-                            if EducationalFilter.is_likely_channel(msg_text, link_info.get('username', '')):
-                                self._bulk_join_stats['skipped'] += 1
-                                logging.info(f"[BULK_JOIN] Skip likely channel: {raw_link[:50]}")
-                                await self.prod_db.set_group_state(normalized, GroupState.FAILED, raw_link,
-                                                                   error='likely_channel')
-                                continue
-
-                            # b. تجاوز لو الحالة معروفة في group_states
-                            state = await self.prod_db.get_group_state(normalized)
-                            if state in (GroupState.JOINED, GroupState.ALREADY_MEMBER, GroupState.BANNED, GroupState.PRIVATE):
-                                self._bulk_join_stats['skipped'] += 1
-                                logging.debug(f"[BULK_JOIN] Skip {state}: {raw_link[:50]}")
-                                continue
-
-                            # c. تحقق من FloodWait
-                            is_blocked, wait = await self.floodwait_mgr.is_blocked(joiner_phone)
-                            if is_blocked:
-                                logging.warning(f"[BULK_JOIN] Joiner in FloodWait ({wait}s) — pausing")
-                                await self._send(f"⏳ FloodWait {wait}s — Bulk join paused\n📊 {self._bulk_join_stats}")
-                                # انتظر حتى ينتهي FloodWait
-                                await asyncio.sleep(min(wait + 10, 3600))
-                                continue
-
-                            # d. حاول الانضمام
-                            logging.info(f"[BULK_JOIN] ({self._bulk_join_stats['total']}) Joining EDUCATIONAL: {raw_link[:60]}")
-                            link_data = {
-                                'raw': raw_link,
-                                'raw_link': raw_link,
-                                'normalized_link': normalized,
-                                'link_type': link_type,
-                                'username': link_info.get('username', ''),
-                                'invite_hash': link_info.get('invite_hash', ''),
-                            }
-
-                            success, status, member_count = await self._join_group_safe(
-                                joiner_client, link_data, joiner_phone)
-
-                            if success:
-                                self._bulk_join_stats['joined'] += 1
-                                await self.prod_db.set_group_state(normalized, GroupState.JOINED, raw_link,
-                                                                   joined_by=joiner_phone, member_count=member_count)
-                                logging.info(f"[BULK_JOIN] ✅ JOINED: {raw_link[:50]}")
-                            elif status == "ALREADY_MEMBER":
-                                self._bulk_join_stats['already'] += 1
-                                await self.prod_db.set_group_state(normalized, GroupState.ALREADY_MEMBER, raw_link,
-                                                                   joined_by=joiner_phone)
-                                logging.info(f"[BULK_JOIN] ℹ️ Already member: {raw_link[:50]}")
-                            elif status == "IS_CHANNEL":
-                                # قناة broadcast — سجلها ولا تعد المحاولة
-                                self._bulk_join_stats['skipped'] += 1
-                                await self.prod_db.set_group_state(normalized, GroupState.FAILED, raw_link,
-                                                                   error='is_channel')
-                                logging.info(f"[BULK_JOIN] 📢 Skipped channel: {raw_link[:50]}")
-                                # لا ننتظر 120s لأن ما في API call
-                                continue
-                            elif status == "FLOODWAIT":
-                                self._bulk_join_stats['failed'] += 1
-                                logging.warning(f"[BULK_JOIN] ⚠️ FloodWait — pausing")
-                                # FloodWait تم تسجيله في _join_group_safe
-                                break  # اخرج من حلقة الروابط، انتظر
-                            else:
-                                self._bulk_join_stats['failed'] += 1
-                                await self.prod_db.set_group_state(normalized, GroupState.FAILED, raw_link,
-                                                                   error=status)
-                                logging.warning(f"[BULK_JOIN] ❌ {status}: {raw_link[:50]}")
-
-                            # e. انتظر 120 ثانية بين كل انضمام (آمن)
-                            await asyncio.sleep(120)
+                        # e. انتظر 120 ثانية بين كل انضمام (آمن)
+                        await asyncio.sleep(120)
 
                     # تقرير كل 1000 رسالة
                     if self._bulk_join_stats['total'] % 50 == 0 and self._bulk_join_stats['total'] > 0:
@@ -4193,16 +4986,25 @@ class Monitor:
                                      f"{s['already']} already, {s['failed']} failed, {s['skipped']} skipped")
 
                 except asyncio.CancelledError:
+                    worker_state = 'STOPPED'
                     break
                 except Exception as e:
-                    logging.error(f"[BULK_JOIN] Batch error: {e}", exc_info=True)
+                    worker_state = 'FAILED'
+                    logging.error(
+                        f"[BULK_JOIN] ❌ WORKER ERROR\n"
+                        f"[BULK_JOIN] state={worker_state}\n"
+                        f"[BULK_JOIN] current_link={self._bulk_join_stats.get('current', 'none')}\n"
+                        f"[BULK_JOIN] error={type(e).__name__}: {e}",
+                        exc_info=True
+                    )
                     await asyncio.sleep(60)
+                    worker_state = 'RUNNING'  # استئناف بعد الـ sleep
 
             # انتهى
             self._bulk_join_running = False
             s = self._bulk_join_stats
             final_msg = (
-                f"🏁 Bulk Join Finished\n"
+                f"🏁 Bulk Join Finished [{worker_state}]\n"
                 f"════════════════════\n"
                 f"🔗 Total: {s['total']}\n"
                 f"✅ Joined: {s['joined']}\n"
@@ -4211,14 +5013,23 @@ class Monitor:
                 f"⏭️ Skipped: {s['skipped']}"
             )
             logging.info(f"[BULK_JOIN] {final_msg}")
-            await self._send(final_msg)
+            published, _ = await self._send(final_msg)
+            if not published:
+                logging.error("[BULK_JOIN] ❌ Failed to send final report to channel")
 
         except asyncio.CancelledError:
             self._bulk_join_running = False
-            logging.info("[BULK_JOIN] Cancelled")
+            logging.info(f"[BULK_JOIN] Cancelled [state={worker_state}]")
         except Exception as e:
             self._bulk_join_running = False
-            logging.error(f"[BULK_JOIN] Fatal: {e}", exc_info=True)
+            worker_state = 'FAILED'
+            logging.error(
+                f"[BULK_JOIN] ❌ FATAL WORKER ERROR\n"
+                f"[BULK_JOIN] state=FAILED\n"
+                f"[BULK_JOIN] current_link={self._bulk_join_stats.get('current', 'none')}\n"
+                f"[BULK_JOIN] error={type(e).__name__}: {e}",
+                exc_info=True
+            )
 
     async def _cleanup_worker(self, preview_only: bool = True):
         """عامل التنظيف — يحلل روابط القناة ويحذف غير التعليمية والمكررة.
@@ -4230,7 +5041,8 @@ class Monitor:
         logging.info(f"[CLEANUP] {mode} mode — scanning channel messages")
         self._cleanup_stats = {
             'running': True, 'total': 0, 'educational': 0,
-            'non_educational': 0, 'duplicates': 0, 'deleted': 0, 'current': ''
+            'non_educational': 0, 'duplicates': 0, 'deleted': 0, 'current': '',
+            'worker_state': 'RUNNING'
         }
 
         # set لتتبع الروابط التعليمية المرئية (لاكتشاف التكرار)
@@ -4238,20 +5050,45 @@ class Monitor:
         offset_id = 0
         batch_size = 200
         deleted_count = 0
+        worker_state = 'RUNNING'
 
         try:
             while self._cleanup_stats['running']:
                 try:
-                    # اجلب batch من رسائل القناة (الأقدم أولاً)
-                    messages = await self.bot_client.get_messages(
-                        self.config.channel_id,
-                        limit=batch_size,
-                        offset_id=offset_id,
-                        reverse=True  # الأقدم أولاً
+                    # تحقق من اتصال البوت
+                    if not self.bot_client or not self.bot_client.is_connected():
+                        logging.error("[CLEANUP] ❌ bot_client not connected — pausing 30s")
+                        worker_state = 'FAILED'
+                        self._cleanup_stats['worker_state'] = worker_state
+                        await asyncio.sleep(30)
+                        worker_state = 'RUNNING'
+                        self._cleanup_stats['worker_state'] = worker_state
+                        continue
+
+                    # اجلب batch من رسائل القناة — استخدم user_client (Bot API لا يدعم get_messages)
+                    history_client = self._get_any_user_client()
+                    if not history_client:
+                        logging.error("[CLEANUP] ❌ No connected user client for get_messages — pausing 30s")
+                        worker_state = 'FAILED'
+                        self._cleanup_stats['worker_state'] = worker_state
+                        await asyncio.sleep(30)
+                        worker_state = 'RUNNING'
+                        self._cleanup_stats['worker_state'] = worker_state
+                        continue
+                    messages = await asyncio.wait_for(
+                        history_client.get_messages(
+                            self.config.channel_id,
+                            limit=batch_size,
+                            offset_id=offset_id,
+                            reverse=True  # الأقدم أولاً
+                        ),
+                        timeout=60
                     )
 
                     if not messages:
                         logging.info(f"[CLEANUP] {mode} — No more messages")
+                        worker_state = 'COMPLETED'
+                        self._cleanup_stats['worker_state'] = worker_state
                         break
 
                     offset_id = messages[-1].id
@@ -4274,25 +5111,33 @@ class Monitor:
                             normalized = link_info['normalized']
                             username = link_info.get('username', '')
 
-                            # فحص تعليمي
-                            is_edu, reason = EducationalFilter.is_educational(raw_text, username)
+                            # فحص تعليمي — استخدم username فقط (الرسالة المنشورة منسقة)
+                            is_edu, reason = EducationalFilter.is_educational('', username)
 
                             if not is_edu:
                                 # غير تعليمي → احذف
                                 self._cleanup_stats['non_educational'] += 1
                                 logging.info(f"[CLEANUP] {mode} non-educational msg={msg.id}: {raw_link[:50]} ({reason})")
                                 if not preview_only:
+                                    # === VERIFY BEFORE DELETE ===
+                                    # 1. message exists (we have it)
+                                    # 2. contains target link (we extracted it)
+                                    # 3. matches cleanup policy (non-educational)
                                     try:
-                                        await self.bot_client.delete_messages(
+                                        await history_client.delete_messages(
                                             self.config.channel_id, [msg.id])
                                         deleted_count += 1
                                         self._cleanup_stats['deleted'] = deleted_count
+                                        logging.info(f"[CLEANUP] ✅ DELETED msg={msg.id} (verified)")
                                         await asyncio.sleep(0.5)  # تجنب FloodWait
                                     except FloodWaitError as e:
                                         logging.warning(f"[CLEANUP] FloodWait {e.seconds}s — pausing")
                                         await asyncio.sleep(e.seconds + 1)
                                     except Exception as e:
-                                        logging.error(f"[CLEANUP] Delete error: {e}")
+                                        logging.error(
+                                            f"[CLEANUP] ❌ Delete FAILED msg={msg.id}\n"
+                                            f"[CLEANUP] error={type(e).__name__}: {e}"
+                                        )
                                 break  # لا تفحص روابط أخرى في نفس الرسالة
 
                             # تعليمي → تحقق من التكرار
@@ -4302,16 +5147,20 @@ class Monitor:
                                 logging.info(f"[CLEANUP] {mode} duplicate msg={msg.id}: {raw_link[:50]}")
                                 if not preview_only:
                                     try:
-                                        await self.bot_client.delete_messages(
+                                        await history_client.delete_messages(
                                             self.config.channel_id, [msg.id])
                                         deleted_count += 1
                                         self._cleanup_stats['deleted'] = deleted_count
+                                        logging.info(f"[CLEANUP] ✅ DELETED msg={msg.id} (duplicate, verified)")
                                         await asyncio.sleep(0.5)
                                     except FloodWaitError as e:
                                         logging.warning(f"[CLEANUP] FloodWait {e.seconds}s — pausing")
                                         await asyncio.sleep(e.seconds + 1)
                                     except Exception as e:
-                                        logging.error(f"[CLEANUP] Delete error: {e}")
+                                        logging.error(
+                                            f"[CLEANUP] ❌ Delete FAILED msg={msg.id}\n"
+                                            f"[CLEANUP] error={type(e).__name__}: {e}"
+                                        )
                                 break
                             else:
                                 # تعليمي جديد → سجل
@@ -4328,16 +5177,42 @@ class Monitor:
                 except FloodWaitError as e:
                     logging.warning(f"[CLEANUP] FloodWait {e.seconds}s — pausing")
                     await asyncio.sleep(e.seconds + 1)
+                except asyncio.TimeoutError:
+                    logging.error("[CLEANUP] ❌ get_messages TIMEOUT (60s) — pausing 30s")
+                    worker_state = 'FAILED'
+                    self._cleanup_stats['worker_state'] = worker_state
+                    await asyncio.sleep(30)
+                    worker_state = 'RUNNING'
+                    self._cleanup_stats['worker_state'] = worker_state
                 except asyncio.CancelledError:
+                    worker_state = 'STOPPED'
+                    self._cleanup_stats['worker_state'] = worker_state
                     break
                 except Exception as e:
-                    logging.error(f"[CLEANUP] Batch error: {e}", exc_info=True)
+                    worker_state = 'FAILED'
+                    self._cleanup_stats['worker_state'] = worker_state
+                    logging.error(
+                        f"[CLEANUP] ❌ WORKER ERROR\n"
+                        f"[CLEANUP] state={worker_state}\n"
+                        f"[CLEANUP] current={self._cleanup_stats.get('current', 'none')}\n"
+                        f"[CLEANUP] error={type(e).__name__}: {e}",
+                        exc_info=True
+                    )
                     await asyncio.sleep(5)
+                    worker_state = 'RUNNING'
+                    self._cleanup_stats['worker_state'] = worker_state
 
             # انتهى
             self._cleanup_stats['running'] = False
+            self._cleanup_stats['worker_state'] = worker_state
             s = self._cleanup_stats
-            action = "🔍 PREVIEW RESULTS" if preview_only else "✅ CLEANUP COMPLETE"
+            # لا تقل "COMPLETE" إلا إذا انتهت فعلياً بنجاح
+            if worker_state == 'COMPLETED':
+                action = "🔍 PREVIEW RESULTS" if preview_only else "✅ CLEANUP COMPLETE"
+            elif worker_state == 'STOPPED':
+                action = "⏹️ CLEANUP STOPPED"
+            else:
+                action = f"❌ CLEANUP FAILED [{worker_state}]"
             final_msg = (
                 f"{action}\n"
                 f"════════════════════\n"
@@ -4347,18 +5222,27 @@ class Monitor:
                 f"🔄 Duplicates: {s['duplicates']}\n"
                 f"🗑️ Deleted: {s['deleted']}"
             )
-            if not preview_only:
+            if not preview_only and worker_state == 'COMPLETED':
                 final_msg += f"\n\n✨ تم تنظيف القناة!\nالآن أرسل /bulk_join للانضمام للمجموعات التعليمية المتبقية"
             logging.info(f"[CLEANUP] {final_msg}")
-            await self._send(final_msg)
+            published, _ = await self._send(final_msg)
+            if not published:
+                logging.error("[CLEANUP] ❌ Failed to send final report to channel")
 
         except asyncio.CancelledError:
             self._cleanup_stats['running'] = False
+            self._cleanup_stats['worker_state'] = 'STOPPED'
             logging.info("[CLEANUP] Cancelled")
         except Exception as e:
             self._cleanup_stats['running'] = False
-            logging.error(f"[CLEANUP] Fatal: {e}", exc_info=True)
-            await self._send(f"❌ خطأ في التنظيف: {e}")
+            self._cleanup_stats['worker_state'] = 'FAILED'
+            logging.error(
+                f"[CLEANUP] ❌ FATAL WORKER ERROR\n"
+                f"[CLEANUP] state=FAILED\n"
+                f"[CLEANUP] error={type(e).__name__}: {e}",
+                exc_info=True
+            )
+            await self._send(f"❌ خطأ في التنظيف: {e}")  # noqa: ignore result
 
     async def _safety_guard(self, phone: str, normalized_link: str, link_data: dict) -> Tuple[bool, str]:
         """Safety Guard — 6 فحوصات صارمة قبل أي Join API call.
@@ -4389,15 +5273,17 @@ class Monitor:
 
         # 3. Hourly Join Limit (DB-backed, survives restart) — conservative: 1/hour
         hourly_joins = await self.prod_db.count_operations(phone, 'join', 3600)
-        if hourly_joins >= 5:  # 5/hour max (تخفيف)
-            return False, f'hourly_limit_{hourly_joins}/5'
+        if hourly_joins >= 50:  # 50/hour max
+            return False, f'hourly_limit_{hourly_joins}/50'
 
         # 4. Group Reputation — تم إزالته (تخفيف)
         # كان يمنع الانضمام للمجموعات الجديدة، الآن مسموح
 
         # 5. Attempt history — تم تخفيف (فقط لو انضم بالفعل)
         state = await self.prod_db.get_group_state(normalized_link)
-        if state in (GroupState.JOINING, GroupState.JOINED, GroupState.ALREADY_MEMBER):
+        # JOINING = محاولة حالية (هذا الـ Scheduler نفسه)، لا ترفض
+        # فقط JOINED و ALREADY_MEMBER تعني أننا انضممنا سابقاً
+        if state in (GroupState.JOINED, GroupState.ALREADY_MEMBER):
             return False, f'already_attempted_{state}'
         # تم إزالة فحص attempt_count >= 3 (تخفيف)
 
@@ -4409,8 +5295,8 @@ class Monitor:
                 last_join_ts = w['last_join_timestamp']
                 last_join = datetime.fromisoformat(str(last_join_ts).replace('Z', '+00:00')) if isinstance(last_join_ts, str) else last_join_ts
                 elapsed = (datetime.now() - last_join.replace(tzinfo=None)).total_seconds()
-                if elapsed < 600:  # 10 min cooldown (تخفيف من ساعة إلى 10 دقائق)
-                    return False, f'join_cooldown_{int(600-elapsed)}s'
+                if elapsed < 30:  # 30s cooldown
+                    return False, f'join_cooldown_{int(30-elapsed)}s'
             except Exception:
                 pass
 
@@ -4426,7 +5312,7 @@ class Monitor:
         role = w.get('role', 'monitor') if w else 'monitor'
 
         if role == 'joiner':
-            return int(os.getenv('DAILY_JOIN_LIMIT', '15'))  # 15/day (تخفيف)
+            return int(os.getenv('DAILY_JOIN_LIMIT', '200'))  # 200/day
         elif role == 'backup':
             return int(os.getenv('DAILY_BACKUP_LIMIT', '5'))  # 5/day (تخفيف)
         else:
@@ -4480,16 +5366,93 @@ class Monitor:
 
         return max(0, min(100, score))
 
+    async def _verify_membership(self, client, entity, phone: str, raw_link: str) -> Tuple[bool, Optional[int]]:
+        """يتحقق من العضوية بعد Join API call.
+
+        Returns:
+            (True, member_count) — العضوية مؤكدة
+            (False, None) — العضوية غير مؤكدة أو فشل التحقق
+        """
+        try:
+            from telethon.tl.functions.channels import GetParticipantRequest
+            from telethon.errors import UserNotParticipantError, ChannelPrivateError
+        except ImportError:
+            logging.error("[JOIN] Cannot import GetParticipantRequest — verification impossible")
+            return False, None
+
+        try:
+            await asyncio.wait_for(
+                client(GetParticipantRequest(channel=entity, participant="me")),
+                timeout=15
+            )
+            member_count = None
+            if hasattr(entity, 'participants_count'):
+                member_count = entity.participants_count
+            logging.info(
+                f"[JOIN] ✅ MEMBERSHIP VERIFIED\n"
+                f"[JOIN] phone={phone}\n"
+                f"[JOIN] link={raw_link[:50]}\n"
+                f"[JOIN] members={member_count}"
+            )
+            return True, member_count
+        except UserNotParticipantError:
+            logging.error(
+                f"[JOIN] ❌ Membership verification FAILED\n"
+                f"[JOIN] reason=UserNotParticipant\n"
+                f"[JOIN] phone={phone}\n"
+                f"[JOIN] link={raw_link[:50]}"
+            )
+            return False, None
+        except asyncio.TimeoutError:
+            logging.error(
+                f"[JOIN] ❌ Membership verification TIMEOUT\n"
+                f"[JOIN] phone={phone}\n"
+                f"[JOIN] link={raw_link[:50]}"
+            )
+            return False, None
+        except ChannelPrivateError:
+            logging.error(
+                f"[JOIN] ❌ Membership verification FAILED\n"
+                f"[JOIN] reason=ChannelPrivate\n"
+                f"[JOIN] phone={phone}\n"
+                f"[JOIN] link={raw_link[:50]}"
+            )
+            return False, None
+        except FloodWaitError as e:
+            logging.warning(
+                f"[JOIN] ❌ Membership verification FloodWait\n"
+                f"[JOIN] seconds={e.seconds}\n"
+                f"[JOIN] phone={phone}"
+            )
+            await self.rate_limiter.record_floodwait(phone, e.seconds)
+            return False, None
+        except Exception as e:
+            logging.error(
+                f"[JOIN] ❌ Membership verification error\n"
+                f"[JOIN] error={type(e).__name__}: {str(e)[:80]}\n"
+                f"[JOIN] phone={phone}\n"
+                f"[JOIN] link={raw_link[:50]}"
+            )
+            return False, None
+
     async def _join_group_safe(self, client, link_data: dict, phone: str):
-        """ينضم لمجموعة عبر Rate Limiter — كل استدعاءات API تمر من هنا.
+        """ينضم لمجموعة ويتحقق من العضوية فعلياً.
+
+        Contract:
+            - returns (True, "JOINED_VERIFIED", member_count) فقط بعد GetParticipantRequest
+            - returns (True, "JOIN_UNVERIFIED", None) لو Join نجح لكن التحقق تعذر
+            - returns (False, reason, None) للفشل بأنواعه
 
         EXPLICIT PROTECTION: Monitor accounts can NEVER join.
-        حتى لو حدث خطأ في الكود، هذه الطريقة ترفض Join من monitor.
         """
         raw_link = link_data.get('raw', link_data.get('raw_link', ''))
 
+        # تحقق من اتصال الـ client
+        if not client or not client.is_connected():
+            logging.error(f"[JOIN] ❌ client not connected for {phone}")
+            return False, "DISCONNECTED", None
+
         # === EXPLICIT MONITOR PROTECTION ===
-        # اقرأ role من Supabase (المصدر الوحيد) — ليس من SQLite watchers
         w = await self.db._supabase_get_watcher(phone)
         role = w.get('role', 'monitor') if w else 'monitor'
         if role == 'monitor':
@@ -4531,31 +5494,46 @@ class Monitor:
 
                 allowed = await self.rate_limiter.acquire(phone, 'import_invite')
                 if not allowed:
-                    return False, "FLOODWAIT", None
+                    logging.info(f"[JOIN] {phone} rate limited on import_invite — will retry later")
+                    return False, "RATE_LIMITED", None
 
+                logging.info(f"[JOIN] API request started: IMPORT_INVITE phone={phone} link={raw_link[:50]}")
                 try:
                     await asyncio.wait_for(client(ImportChatInviteRequest(invite_hash)), timeout=30)
                     await self.metrics.record_api_call(phone)
-                    return True, "JOINED", None
+                    logging.info(f"[JOIN] Telegram accepted IMPORT_INVITE request for {phone}")
                 except asyncio.TimeoutError:
-                    logging.error(f"[TELEGRAM_ERROR] phone={phone} op=IMPORT_INVITE group={raw_link[:50]} error=TIMEOUT (30s)")
+                    logging.error(f"[JOIN] ❌ TIMEOUT (30s) phone={phone} op=IMPORT_INVITE link={raw_link[:50]}")
                     return False, "TIMEOUT", None
                 except UserAlreadyParticipantError:
                     return False, "ALREADY_MEMBER", None
                 except FloodWaitError as e:
-                    logging.warning(f"[TELEGRAM_ERROR] phone={phone} op=IMPORT_INVITE group={raw_link[:50]} error=FloodWaitError seconds={e.seconds}")
+                    logging.warning(f"[JOIN] ❌ FloodWait phone={phone} seconds={e.seconds} link={raw_link[:50]}")
                     await self.rate_limiter.record_floodwait(phone, e.seconds)
                     return False, "FLOODWAIT", None
                 except (ChannelPrivateError, InviteHashExpiredError) as e:
-                    logging.warning(f"[TELEGRAM_ERROR] phone={phone} op=IMPORT_INVITE group={raw_link[:50]} error={type(e).__name__}")
+                    logging.warning(f"[JOIN] ❌ {type(e).__name__} phone={phone} link={raw_link[:50]}")
                     return False, "PRIVATE", None
                 except (PeerFloodError, UserBannedInChannelError) as e:
-                    logging.error(f"[TELEGRAM_ERROR] phone={phone} op=IMPORT_INVITE group={raw_link[:50]} error={type(e).__name__}")
+                    logging.error(f"[JOIN] ❌ {type(e).__name__} phone={phone} link={raw_link[:50]}")
                     await self.rate_limiter.record_floodwait(phone, 3600)
                     return False, "BANNED", None
-                except ChatWriteForbiddenError as e:
-                    logging.error(f"[TELEGRAM_ERROR] phone={phone} op=IMPORT_INVITE group={raw_link[:50]} error=ChatWriteForbiddenError")
+                except ChatWriteForbiddenError:
+                    logging.error(f"[JOIN] ❌ ChatWriteForbidden phone={phone} link={raw_link[:50]}")
                     return False, "PRIVATE", None
+
+                # === POST-JOIN VERIFICATION ===
+                logging.info(f"[JOIN] Verifying membership after IMPORT_INVITE for {phone}...")
+                # For private invite, we don't have entity easily
+                # Mark as UNVERIFIED — Telegram accepted but membership not confirmed
+                logging.warning(
+                    f"[JOIN] ⚠️ JOIN_UNVERIFIED — Telegram accepted IMPORT_INVITE but "
+                    f"verification not possible for private invite (no entity)\n"
+                    f"[JOIN] phone={phone} link={raw_link[:50]}"
+                )
+                # سجل نجاح العملية في Rate Limiter DB
+                await self.rate_limiter.record_success(phone, 'import_invite')
+                return True, "JOIN_UNVERIFIED", None
 
             elif link_type == 'telegram':
                 username = link_data.get('username', '')
@@ -4564,16 +5542,14 @@ class Monitor:
 
                 allowed = await self.rate_limiter.acquire(phone, 'join_channel')
                 if not allowed:
-                    logging.info(f"[JOIN] {phone} rate limited (not FloodWait) — will retry later")
+                    logging.info(f"[JOIN] {phone} rate limited on join_channel — will retry later")
                     return False, "RATE_LIMITED", None
 
+                logging.info(f"[JOIN] API request started: JOIN_CHANNEL phone={phone} link={raw_link[:50]}")
                 try:
-                    # timeout 30s لمنع التعليق لو Telegram ما رد
                     entity = await asyncio.wait_for(client.get_entity(username), timeout=30)
 
                     # تحقق: هل الكيان قناة (channel) وليس مجموعة؟
-                    # Channel = نوع "channel" (broadcast)، Chat = "group" أو "supergroup"
-                    # نريد الانضمام للمجموعات فقط، نتخطى القنوات
                     is_channel = False
                     if hasattr(entity, 'broadcast') and entity.broadcast:
                         is_channel = True
@@ -4589,6 +5565,7 @@ class Monitor:
                         logging.info(f"[JOIN] {phone} skipped CHANNEL (broadcast): {raw_link[:50]}")
                         return False, "IS_CHANNEL", None
 
+                    logging.info(f"[JOIN] Telegram accepted JoinChannelRequest for {phone}")
                     await asyncio.wait_for(client(JoinChannelRequest(entity)), timeout=30)
                     await self.metrics.record_api_call(phone)
 
@@ -4596,28 +5573,44 @@ class Monitor:
                     if hasattr(entity, 'participants_count'):
                         member_count = entity.participants_count
 
-                    return True, "JOINED", member_count
+                    # === POST-JOIN VERIFICATION ===
+                    logging.info(f"[JOIN] Verifying membership for {phone} link={raw_link[:50]}...")
+                    verified, verified_count = await self._verify_membership(client, entity, phone, raw_link)
+                    if verified:
+                        # سجل نجاح العملية في Rate Limiter DB
+                        await self.rate_limiter.record_success(phone, 'join_channel')
+                        return True, "JOINED_VERIFIED", verified_count if verified_count is not None else member_count
+                    else:
+                        # Join API نجح لكن التحقق فشل — لا نعتبرها نجاح كامل
+                        # لكن سجل في Rate Limiter لأن Telegram استقبل الـ API call
+                        await self.rate_limiter.record_success(phone, 'join_channel')
+                        logging.warning(
+                            f"[JOIN] ⚠️ JOIN_UNVERIFIED — Telegram accepted but membership not confirmed\n"
+                            f"[JOIN] phone={phone} link={raw_link[:50]}"
+                        )
+                        return True, "JOIN_UNVERIFIED", member_count
+
                 except asyncio.TimeoutError:
-                    logging.error(f"[TELEGRAM_ERROR] phone={phone} op=JOIN group={raw_link[:50]} error=TIMEOUT (30s)")
+                    logging.error(f"[JOIN] ❌ TIMEOUT (30s) phone={phone} op=JOIN link={raw_link[:50]}")
                     return False, "TIMEOUT", None
                 except UserAlreadyParticipantError:
                     return False, "ALREADY_MEMBER", None
                 except FloodWaitError as e:
-                    logging.warning(f"[TELEGRAM_ERROR] phone={phone} op=JOIN group={raw_link[:50]} error=FloodWaitError seconds={e.seconds}")
+                    logging.warning(f"[JOIN] ❌ FloodWait phone={phone} seconds={e.seconds} link={raw_link[:50]}")
                     await self.rate_limiter.record_floodwait(phone, e.seconds)
                     return False, "FLOODWAIT", None
                 except (ChannelPrivateError, InviteHashExpiredError) as e:
-                    logging.warning(f"[TELEGRAM_ERROR] phone={phone} op=JOIN group={raw_link[:50]} error={type(e).__name__}")
+                    logging.warning(f"[JOIN] ❌ {type(e).__name__} phone={phone} link={raw_link[:50]}")
                     return False, "PRIVATE", None
                 except (PeerFloodError, UserBannedInChannelError) as e:
-                    logging.error(f"[TELEGRAM_ERROR] phone={phone} op=JOIN group={raw_link[:50]} error={type(e).__name__}")
+                    logging.error(f"[JOIN] ❌ {type(e).__name__} phone={phone} link={raw_link[:50]}")
                     await self.rate_limiter.record_floodwait(phone, 3600)
                     return False, "BANNED", None
-                except ChatWriteForbiddenError as e:
-                    logging.error(f"[TELEGRAM_ERROR] phone={phone} op=JOIN group={raw_link[:50]} error=ChatWriteForbiddenError")
+                except ChatWriteForbiddenError:
+                    logging.error(f"[JOIN] ❌ ChatWriteForbidden phone={phone} link={raw_link[:50]}")
                     return False, "PRIVATE", None
                 except Exception as e:
-                    logging.error(f"[TELEGRAM_ERROR] phone={phone} op=JOIN group={raw_link[:50]} error={type(e).__name__}: {e}")
+                    logging.error(f"[JOIN] ❌ {type(e).__name__}: {str(e)[:80]} phone={phone} link={raw_link[:50]}")
                     return False, "FAILED", None
 
             else:
@@ -4625,9 +5618,8 @@ class Monitor:
                 return False, "SKIP", None
 
         except Exception as e:
-            logging.error(f"[JOIN] {phone} unexpected: {e}")
+            logging.error(f"[JOIN] {phone} unexpected: {e}", exc_info=True)
             return False, "FAILED", None
-
     async def _keep_alive(self):
         app_url = os.getenv("RENDER_EXTERNAL_URL") or os.getenv("APP_URL")
         if not app_url:
@@ -4662,9 +5654,49 @@ class Monitor:
             logging.info(f"  → {w['phone']} (role={role})")
             self._user_tasks[w['phone']] = asyncio.create_task(self._run_user_client(w))
         self._keep_alive_task = asyncio.create_task(self._keep_alive())
-        # بدء محرك الانضمام التدريجي
-        self._joiner_task = asyncio.create_task(self._joiner_worker())
-        logging.info("🚀 Joiner worker started")
+
+        # === STARTUP RECOVERY: إعادة الروابط العالقة ===
+        try:
+            conn = await self.db._ensure_conn()
+            # روابط في group_states بحالة JOINING — أعد لـ QUEUED
+            cursor = await conn.execute(
+                "UPDATE group_states SET state = 'QUEUED' WHERE state = 'JOINING'")
+            stuck_joining = cursor.rowcount
+            # روابط في link_queue بحالة PROCESSING — أعد لـ QUEUED
+            cursor = await conn.execute(
+                "UPDATE link_queue SET status = 'QUEUED' WHERE status = 'PROCESSING'")
+            stuck_processing = cursor.rowcount
+            await conn.commit()
+            if stuck_joining or stuck_processing:
+                logging.warning(
+                    f"[STARTUP RECOVERY] Reset {stuck_joining} JOINING + {stuck_processing} PROCESSING → QUEUED"
+                )
+        except Exception as e:
+            logging.error(f"[STARTUP RECOVERY] Error: {e}")
+
+        # === AUTO-START JOIN WORKER ===
+        # اقرأ join_paused من DB — لو paused، Worker يبدأ لكن يبقى PAUSED
+        db_paused = await self.prod_db.get_setting('join_paused', 'false')
+        self._join_paused = (db_paused == 'true')
+        if self._join_paused:
+            # تحقق: هل في FloodWait حقيقي؟ لو لا، auto-resume
+            blocked = await self.floodwait_mgr.get_blocked_accounts()
+            if not blocked:
+                logging.info("▶️ Auto-resume: join_paused was true but no FloodWait — resuming")
+                self._join_paused = False
+                await self.prod_db.set_setting('join_paused', 'false')
+            else:
+                logging.info("🔒 Join PAUSED — accounts in FloodWait, Worker will wait")
+
+        # ابدأ Join Worker تلقائياً ( Independent Task)
+        if not hasattr(self, '_joiner_task') or self._joiner_task is None or self._joiner_task.done():
+            self._joiner_task = asyncio.create_task(self._joiner_worker())
+            if self._join_paused:
+                logging.info("🚀 Join Worker started (PAUSED — waiting for /resume_join)")
+            else:
+                logging.info("🚀 Join Worker started (AUTO — will process QUEUED links)")
+        else:
+            logging.info("🚀 Join Worker already running — skip duplicate")
 
     async def stop(self):
         """إيقاف نظيف لمنع تسريب الذاكرة
@@ -4713,6 +5745,213 @@ class Monitor:
 async def health_handler(request):
     """Liveness probe — returns 200 if the process is alive."""
     return web.Response(text="✅ Bot is running", status=200)
+
+
+async def api_joined_groups_handler(request):
+    """API endpoint: returns all joined groups from SQLite group_states.
+
+    This is the REAL data source for the dashboard — not Supabase target_groups.
+    The bot stores join results in SQLite group_states table.
+    """
+    monitor = request.app.get("monitor")
+    db = request.app.get("db")
+    if not monitor or not db:
+        return web.json_response({"error": "not ready"}, status=503)
+
+    try:
+        conn = await db._ensure_conn()
+
+        # Joined groups
+        cursor = await conn.execute(
+            "SELECT normalized_link, raw_link, joined_by, member_count, last_seen, last_error, state "
+            "FROM group_states WHERE state IN ('JOINED', 'ALREADY_MEMBER') ORDER BY last_seen DESC LIMIT 100")
+        joined_rows = await cursor.fetchall()
+
+        groups = []
+        for r in joined_rows:
+            groups.append({
+                "id": len(groups) + 1,
+                "group_title": r[0] or '',
+                "group_link": r[1] or '',
+                "status": r[6] or 'JOINED',
+                "joined_by_phone": r[2] or '',
+                "join_date": r[4] or '',
+                "member_count": r[3] or 0,
+            })
+
+        # Stats
+        cursor = await conn.execute(
+            "SELECT COUNT(*) FROM group_states WHERE state = 'JOINED'")
+        total_joined = (await cursor.fetchone())[0]
+
+        cursor = await conn.execute(
+            "SELECT COUNT(*) FROM link_queue WHERE status = 'QUEUED'")
+        pending = (await cursor.fetchone())[0]
+
+        # Active joiners from Supabase
+        try:
+            joiners = await db.get_watchers_by_role("joiner")
+            active_joiners = len(joiners)
+        except Exception:
+            active_joiners = 0
+
+        return web.json_response({
+            "joined_groups": groups,
+            "stats": {
+                "total_joined": total_joined,
+                "pending_groups": pending,
+                "active_joiners": active_joiners,
+            }
+        }, status=200, headers={"Access-Control-Allow-Origin": "*"})
+
+    except Exception as e:
+        logging.error(f"[API] joined_groups error: {e}")
+        return web.json_response({"error": str(e)}, status=500,
+                                 headers={"Access-Control-Allow-Origin": "*"})
+
+
+async def api_links_handler(request):
+    """API endpoint: returns recent published links from Supabase.
+
+    Supports optional filtering by AI status via query params:
+      ?ai_approved=true    → only AI-approved links
+      ?ai_approved=false   → only AI-rejected links
+      ?ai_is_ad=true       → only flagged as ads
+      ?link_type=whatsapp  → filter by link type
+    Returns all columns including ai_approved, ai_description, ai_country, ai_is_ad.
+    """
+    db = request.app.get("db")
+    if not db:
+        return web.json_response({"error": "not ready"}, status=503)
+
+    try:
+        limit = int(request.query.get("limit", "50"))
+        offset = int(request.query.get("offset", "0"))
+
+        if not db.supabase_url or not db.supabase_key:
+            return web.json_response({"links": [], "error": "supabase not configured"},
+                                     status=200, headers={"Access-Control-Allow-Origin": "*"})
+
+        # Build query with explicit column selection to ensure AI fields are returned
+        # (also lets us add filters cleanly)
+        columns = (
+            "id,link,link_type,message_text,group_name,sender_name,"
+            "sender_contact,source_phone,message_link,created_at,"
+            "ai_approved,ai_description,ai_country,ai_is_ad"
+        )
+        query_parts = [f"select={columns}", f"order=created_at.desc", f"limit={limit}"]
+
+        ai_approved = request.query.get("ai_approved")  # 'true' | 'false' | None
+        ai_is_ad = request.query.get("ai_is_ad")
+        link_type = request.query.get("link_type")
+
+        if ai_approved is not None:
+            val = "true" if ai_approved.lower() == "true" else "false"
+            query_parts.append(f"ai_approved=eq.{val}")
+        if ai_is_ad is not None:
+            val = "true" if ai_is_ad.lower() == "true" else "false"
+            query_parts.append(f"ai_is_ad=eq.{val}")
+        if link_type in ("whatsapp", "telegram", "other"):
+            query_parts.append(f"link_type=eq.{link_type}")
+
+        url = f"{db.supabase_url}/rest/v1/links?" + "&".join(query_parts)
+        session = await db._get_supabase_session()
+        headers = {**session.headers, "Range": f"{offset}-{offset + limit - 1}"}
+
+        async with session.get(url, headers=headers) as resp:
+            if resp.status == 200:
+                data = await resp.json()
+                return web.json_response({"links": data},
+                                        status=200, headers={"Access-Control-Allow-Origin": "*"})
+            else:
+                text = await resp.text()
+                logging.error(f"[API] /api/links supabase {resp.status}: {text[:200]}")
+                return web.json_response({"links": [], "error": f"supabase {resp.status}"},
+                                        status=200, headers={"Access-Control-Allow-Origin": "*"})
+    except Exception as e:
+        logging.error(f"[API] /api/links error: {e}")
+        return web.json_response({"links": [], "error": str(e)},
+                                status=200, headers={"Access-Control-Allow-Origin": "*"})
+
+
+async def api_stats_handler(request):
+    """API endpoint: returns system stats for dashboard.
+
+    Includes AI stats (ai_approved, ai_rejected, ai_ads, ai_pending)
+    so the dashboard can show AI verification coverage.
+    """
+    monitor = request.app.get("monitor")
+    db = request.app.get("db")
+    if not monitor or not db:
+        return web.json_response({"error": "not ready"}, status=503)
+
+    try:
+        # Total links from Supabase
+        total_links = await db.count_requests() if db else 0
+
+        # Watchers
+        watchers = await db.get_active_watchers()
+        active_watchers = len(watchers)
+
+        # Connected accounts
+        connected = sum(1 for c in monitor.user_clients.values() if c and c.is_connected())
+
+        # AI stats — query Supabase for each count using Prefer: count=exact
+        ai_approved_count = 0
+        ai_rejected_count = 0
+        ai_ads_count = 0
+        ai_pending_count = 0
+        wa_count = 0
+        tg_count = 0
+
+        if db.supabase_url and db.supabase_key:
+            try:
+                session = await db._get_supabase_session()
+                count_headers = {**session.headers, "Prefer": "count=exact", "Range": "0-0"}
+
+                async def _count(url: str) -> int:
+                    try:
+                        async with session.get(url, headers=count_headers) as r:
+                            if r.status in (200, 206):
+                                cr = r.headers.get("content-range", "*/0")
+                                return int(cr.split("/")[-1] or "0")
+                    except Exception:
+                        pass
+                    return 0
+
+                wa_count = await _count(f"{db.supabase_url}/rest/v1/links?link_type=eq.whatsapp&select=id")
+                tg_count = await _count(f"{db.supabase_url}/rest/v1/links?link_type=eq.telegram&select=id")
+                ai_approved_count = await _count(f"{db.supabase_url}/rest/v1/links?ai_approved=eq.true&select=id")
+                ai_rejected_count = await _count(f"{db.supabase_url}/rest/v1/links?ai_approved=eq.false&select=id")
+                ai_ads_count = await _count(f"{db.supabase_url}/rest/v1/links?ai_is_ad=eq.true&select=id")
+                # Pending = total - (approved + rejected)
+                ai_pending_count = max(0, total_links - ai_approved_count - ai_rejected_count)
+            except Exception as e:
+                logging.warning(f"[API] ai stats fetch failed: {e}")
+
+        # AI batch mode status (controlled by env var AI_BATCH_MODE)
+        ai_batch_mode = os.getenv("AI_BATCH_MODE", "true").lower() in ("true", "1", "yes")
+
+        return web.json_response({
+            "total_links": total_links,
+            "whatsapp_links": wa_count,
+            "telegram_links": tg_count,
+            "active_watchers": active_watchers,
+            "connected_accounts": connected,
+            "bot_connected": bool(monitor.bot_client and monitor.bot_client.is_connected()),
+            "ai_stats": {
+                "ai_approved": ai_approved_count,
+                "ai_rejected": ai_rejected_count,
+                "ai_ads": ai_ads_count,
+                "ai_pending": ai_pending_count,
+                "ai_batch_mode": ai_batch_mode,
+            },
+        }, status=200, headers={"Access-Control-Allow-Origin": "*"})
+
+    except Exception as e:
+        logging.error(f"[API] /api/stats error: {e}")
+        return web.json_response({"error": str(e)}, status=500,
+                                 headers={"Access-Control-Allow-Origin": "*"})
 
 
 async def ready_handler(request):
@@ -4817,11 +6056,14 @@ async def start_http_server(monitor=None, db=None):
     app.router.add_get("/health", health_handler)      # liveness
     app.router.add_get("/ready", ready_handler)        # readiness
     app.router.add_get("/metrics", metrics_handler)    # Prometheus metrics
+    app.router.add_get("/api/joined_groups", api_joined_groups_handler)
+    app.router.add_get("/api/links", api_links_handler)
+    app.router.add_get("/api/stats", api_stats_handler)
     runner = web.AppRunner(app)
     await runner.setup()
     site = web.TCPSite(runner, "0.0.0.0", port)
     await site.start()
-    logging.info(f"HTTP server listening on port {port} (endpoints: /health /ready /metrics)")
+    logging.info(f"HTTP server listening on port {port} (endpoints: /health /ready /metrics /api/joined_groups /api/links /api/stats)")
     return runner
 
 
@@ -4875,21 +6117,8 @@ async def main():
 
     monitor = Monitor(config, db)
 
-    # ===== Recovery Mode Startup =====
-    # 1. اقرأ join_paused من DB
-    db_paused = await monitor.prod_db.get_setting('join_paused', 'false')  # افتراضي: يعمل تلقائياً
-    monitor._join_paused = (db_paused == 'true')
-    if monitor._join_paused:
-        # تحقق: هل في حسابات فعلاً في FloodWait؟ لو لا، أعد التفعيل تلقائياً
-        blocked = await monitor.floodwait_mgr.get_blocked_accounts()
-        if not blocked:
-            logging.info("▶️ Auto-resume: join_paused was true but no accounts in FloodWait — resuming")
-            monitor._join_paused = False
-            await monitor.prod_db.set_setting('join_paused', 'false')
-        else:
-            logging.info("🔒 Recovery Mode: JOIN PAUSED (accounts in FloodWait)")
-    else:
-        logging.info("▶️ Join enabled (from DB setting)")
+    # ملاحظة: Recovery Mode و join_paused تم نقلهما إلى monitor.start()
+    # حيث تتم معالجتها بشكل صحيح بعد تشغيل الحسابات
 
     # 2. اقرأ floodwait_tracker — سجل الحسابات المحظورة
     blocked = await monitor.floodwait_mgr.get_blocked_accounts()
@@ -4907,11 +6136,11 @@ async def main():
     else:
         logging.info("📡 Production Mode: Real Telegram API calls enabled")
 
-    # 4. Conservative post-FloodWait limits
-    daily_limit = os.getenv('DAILY_JOIN_LIMIT', '15')
+    # 4. Join limits (optimized for batch processing)
+    daily_limit = os.getenv('DAILY_JOIN_LIMIT', '200')
     logging.info(f"📊 Daily Join Limit: {daily_limit}/day")
-    logging.info(f"📊 Hourly Join Limit: 5/hour")
-    logging.info(f"📊 Join Cooldown: 600s (10 min)")
+    logging.info(f"📊 Hourly Join Limit: 50/hour")
+    logging.info(f"📊 Join Cooldown: 15s")
 
     # ===== Startup Verification — تأكد من وجود حسابات في Supabase =====
     logging.info("━" * 60)
@@ -4955,7 +6184,16 @@ async def main():
     await monitor.start()
     http_runner = await start_http_server(monitor=monitor, db=db)
 
-    logging.info("✅ Monitor started. Send /help to channel.")
+    # انتظر قليلاً ثم تحقق من الاتصال الفعلي
+    await asyncio.sleep(5)
+    connected_count = sum(1 for c in monitor.user_clients.values() if c and c.is_connected())
+    total_accounts = len(monitor.user_clients)
+    if connected_count == total_accounts and total_accounts > 0:
+        logging.info(f"✅ Monitor started — {connected_count}/{total_accounts} accounts connected")
+    elif connected_count > 0:
+        logging.warning(f"⚠️ Monitor started — {connected_count}/{total_accounts} accounts connected (some failed)")
+    else:
+        logging.error(f"❌ Monitor started but 0 accounts connected — check sessions")
 
     shutdown = asyncio.Event()
     def sh(): shutdown.set()

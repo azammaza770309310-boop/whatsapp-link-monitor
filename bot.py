@@ -1717,7 +1717,8 @@ class MessageFormatter:
             "• /bulk_join — الانضمام لكل روابط القناة (22 ألف+)\n"
             "• /bulk_join_status — تقدم الانضمام الجماعي\n"
             "• /bulk_join_stop — إيقاف الانضمام الجماعي\n"
-            "• /clear_floodwait — مسح FloodWait وإعادة تفعيل الانضمام\n\n"
+            "• /clear_floodwait — مسح FloodWait وإعادة تفعيل الانضمام\n"
+            "• /ai_mode — عرض/تبديل فحص الذكاء الاصطناعي (on/off)\n\n"
             "📌 أوامر تنظيف القناة:\n"
             "• /cleanup_preview — معاينة ما سيُحذف (بدون حذف فعلي)\n"
             "• /cleanup_links — حذف الروابط غير التعليمية والمكررة\n"
@@ -2976,7 +2977,7 @@ class Monitor:
                 admin_commands = [
                     '/pause_join', '/resume_join', '/set_role',
                     '/enable_joiner', '/disable_joiner', '/join_status',
-                    '/verify', '/sqlite_check', '/clear_floodwait',
+                    '/verify', '/sqlite_check', '/clear_floodwait', '/ai_mode',
                     '/bulk_join', '/bulk_join_status', '/bulk_join_stop',
                     '/cleanup_preview', '/cleanup_links', '/cleanup_status',
                     '/live_audit', '/status', '/watchers', '/help',
@@ -3762,6 +3763,48 @@ class Monitor:
                     logging.error(f"[CLEAR_FLOODWAIT] Error: {e}")
                     await reply(f"❌ خطأ: {e}")
 
+            elif cmd == "/ai_mode":
+                # === عرض/تبديل وضع AI Batch Mode ===
+                # الاستخدام:
+                #   /ai_mode         → عرض الحالة الحالية
+                #   /ai_mode on      → تفعيل AI (يعطل batch mode)
+                #   /ai_mode off     → تعطيل AI (يفعل batch mode — افتراضي)
+                parts = text.split()
+                ai_batch_mode = os.getenv("AI_BATCH_MODE", "true").lower() in ("true", "1", "yes")
+                if len(parts) >= 2:
+                    arg = parts[1].lower()
+                    if arg in ("on", "enable", "true"):
+                        os.environ["AI_BATCH_MODE"] = "false"
+                        await reply(
+                            "🤖 AI Verification: ENABLED\n\n"
+                            "ستتم فحص كل رابط جديد قبل النشر والانضمام.\n"
+                            "الروابط المرفوضة من AI ستتجاهل تلقائياً.\n\n"
+                            "⚠️ ملاحظة: قد يبطئ معالجة قائمة الانتظار."
+                        )
+                    elif arg in ("off", "disable", "false"):
+                        os.environ["AI_BATCH_MODE"] = "true"
+                        await reply(
+                            "⏭️ AI Verification: DISABLED (batch mode)\n\n"
+                            "سيتم نشر جميع الروابط بدون فحص AI.\n"
+                            "مفيد لمعالجة القائمة المتراكمة بسرعة.\n\n"
+                            "أرسل /ai_mode on لإعادة التفعيل."
+                        )
+                    else:
+                        await reply("❌ استخدام خاطئ\nالصيغة: /ai_mode on|off")
+                else:
+                    status = "⏭️ DISABLED (batch mode)" if ai_batch_mode else "🤖 ENABLED"
+                    ai_enabled = bool(self.ai_analyzer and self.ai_analyzer.enabled)
+                    providers = len(self.ai_analyzer.providers) if ai_enabled else 0
+                    await reply(
+                        f"🤖 AI Verification Status\n\n"
+                        f"الحالة: {status}\n"
+                        f"AI Provider: {'✅ متاح' if ai_enabled else '❌ غير متاح'}\n"
+                        f"عدد المفاتيح: {providers}\n\n"
+                        f"للتبديل:\n"
+                        f"  /ai_mode on  ← تفعيل الفحص\n"
+                        f"  /ai_mode off ← تعطيل (batch mode)"
+                    )
+
             elif cmd == "/bulk_join":
                 # === بدء/استئناف الانضمام الجماعي ===
                 # Worker الأساسي يبدأ تلقائياً عند Startup — هذا الزر اختياري لإعادة التشغيل
@@ -4472,11 +4515,44 @@ class Monitor:
                     await self.metrics.record_skip('banned')
                     continue
 
-                # 3. AI فحص الرابط — معطل مؤقتاً للسرعة (الروابط كلها من مجموعات طلابية)
+                # 3. AI فحص الرابط — يخضع لمتغير البيئة AI_BATCH_MODE
+                # AI_BATCH_MODE=true  (افتراضي): يتخطى الذكاء الاصطناعي لمعالجة قائمة الانتظار المتراكمة بسرعة
+                # AI_BATCH_MODE=false         : يعيد تفعيل فحص الذكاء الاصطناعي لكل رابط
+                ai_batch_mode = os.getenv("AI_BATCH_MODE", "true").lower() in ("true", "1", "yes")
                 if state == GroupState.DISCOVERED or state is None:
-                    # تخطي AI — كل الروابط في القائمة جاءت من مجموعات يراقبها Monitor
-                    # AI سيُعاد تفعيله لاحقاً بعد معالجة القائمة المتراكمة
-                    logging.info(f"[LINK id={link_id}] [PIPELINE-4] ⏭️ AI SKIPPED (batch mode)")
+                    ai_approved = None
+                    ai_description = None
+                    ai_country = None
+                    ai_is_ad = None
+
+                    if not ai_batch_mode and self.ai_analyzer and self.ai_analyzer.enabled:
+                        # === PIPELINE STAGE 4: AI verification ===
+                        try:
+                            ai_text = (link_data.get('message_text') or '') + ' ' + (link_data.get('group_name') or '')
+                            ai_result = await self.ai_analyzer.analyze_message(ai_text[:1500])
+                            if ai_result:
+                                ai_approved = ai_result.get('should_save', True)
+                                ai_description = ai_result.get('description')
+                                ai_country = ai_result.get('country')
+                                ai_is_ad = ai_result.get('is_advertisement', False)
+                                logging.info(
+                                    f"[LINK id={link_id}] [PIPELINE-4] 🤖 AI verdict: "
+                                    f"approved={ai_approved} country={ai_country} ad={ai_is_ad} desc={ai_description}"
+                                )
+                                # إذا رفض الذكاء الاصطناعي الرابط، تخطي النشر والانضمام
+                                if ai_approved is False:
+                                    logging.info(f"[LINK id={link_id}] [PIPELINE-4] ❌ AI REJECTED — skipping link")
+                                    await self.prod_db.set_group_state(normalized, GroupState.BANNED, raw_link, error='ai_rejected')
+                                    await self.prod_db.update_queue_status(link_data['id'], 'DONE')
+                                    await self.metrics.record_skip('ai_rejected')
+                                    continue
+                            else:
+                                logging.info(f"[LINK id={link_id}] [PIPELINE-4] ⚠️ AI returned empty — treating as approved")
+                        except Exception as ai_err:
+                            logging.warning(f"[LINK id={link_id}] [PIPELINE-4] ⚠️ AI error: {ai_err} — proceeding without AI")
+                    else:
+                        logging.info(f"[LINK id={link_id}] [PIPELINE-4] ⏭️ AI SKIPPED (batch mode={ai_batch_mode})")
+
                     await self.prod_db.set_group_state(normalized, GroupState.QUEUED, raw_link)
 
                     # === PIPELINE STAGE 5: Publish to channel ===
@@ -4486,7 +4562,11 @@ class Monitor:
                         link_data.get('source_phone', ''), link_data.get('message_link'),
                         message_text=link_data.get('message_text', ''),
                         sender_contact=link_data.get('sender_contact', ''),
-                        link_type=link_data.get('link_type', 'other'))
+                        link_type=link_data.get('link_type', 'other'),
+                        ai_approved=ai_approved,
+                        ai_description=ai_description,
+                        ai_country=ai_country,
+                        ai_is_ad=ai_is_ad)
                     if inserted:
                         formatted = MessageFormatter.format_link_message(
                             link_data.get('group_name', ''), link_data.get('sender_name', ''),
@@ -5731,7 +5811,15 @@ async def api_joined_groups_handler(request):
 
 
 async def api_links_handler(request):
-    """API endpoint: returns recent published links from Supabase."""
+    """API endpoint: returns recent published links from Supabase.
+
+    Supports optional filtering by AI status via query params:
+      ?ai_approved=true    → only AI-approved links
+      ?ai_approved=false   → only AI-rejected links
+      ?ai_is_ad=true       → only flagged as ads
+      ?link_type=whatsapp  → filter by link type
+    Returns all columns including ai_approved, ai_description, ai_country, ai_is_ad.
+    """
     db = request.app.get("db")
     if not db:
         return web.json_response({"error": "not ready"}, status=503)
@@ -5744,28 +5832,54 @@ async def api_links_handler(request):
             return web.json_response({"links": [], "error": "supabase not configured"},
                                      status=200, headers={"Access-Control-Allow-Origin": "*"})
 
-        import aiohttp as _aiohttp
+        # Build query with explicit column selection to ensure AI fields are returned
+        # (also lets us add filters cleanly)
+        columns = (
+            "id,link,link_type,message_text,group_name,sender_name,"
+            "sender_contact,source_phone,message_link,created_at,"
+            "ai_approved,ai_description,ai_country,ai_is_ad"
+        )
+        query_parts = [f"select={columns}", f"order=created_at.desc", f"limit={limit}"]
+
+        ai_approved = request.query.get("ai_approved")  # 'true' | 'false' | None
+        ai_is_ad = request.query.get("ai_is_ad")
+        link_type = request.query.get("link_type")
+
+        if ai_approved is not None:
+            val = "true" if ai_approved.lower() == "true" else "false"
+            query_parts.append(f"ai_approved=eq.{val}")
+        if ai_is_ad is not None:
+            val = "true" if ai_is_ad.lower() == "true" else "false"
+            query_parts.append(f"ai_is_ad=eq.{val}")
+        if link_type in ("whatsapp", "telegram", "other"):
+            query_parts.append(f"link_type=eq.{link_type}")
+
+        url = f"{db.supabase_url}/rest/v1/links?" + "&".join(query_parts)
         session = await db._get_supabase_session()
         headers = {**session.headers, "Range": f"{offset}-{offset + limit - 1}"}
 
-        async with session.get(
-            f"{db.supabase_url}/rest/v1/links?order=created_at.desc&limit={limit}",
-            headers=headers
-        ) as resp:
+        async with session.get(url, headers=headers) as resp:
             if resp.status == 200:
                 data = await resp.json()
                 return web.json_response({"links": data},
                                         status=200, headers={"Access-Control-Allow-Origin": "*"})
             else:
+                text = await resp.text()
+                logging.error(f"[API] /api/links supabase {resp.status}: {text[:200]}")
                 return web.json_response({"links": [], "error": f"supabase {resp.status}"},
                                         status=200, headers={"Access-Control-Allow-Origin": "*"})
     except Exception as e:
+        logging.error(f"[API] /api/links error: {e}")
         return web.json_response({"links": [], "error": str(e)},
                                 status=200, headers={"Access-Control-Allow-Origin": "*"})
 
 
 async def api_stats_handler(request):
-    """API endpoint: returns system stats for dashboard."""
+    """API endpoint: returns system stats for dashboard.
+
+    Includes AI stats (ai_approved, ai_rejected, ai_ads, ai_pending)
+    so the dashboard can show AI verification coverage.
+    """
     monitor = request.app.get("monitor")
     db = request.app.get("db")
     if not monitor or not db:
@@ -5779,25 +5893,63 @@ async def api_stats_handler(request):
         watchers = await db.get_active_watchers()
         active_watchers = len(watchers)
 
-        # Telegram links vs whatsapp
-        wa_count = 0
-        tg_count = 0
-        for w in watchers:
-            pass  # counts from links table
-
         # Connected accounts
         connected = sum(1 for c in monitor.user_clients.values() if c and c.is_connected())
 
+        # AI stats — query Supabase for each count using Prefer: count=exact
+        ai_approved_count = 0
+        ai_rejected_count = 0
+        ai_ads_count = 0
+        ai_pending_count = 0
+        wa_count = 0
+        tg_count = 0
+
+        if db.supabase_url and db.supabase_key:
+            try:
+                session = await db._get_supabase_session()
+                count_headers = {**session.headers, "Prefer": "count=exact", "Range": "0-0"}
+
+                async def _count(url: str) -> int:
+                    try:
+                        async with session.get(url, headers=count_headers) as r:
+                            if r.status in (200, 206):
+                                cr = r.headers.get("content-range", "*/0")
+                                return int(cr.split("/")[-1] or "0")
+                    except Exception:
+                        pass
+                    return 0
+
+                wa_count = await _count(f"{db.supabase_url}/rest/v1/links?link_type=eq.whatsapp&select=id")
+                tg_count = await _count(f"{db.supabase_url}/rest/v1/links?link_type=eq.telegram&select=id")
+                ai_approved_count = await _count(f"{db.supabase_url}/rest/v1/links?ai_approved=eq.true&select=id")
+                ai_rejected_count = await _count(f"{db.supabase_url}/rest/v1/links?ai_approved=eq.false&select=id")
+                ai_ads_count = await _count(f"{db.supabase_url}/rest/v1/links?ai_is_ad=eq.true&select=id")
+                # Pending = total - (approved + rejected)
+                ai_pending_count = max(0, total_links - ai_approved_count - ai_rejected_count)
+            except Exception as e:
+                logging.warning(f"[API] ai stats fetch failed: {e}")
+
+        # AI batch mode status (controlled by env var AI_BATCH_MODE)
+        ai_batch_mode = os.getenv("AI_BATCH_MODE", "true").lower() in ("true", "1", "yes")
+
         return web.json_response({
             "total_links": total_links,
-            "whatsapp_links": 0,
-            "telegram_links": 0,
+            "whatsapp_links": wa_count,
+            "telegram_links": tg_count,
             "active_watchers": active_watchers,
             "connected_accounts": connected,
             "bot_connected": bool(monitor.bot_client and monitor.bot_client.is_connected()),
+            "ai_stats": {
+                "ai_approved": ai_approved_count,
+                "ai_rejected": ai_rejected_count,
+                "ai_ads": ai_ads_count,
+                "ai_pending": ai_pending_count,
+                "ai_batch_mode": ai_batch_mode,
+            },
         }, status=200, headers={"Access-Control-Allow-Origin": "*"})
 
     except Exception as e:
+        logging.error(f"[API] /api/stats error: {e}")
         return web.json_response({"error": str(e)}, status=500,
                                  headers={"Access-Control-Allow-Origin": "*"})
 

@@ -1,0 +1,697 @@
+     1→     1→'use client'
+     2→     2→
+     3→     3→import { useState, useEffect, useCallback } from 'react'
+     4→     4→import { motion, AnimatePresence } from 'framer-motion'
+     5→     5→import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
+     6→     6→import { Badge } from '@/components/ui/badge'
+     7→     7→import { Button } from '@/components/ui/button'
+     8→     8→import { Input } from '@/components/ui/input'
+     9→     9→import { ScrollArea } from '@/components/ui/scroll-area'
+    10→    10→import { Skeleton } from '@/components/ui/skeleton'
+    11→    11→import {
+    12→    12→  MessageCircle, Send, Search, Users, Link2,
+    13→    13→  RefreshCw, ExternalLink, Phone, MapPin, Clock, Globe, ArrowRight
+    14→    14→} from 'lucide-react'
+    15→    15→
+    16→    16→interface LinkItem {
+    17→    17→  id: number
+    18→    18→  link: string
+    19→    19→  link_type: string
+    20→    20→  message_text: string | null
+    21→    21→  group_name: string | null
+    22→    22→  sender_name: string | null
+    23→    23→  sender_contact: string | null
+    24→    24→  source_phone: string | null
+    25→    25→  message_link: string | null
+    26→    26→  created_at: string
+    27→    27→}
+    28→    28→
+    29→    29→interface Stats {
+    30→    30→  total_links: number
+    31→    31→  whatsapp_links: number
+    32→    32→  telegram_links: number
+    33→    33→  active_watchers: number
+    34→    34→}
+    35→    35→
+    36→    36→interface CountryStat {
+    37→    37→  country: string
+    38→    38→  count: number
+    39→    39→  percentage: number
+    40→    40→}
+    41→    41→
+    42→    42→// API base URL — البوت يخدم API endpoints على Render
+    43→    43→// هذا هو المصدر الوحيد للبيانات — لا نستخدم Supabase مباشرة (RLS مفعّل)
+    44→    44→const API_URL = process.env.NEXT_PUBLIC_API_URL || 'https://whatsapp-userbot-0xwu.onrender.com'
+    45→    45→// Supabase معطّل — RLS يمنع الوصول المباشر من الواجهة
+    46→    46→const SUPABASE_URL = ''
+    47→    47→const SUPABASE_KEY = ''
+    48→    48→
+    49→    49→const COUNTRY_KEYWORDS: Record<string, string[]> = {
+    50→    50→  'السعودية': ['السعودية', 'saudi', 'ksa', 'السعودي', 'الاهلية', 'الأهلية', 'دار الحكمة', 'اليمامة', 'ابن رشد', 'الملك', 'KAU', 'KSU', 'KFU', 'KFUPM', 'PSAU', 'UQU', 'JU', 'TAU', 'BAU', 'NU', 'IMAMU'],
+    51→    51→  'الكويت': ['الكويت', 'kuwait', 'الكويتي', 'AUM', 'AUK', 'GUST', 'الكندي', 'PAAET', 'KU '],
+    52→    52→  'قطر': ['قطر', 'qatar', 'القطري', 'Carnegie', 'Georgetown', 'HBKU', 'QU'],
+    53→    53→  'البحرين': ['البحرين', 'bahrain', 'البحريني', 'Ahlia', 'AMA', 'المنامة'],
+    54→    54→  'الإمارات': ['الإمارات', 'UAE', 'الإماراتي', 'Khalifa', 'Zayed', 'Sharjah', 'دبي', 'أبوظبي', 'الشارقة', 'UAEU', 'UOS']
+    55→    55→}
+    56→    56→
+    57→    57→function detectCountry(text: string): string | null {
+    58→    58→  if (!text) return null
+    59→    59→  const lower = text.toLowerCase()
+    60→    60→  for (const [country, keywords] of Object.entries(COUNTRY_KEYWORDS)) {
+    61→    61→    for (const kw of keywords) {
+    62→    62→      if (lower.includes(kw.toLowerCase())) return country
+    63→    63→    }
+    64→    64→  }
+    65→    65→  return null
+    66→    66→}
+    67→    67→
+    68→    68→/**
+    69→    69→ * Defense-in-depth: only allow http(s) URLs in href attributes.
+    70→    70→ * React 19 blocks javascript: URLs by default, but explicit validation
+    71→    71→ * prevents any future regression and handles edge cases (data: URIs, etc).
+    72→    72→ */
+    73→    73→function safeUrl(url: string | null | undefined): string | null {
+    74→    74→  if (!url || typeof url !== 'string') return null
+    75→    75→  const trimmed = url.trim()
+    76→    76→  if (/^https?:\/\//i.test(trimmed)) return trimmed
+    77→    77→  return null
+    78→    78→}
+    79→    79→
+    80→    80→type ViewType = 'all' | 'whatsapp' | 'telegram' | string // string = country name
+    81→    81→
+    82→    82→export default function Home() {
+    83→    83→  const [links, setLinks] = useState<LinkItem[]>([])
+    84→    84→  const [stats, setStats] = useState<Stats | null>(null)
+    85→    85→  const [countryStats, setCountryStats] = useState<CountryStat[]>([])
+    86→    86→  const [loading, setLoading] = useState(true)
+    87→    87→  const [searchQuery, setSearchQuery] = useState('')
+    88→    88→  const [currentView, setCurrentView] = useState<ViewType>('all')
+    89→    89→  const [allLinks, setAllLinks] = useState<LinkItem[]>([])
+    90→    90→  const [error, setError] = useState<string | null>(null)
+    91→    91→  const [usingMockData, setUsingMockData] = useState(false)
+    92→    92→
+    93→    93→  const fetchLinks = useCallback(async () => {
+    94→    94→    // استخدم API endpoint أولاً (المصدر الحقيقي)
+    95→    95→    try {
+    96→    96→      const response = await fetch(`${API_URL}/api/links?limit=200`, {
+    97→    97→        headers: { 'Accept': 'application/json' }
+    98→    98→      })
+    99→    99→      if (response.ok) {
+   100→   100→        const data = await response.json()
+   101→   101→        const links = data.links || data || []
+   102→   102→        if (Array.isArray(links) && links.length > 0) {
+   103→   103→          setAllLinks(links)
+   104→   104→          setLoading(false)
+   105→   105→          setError(null)
+   106→   106→          setUsingMockData(false)
+   107→   107→          return
+   108→   108→        }
+   109→   109→      }
+   110→   110→    } catch {
+   111→   111→      // API غير متاح، جرب Supabase مباشرة
+   112→   112→    }
+   113→   113→    // Fallback: Supabase مباشرة
+   114→   114→    if (!SUPABASE_URL || !SUPABASE_KEY) {
+   115→   115→      setAllLinks(mockLinks)
+   116→   116→      setLinks(mockLinks)
+   117→   117→      setLoading(false)
+   118→   118→      setUsingMockData(true)
+   119→   119→      return
+   120→   120→    }
+   121→   121→    try {
+   122→   122→      const response = await fetch(`${SUPABASE_URL}/rest/v1/links?order=created_at.desc&limit=200`, {
+   123→   123→        headers: {
+   124→   124→          'apikey': SUPABASE_KEY,
+   125→   125→          'Authorization': `Bearer ${SUPABASE_KEY}`
+   126→   126→        }
+   127→   127→      })
+   128→   128→      if (!response.ok) {
+   129→   129→        throw new Error(`Supabase returned ${response.status}`)
+   130→   130→      }
+   131→   131→      const data = await response.json()
+   132→   132→      setAllLinks(data || [])
+   133→   133→      setLoading(false)
+   134→   134→      setError(null)
+   135→   135→      setUsingMockData(false)
+   136→   136→    } catch (e) {
+   137→   137→      setError(e instanceof Error ? e.message : 'Failed to load links')
+   138→   138→      setLoading(false)
+   139→   139→      if (allLinks.length === 0) {
+   140→   140→        setAllLinks(mockLinks)
+   141→   141→        setUsingMockData(true)
+   142→   142→      }
+   143→   143→    }
+   144→   144→  }, [allLinks.length])
+   145→   145→
+   146→   146→  const fetchStats = useCallback(async () => {
+   147→   147→    // استخدم API endpoint أولاً
+   148→   148→    try {
+   149→   149→      const response = await fetch(`${API_URL}/api/stats`, {
+   150→   150→        headers: { 'Accept': 'application/json' }
+   151→   151→      })
+   152→   152→      if (response.ok) {
+   153→   153→        const data = await response.json()
+   154→   154→        setStats({
+   155→   155→          total_links: data.total_links || 0,
+   156→   156→          whatsapp_links: data.whatsapp_links || 0,
+   157→   157→          telegram_links: data.telegram_links || 0,
+   158→   158→          active_watchers: data.active_watchers || 0
+   159→   159→        })
+   160→   160→        setError(null)
+   161→   161→        setUsingMockData(false)
+   162→   162→        return
+   163→   163→      }
+   164→   164→    } catch {
+   165→   165→      // API غير متاح
+   166→   166→    }
+   167→   167→    // Fallback: Supabase
+   168→   168→    if (!SUPABASE_URL || !SUPABASE_KEY) {
+   169→   169→      setStats(mockStats)
+   170→   170→      setUsingMockData(true)
+   171→   171→      return
+   172→   172→    }
+   173→   173→    try {
+   174→   174→      const headers = {
+   175→   175→        'apikey': SUPABASE_KEY,
+   176→   176→        'Authorization': `Bearer ${SUPABASE_KEY}`,
+   177→   177→        'Prefer': 'count=exact'
+   178→   178→      }
+   179→   179→      const [totalRes, waRes, tgRes, watchRes] = await Promise.all([
+   180→   180→        fetch(`${SUPABASE_URL}/rest/v1/links?select=id&limit=1`, { headers }),
+   181→   181→        fetch(`${SUPABASE_URL}/rest/v1/links?link_type=eq.whatsapp&select=id&limit=1`, { headers }),
+   182→   182→        fetch(`${SUPABASE_URL}/rest/v1/links?link_type=eq.telegram&select=id&limit=1`, { headers }),
+   183→   183→        fetch(`${SUPABASE_URL}/rest/v1/watchers?is_active=eq.true&select=id&limit=1`, { headers })
+   184→   184→      ])
+   185→   185→      if (!totalRes.ok) {
+   186→   186→        throw new Error(`Supabase stats returned ${totalRes.status}`)
+   187→   187→      }
+   188→   188→      const getCount = (res: Response) => {
+   189→   189→        const range = res.headers.get('content-range') || '0/0'
+   190→   190→        return parseInt(range.split('/')[1] || '0')
+   191→   191→      }
+   192→   192→      setStats({
+   193→   193→        total_links: getCount(totalRes),
+   194→   194→        whatsapp_links: getCount(waRes),
+   195→   195→        telegram_links: getCount(tgRes),
+   196→   196→        active_watchers: getCount(watchRes)
+   197→   197→      })
+   198→   198→      setError(null)
+   199→   199→      setUsingMockData(false)
+   200→   200→    } catch (e) {
+   201→   201→      setError(e instanceof Error ? e.message : 'Failed to load stats')
+   202→   202→      if (!stats) {
+   203→   203→        setStats(mockStats)
+   204→   204→        setUsingMockData(true)
+   205→   205→      }
+   206→   206→    }
+   207→   207→  }, [stats])
+   208→   208→
+   209→   209→  const fetchCountryStats = useCallback(async () => {
+   210→   210→    if (!SUPABASE_URL || !SUPABASE_KEY) {
+   211→   211→      setCountryStats(mockCountryStats)
+   212→   212→      setUsingMockData(true)
+   213→   213→      return
+   214→   214→    }
+   215→   215→    try {
+   216→   216→      const response = await fetch(`${SUPABASE_URL}/rest/v1/links?select=message_text,group_name&limit=1000`, {
+   217→   217→        headers: {
+   218→   218→          'apikey': SUPABASE_KEY,
+   219→   219→          'Authorization': `Bearer ${SUPABASE_KEY}`
+   220→   220→        }
+   221→   221→      })
+   222→   222→      if (!response.ok) {
+   223→   223→        throw new Error(`Supabase country stats returned ${response.status}`)
+   224→   224→      }
+   225→   225→      const data = await response.json() || []
+   226→   226→      const counts: Record<string, number> = {}
+   227→   227→      let total = 0
+   228→   228→      for (const item of data) {
+   229→   229→        const text = `${item.message_text || ''} ${item.group_name || ''}`
+   230→   230→        const country = detectCountry(text)
+   231→   231→        if (country) {
+   232→   232→          counts[country] = (counts[country] || 0) + 1
+   233→   233→          total++
+   234→   234→        }
+   235→   235→      }
+   236→   236→      const result: CountryStat[] = Object.entries(counts).map(([country, count]) => ({
+   237→   237→        country,
+   238→   238→        count,
+   239→   239→        percentage: total > 0 ? Math.round((count / total) * 100) : 0
+   240→   240→      })).sort((a, b) => b.count - a.count)
+   241→   241→      setCountryStats(result)
+   242→   242→      setError(null)
+   243→   243→      setUsingMockData(false)
+   244→   244→    } catch (e) {
+   245→   245→      setError(e instanceof Error ? e.message : 'Failed to load country stats')
+   246→   246→      if (countryStats.length === 0) {
+   247→   247→        setCountryStats(mockCountryStats)
+   248→   248→        setUsingMockData(true)
+   249→   249→      }
+   250→   250→    }
+   251→   251→  }, [countryStats.length])
+   252→   252→
+   253→   253→  useEffect(() => {
+   254→   254→    const load = async () => {
+   255→   255→      await Promise.all([fetchLinks(), fetchStats(), fetchCountryStats()])
+   256→   256→    }
+   257→   257→    load()
+   258→   258→    const interval = setInterval(load, 30000)
+   259→   259→    return () => clearInterval(interval)
+   260→   260→  }, [fetchLinks, fetchStats, fetchCountryStats])
+   261→   261→
+   262→   262→  // فلترة الروابط حسب العرض الحالي
+   263→   263→  useEffect(() => {
+   264→   264→    let filtered = [...allLinks]
+   265→   265→
+   266→   266→    if (currentView === 'whatsapp') {
+   267→   267→      filtered = filtered.filter(l => l.link_type === 'whatsapp')
+   268→   268→    } else if (currentView === 'telegram') {
+   269→   269→      filtered = filtered.filter(l => l.link_type === 'telegram')
+   270→   270→    } else if (currentView !== 'all') {
+   271→   271→      // فلترة حسب الدولة
+   272→   272→      filtered = filtered.filter(l => {
+   273→   273→        const text = `${l.message_text || ''} ${l.group_name || ''}`
+   274→   274→        return detectCountry(text) === currentView
+   275→   275→      })
+   276→   276→    }
+   277→   277→
+   278→   278→    if (searchQuery) {
+   279→   279→      const q = searchQuery.toLowerCase()
+   280→   280→      filtered = filtered.filter(l =>
+   281→   281→        l.link?.toLowerCase().includes(q) ||
+   282→   282→        l.message_text?.toLowerCase().includes(q) ||
+   283→   283→        l.group_name?.toLowerCase().includes(q) ||
+   284→   284→        l.sender_name?.toLowerCase().includes(q)
+   285→   285→      )
+   286→   286→    }
+   287→   287→
+   288→   288→    setLinks(filtered)
+   289→   289→  }, [currentView, searchQuery, allLinks])
+   290→   290→
+   291→   291→  const countryColors: Record<string, string> = {
+   292→   292→    'السعودية': 'from-emerald-500 to-green-400',
+   293→   293→    'الكويت': 'from-blue-500 to-cyan-400',
+   294→   294→    'قطر': 'from-purple-500 to-pink-400',
+   295→   295→    'البحرين': 'from-amber-500 to-orange-400',
+   296→   296→    'الإمارات': 'from-rose-500 to-red-400'
+   297→   297→  }
+   298→   298→
+   299→   299→  return (
+   300→   300→    <div className="min-h-screen bg-gradient-to-br from-slate-950 via-slate-900 to-slate-950 text-white">
+   301→   301→      <div className="fixed inset-0 overflow-hidden pointer-events-none">
+   302→   302→        <div className="absolute -top-40 -right-40 w-96 h-96 bg-emerald-500/10 rounded-full blur-3xl" />
+   303→   303→        <div className="absolute -bottom-40 -left-40 w-96 h-96 bg-blue-500/10 rounded-full blur-3xl" />
+   304→   304→      </div>
+   305→   305→
+   306→   306→      <div className="relative z-10 container mx-auto px-4 py-8 max-w-6xl">
+   307→   307→        {/* الرأس */}
+   308→   308→        <motion.div initial={{ opacity: 0, y: -20 }} animate={{ opacity: 1, y: 0 }} className="mb-8">
+   309→   309→          <div className="flex items-center justify-between">
+   310→   310→            <div className="flex items-center gap-3">
+   311→   311→              <div className="w-12 h-12 rounded-2xl bg-gradient-to-br from-emerald-500 to-blue-500 flex items-center justify-center shadow-lg shadow-emerald-500/20">
+   312→   312→                <Link2 className="w-6 h-6 text-white" />
+   313→   313→              </div>
+   314→   314→              <div>
+   315→   315→                <h1 className="text-2xl md:text-3xl font-bold bg-gradient-to-r from-emerald-400 via-white to-blue-400 bg-clip-text text-transparent">
+   316→   316→                  مراقب الروابط
+   317→   317→                </h1>
+   318→   318→                <p className="text-slate-400 text-xs">نظام سحب الروابط الذكي</p>
+   319→   319→              </div>
+   320→   320→            </div>
+   321→   321→            <Button variant="ghost" size="sm" onClick={() => { fetchLinks(); fetchStats(); fetchCountryStats(); }}
+   322→   322→              className="text-slate-400 hover:text-white">
+   323→   323→              <RefreshCw className="w-4 h-4" />
+   324→   324→            </Button>
+   325→   325→          </div>
+   326→   326→        </motion.div>
+   327→   327→
+   328→   328→        {/* عرض الكل - الإحصائيات والتبويبات */}
+   329→   329→        {currentView === 'all' && (
+   330→   330→          <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }}>
+   331→   331→            {/* Error banner — surface real errors instead of silently using mock data */}
+   332→   332→            {error && (
+   333→   333→              <div className="mb-4 p-3 rounded-lg bg-red-500/10 border border-red-500/30 text-red-300 text-sm">
+   334→   334→                ⚠️ فشل تحميل البيانات: {error}
+   335→   335→                {usingMockData && <span className="block text-xs text-red-400/70 mt-1">يعرض الآن بيانات تجريبية</span>}
+   336→   336→              </div>
+   337→   337→            )}
+   338→   338→            {/* بطاقات الإحصائيات كأزرار */}
+   339→   339→            <div className="grid grid-cols-2 md:grid-cols-4 gap-3 md:gap-4 mb-6">
+   340→   340→              <StatCard icon={<Link2 className="w-5 h-5" />} label="إجمالي الروابط" value={stats?.total_links ?? 0}
+   341→   341→                gradient="from-emerald-500/20 to-emerald-500/5" iconColor="text-emerald-400"
+   342→   342→                onClick={() => setCurrentView('all')} active={true} />
+   343→   343→              <StatCard icon={<MessageCircle className="w-5 h-5" />} label="🟢 واتساب" value={stats?.whatsapp_links ?? 0}
+   344→   344→                gradient="from-green-500/20 to-green-500/5" iconColor="text-green-400"
+   345→   345→                onClick={() => setCurrentView('whatsapp')} active={false} />
+   346→   346→              <StatCard icon={<Send className="w-5 h-5" />} label="🔵 تيليجرام" value={stats?.telegram_links ?? 0}
+   347→   347→                gradient="from-blue-500/20 to-blue-500/5" iconColor="text-blue-400"
+   348→   348→                onClick={() => setCurrentView('telegram')} active={false} />
+   349→   349→              <StatCard icon={<Users className="w-5 h-5" />} label="المراقبون" value={stats?.active_watchers ?? 0}
+   350→   350→                gradient="from-purple-500/20 to-purple-500/5" iconColor="text-purple-400"
+   351→   351→                onClick={() => {}} active={false} />
+   352→   352→            </div>
+   353→   353→
+   354→   354→            {/* التحليل الإحصائي - أزرار قابلة للضغط */}
+   355→   355→            {countryStats.length > 0 && (
+   356→   356→              <Card className="bg-slate-800/30 border-slate-700/50 backdrop-blur-sm mb-6">
+   357→   357→                <CardHeader>
+   358→   358→                  <CardTitle className="flex items-center gap-2 text-lg">
+   359→   359→                    <Globe className="w-5 h-5 text-emerald-400" />
+   360→   360→                    التحليل الإحصائي حسب الدولة
+   361→   361→                  </CardTitle>
+   362→   362→                </CardHeader>
+   363→   363→                <CardContent>
+   364→   364→                  <div className="grid grid-cols-2 md:grid-cols-3 gap-3">
+   365→   365→                    {countryStats.map((cs, i) => (
+   366→   366→                      <button key={cs.country} onClick={() => setCurrentView(cs.country)}
+   367→   367→                        className="text-right hover:scale-105 transition-transform">
+   368→   368→                        <Card className={`bg-gradient-to-br ${countryColors[cs.country] || 'from-slate-600 to-slate-700'} border-0 overflow-hidden`}>
+   369→   369→                          <CardContent className="p-4">
+   370→   370→                            <div className="flex items-center justify-between mb-2">
+   371→   371→                              <span className="text-sm font-bold text-white">{cs.country}</span>
+   372→   372→                              <Badge className="bg-black/30 text-white border-0">{cs.count}</Badge>
+   373→   373→                            </div>
+   374→   374→                            <div className="w-full bg-black/30 rounded-full h-2 overflow-hidden">
+   375→   375→                              <div className="h-full bg-white/80 rounded-full" style={{ width: `${cs.percentage}%` }} />
+   376→   376→                            </div>
+   377→   377→                            <span className="text-xs text-white/80 mt-1 block">{cs.percentage}%</span>
+   378→   378→                          </CardContent>
+   379→   379→                        </Card>
+   380→   380→                      </button>
+   381→   381→                    ))}
+   382→   382→                  </div>
+   383→   383→                </CardContent>
+   384→   384→              </Card>
+   385→   385→            )}
+   386→   386→
+   387→   387→            {/* البحث */}
+   388→   388→            <div className="relative mb-4">
+   389→   389→              <Search className="absolute right-3 top-1/2 -translate-y-1/2 w-4 h-4 text-slate-400" />
+   390→   390→              <Input placeholder="ابحث في الروابط..." value={searchQuery} onChange={(e) => setSearchQuery(e.target.value)}
+   391→   391→                className="bg-slate-800/50 border-slate-700 text-white placeholder:text-slate-500 pr-10" />
+   392→   392→            </div>
+   393→   393→
+   394→   394→            {/* ===== Joiner Dashboard ===== */}
+   395→   395→            <JoinerDashboard />
+   396→   396→          </motion.div>
+   397→   397→        )}
+   398→   398→
+   399→   399→        {/* عرض مخصص (واتساب/تيليجرام/دولة) */}
+   400→   400→        {currentView !== 'all' && (
+   401→   401→          <motion.div initial={{ opacity: 0, x: 20 }} animate={{ opacity: 1, x: 0 }} className="mb-6">
+   402→   402→            <div className="flex items-center gap-3 mb-4">
+   403→   403→              <Button variant="ghost" size="sm" onClick={() => setCurrentView('all')}
+   404→   404→                className="text-slate-400 hover:text-white">
+   405→   405→                <ArrowRight className="w-4 h-4 ml-2" />
+   406→   406→                رجوع
+   407→   407→              </Button>
+   408→   408→              <h2 className="text-xl font-bold">
+   409→   409→                {currentView === 'whatsapp' && '🟢 روابط واتساب'}
+   410→   410→                {currentView === 'telegram' && '🔵 روابط تيليجرام'}
+   411→   411→                {currentView !== 'whatsapp' && currentView !== 'telegram' && `🌐 روابط ${currentView}`}
+   412→   412→              </h2>
+   413→   413→              <Badge className="bg-slate-700 text-white border-0">{links.length}</Badge>
+   414→   414→            </div>
+   415→   415→            <div className="relative mb-4">
+   416→   416→              <Search className="absolute right-3 top-1/2 -translate-y-1/2 w-4 h-4 text-slate-400" />
+   417→   417→              <Input placeholder="ابحث..." value={searchQuery} onChange={(e) => setSearchQuery(e.target.value)}
+   418→   418→                className="bg-slate-800/50 border-slate-700 text-white placeholder:text-slate-500 pr-10" />
+   419→   419→            </div>
+   420→   420→          </motion.div>
+   421→   421→        )}
+   422→   422→
+   423→   423→        {/* قائمة الروابط */}
+   424→   424→        <div className="mb-4 flex items-center justify-between">
+   425→   425→          <p className="text-sm text-slate-400">عرض {links.length} رابط</p>
+   426→   426→        </div>
+   427→   427→
+   428→   428→        <ScrollArea className="h-[500px] pr-4">
+   429→   429→          {loading ? (
+   430→   430→            <div className="space-y-4">{[...Array(5)].map((_, i) => <Skeleton key={i} className="h-32 w-full bg-slate-800/50 rounded-xl" />)}</div>
+   431→   431→          ) : links.length === 0 ? (
+   432→   432→            <div className="text-center py-20">
+   433→   433→              <Link2 className="w-12 h-12 mx-auto text-slate-600 mb-4" />
+   434→   434→              <p className="text-slate-500">لا توجد روابط</p>
+   435→   435→            </div>
+   436→   436→          ) : (
+   437→   437→            <AnimatePresence mode="popLayout">
+   438→   438→              {links.map((link, index) => (
+   439→   439→                <motion.div key={link.id || index} initial={{ opacity: 0, scale: 0.95 }} animate={{ opacity: 1, scale: 1 }} exit={{ opacity: 0, scale: 0.95 }} transition={{ delay: index * 0.03 }} layout>
+   440→   440→                  <LinkCard link={link} />
+   441→   441→                </motion.div>
+   442→   442→              ))}
+   443→   443→            </AnimatePresence>
+   444→   444→          )}
+   445→   445→        </ScrollArea>
+   446→   446→
+   447→   447→        <footer className="mt-10 text-center text-slate-500 text-xs"><p>نظام مراقبة الروابط © 2026</p></footer>
+   448→   448→      </div>
+   449→   449→    </div>
+   450→   450→  )
+   451→   451→}
+   452→   452→
+   453→   453→function StatCard({ icon, label, value, gradient, iconColor, onClick, active }: {
+   454→   454→  icon: React.ReactNode; label: string; value: number; gradient: string; iconColor: string;
+   455→   455→  onClick: () => void; active: boolean
+   456→   456→}) {
+   457→   457→  return (
+   458→   458→    <button onClick={onClick} className="text-right hover:scale-105 transition-transform">
+   459→   459→      <Card className={`bg-gradient-to-br ${gradient} border-slate-700/50 backdrop-blur-sm overflow-hidden ${active ? 'ring-2 ring-emerald-500' : ''}`}>
+   460→   460→        <CardContent className="p-4">
+   461→   461→          <div className="flex items-center justify-between">
+   462→   462→            <div><p className="text-slate-400 text-xs mb-1">{label}</p><p className="text-2xl font-bold text-white">{value}</p></div>
+   463→   463→            <div className={`${iconColor} opacity-80`}>{icon}</div>
+   464→   464→          </div>
+   465→   465→        </CardContent>
+   466→   466→      </Card>
+   467→   467→    </button>
+   468→   468→  )
+   469→   469→}
+   470→   470→
+   471→   471→function LinkCard({ link }: { link: LinkItem }) {
+   472→   472→  const isWhatsapp = link.link_type === 'whatsapp'
+   473→   473→  const date = new Date(link.created_at)
+   474→   474→  const timeStr = date.toLocaleString('ar-SA', { year: 'numeric', month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' })
+   475→   475→  const country = detectCountry(`${link.message_text || ''} ${link.group_name || ''}`)
+   476→   476→  const href = safeUrl(link.link)
+   477→   477→  return (
+   478→   478→    <Card className="mb-3 bg-slate-800/30 border-slate-700/50 backdrop-blur-sm hover:bg-slate-800/50 transition-all duration-300 overflow-hidden">
+   479→   479→      <CardContent className="p-4">
+   480→   480→        <div className="flex items-start justify-between mb-3">
+   481→   481→          <div className="flex items-center gap-2 flex-wrap">
+   482→   482→            <div className={`w-3 h-3 rounded-full ${isWhatsapp ? 'bg-green-500' : 'bg-blue-500'} shadow-lg`} />
+   483→   483→            <Badge variant="outline" className={isWhatsapp ? 'border-green-500/30 text-green-400' : 'border-blue-500/30 text-blue-400'}>
+   484→   484→              {isWhatsapp ? '🟢 واتساب' : '🔵 تيليجرام'}
+   485→   485→            </Badge>
+   486→   486→            {country && <Badge variant="outline" className="border-purple-500/30 text-purple-400">{country}</Badge>}
+   487→   487→          </div>
+   488→   488→          <div className="flex items-center gap-1 text-slate-500 text-xs"><Clock className="w-3 h-3" />{timeStr}</div>
+   489→   489→        </div>
+   490→   490→        {href ? (
+   491→   491→          <a href={href} target="_blank" rel="noopener noreferrer" className="block mb-3 group">
+   492→   492→            <div className="flex items-center gap-2 bg-slate-900/50 rounded-lg p-3 hover:bg-slate-900/80 transition-colors">
+   493→   493→              <ExternalLink className="w-4 h-4 text-slate-400 group-hover:text-white shrink-0" />
+   494→   494→              <span className="text-sm text-blue-300 group-hover:text-blue-200 truncate font-mono">{href}</span>
+   495→   495→            </div>
+   496→   496→          </a>
+   497→   497→        ) : (
+   498→   498→          <div className="mb-3 bg-slate-900/50 rounded-lg p-3">
+   499→   499→            <div className="flex items-center gap-2">
+   500→   500→              <ExternalLink className="w-4 h-4 text-slate-500 shrink-0" />
+   501→   501→              <span className="text-sm text-slate-400 truncate font-mono">{link.link || '(no URL)'}</span>
+   502→   502→            </div>
+   503→   503→          </div>
+   504→   504→        )}
+   505→   505→        <div className="grid grid-cols-2 gap-2 text-xs">
+   506→   506→          {link.group_name && <div className="flex items-center gap-1.5 text-slate-400"><MapPin className="w-3 h-3 shrink-0" /><span className="truncate">{link.group_name}</span></div>}
+   507→   507→          {link.sender_name && <div className="flex items-center gap-1.5 text-slate-400"><Users className="w-3 h-3 shrink-0" /><span className="truncate">{link.sender_name}</span></div>}
+   508→   508→          {link.sender_contact && <div className="flex items-center gap-1.5 text-slate-400"><Phone className="w-3 h-3 shrink-0" /><span className="truncate">{link.sender_contact}</span></div>}
+   509→   509→        </div>
+   510→   510→        {link.message_text && <div className="mt-3 bg-slate-900/40 rounded-lg p-3 text-xs text-slate-400 max-h-24 overflow-hidden">{link.message_text}</div>}
+   511→   511→      </CardContent>
+   512→   512→    </Card>
+   513→   513→  )
+   514→   514→}
+   515→   515→
+   516→   516→const mockLinks: LinkItem[] = [
+   517→   517→  { id: 1, link: 'https://chat.whatsapp.com/ABC123xyz', link_type: 'whatsapp', message_text: 'انضموا لمجموعة جامعة الأهلية السعودية', group_name: 'دعم SEU للطلاب الجدد', sender_name: 'محمد', sender_contact: '📱 +966500000000', source_phone: '+967770309310', message_link: null, created_at: new Date(Date.now() - 1000 * 60 * 5).toISOString() },
+   518→   518→  { id: 2, link: 'https://t.me/kuwait_university', link_type: 'telegram', message_text: 'قناة جامعة الكويت الرسمية', group_name: 'مجموعة الكويت الجامعية', sender_name: 'أحمد', sender_contact: '✈️ @ahmed', source_phone: '+96550000000', message_link: null, created_at: new Date(Date.now() - 1000 * 60 * 30).toISOString() },
+   519→   519→  { id: 3, link: 'https://chat.whatsapp.com/DEF456uvw', link_type: 'whatsapp', message_text: 'مجموعة جامعة قطر للطلاب', group_name: 'طلاب قطر', sender_name: 'سارة', sender_contact: '📱 +97430000000', source_phone: '+967770309310', message_link: null, created_at: new Date(Date.now() - 1000 * 60 * 60).toISOString() }
+   520→   520→]
+   521→   521→
+   522→   522→// ===== Joiner Dashboard Types =====
+   523→   523→interface JoinedGroup {
+   524→   524→  id: number
+   525→   525→  group_title: string | null
+   526→   526→  group_link: string
+   527→   527→  status: string
+   528→   528→  joined_by_phone: string | null
+   529→   529→  join_date: string | null
+   530→   530→  member_count: number | null
+   531→   531→}
+   532→   532→
+   533→   533→interface JoinerStats {
+   534→   534→  total_joined: number
+   535→   535→  pending_groups: number
+   536→   536→  active_joiners: number
+   537→   537→}
+   538→   538→
+   539→   539→function JoinerDashboard() {
+   540→   540→  const [joinedGroups, setJoinedGroups] = useState<JoinedGroup[]>([])
+   541→   541→  const [joinerStats, setJoinerStats] = useState<JoinerStats | null>(null)
+   542→   542→  const [loading, setLoading] = useState(true)
+   543→   543→
+   544→   544→  const fetchJoinerData = useCallback(async () => {
+   545→   545→    // استخدم API endpoint أولاً (المصدر الحقيقي من SQLite group_states)
+   546→   546→    try {
+   547→   547→      const response = await fetch(`${API_URL}/api/joined_groups`, {
+   548→   548→        headers: { 'Accept': 'application/json' }
+   549→   549→      })
+   550→   550→      if (response.ok) {
+   551→   551→        const data = await response.json()
+   552→   552→        const groups = data.joined_groups || []
+   553→   553→        const stats = data.stats || {}
+   554→   554→        setJoinedGroups(groups)
+   555→   555→        setJoinerStats({
+   556→   556→          total_joined: stats.total_joined || 0,
+   557→   557→          pending_groups: stats.pending_groups || 0,
+   558→   558→          active_joiners: stats.active_joiners || 0
+   559→   559→        })
+   560→   560→        setLoading(false)
+   561→   561→        return
+   562→   562→      }
+   563→   563→    } catch {
+   564→   564→      // API غير متاح، جرب Supabase
+   565→   565→    }
+   566→   566→    // Fallback: Supabase target_groups
+   567→   567→    if (!SUPABASE_URL || !SUPABASE_KEY) {
+   568→   568→      setJoinerStats({ total_joined: 0, pending_groups: 0, active_joiners: 0 })
+   569→   569→      setJoinedGroups([])
+   570→   570→      setLoading(false)
+   571→   571→      return
+   572→   572→    }
+   573→   573→    try {
+   574→   574→      const headers = { 'apikey': SUPABASE_KEY, 'Authorization': `Bearer ${SUPABASE_KEY}` }
+   575→   575→      const controller = new AbortController()
+   576→   576→      const timeout = setTimeout(() => controller.abort(), 10000)
+   577→   577→
+   578→   578→      const [joinedRes, pendingRes, joinersRes] = await Promise.all([
+   579→   579→        fetch(`${SUPABASE_URL}/rest/v1/target_groups?status=in.(JOINED,ALREADY_MEMBER)&order=join_date.desc&limit=50`, { headers, signal: controller.signal }),
+   580→   580→        fetch(`${SUPABASE_URL}/rest/v1/target_groups?status=eq.PENDING&select=id&limit=1`, { headers: { ...headers, Prefer: 'count=exact' } as any, signal: controller.signal }),
+   581→   581→        fetch(`${SUPABASE_URL}/rest/v1/watchers?role=eq.joiner&is_active=eq.true&select=id&limit=1`, { headers: { ...headers, Prefer: 'count=exact' } as any, signal: controller.signal }),
+   582→   582→      ])
+   583→   583→      clearTimeout(timeout)
+   584→   584→
+   585→   585→      const joined = joinedRes.ok ? ((await joinedRes.json()) || []) : []
+   586→   586→      const joinedArray = Array.isArray(joined) ? joined : []
+   587→   587→
+   588→   588→      const pendingCount = parseInt(pendingRes.headers.get('content-range')?.split('/')[1] || '0')
+   589→   589→      const joinerCount = parseInt(joinersRes.headers.get('content-range')?.split('/')[1] || '0')
+   590→   590→
+   591→   591→      setJoinedGroups(joinedArray)
+   592→   592→      setJoinerStats({ total_joined: joinedArray.length, pending_groups: isNaN(pendingCount) ? 0 : pendingCount, active_joiners: isNaN(joinerCount) ? 0 : joinerCount })
+   593→   593→      setLoading(false)
+   594→   594→    } catch {
+   595→   595→      setJoinerStats({ total_joined: 0, pending_groups: 0, active_joiners: 0 })
+   596→   596→      setJoinedGroups([])
+   597→   597→      setLoading(false)
+   598→   598→    }
+   599→   599→  }, [])
+   600→   600→
+   601→   601→  useEffect(() => { fetchJoinerData() }, [fetchJoinerData])
+   602→   602→
+   603→   603→  if (loading) return <div className="mb-6"><Skeleton className="h-40 w-full bg-slate-800/50 rounded-xl" /></div>
+   604→   604→
+   605→   605→  // حتى لو ما فيه بيانات، اعرض اللوحة مع رسالة فارغة
+   606→   606→  const stats = joinerStats || { total_joined: 0, pending_groups: 0, active_joiners: 0 }
+   607→   607→  const isEmpty = stats.total_joined === 0 && stats.pending_groups === 0 && stats.active_joiners === 0
+   608→   608→
+   609→   609→  return (
+   610→   610→    <Card className="bg-slate-800/30 border-slate-700/50 backdrop-blur-sm mb-6">
+   611→   611→      <CardHeader>
+   612→   612→        <CardTitle className="flex items-center gap-2 text-lg">
+   613→   613→          <span className="text-2xl">🚀</span>
+   614→   614→          لوحة الفدائي (Joiner Dashboard)
+   615→   615→        </CardTitle>
+   616→   616→      </CardHeader>
+   617→   617→      <CardContent>
+   618→   618→        {/* Stats Cards — دائماً تظهر */}
+   619→   619→        <div className="grid grid-cols-3 gap-3 mb-4">
+   620→   620→          <div className="bg-emerald-500/10 border border-emerald-500/30 rounded-lg p-3 text-center">
+   621→   621→            <p className="text-2xl font-bold text-emerald-400">{stats.total_joined}</p>
+   622→   622→            <p className="text-xs text-slate-400 mt-1">مجموعة منضم إليها</p>
+   623→   623→          </div>
+   624→   624→          <div className="bg-amber-500/10 border border-amber-500/30 rounded-lg p-3 text-center">
+   625→   625→            <p className="text-2xl font-bold text-amber-400">{stats.pending_groups}</p>
+   626→   626→            <p className="text-xs text-slate-400 mt-1">مجموعة معلقة</p>
+   627→   627→          </div>
+   628→   628→          <div className="bg-purple-500/10 border border-purple-500/30 rounded-lg p-3 text-center">
+   629→   629→            <p className="text-2xl font-bold text-purple-400">{stats.active_joiners}</p>
+   630→   630→            <p className="text-xs text-slate-400 mt-1">حسابات فدائية نشطة</p>
+   631→   631→          </div>
+   632→   632→        </div>
+   633→   633→
+   634→   634→        {/* Joined Groups Table */}
+   635→   635→        {joinedGroups.length > 0 && (
+   636→   636→          <div className="overflow-x-auto">
+   637→   637→            <table className="w-full text-sm">
+   638→   638→              <thead>
+   639→   639→                <tr className="border-b border-slate-700 text-slate-400 text-xs">
+   640→   640→                  <th className="text-right py-2 px-2">اسم المجموعة</th>
+   641→   641→                  <th className="text-right py-2 px-2">الرابط</th>
+   642→   642→                  <th className="text-right py-2 px-2">الأعضاء</th>
+   643→   643→                  <th className="text-right py-2 px-2">الحساب</th>
+   644→   644→                  <th className="text-right py-2 px-2">تاريخ الانضمام</th>
+   645→   645→                  <th className="text-right py-2 px-2">الحالة</th>
+   646→   646→                </tr>
+   647→   647→              </thead>
+   648→   648→              <tbody>
+   649→   649→                {joinedGroups.map((g) => (
+   650→   650→                  <tr key={g.id} className="border-b border-slate-800 hover:bg-slate-800/30">
+   651→   651→                    <td className="py-2 px-2 text-white truncate max-w-[150px]">{g.group_title || 'غير معروف'}</td>
+   652→   652→                    <td className="py-2 px-2">
+   653→   653→                      <a href={g.group_link} target="_blank" rel="noopener noreferrer" className="text-blue-400 hover:text-blue-300 truncate inline-block max-w-[120px] font-mono text-xs">
+   654→   654→                        {g.group_link}
+   655→   655→                      </a>
+   656→   656→                    </td>
+   657→   657→                    <td className="py-2 px-2 text-slate-400">{g.member_count != null ? g.member_count.toLocaleString() : '-'}</td>
+   658→   658→                    <td className="py-2 px-2 text-slate-400 font-mono text-xs">{g.joined_by_phone || '-'}</td>
+   659→   659→                    <td className="py-2 px-2 text-slate-400 text-xs">{g.join_date ? new Date(g.join_date).toLocaleDateString('ar-SA') : '-'}</td>
+   660→   660→                    <td className="py-2 px-2">
+   661→   661→                      <Badge variant="outline" className={g.status === 'JOINED' ? 'border-emerald-500/30 text-emerald-400' : 'border-blue-500/30 text-blue-400'}>
+   662→   662→                        {g.status === 'JOINED' ? '✅ ناجح' : '👤 منضم مسبقاً'}
+   663→   663→                      </Badge>
+   664→   664→                    </td>
+   665→   665→                  </tr>
+   666→   666→                ))}
+   667→   667→              </tbody>
+   668→   668→            </table>
+   669→   669→          </div>
+   670→   670→        )}
+   671→   671→
+   672→   672→        {/* Empty State — يظهر لما ما فيه مجموعات */}
+   673→   673→        {isEmpty && (
+   674→   674→          <div className="text-center py-8 px-4">
+   675→   675→            <div className="text-4xl mb-3">🚀</div>
+   676→   676→            <p className="text-slate-300 text-sm font-medium mb-2">لا توجد بيانات فدائي بعد</p>
+   677→   677→            <p className="text-slate-500 text-xs leading-relaxed">
+   678→   678→              أضف حساب فدائي عبر إرسال <code className="bg-slate-700/50 px-1.5 py-0.5 rounded text-blue-300">/login</code> للبوت
+   679→   679→              واختيار "🚀 حساب فدائي"<br/>
+   680→   680→              سيبدأ البوت بالانضمام التلقائي للمجموعات المكتشفة
+   681→   681→            </p>
+   682→   682→          </div>
+   683→   683→        )}
+   684→   684→      </CardContent>
+   685→   685→    </Card>
+   686→   686→  )
+   687→   687→}
+   688→   688→
+   689→   689→const mockStats: Stats = { total_links: 156, whatsapp_links: 98, telegram_links: 58, active_watchers: 7 }
+   690→   690→const mockCountryStats: CountryStat[] = [
+   691→   691→  { country: 'السعودية', count: 65, percentage: 42 },
+   692→   692→  { country: 'الكويت', count: 35, percentage: 22 },
+   693→   693→  { country: 'الإمارات', count: 28, percentage: 18 },
+   694→   694→  { country: 'قطر', count: 18, percentage: 11 },
+   695→   695→  { country: 'البحرين', count: 10, percentage: 7 }
+   696→   696→]
+   697→   697→
