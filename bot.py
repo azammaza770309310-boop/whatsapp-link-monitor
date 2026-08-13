@@ -1519,6 +1519,50 @@ class EducationalFilter:
     ]
 
     # ====================================================================
+    # سياق أكاديمي عام — كلمات تشير لبيئة جامعية بدون ذكر دولة محددة
+    # لو ظهرت بدون blacklist match → اقبل (لأن البوت يراقب مجموعات خليجية أصلاً)
+    # ====================================================================
+    ACADEMIC_CONTEXT = [
+        # مستويات دراسية
+        'مستوى', 'مستوى أول', 'مستوى ثاني', 'مستوى ثالث', 'مستوى رابع',
+        'مستوى خامس', 'مستوى سادس', 'مستوى سابع', 'مستوى ثامن',
+        'level 1', 'level 2', 'level1', 'level2',
+        # فصول وترامس
+        'ترم', 'ترم أول', 'ترم ثاني', 'ترم صيفي', 'فصل دراسي', 'فصل أول',
+        'semester', 'term', 'fall', 'spring', 'summer',
+        # دفعات (السنة الهجرية السعودية شائعة جداً)
+        'دفعة', 'دفعه', 'دفعة 144', '1444', '1445', '1446', '1447', '1448',
+        'cohort', 'batch',
+        # أنشطة دراسية
+        'محاضرة', 'سكشن', 'واجب', 'واجبات', 'بحث', 'مشروع', 'تقرير', 'عرض',
+        'ميدتيرم', 'فاينل', 'اختبار', 'امتحان', 'كويز', 'quiz', 'midterm', 'final',
+        'lecture', 'section', 'assignment', 'exam',
+        # مواد دراسية
+        'مادة', 'مواد', 'منهج', 'كتاب', 'ملخص', 'شرائح', 'slides',
+        'course', 'subject', 'curriculum', 'syllabus',
+        # أنظمة جامعية
+        'تسجيل', 'add drop', 'withdraw', 'معدل', 'gpa', 'credit',
+        'blackboard', 'بلاك بورد', 'moodle', 'مودل', 'tudris', 'تودرس',
+        'registration', 'enrollment',
+        # أقسام وتخصصات (كلمات عامة)
+        'تخصص', 'قسم', 'شعبة', 'فرقة', 'major', 'department', 'section',
+        # تجمعات طلابية
+        'طلاب', 'طالبات', 'تجمع', 'طلابي', 'طالبة', 'students', 'student',
+        # مستويات جامعية
+        'بكالوريوس', 'ماجستير', 'دكتوراه', 'دبلوم',
+        'bachelor', 'master', 'phd', 'diploma', 'degree',
+        # إرشاد أكاديمي
+        'مرشد', 'إرشاد', 'إرشاد أكاديمي', 'ساعات معتمدة', 'تخصص ثانٍ',
+        'academic', 'advisor', 'credit hours',
+        # مناسبات جامعية
+        'جدول', 'جدول المحاضرات', 'تقويم', 'تقويم جامعي',
+        'orientation', 'تعريف', 'يوم تعريفي',
+        # رموز سعودية/خليجية شائعة في السياق الأكاديمي
+        'سنة تحضيرية', 'سنة تحضيري', 'تحضيري', 'preparatory', 'foundation',
+        'انتساب', 'تعليم عن بعد', 'distance learning',
+    ]
+
+    # ====================================================================
     # قائمة سوداء صارمة — تستبعد الرابط قبل الانضمام مباشرة
     # هذه الكلمات لو ظهرت في username الرابط أو نص الرسالة → رفض فوري
     # ====================================================================
@@ -1628,6 +1672,26 @@ class EducationalFilter:
     ]
 
     @classmethod
+    def is_academic_context(cls, text: str, link_username: str = '') -> bool:
+        """فحص هل النص يحتوي على سياق أكاديمي عام.
+
+        السياق الأكاديمي = كلمات تشير لبيئة جامعية بدون ذكر دولة محددة:
+        مستوى، ترم، دفعة، محاضرة، سكشن، واجب، 1446، gpa، blackboard...
+
+        Returns:
+            True لو فيه سياق أكاديمي واضح
+        """
+        combined = f"{text or ''} {link_username or ''}".lower()
+        if not combined.strip():
+            return False
+
+        for ctx in cls.ACADEMIC_CONTEXT:
+            if ctx.lower() in combined:
+                return True
+
+        return False
+
+    @classmethod
     def is_blacklisted(cls, text: str, link_username: str = '') -> Tuple[bool, str]:
         """فحص القائمة السوداء الصارمة.
 
@@ -1666,24 +1730,35 @@ class EducationalFilter:
         return False
 
     @classmethod
-    def should_join(cls, text: str, link_username: str = '', link: str = '') -> Tuple[bool, str]:
+    def should_join(cls, text: str, link_username: str = '', link: str = '',
+                    source_group_name: str = '', source_phone: str = '') -> Tuple[bool, str]:
         """الفحص الشامل قبل الانضمام — يجمع كل الفلاتر.
 
-        الترتيب:
-        1. القائمة السوداء → رفض فوري
+        الترتيب (من الأقوى للأضعف):
+        1. القائمة السوداء → رفض فوري (حتى لو المصدر خليجي)
         2. القائمة البيضاء الخليجية → قبول فوري
-        3. الفلتر التعليمي العام → قبول/رفض
-        4. لو ما في مطابقة → رفض (احتياطي — لا تنضم لشيء مجهول)
+        3. مصدر الرسالة خليجي (group_name المصدر) → قبول (البوت يراقك مجموعات خليجية)
+        4. سياق أكاديمي عام (مستوى/ترم/دفعة/1446...) → قبول
+        5. الفلتر التعليمي العام → قبول/رفض
+        6. لو ما في مطابقة → رفض (احتياطي — لا تنضم لشيء مجهول)
+
+        Args:
+            text: نص الرسالة اللي فيها الرابط
+            link_username: username المستخرج من الرابط (مثلاً KFUPM_students)
+            link: الرابط الكامل
+            source_group_name: اسم المجموعة المصدر (اللي جاء منها الرابط)
+            source_phone: رقم المراقب اللي سحب الرابط
 
         Returns:
             (True, reason) لو ينضم
             (False, reason) لو يرفض
         """
-        # ادمج كل النصوص المتاحة
         combined_text = f"{text or ''} {link_username or ''} {link or ''}"
 
-        # 1. القائمة السوداء (أقوى رفض)
-        is_bad, bad_reason = cls.is_blacklisted(text, link_username)
+        # 1. القائمة السوداء (أقوى رفض) — تفحص كل النصوص المتاحة
+        # نفحص: text + link_username + link + source_group_name
+        all_text_for_blacklist = f"{combined_text} {source_group_name or ''}"
+        is_bad, bad_reason = cls.is_blacklisted(all_text_for_blacklist, link_username)
         if is_bad:
             return False, bad_reason
 
@@ -1691,13 +1766,27 @@ class EducationalFilter:
         if cls.is_gulf_target(text, link_username):
             return True, 'gulf_target'
 
-        # 3. الفلتر التعليمي العام
+        # 3. مصدر الرسالة خليجي؟
+        # البوت يراقب مجموعات خليجية أصلاً — لو المجموعة المصدر فيها إشارة خليجية، اقبل
+        if source_group_name and cls.is_gulf_target(source_group_name, ''):
+            return True, 'gulf_source_group'
+
+        # 4. سياق أكاديمي عام (مستوى/ترم/دفعة/1446...)
+        # هذا يغطي مجموعات مثل "طلاب المستوى الأول" بدون ذكر جامعة
+        if cls.is_academic_context(text, link_username):
+            return True, 'academic_context'
+
+        # 4ب. لو المصدر فيه سياق أكاديمي → اقبل (الرسالة جاءت من بيئة جامعية)
+        if source_group_name and cls.is_academic_context(source_group_name, ''):
+            return True, 'academic_source_group'
+
+        # 5. الفلتر التعليمي العام
         is_edu, edu_reason = cls.is_educational(text, link_username)
         if is_edu:
             return True, edu_reason
 
-        # 4. احتياطي — لو ما عرفنا، لا تنضم
-        return False, f'not_confirmed_gulf_{edu_reason}'
+        # 6. احتياطي — لو ما عرفنا، لا تنضم
+        return False, f'not_confirmed_{edu_reason}'
 
     @classmethod
     def is_educational(cls, text: str, link_username: str = '') -> Tuple[bool, str]:
@@ -4909,15 +4998,22 @@ class Monitor:
                 except Exception:
                     pass
 
+                # مصدر الرسالة — مهم لتحديد السياق الخليجي
+                source_group_name = link_data.get('group_name', '') or ''
+                source_phone = link_data.get('source_phone', '') or ''
+
                 should_join, filter_reason = EducationalFilter.should_join(
-                    filter_text, filter_username, raw_link
+                    filter_text, filter_username, raw_link,
+                    source_group_name=source_group_name,
+                    source_phone=source_phone,
                 )
 
                 if not should_join:
                     # الرابط مرفوض — لا تنضم
                     logging.warning(
                         f"[LINK id={link_id}] [PIPELINE-6] 🚫 GULF FILTER REJECTED: "
-                        f"{raw_link[:60]} (reason={filter_reason}, username={filter_username})"
+                        f"{raw_link[:60]} (reason={filter_reason}, username={filter_username}, "
+                        f"source_group={source_group_name[:30]})"
                     )
                     await self.prod_db.set_group_state(
                         normalized, GroupState.BANNED, raw_link, error=f'gulf_filter_{filter_reason}'
