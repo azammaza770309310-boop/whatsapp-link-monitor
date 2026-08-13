@@ -691,8 +691,9 @@ class DatabaseManager:
         return self._supabase_session
 
     async def _supabase_insert_link(self, link, link_type, message_text, group_name,
-                                     sender_name, sender_contact, source_phone, message_link):
-        """إرسال الرابط إلى Supabase"""
+                                     sender_name, sender_contact, source_phone, message_link,
+                                     ai_approved=None, ai_description=None, ai_country=None, ai_is_ad=None):
+        """إرسال الرابط إلى Supabase مع بيانات AI"""
         if not self.supabase_url or not self.supabase_key:
             return
         try:
@@ -705,13 +706,42 @@ class DatabaseManager:
                 "sender_name": sender_name,
                 "sender_contact": sender_contact,
                 "source_phone": source_phone,
-                "message_link": message_link
+                "message_link": message_link,
             }
+            # أضف بيانات AI لو موجودة
+            if ai_approved is not None:
+                data["ai_approved"] = ai_approved
+            if ai_description:
+                data["ai_description"] = ai_description[:200]
+            if ai_country:
+                data["ai_country"] = ai_country
+            if ai_is_ad is not None:
+                data["ai_is_ad"] = ai_is_ad
+
             async with session.post(f"{self.supabase_url}/rest/v1/links", json=data) as resp:
                 if resp.status not in (200, 201):
                     text = await resp.text()
                     if "duplicate" not in text.lower():
                         logging.error(f"Supabase link insert: {resp.status} - {text[:100]}")
+                    else:
+                        # لو مكرر، حدّث بيانات AI
+                        safe_link = url_quote(link, safe='')
+                        update_data = {}
+                        if ai_approved is not None:
+                            update_data["ai_approved"] = ai_approved
+                        if ai_description:
+                            update_data["ai_description"] = ai_description[:200]
+                        if ai_country:
+                            update_data["ai_country"] = ai_country
+                        if ai_is_ad is not None:
+                            update_data["ai_is_ad"] = ai_is_ad
+                        if update_data:
+                            async with session.patch(
+                                f"{self.supabase_url}/rest/v1/links?link=eq.{safe_link}",
+                                json=update_data
+                            ) as patch_resp:
+                                if patch_resp.status in (200, 204):
+                                    logging.info(f"[SUPABASE] Updated AI data for: {link[:50]}")
         except Exception as e:
             logging.error(f"Supabase insert exception: {e}")
 
@@ -1181,7 +1211,8 @@ class DatabaseManager:
     async def insert_request(self, link: str, message_date: datetime,
                               group_name: str, sender_name: str, source_phone: str,
                               message_link: str = None, message_text: str = None,
-                              sender_contact: str = None, link_type: str = None) -> bool:
+                              sender_contact: str = None, link_type: str = None,
+                              ai_approved=None, ai_description=None, ai_country=None, ai_is_ad=None) -> bool:
         """إدراج رابط جديد - يتحقق من التكرار أولاً ثم يحفظ
 
         Race-safe: uses SQLite UNIQUE constraint as the authoritative check.
@@ -1237,7 +1268,9 @@ class DatabaseManager:
         # 2. حفظ في Supabase (فقط بعد نجاح الإدراج المحلي)
         await self._supabase_insert_link(
             link, link_type, message_text, group_name,
-            sender_name, sender_contact, source_phone, message_link)
+            sender_name, sender_contact, source_phone, message_link,
+            ai_approved=ai_approved, ai_description=ai_description,
+            ai_country=ai_country, ai_is_ad=ai_is_ad)
         return True
 
     async def count_requests(self, source_phone: str = None) -> int:
