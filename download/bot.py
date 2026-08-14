@@ -5402,11 +5402,11 @@ class Monitor:
                         except Exception as e:
                             err_str = str(e)[:100]
                             # لو المجموعة خاصة أو محذوفة → priority=3 (low) ونكمل
-                            if 'UsernameNotOccupied' in err_str or 'CHANNEL_PRIVATE' in err_str:
+                            if 'UsernameNotOccupied' in err_str or 'CHANNEL_PRIVATE' in err_str or 'Nobody is using' in err_str:
                                 await self.prod_db.update_link_priority(link_id, 0)
-                                logging.debug(f"[SCORER] {link_id} @{username}: private/deleted → priority=3")
+                                logging.debug(f"[SCORER] {link_id} @{username}: private/deleted/unknown → priority=3")
                             else:
-                                logging.warning(f"[SCORER] {link_id} error: {err_str}")
+                                logging.debug(f"[SCORER] {link_id} @{username}: skip ({err_str[:60]})")
                                 await self.prod_db.update_link_priority(link_id, 0)
 
                     except Exception as e:
@@ -6545,7 +6545,9 @@ async def api_stats_handler(request):
                 wa_count = await _count(f"{db.supabase_url}/rest/v1/links?link_type=eq.whatsapp&select=id")
                 tg_count = await _count(f"{db.supabase_url}/rest/v1/links?link_type=eq.telegram&select=id")
                 ai_approved_count = await _count(f"{db.supabase_url}/rest/v1/links?ai_approved=eq.true&select=id")
-                ai_rejected_count = await _count(f"{db.supabase_url}/rest/v1/links?ai_approved=eq.false&select=id")
+                # ai_rejected = بالفعل رفضها AI (ai_approved=false AND ai_description not null)
+                # لو ai_description فاضي → ما تم فحصها (pending) — لا ت counted كـ rejected
+                ai_rejected_count = await _count(f"{db.supabase_url}/rest/v1/links?ai_approved=eq.false&ai_description=not.is.null&select=id")
                 ai_ads_count = await _count(f"{db.supabase_url}/rest/v1/links?ai_is_ad=eq.true&select=id")
                 # Pending = total - (approved + rejected)
                 ai_pending_count = max(0, total_links - ai_approved_count - ai_rejected_count)
