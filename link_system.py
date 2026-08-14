@@ -686,10 +686,22 @@ async def init_production_tables(db):
         attempt_count INTEGER DEFAULT 0,
         last_error TEXT,
         next_retry_at TIMESTAMP,
+        member_count INTEGER,
+        priority INTEGER DEFAULT 3,
         UNIQUE(normalized_link)
     )""")
     await conn.execute("CREATE INDEX IF NOT EXISTS idx_queue_status ON link_queue (status)")
     await conn.execute("CREATE INDEX IF NOT EXISTS idx_queue_next_retry ON link_queue (next_retry_at)")
+    await conn.execute("CREATE INDEX IF NOT EXISTS idx_queue_priority ON link_queue (priority, status)")
+    # migration: أضف الأعمدة لو الجدول قديم
+    try:
+        await conn.execute("ALTER TABLE link_queue ADD COLUMN member_count INTEGER")
+    except Exception:
+        pass  # العمود موجود
+    try:
+        await conn.execute("ALTER TABLE link_queue ADD COLUMN priority INTEGER DEFAULT 3")
+    except Exception:
+        pass
 
     # جدول حالة المجموعات (state machine)
     await conn.execute("""CREATE TABLE IF NOT EXISTS group_states (
@@ -783,23 +795,69 @@ class ProductionDB:
             return False
 
     async def get_queued_links(self, limit: int = 1) -> List[dict]:
-        """يجلب روابط QUEUED جاهزة للمعالجة."""
+        """يجلب روابط QUEUED جاهزة للمعالجة — مرتبة حسب الأولوية.
+
+        الأولوية:
+          1 = member_count >= 10,000 (تجمع عالي)
+          2 = member_count >= 1,000 (تجمع متوسط)
+          3 = member_count < 1,000 أو غير معروف
+        """
         conn = await self._conn()
         now = datetime.now().isoformat()
         cursor = await conn.execute(
             """SELECT id, raw_link, normalized_link, link_type, username, invite_hash,
                       msg_id, group_name, sender_name, sender_contact, source_phone,
-                      message_text, message_link, attempt_count
+                      message_text, message_link, attempt_count, member_count, priority
                FROM link_queue 
                WHERE status = 'QUEUED' 
                AND (next_retry_at IS NULL OR next_retry_at <= ?)
-               ORDER BY enqueued_at ASC LIMIT ?""",
+               ORDER BY priority ASC, member_count DESC NULLS LAST, enqueued_at ASC LIMIT ?""",
             (now, limit))
         rows = await cursor.fetchall()
         return [{'id': r[0], 'raw_link': r[1], 'normalized_link': r[2], 'link_type': r[3],
                  'username': r[4], 'invite_hash': r[5], 'msg_id': r[6], 'group_name': r[7],
                  'sender_name': r[8], 'sender_contact': r[9], 'source_phone': r[10],
-                 'message_text': r[11], 'message_link': r[12], 'attempt_count': r[13]} for r in rows]
+                 'message_text': r[11], 'message_link': r[12], 'attempt_count': r[13],
+                 'member_count': r[14], 'priority': r[15]} for r in rows]
+
+    async def update_link_priority(self, link_id: int, member_count: int) -> None:
+        """يحدّث member_count و priority لرابط في القائمة.
+
+        priority:
+          1 = HIGH (>= 10,000 عضو)
+          2 = MEDIUM (>= 1,000 عضو)
+          3 = LOW (< 1,000 أو غير معروف)
+        """
+        if member_count is None or member_count <= 0:
+            priority = 3
+        elif member_count >= 10000:
+            priority = 1
+        elif member_count >= 1000:
+            priority = 2
+        else:
+            priority = 3
+
+        conn = await self._conn()
+        await conn.execute(
+            """UPDATE link_queue SET member_count = ?, priority = ? WHERE id = ?""",
+            (member_count, priority, link_id))
+        await conn.commit()
+
+    async def get_unscored_links(self, limit: int = 10) -> List[dict]:
+        """يجلب روابط QUEUED بدون member_count — لأخذ الأولوية.
+
+        تُستخدم من قبل مهمة _priority_scorer الخلفية.
+        """
+        conn = await self._conn()
+        cursor = await conn.execute(
+            """SELECT id, raw_link, normalized_link, link_type, username
+               FROM link_queue
+               WHERE status = 'QUEUED' AND member_count IS NULL
+               ORDER BY enqueued_at ASC LIMIT ?""",
+            (limit,))
+        rows = await cursor.fetchall()
+        return [{'id': r[0], 'raw_link': r[1], 'normalized_link': r[2],
+                 'link_type': r[3], 'username': r[4]} for r in rows]
 
     async def update_queue_status(self, link_id: int, status: str, error: str = None, next_retry: datetime = None):
         """يحدّث حالة رابط في القائمة."""

@@ -4646,13 +4646,19 @@ class Monitor:
                     await reply(f"❌ خطأ: {e}")
 
             elif cmd == "/queue":
-                # === عرض محتويات القائمة ===
+                # === عرض محتويات القائمة + الأولوية ===
                 logging.info("[QUEUE] /queue command invoked")
                 try:
                     conn = await self.db._ensure_conn()
+                    # إحصائيات الأولوية
                     cursor = await conn.execute(
-                        "SELECT id, raw_link, status, enqueued_at, next_retry_at, attempt_count, last_error "
-                        "FROM link_queue ORDER BY id DESC LIMIT 20")
+                        "SELECT priority, COUNT(*) FROM link_queue WHERE status = 'QUEUED' GROUP BY priority ORDER BY priority")
+                    priority_stats = await cursor.fetchall()
+
+                    # أحدث 20 رابط
+                    cursor = await conn.execute(
+                        "SELECT id, raw_link, status, enqueued_at, next_retry_at, attempt_count, last_error, member_count, priority "
+                        "FROM link_queue ORDER BY priority ASC, member_count DESC NULLS LAST, id DESC LIMIT 20")
                     rows = await cursor.fetchall()
 
                     queue_size = await self.prod_db.get_queue_size()
@@ -4662,9 +4668,20 @@ class Monitor:
                         f"═══════════════════════════",
                     ]
 
+                    # إحصائيات الأولوية
+                    if priority_stats:
+                        lines.append("📊 توزيع الأولوية:")
+                        for p, count in priority_stats:
+                            label = {1: '🔴 HIGH (10K+)', 2: '🟡 MEDIUM (1K+)', 3: '⚪ LOW'}.get(p, f'?{p}')
+                            lines.append(f"   {label}: {count}")
+                        lines.append("")
+
                     if rows:
                         for r in rows:
-                            lines.append(f"  id={r[0]} status={r[2]}")
+                            mc = r[7] if r[7] else '?'
+                            pr = r[8] if r[8] else 3
+                            pr_label = {1: '🔴', 2: '🟡', 3: '⚪'}.get(pr, '?')
+                            lines.append(f"  {pr_label} id={r[0]} status={r[2]} members={mc}")
                             lines.append(f"    link={r[1][:50]}")
                             lines.append(f"    attempts={r[5]} enqueued={r[3][:19] if r[3] else '?'}")
                             if r[4]:
@@ -5288,6 +5305,121 @@ class Monitor:
             except Exception as e:
                 logging.error(f"[SCHED] Error: {e}", exc_info=True)
                 await asyncio.sleep(60)
+
+    async def _priority_scorer(self):
+        """مهمة خلفية: تجلب member_count للروابط QUEUED بدون member_count.
+
+        تستخدم حساب المراقب (مو الفدائي) لـ get_entity على الروابط.
+        هذا يفصل بين:
+          - السحب (مراقب)
+          - فحص الأولوية (مراقب)
+          - الانضمام (فدائي)
+
+        الأولوية:
+          1 = HIGH: member_count >= 10,000 (تجمع عالي)
+          2 = MEDIUM: member_count >= 1,000
+          3 = LOW: < 1,000 أو غير معروف
+        """
+        await asyncio.sleep(60)  # انتظر البوت يكمل الإقلاع
+        logging.info("📊 Priority Scorer started — scores unscored links every 30s")
+        while self._running:
+            try:
+                # اجلب روابط بدون member_count
+                unscored = await self.prod_db.get_unscored_links(limit=5)
+                if not unscored:
+                    await asyncio.sleep(30)
+                    continue
+
+                # استخدم أول مراقب متصل
+                monitor_client = None
+                for phone, client in self.user_clients.items():
+                    if client and client.is_connected():
+                        # تأكد إنه مراقب مو فدائي
+                        try:
+                            w = await self.db._supabase_get_watcher(phone)
+                            if w and w.get('role') == 'monitor':
+                                monitor_client = client
+                                break
+                        except Exception:
+                            # fallback: استخدم أي حساب متصل
+                            monitor_client = client
+                            break
+
+                if not monitor_client:
+                    logging.debug("[SCORER] No monitor client connected — sleeping 60s")
+                    await asyncio.sleep(60)
+                    continue
+
+                for link_data in unscored:
+                    try:
+                        link_id = link_data['id']
+                        raw_link = link_data['raw_link']
+                        link_type = link_data.get('link_type', '')
+                        username = link_data.get('username', '')
+
+                        # WhatsApp — ما نقدر نجيب member_count
+                        if link_type == 'whatsapp' or 'chat.whatsapp.com' in (raw_link or ''):
+                            await self.prod_db.update_link_priority(link_id, 0)
+                            logging.debug(f"[SCORER] {link_id} WhatsApp — priority=3")
+                            continue
+
+                        # Telegram — استخرج username لو ما موجود
+                        if not username:
+                            import re as _re
+                            m = _re.search(r'(?:t\.me/|@)([A-Za-z0-9_]{3,})', raw_link or '')
+                            if m:
+                                username = m.group(1)
+
+                        if not username:
+                            await self.prod_db.update_link_priority(link_id, 0)
+                            continue
+
+                        # جلب entity للحصول على member_count
+                        from telethon.tl.functions.channels import GetFullChannelRequest
+                        from telethon.tl.functions.users import GetFullUserRequest
+                        from telethon.tl.types import Channel, Chat
+
+                        try:
+                            entity = await monitor_client.get_entity(username)
+                            member_count = 0
+                            if hasattr(entity, 'participants_count') and entity.participants_count:
+                                member_count = entity.participants_count
+                            elif isinstance(entity, (Channel, Chat)):
+                                # جرّب GetFullChannel للمجموعات الكبيرة
+                                try:
+                                    full = await monitor_client(GetFullChannelRequest(entity))
+                                    if full and full.full_chat:
+                                        member_count = full.full_chat.participants_count or 0
+                                except Exception:
+                                    pass
+
+                            await self.prod_db.update_link_priority(link_id, member_count)
+                            priority_label = 'HIGH' if member_count >= 10000 else ('MEDIUM' if member_count >= 1000 else 'LOW')
+                            logging.info(
+                                f"[SCORER] {link_id} @{username}: {member_count:,} members → priority={priority_label}"
+                            )
+                            await asyncio.sleep(1)  # تجنب rate limit
+                        except Exception as e:
+                            err_str = str(e)[:100]
+                            # لو المجموعة خاصة أو محذوفة → priority=3 (low) ونكمل
+                            if 'UsernameNotOccupied' in err_str or 'CHANNEL_PRIVATE' in err_str:
+                                await self.prod_db.update_link_priority(link_id, 0)
+                                logging.debug(f"[SCORER] {link_id} @{username}: private/deleted → priority=3")
+                            else:
+                                logging.warning(f"[SCORER] {link_id} error: {err_str}")
+                                await self.prod_db.update_link_priority(link_id, 0)
+
+                    except Exception as e:
+                        logging.error(f"[SCORER] link {link_data.get('id')}: {e}")
+                        await self.prod_db.update_link_priority(link_data.get('id'), 0)
+
+                await asyncio.sleep(5)  # فاصل قصير قبل الجولة التالية
+
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logging.error(f"[SCORER] outer error: {e}", exc_info=True)
+                await asyncio.sleep(30)
 
     async def _bulk_join_worker(self):
         """Bulk Join Worker — يقرأ روابط القناة ويحاول الانضمام لكل واحد.
@@ -6180,6 +6312,14 @@ class Monitor:
         else:
             logging.info("🚀 Join Worker already running — skip duplicate")
 
+        # ابدأ Priority Scorer — يجلب member_count للروابط بدون score
+        # هذا يخلّي المجدول يختار المجموعات الكبيرة (10K+) أولاً
+        if not hasattr(self, '_priority_scorer_task') or self._priority_scorer_task is None or self._priority_scorer_task.done():
+            self._priority_scorer_task = asyncio.create_task(self._priority_scorer())
+            logging.info("📊 Priority Scorer started (will fetch member_count for queue links)")
+        else:
+            logging.info("📊 Priority Scorer already running — skip duplicate")
+
     async def stop(self):
         """إيقاف نظيف لمنع تسريب الذاكرة
 
@@ -6209,7 +6349,8 @@ class Monitor:
                 except Exception: pass
 
         # إلغاء المهام مع timeout لمنع التعليق
-        tasks = [self._bot_task, self._keep_alive_task, self._joiner_task] + list(self._user_tasks.values()) + self._current_scan_tasks
+        scorer_task = getattr(self, '_priority_scorer_task', None)
+        tasks = [self._bot_task, self._keep_alive_task, self._joiner_task, scorer_task] + list(self._user_tasks.values()) + self._current_scan_tasks
         for t in tasks:
             if t and not t.done():
                 t.cancel()
