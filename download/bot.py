@@ -206,6 +206,11 @@ def extract_whatsapp_telegram_links(text: str) -> list:
         # استبعاد روابط الدردشة المباشرة (t.me/username?start=xxx)
         if "?start=" in link_lower or "?text=" in link_lower:
             continue
+        # استبعاد روابط الرسائل داخل القنوات (t.me/username/123)
+        # هذه روابط رسائل وليست دعوات لمجموعات
+        # الـ username صحيح لكن الرابط يشير لرسالة محددة
+        if re.search(r'^https?://t(?:elegram)?\.me/[A-Za-z0-9_]+/\d+', link, re.IGNORECASE):
+            continue
         if link and link not in links:
             links.append(link)
 
@@ -2067,7 +2072,8 @@ class MessageFormatter:
             "• /bulk_join_stop — إيقاف الانضمام الجماعي\n"
             "• /clear_floodwait — مسح FloodWait وإعادة تفعيل الانضمام\n"
             "• /ai_mode — عرض/تبديل فحص الذكاء الاصطناعي (on/off)\n"
-            "• /leave_bad_groups — مغادرة المجموعات السيئة (بيتكوين/عراقية/غير خليجية)\n\n"
+            "• /leave_bad_groups — مغادرة المجموعات السيئة (بيتكوين/عراقية/غير خليجية)\n"
+            "• /clean_queue — حذف روابط الرسائل (t.me/user/123) من Queue\n\n"
             "📌 أوامر تنظيف القناة:\n"
             "• /cleanup_preview — معاينة ما سيُحذف (بدون حذف فعلي)\n"
             "• /cleanup_links — حذف الروابط غير التعليمية والمكررة\n"
@@ -3327,7 +3333,7 @@ class Monitor:
                     '/pause_join', '/resume_join', '/set_role',
                     '/enable_joiner', '/disable_joiner', '/join_status',
                     '/verify', '/sqlite_check', '/clear_floodwait', '/ai_mode',
-                    '/leave_bad_groups',
+                    '/leave_bad_groups', '/clean_queue',
                     '/bulk_join', '/bulk_join_status', '/bulk_join_stop',
                     '/cleanup_preview', '/cleanup_links', '/cleanup_status',
                     '/live_audit', '/status', '/watchers', '/help',
@@ -4111,6 +4117,75 @@ class Monitor:
                     await reply(f"✅ تم مسح {count} سجل FloodWait\n▶️ تم إعادة تفعيل الانضمام")
                 except Exception as e:
                     logging.error(f"[CLEAR_FLOODWAIT] Error: {e}")
+                    await reply(f"❌ خطأ: {e}")
+
+            elif cmd == "/clean_queue":
+                # === تنظيف queue من روابط الرسائل (t.me/username/123) ===
+                import re as _re_clean
+                try:
+                    conn = await self.db._ensure_conn()
+                    # اجلب كل روابط QUEUED
+                    cursor = await conn.execute(
+                        "SELECT id, raw_link FROM link_queue WHERE status = 'QUEUED'")
+                    rows = await cursor.fetchall()
+
+                    # حدّد روابط الرسائل (t.me/username/123)
+                    msg_pattern = _re_clean.compile(
+                        r'^https?://t(?:elegram)?\.me/[A-Za-z0-9_]+/\d+', _re_clean.IGNORECASE
+                    )
+                    # كذلك روابط +private و joinchat المرفوضة
+                    bad_links = []
+                    for r in rows:
+                        link_id = r[0]
+                        link = r[1] or ''
+                        is_msg = bool(msg_pattern.match(link))
+                        is_private = '/+' in link or 'joinchat' in link.lower()
+                        if is_msg or is_private:
+                            bad_links.append((link_id, link, 'message' if is_msg else 'private'))
+
+                    # احذفها من queue
+                    if bad_links:
+                        ids_to_delete = [b[0] for b in bad_links]
+                        placeholders = ','.join('?' * len(ids_to_delete))
+                        cursor = await conn.execute(
+                            f"DELETE FROM link_queue WHERE id IN ({placeholders})",
+                            ids_to_delete
+                        )
+                        await conn.commit()
+                        deleted = cursor.rowcount
+
+                        # حدّث group_states للروابط المحذوفة
+                        for link_id, link, reason in bad_links:
+                            cursor = await conn.execute(
+                                "SELECT normalized_link FROM link_queue WHERE id = ?", (link_id,)
+                            )
+                            # normalized_link انحذف، نحسبه من raw_link
+                            from urllib.parse import unquote
+                            norm = link.lower().strip().rstrip('/')
+                            for sep in ('#', '?'):
+                                idx = norm.find(sep)
+                                if idx > 0:
+                                    norm = norm[:idx]
+
+                        await reply(
+                            f"🧹 تنظيف Queue\n\n"
+                            f"📊 الإحصائيات:\n"
+                            f"  • إجمالي QUEUED قبل التنظيف: {len(rows)}\n"
+                            f"  • روابط رسائل (t.me/user/123): {sum(1 for b in bad_links if b[2] == 'message')}\n"
+                            f"  • روابط خاصة (t.me/+xxx): {sum(1 for b in bad_links if b[2] == 'private')}\n"
+                            f"  • تم حذفها: {deleted}\n"
+                            f"  • QUEUED المتبقي: {len(rows) - deleted}\n\n"
+                            f"✅ الحين المجدول يقدر يركز على روابط المجموعات الحقيقية"
+                        )
+                        logging.info(f"[CLEAN_QUEUE] Deleted {deleted} bad links from queue")
+                    else:
+                        await reply(
+                            f"✅ Queue نظيف\n"
+                            f"📊 إجمالي QUEUED: {len(rows)}\n"
+                            f"لا توجد روابط رسائل أو خاصة للحذف"
+                        )
+                except Exception as e:
+                    logging.error(f"[CLEAN_QUEUE] Error: {e}", exc_info=True)
                     await reply(f"❌ خطأ: {e}")
 
             elif cmd == "/leave_bad_groups":
@@ -5293,9 +5368,10 @@ class Monitor:
                     logging.warning(f"[LINK id={link_id}] [PIPELINE-6] ⚠️ {phone} {status} — skipping")
 
                 elif status == "INVALID":
-                    state_to_set = GroupState.FAILED
+                    state_to_set = GroupState.BANNED  # لا إعادة محاولة
                     state_error = 'invalid_link'
                     final_status = 'DONE'  # فشل نهائي
+                    await self.metrics.record_skip('invalid_link')
                     logging.info(f"[LINK id={link_id}] [PIPELINE-6] ❌ invalid link (no username) — skipping")
 
                 elif status == "SKIP":
@@ -5303,9 +5379,10 @@ class Monitor:
                     logging.info(f"[LINK id={link_id}] [PIPELINE-6] ⏭️ WhatsApp link — no join needed")
 
                 elif status == "IS_CHANNEL":
-                    state_to_set = GroupState.FAILED
+                    state_to_set = GroupState.BANNED  # غيرت من FAILED لـ BANNED — لا إعادة محاولة
                     state_error = 'is_channel'
                     final_status = 'DONE'
+                    await self.metrics.record_skip('is_channel')
                     logging.info(f"[LINK id={link_id}] [PIPELINE-6] 📢 Skipped channel (broadcast): {raw_link[:50]}")
 
                 elif status == "PRIVATE":
