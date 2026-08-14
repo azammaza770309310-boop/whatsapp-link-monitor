@@ -300,3 +300,46 @@ Stage Summary:
   * كل methods متسقة (Tuple[bool, str])
   * 24 اختبار ناجح
 - الملفات: bot.py, download/bot.py, scripts/gulf_filter_v2.py, scripts/replace_filter.py
+
+---
+Task ID: PRIORITY-SCORER-6fd1acc
+Agent: main (Super Z)
+Task: إضافة نظام أولوية — البوت يعطي أولوية الانضمام للمجموعات الكبيرة (10K+ عضو).
+
+Work Log:
+- الطلب: البوت يركز على المجموعات ذات التجمع العالي (10,000+ عضو).
+- إضافة أعمدة جديدة لـ link_queue في link_system.py:
+  * member_count INTEGER — يخزن عدد الأعضاء
+  * priority INTEGER DEFAULT 3 — 1=HIGH, 2=MEDIUM, 3=LOW
+  * migration: ALTER TABLE ADD COLUMN للجداول القديمة
+  * index على (priority, status) للفرز السريع
+- تعديل get_queued_links():
+  * ORDER BY priority ASC, member_count DESC NULLS LAST, enqueued_at ASC
+  * يرجع member_count و priority في النتائج
+- إضافة method جديدة update_link_priority():
+  * >= 10,000 عضو → priority 1 (HIGH)
+  * >= 1,000 عضو → priority 2 (MEDIUM)
+  * < 1,000 أو غير معروف → priority 3 (LOW)
+- إضافة method get_unscored_links() — للروابط بدون member_count
+- إضافة مهمة _priority_scorer() الخلفية في bot.py:
+  * تعمل كل 30 ثانية
+  * تستخدم حساب المراقب (مو الفدائي)
+  * تجلب member_count عبر get_entity + GetFullChannelRequest
+  * تتعامل مع المجموعات الخاصة/المحذوفة
+  * تسجّل: [SCORER] id @username: 12,345 members → priority=HIGH
+- بدء المهمة في start() + إلغاؤها في stop()
+- تحسين /queue command:
+  * عرض توزيع الأولوية (HIGH/MEDIUM/LOW)
+  * عرض member_count لكل رابط
+  * رموز تعبيرية: 🔴 HIGH, 🟡 MEDIUM, ⚪ LOW
+- رفع لـ GitHub: 6fd1acc
+
+Stage Summary:
+- الروابط الجديدة تدخل القائمة priority=3 (غير معروف)
+- خلال 30 ثانية، الـ scorer يجلب member_count ويحدّث priority
+- المجدول يختار الروابط بهذا الترتيب:
+  1. HIGH (10K+ عضو) أولاً
+  2. MEDIUM (1K+ عضو) ثانياً
+  3. LOW (أقل من 1K أو غير معروف) أخيراً
+- ضمن نفس الأولوية، الأكثر أعضاءً يُختار أولاً
+- الملفات: bot.py, download/bot.py, link_system.py, download/link_system.py
