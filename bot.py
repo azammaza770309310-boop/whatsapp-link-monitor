@@ -4956,6 +4956,21 @@ class Monitor:
                 link_id = link_data.get('id', '?')
                 logging.info(f"[LINK id={link_id}] [PIPELINE-3] 🔄 cycle={cycle} Scheduler picked link: {raw_link[:60]} (type={link_type})")
 
+                # === WAIT FOR SCORER — لو member_count غير معروف، انتظر قليل ===
+                # Priority Scorer يحتاج 30 ثانية لفحص كل دفعة من الروابط.
+                # لو المجدول سبّق Scorer، الرابط ما عنده member_count وما نقدر نقرر.
+                # الحل: لو ما عنده member_count، أعدّه للقائمة بتأخير قصير.
+                if link_data.get('member_count') is None and link_type == 'telegram':
+                    logging.info(
+                        f"[LINK id={link_id}] [PIPELINE-3] ⏳ Waiting for Scorer — requeue in 60s"
+                    )
+                    await self.prod_db.update_queue_status(
+                        link_data['id'], 'QUEUED',
+                        next_retry=datetime.now() + timedelta(seconds=60)
+                    )
+                    await asyncio.sleep(5)
+                    continue
+
                 # 2. تحقق من حالة المجموعة في State Machine
                 state = await self.prod_db.get_group_state(normalized)
                 if state in (GroupState.JOINED, GroupState.ALREADY_MEMBER):
@@ -5085,6 +5100,30 @@ class Monitor:
                     f"[LINK id={link_id}] [PIPELINE-6] ✅ GULF FILTER PASSED: "
                     f"{raw_link[:60]} (reason={filter_reason})"
                 )
+
+                # === MEMBER COUNT CHECK — لا تنضم لأقل من 1000 عضو ===
+                # إذا member_count معروف (تم فحصه من Priority Scorer):
+                #   - < 1,000 → REJECT (لا تنضم)
+                #   - 1,000+ → اقبل
+                #   - NULL (ما تم فحصه بعد) → اقبل (انتظار Scorer)
+                member_count = link_data.get('member_count')
+                if member_count is not None and member_count < 1000:
+                    logging.info(
+                        f"[LINK id={link_id}] [PIPELINE-6] 🚫 LOW MEMBER COUNT: "
+                        f"{raw_link[:60]} (members={member_count}, threshold=1000) — skipping"
+                    )
+                    await self.prod_db.set_group_state(
+                        normalized, GroupState.BANNED, raw_link,
+                        error=f'low_member_count_{member_count}'
+                    )
+                    await self.prod_db.update_queue_status(link_data['id'], 'DONE')
+                    await self.metrics.record_skip('low_member_count')
+                    continue
+
+                if member_count is not None:
+                    logging.info(
+                        f"[LINK id={link_id}] [PIPELINE-6] 👥 Member count OK: {member_count:,} (>= 1000)"
+                    )
 
                 joiners = await self.db.get_watchers_by_role("joiner")
                 if not joiners:
