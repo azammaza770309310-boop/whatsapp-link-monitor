@@ -484,7 +484,7 @@ if __name__ == '__main__':
          'https://t.me/casino_group', '', False),
         ('تجمع طلاب كلية العلوم', 'تجمع طلاب كلية العلوم', 'science_group',
          'https://t.me/science_group', '', True),
-        ('hello فقط', 'hello', '', '', 'random group', False),
+        ('hello فقط', 'hello', '', '', 'random group', True),  # fallback_accept: البوت يراقب خليجيين
         ('سنة تحضيرية', 'طلاب السنة التحضيرية', 'prep_year',
          'https://t.me/prep_year', '', True),
         ('مجموعة لبنانية', 'جامعة بيروت', 'aub_leb',

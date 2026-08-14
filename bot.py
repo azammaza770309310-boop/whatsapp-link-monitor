@@ -1451,18 +1451,17 @@ class GulfFilter:
     # القوائم السوداء — مقسّمة لفئات منطقية (من DeepSeek + توسعات)
     # ==================================================================
     BLACKLIST_CRYPTO_INVEST = [
-        # إنجليزي
+        # إنجليزي — كلمات دقيقة فقط (تجنب false positives من الكلمات القصيرة)
         'bitcoin', 'btc', 'crypto', 'cryptocurrency', 'blockchain',
-        'forex', 'trading', 'stocks', 'stock', 'profit', 'money',
-        'earn', 'income', 'passive', 'airdrop', 'nft', 'binance',
-        'coinbase', 'coin', 'token', 'tokens', 'defi', 'web3',
-        'pump', 'dump', 'signal', 'signals', 'fx', 'cfd', 'leverage',
-        'trade', 'investment', 'mining',
+        'forex', 'trading', 'stocks', 'profit', 'airdrop',
+        'binance', 'coinbase', 'defi', 'web3',
+        'pump and dump', 'cfd', 'leverage',
+        'investment', 'mining crypto',
         # عربي
         'بيتكوين', 'كريبتو', 'عملة رقمية', 'عملات رقمية',
         'استثمار', 'استثماري', 'تداول', 'فوركس', 'بورصة', 'اسهم', 'سهم',
-        'ربح', 'ارباح', 'دولار', 'دولارات', 'ايردروب',
-        'بينانس', 'اشارات', 'رافعة', 'هايف', 'هيفي',
+        'ربح', 'ارباح', 'دولار', 'ايردروب',
+        'بينانس', 'اشارات', 'رافعة',
     ]
 
     BLACKLIST_GAMBLING = [
@@ -1516,16 +1515,22 @@ class GulfFilter:
     ]
 
     BLACKLIST_SOCIAL = [
-        'sub4sub', 'follow4follow', 'like4like', 'متابعين', 'لايكات',
-        'followers', 'subscribers', 'تيك توك', 'يوتيوب', 'سناب',
-        'tiktok', 'youtube', 'snapchat', 'instagram', 'انستقرام',
+        # عبارات تبادل متابعين
+        'sub4sub', 'follow4follow', 'like4like',
+        'متابعين', 'لايكات', 'تبادل متابعين',
+        # أسماء منصات (فقط لو مستخدمة كإعلان)
+        'تيك توك', 'انستقرام',
+        'tiktok', 'instagram',
     ]
 
     BLACKLIST_SHOPS = [
+        # عربي — محدد
         'متجر', 'متاجر', 'تسوق', 'شراء', 'بيع', 'سعر', 'خصم', 'عرض خاص',
-        'store', 'shop', 'buy', 'sell', 'price', 'discount',
         'متوفر', 'للبيع', 'للإيجار', 'توصيل', 'شحن',
-        'خدمات', 'باقات', 'باقة', 'اشتراك', 'مدفوع',
+        'خدمات مدفوعة', 'باقات', 'باقة', 'اشتراك', 'مدفوع',
+        # إنجليزي — عبارات مركبة فقط (تجنب false positives)
+        'for sale', 'online store', 'online shop',
+        'discount code', 'promo code',
     ]
 
     # القائمة السوداء الموحدة (للفحص السريع)
@@ -1860,8 +1865,12 @@ class GulfFilter:
         if is_edu:
             return True, edu_reason
 
-        # 6. احتياطي — لا تنضم لمجهول
-        return False, f'not_confirmed_{edu_reason}'
+        # 6. احتياطي — لو ما في أي مطابقة:
+        # البوت يراقب أصلاً مجموعات خليجية، فالروابط اللي تجي منها
+        # على الأرجح خليجية حتى لو ما فيها اسم جامعة.
+        # نقبلها بدل ما نرفضها (تجنب توقف الانضمام بالكامل).
+        # الرفض الوحيد يكون من القائمة السوداء (خطوة 1).
+        return True, f'fallback_accept_from_gulf_monitor_{edu_reason}'
 
 # Alias — EducationalFilter هو الاسم القديم المستخدم في باقي الكود
 EducationalFilter = GulfFilter
