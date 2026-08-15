@@ -6180,10 +6180,11 @@ class Monitor:
         if daily_joins >= daily_limit:
             return False, f'daily_limit_{daily_joins}/{daily_limit}'
 
-        # 3. Hourly Join Limit (DB-backed, survives restart) — conservative: 1/hour
+        # 3. Hourly Join Limit (DB-backed, survives restart) — محافظ جداً
+        # تيليجرام يlimitk لو تجاوزت 5 انضمامات/ساعة على UserBot
         hourly_joins = await self.prod_db.count_operations(phone, 'join', 3600)
-        if hourly_joins >= 50:  # 50/hour max
-            return False, f'hourly_limit_{hourly_joins}/50'
+        if hourly_joins >= 5:  # 5/hour max (آمن ضد FloodWait)
+            return False, f'hourly_limit_{hourly_joins}/5'
 
         # 4. Group Reputation — تم إزالته (تخفيف)
         # كان يمنع الانضمام للمجموعات الجديدة، الآن مسموح
@@ -6196,7 +6197,7 @@ class Monitor:
             return False, f'already_attempted_{state}'
         # تم إزالة فحص attempt_count >= 3 (تخفيف)
 
-        # 6. Last join timestamp for this account — 600s (10 min) minimum between joins
+        # 6. Last join timestamp for this account — 120s (2 min) minimum between joins
         # اقرأ من Supabase (المصدر الوحيد) — ليس من SQLite watchers
         w = await self.db._supabase_get_watcher(phone)
         if w and w.get('last_join_timestamp'):
@@ -6204,8 +6205,8 @@ class Monitor:
                 last_join_ts = w['last_join_timestamp']
                 last_join = datetime.fromisoformat(str(last_join_ts).replace('Z', '+00:00')) if isinstance(last_join_ts, str) else last_join_ts
                 elapsed = (datetime.now() - last_join.replace(tzinfo=None)).total_seconds()
-                if elapsed < 30:  # 30s cooldown
-                    return False, f'join_cooldown_{int(30-elapsed)}s'
+                if elapsed < 120:  # 120s cooldown (آمن ضد FloodWait)
+                    return False, f'join_cooldown_{int(120-elapsed)}s'
             except Exception:
                 pass
 
@@ -6213,17 +6214,22 @@ class Monitor:
 
     async def _get_daily_limit(self, phone: str) -> int:
         """يجلب الحد اليومي للانضمام حسب نوع الحساب.
-        joiner: 2/day, backup: 1/day, monitor: 0
 
-        اقرأ role من Supabase (المصدر الوحيد) — ليس من SQLite watchers.
+        تحذير: تيليجرام يفرض FloodWait على UserBot لو تجاوز ~30 انضمام/يوم.
+        الأرقام السابقة (200/day) كانت تسبب FloodWait 16+ ساعة.
+
+        القيم الحالية محافظة جداً:
+        - joiner: 25/day (آمن)
+        - backup: 5/day
+        - monitor: 0
         """
         w = await self.db._supabase_get_watcher(phone)
         role = w.get('role', 'monitor') if w else 'monitor'
 
         if role == 'joiner':
-            return int(os.getenv('DAILY_JOIN_LIMIT', '200'))  # 200/day
+            return int(os.getenv('DAILY_JOIN_LIMIT', '25'))  # 25/day (آمن)
         elif role == 'backup':
-            return int(os.getenv('DAILY_BACKUP_LIMIT', '5'))  # 5/day (تخفيف)
+            return int(os.getenv('DAILY_BACKUP_LIMIT', '5'))  # 5/day
         else:
             return 0  # monitor: لا انضمام
 
@@ -7216,11 +7222,12 @@ async def main():
     else:
         logging.info("📡 Production Mode: Real Telegram API calls enabled")
 
-    # 4. Join limits (optimized for batch processing)
-    daily_limit = os.getenv('DAILY_JOIN_LIMIT', '200')
-    logging.info(f"📊 Daily Join Limit: {daily_limit}/day")
-    logging.info(f"📊 Hourly Join Limit: 50/hour")
-    logging.info(f"📊 Join Cooldown: 15s")
+    # 4. Join limits (optimized to AVOID FloodWait)
+    daily_limit = os.getenv('DAILY_JOIN_LIMIT', '25')
+    logging.info(f"📊 Daily Join Limit: {daily_limit}/day (safe)")
+    logging.info(f"📊 Hourly Join Limit: 5/hour (safe)")
+    logging.info(f"📊 Join Cooldown: 120s (2 min between joins)")
+    logging.info(f"⚠️  These limits are intentionally conservative to prevent FloodWait")
 
     # ===== Startup Verification — تأكد من وجود حسابات في Supabase =====
     logging.info("━" * 60)
