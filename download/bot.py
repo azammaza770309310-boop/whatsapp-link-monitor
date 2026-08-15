@@ -5589,6 +5589,7 @@ class Monitor:
             total_skipped_msg_links = 0
             total_skipped_already_joined = 0
             total_skipped_private = 0
+            total_skipped_duplicate = 0  # روابط QUEUED بالفعل
 
             await self._send(f"📖 [REJOIN] بدأ فحص رسائل القناة (حد {max_messages} رسالة)...")  # noqa: ignore result
 
@@ -5668,12 +5669,17 @@ class Monitor:
                                     'source_phone': monitor_phone,
                                     'message_text': text[:200],
                                 }
-                                enqueued = await self.prod_db.enqueue_link(link_data_for_queue)
+                                # allow_requeue=True: لو الرابط موجود لكنه DONE، أعد لـ QUEUED
+                                enqueued = await self.prod_db.enqueue_link(
+                                    link_data_for_queue, allow_requeue=True
+                                )
                                 if enqueued:
                                     total_readded += 1
                                     if total_readded % 50 == 0:
                                         logging.info(f"[REJOIN] Re-added {total_readded} links so far")
                                         await self._send(f"📖 [REJOIN] تمت إعادة {total_readded} رابط للقائمة")  # noqa: ignore result
+                                else:
+                                    total_skipped_duplicate += 1
                             except Exception as e:
                                 logging.debug(f"[REJOIN] enqueue error for {link[:50]}: {e}")
 
@@ -5694,10 +5700,12 @@ class Monitor:
                 f"📊 الإحصائيات:\n"
                 f"  • رسائل مُفحوصة: {total_scanned}\n"
                 f"  • روابط أُعيدت للقائمة: {total_readded}\n"
-                f"  • تخطّى روابط رسائل: {total_skipped_msg_links}\n"
-                f"  • تخطّى روابط خاصة: {total_skipped_private}\n"
-                f"  • تخطّى منضم مسبقاً: {total_skipped_already_joined}\n\n"
-                f"🎯 المجدول سيبدأ معالجة الروابط الجديدة تلقائياً"
+                f"  • تخطّى روابط رسائل (t.me/u/123): {total_skipped_msg_links}\n"
+                f"  • تخطّى روابط خاصة (t.me/+xxx): {total_skipped_private}\n"
+                f"  • تخطّى منضم مسبقاً: {total_skipped_already_joined}\n"
+                f"  • تخطّى QUEUED بالفعل: {total_skipped_duplicate}\n\n"
+                f"🎯 المجدول سيبدأ معالجة الروابط الجديدة تلقائياً\n"
+                f"📊 Queue depth الحالي: {await self.prod_db.get_queue_size()}"
             )
             logging.info(f"[REJOIN] Done: {total_readded} re-added")
             await self._send(report)  # noqa: ignore result

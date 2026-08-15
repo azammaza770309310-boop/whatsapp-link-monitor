@@ -773,12 +773,22 @@ class ProductionDB:
 
     # === Link Queue ===
 
-    async def enqueue_link(self, link_data: dict) -> bool:
-        """يضيف رابط لقائمة الانتظار. يعيد True لو جديد، False لو مكرر."""
+    async def enqueue_link(self, link_data: dict, allow_requeue: bool = False) -> bool:
+        """يضيف رابط لقائمة الانتظار.
+
+        Args:
+            link_data: dict يحتوي على raw, normalized, link_type, username, ...
+            allow_requeue: لو True، يعيد الرابط لـ QUEUED لو كان DONE/REJECTED سابقاً
+
+        Returns:
+            True لو انضاف جديد أو أُعيد لـ QUEUED
+            False لو مكرر وباقي QUEUED (ما يحتاج إعادة)
+        """
         conn = await self._conn()
         try:
+            # محاولة إدخال جديد
             cursor = await conn.execute(
-                """INSERT OR IGNORE INTO link_queue 
+                """INSERT OR IGNORE INTO link_queue
                 (raw_link, normalized_link, link_type, username, invite_hash, msg_id,
                  group_name, sender_name, sender_contact, source_phone, message_text, message_link, status)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'QUEUED')""",
@@ -789,10 +799,42 @@ class ProductionDB:
                  link_data.get('message_text', ''), link_data.get('message_link'))
             )
             await conn.commit()
-            return cursor.rowcount > 0  # True لو انضاف جديد، False لو مكرر (IGNORE)
+            if cursor.rowcount > 0:
+                return True  # انضاف جديد
+
+            # لو ما انضاف (مكرر) و allow_requeue=True — حاول إعادة لـ QUEUED
+            if allow_requeue:
+                cursor = await conn.execute(
+                    """UPDATE link_queue
+                       SET status = 'QUEUED',
+                           member_count = NULL,
+                           priority = 3,
+                           next_retry_at = NULL,
+                           attempt_count = 0,
+                           last_error = NULL
+                       WHERE normalized_link = ?
+                       AND status IN ('DONE', 'REJECTED', 'FAILED')""",
+                    (link_data['normalized'],)
+                )
+                await conn.commit()
+                if cursor.rowcount > 0:
+                    logging.info(f"[ENQUEUE] Re-queued: {link_data['raw'][:50]}")
+                    return True
+
+            return False
         except Exception as e:
             logging.error(f"Enqueue error: {e}")
             return False
+
+    async def get_link_status(self, normalized_link: str) -> Optional[str]:
+        """يجيب status رابط في queue."""
+        conn = await self._conn()
+        cursor = await conn.execute(
+            "SELECT status FROM link_queue WHERE normalized_link = ?",
+            (normalized_link,)
+        )
+        row = await cursor.fetchone()
+        return row[0] if row else None
 
     async def get_queued_links(self, limit: int = 1) -> List[dict]:
         """يجلب روابط QUEUED جاهزة للمعالجة — مرتبة حسب الأولوية.
