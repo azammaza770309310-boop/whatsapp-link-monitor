@@ -236,6 +236,65 @@ async def run_tests():
         print(f"❌ Test 7 FAILED: mc={mc}, pri={pri}, attempts={att}")
         failed += 1
 
+    # === Test 8: كلمات false positives مُزالة ===
+    import sys as _sys
+    _sys.path.insert(0, '/home/z/my-project')
+
+    # اقرأ الكلاس من bot.py
+    with open('/home/z/my-project/bot.py', 'r') as f:
+        bot_content = f.read()
+
+    start = bot_content.find('class GulfFilter:')
+    end = bot_content.find('# Alias — EducationalFilter')
+    if start > 0 and end > 0:
+        filter_code = bot_content[start:end]
+
+        # exec مع globals مشتركة
+        g = globals()
+        # import داخل exec
+        filter_code_with_imports = "import re\nfrom typing import Tuple, List, Optional\n" + filter_code
+        exec(filter_code_with_imports, g)
+
+        GulfFilter = g['GulfFilter']
+
+        # اختبر إن "بيع" ما عادت في blacklist
+        is_bad, reason = GulfFilter.is_blacklisted('مجموعة طلاب لبيع الكتب', '', '', '')
+        if is_bad:
+            print(f"❌ Test 8 FAILED: 'بيع' shouldn't be blacklisted (got: {reason})")
+            failed += 1
+        else:
+            print("✅ Test 8 PASSED: 'بيع' no longer blacklisted (false positive removed)")
+            passed += 1
+
+        # اختبر إن "توصيل" ما عادت
+        is_bad, reason = GulfFilter.is_blacklisted('توصيل مجاني للطلاب', '', '', '')
+        if is_bad:
+            print(f"❌ Test 9 FAILED: 'توصيل' shouldn't be blacklisted (got: {reason})")
+            failed += 1
+        else:
+            print("✅ Test 9 PASSED: 'توصيل' no longer blacklisted")
+            passed += 1
+
+        # اختبر إن "بيتكوين" لسه محظورة
+        is_bad, reason = GulfFilter.is_blacklisted('ربح من بيتكوين', '', '', '')
+        if is_bad:
+            print(f"✅ Test 10 PASSED: 'بيتكوين' still blacklisted ({reason})")
+            passed += 1
+        else:
+            print("❌ Test 10 FAILED: 'بيتكوين' should be blacklisted")
+            failed += 1
+
+        # اختبر إن "متجر" لسه محظور
+        is_bad, reason = GulfFilter.is_blacklisted('متجر إلكتروني', '', '', '')
+        if is_bad:
+            print(f"✅ Test 11 PASSED: 'متجر' still blacklisted ({reason})")
+            passed += 1
+        else:
+            print("❌ Test 11 FAILED: 'متجر' should be blacklisted")
+            failed += 1
+    else:
+        print("⚠️  Test 8-11 SKIPPED: could not extract GulfFilter class")
+
     print("\n" + "=" * 70)
     print(f"النتيجة: {passed}/{passed + failed} نجح")
     if failed == 0:

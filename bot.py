@@ -1529,13 +1529,12 @@ class GulfFilter:
     ]
 
     BLACKLIST_SHOPS = [
-        # عربي — محدد
-        'متجر', 'متاجر', 'تسوق', 'شراء', 'بيع', 'سعر', 'خصم', 'عرض خاص',
-        'متوفر', 'للبيع', 'للإيجار', 'توصيل', 'شحن',
-        'خدمات مدفوعة', 'باقات', 'باقة', 'اشتراك', 'مدفوع',
-        # إنجليزي — عبارات مركبة فقط (تجنب false positives)
-        'for sale', 'online store', 'online shop',
-        'discount code', 'promo code',
+        # عربي — محدد (بدون كلمات شائعة مثل بيع/شراء/توصيل)
+        'متجر', 'متاجر', 'تسوق',
+        'للبيع', 'للإيجار',
+        'خدمات مدفوعة', 'باقات', 'باقة اشتراك', 'اشتراك مدفوع',
+        'متجر إلكتروني', 'online store', 'online shop',
+        'discount code', 'promo code', 'كود خصم',
     ]
 
     # القائمة السوداء الموحدة (للفحص السريع)
@@ -4757,7 +4756,7 @@ class Monitor:
                     if priority_stats:
                         lines.append("📊 توزيع الأولوية:")
                         for p, count in priority_stats:
-                            label = {1: '🔴 HIGH (10K+)', 2: '🟡 MEDIUM (1K+)', 3: '⚪ LOW'}.get(p, f'?{p}')
+                            label = {1: '🔴 HIGH (5K+)', 2: '🟡 MEDIUM (1K+)', 3: '⚪ LOW (500+)'}.get(p, f'?{p}')
                             lines.append(f"   {label}: {count}")
                         lines.append("")
 
@@ -5186,16 +5185,16 @@ class Monitor:
                     f"{raw_link[:60]} (reason={filter_reason})"
                 )
 
-                # === MEMBER COUNT CHECK — لا تنضم لأقل من 1000 عضو ===
+                # === MEMBER COUNT CHECK — لا ينضم لأقل من 500 عضو ===
                 # إذا member_count معروف (تم فحصه من Priority Scorer):
-                #   - < 1,000 → REJECT (لا تنضم)
-                #   - 1,000+ → اقبل
+                #   - < 500 → REJECT (لا ينضم — مجموعة صغيرة جداً)
+                #   - 500+ → اقبل
                 #   - NULL (ما تم فحصه بعد) → اقبل (انتظار Scorer)
                 member_count = link_data.get('member_count')
-                if member_count is not None and member_count < 1000:
+                if member_count is not None and member_count < 500:
                     logging.info(
                         f"[LINK id={link_id}] [PIPELINE-6] 🚫 LOW MEMBER COUNT: "
-                        f"{raw_link[:60]} (members={member_count}, threshold=1000) — skipping"
+                        f"{raw_link[:60]} (members={member_count}, threshold=500) — skipping"
                     )
                     await self.prod_db.set_group_state(
                         normalized, GroupState.BANNED, raw_link,
@@ -5520,7 +5519,7 @@ class Monitor:
                                     pass
 
                             await self.prod_db.update_link_priority(link_id, member_count)
-                            priority_label = 'HIGH' if member_count >= 10000 else ('MEDIUM' if member_count >= 1000 else 'LOW')
+                            priority_label = 'HIGH' if member_count >= 5000 else ('MEDIUM' if member_count >= 1000 else ('LOW' if member_count >= 500 else 'REJECT'))
                             logging.info(
                                 f"[SCORER] {link_id} @{username}: {member_count:,} members → priority={priority_label}"
                             )
@@ -5658,7 +5657,9 @@ class Monitor:
                             if not username:
                                 continue
 
-                            # أعد إدخال الرابط في queue
+                            # أعد إدخال الرابط في queue (بدون requeue — تجنب duplicates)
+                            # allow_requeue=False: ما يعيد روابط QUEUED أو DONE
+                            # فقط روابط جديدة تنضاف
                             try:
                                 link_data_for_queue = {
                                     'raw': link,
@@ -5669,9 +5670,9 @@ class Monitor:
                                     'source_phone': monitor_phone,
                                     'message_text': text[:200],
                                 }
-                                # allow_requeue=True: لو الرابط موجود لكنه DONE، أعد لـ QUEUED
+                                # allow_requeue=False: فقط روابط جديدة (ما يعيد QUEUED)
                                 enqueued = await self.prod_db.enqueue_link(
-                                    link_data_for_queue, allow_requeue=True
+                                    link_data_for_queue, allow_requeue=False
                                 )
                                 if enqueued:
                                     total_readded += 1

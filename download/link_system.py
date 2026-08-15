@@ -866,16 +866,19 @@ class ProductionDB:
         """يحدّث member_count و priority لرابط في القائمة.
 
         priority:
-          1 = HIGH (>= 10,000 عضو)
+          1 = HIGH (>= 5,000 عضو)
           2 = MEDIUM (>= 1,000 عضو)
-          3 = LOW (< 1,000 أو غير معروف)
+          3 = LOW (>= 500 عضو)
+          4 = REJECT (< 500 عضو — ما ينضم)
         """
         if member_count is None or member_count <= 0:
             priority = 3
-        elif member_count >= 10000:
+        elif member_count >= 5000:
             priority = 1
         elif member_count >= 1000:
             priority = 2
+        elif member_count >= 500:
+            priority = 3
         else:
             priority = 3
 
