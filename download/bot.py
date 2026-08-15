@@ -2073,7 +2073,8 @@ class MessageFormatter:
             "• /clear_floodwait — مسح FloodWait وإعادة تفعيل الانضمام\n"
             "• /ai_mode — عرض/تبديل فحص الذكاء الاصطناعي (on/off)\n"
             "• /leave_bad_groups — مغادرة المجموعات السيئة (بيتكوين/عراقية/غير خليجية)\n"
-            "• /clean_queue — حذف روابط الرسائل (t.me/user/123) من Queue\n\n"
+            "• /clean_queue — حذف روابط الرسائل (t.me/user/123) من Queue\n"
+            "• /rejoin_published — إعادة قراءة رسائل القناة وإدخال الروابط في Queue\n\n"
             "📌 أوامر تنظيف القناة:\n"
             "• /cleanup_preview — معاينة ما سيُحذف (بدون حذف فعلي)\n"
             "• /cleanup_links — حذف الروابط غير التعليمية والمكررة\n"
@@ -3333,7 +3334,7 @@ class Monitor:
                     '/pause_join', '/resume_join', '/set_role',
                     '/enable_joiner', '/disable_joiner', '/join_status',
                     '/verify', '/sqlite_check', '/clear_floodwait', '/ai_mode',
-                    '/leave_bad_groups', '/clean_queue',
+                    '/leave_bad_groups', '/clean_queue', '/rejoin_published',
                     '/bulk_join', '/bulk_join_status', '/bulk_join_stop',
                     '/cleanup_preview', '/cleanup_links', '/cleanup_status',
                     '/live_audit', '/status', '/watchers', '/help',
@@ -4154,19 +4155,6 @@ class Monitor:
                         await conn.commit()
                         deleted = cursor.rowcount
 
-                        # حدّث group_states للروابط المحذوفة
-                        for link_id, link, reason in bad_links:
-                            cursor = await conn.execute(
-                                "SELECT normalized_link FROM link_queue WHERE id = ?", (link_id,)
-                            )
-                            # normalized_link انحذف، نحسبه من raw_link
-                            from urllib.parse import unquote
-                            norm = link.lower().strip().rstrip('/')
-                            for sep in ('#', '?'):
-                                idx = norm.find(sep)
-                                if idx > 0:
-                                    norm = norm[:idx]
-
                         await reply(
                             f"🧹 تنظيف Queue\n\n"
                             f"📊 الإحصائيات:\n"
@@ -4187,6 +4175,28 @@ class Monitor:
                 except Exception as e:
                     logging.error(f"[CLEAN_QUEUE] Error: {e}", exc_info=True)
                     await reply(f"❌ خطأ: {e}")
+
+            elif cmd == "/rejoin_published":
+                # === إعادة قراءة رسائل القناة وإدخال الروابط في queue ===
+                # يستخدم عندما queue فاضي والبوت ما عنده روابط جديدة
+                parts = text.split()
+                max_msgs = 5000
+                if len(parts) >= 2:
+                    try:
+                        max_msgs = int(parts[1])
+                    except ValueError:
+                        pass
+
+                await reply(
+                    f"📖 [REJOIN] بدأ فحص رسائل القناة...\n"
+                    f"   الحد الأقصى: {max_msgs} رسالة\n"
+                    f"   سأعيد إدخال الروابط الصالحة في queue\n"
+                    f"   (تخطّي روابط الرسائل والخاصة والمنضم لها)\n\n"
+                    f"⏳ سيستغرق عدة دقائق — سأرسل تقرير عند الانتهاء"
+                )
+
+                # شغّل المهمة في background
+                asyncio.create_task(self._rejoin_published_links(max_msgs))
 
             elif cmd == "/leave_bad_groups":
                 # === مغادرة المجموعات السيئة (بيتكوين/عراقية/غير خليجية) ===
@@ -5536,6 +5546,167 @@ class Monitor:
             except Exception as e:
                 logging.error(f"[SCORER] outer error: {e}", exc_info=True)
                 await asyncio.sleep(30)
+
+    async def _rejoin_published_links(self, max_messages: int = 5000):
+        """يقرأ رسائل القناة المنشورة سابقاً ويعيد إدخال الروابط الصالحة في queue.
+
+        يستخدم عندما queue فاضي والبوت ما عنده روابط جديدة للانضمام.
+        - يقرأ رسائل القناة من الأحدث للأقدم
+        - يستخرج الروابط منها
+        - يفلتر روابط الرسائل (t.me/user/123) والروابط الخاصة (t.me/+xxx)
+        - يفحص: هل المجموعة منضم لها بالفعل؟ (تخطّى)
+        - يدخل الرابط الصالح في queue (لو ما هو مكرر)
+        - Priority Scorer سيجلبه member_count، والمجدول سيعالجه
+        """
+        logging.info(f"[REJOIN] Starting — reading up to {max_messages} channel messages")
+        try:
+            # ابحث عن حساب مراقب متصل (مو فدائي)
+            monitor_client = None
+            monitor_phone = None
+            for phone, client in self.user_clients.items():
+                w = await self.db._supabase_get_watcher(phone)
+                if w and w.get('role') == 'monitor' and client and client.is_connected():
+                    monitor_client = client
+                    monitor_phone = phone
+                    break
+            if not monitor_client:
+                # fallback: أي حساب متصل
+                for phone, client in self.user_clients.items():
+                    if client and client.is_connected():
+                        monitor_client = client
+                        monitor_phone = phone
+                        break
+            if not monitor_client:
+                logging.error("[REJOIN] No connected client — aborting")
+                return 0
+
+            # اقرأ رسائل القناة
+            channel_id = self.config.channel_id
+            offset_id = 0
+            batch_size = 1000
+            total_readded = 0
+            total_scanned = 0
+            total_skipped_msg_links = 0
+            total_skipped_already_joined = 0
+            total_skipped_private = 0
+
+            await self._send(f"📖 [REJOIN] بدأ فحص رسائل القناة (حد {max_messages} رسالة)...")  # noqa: ignore result
+
+            while total_scanned < max_messages:
+                try:
+                    messages = await monitor_client.get_messages(
+                        channel_id, limit=batch_size, offset_id=offset_id, reverse=False
+                    )
+                    if not messages:
+                        logging.info("[REJOIN] No more messages")
+                        break
+
+                    for msg in messages:
+                        total_scanned += 1
+                        if total_scanned > max_messages:
+                            break
+
+                        text = msg.message or ''
+                        if not text:
+                            continue
+
+                        # استخرج الروابط من النص
+                        from link_system import LinkNormalizer, GroupState
+                        links_data = LinkNormalizer.extract_links(text)
+                        if not links_data:
+                            continue
+
+                        for link_info in links_data:
+                            link = link_info.get('raw', '')
+                            if not link:
+                                continue
+                            normalized = link_info.get('normalized', link.lower())
+                            link_lower = link.lower()
+
+                            # تخطّي روابط WhatsApp (ما نقدر ننضم)
+                            if 'chat.whatsapp.com' in link_lower or 'wa.me' in link_lower:
+                                continue
+
+                            # تخطّي روابط الرسائل (t.me/user/123)
+                            import re as _re_msg
+                            if _re_msg.search(r'^https?://t(?:elegram)?\.me/[A-Za-z0-9_]+/\d+', link, _re_msg.IGNORECASE):
+                                total_skipped_msg_links += 1
+                                continue
+
+                            # تخطّي روابط خاصة (t.me/+xxx, joinchat)
+                            if '/+' in link or 'joinchat' in link_lower:
+                                total_skipped_private += 1
+                                continue
+
+                            # تحقق من group_states — هل المجموعة منضم لها بالفعل؟
+                            state = await self.prod_db.get_group_state(normalized)
+                            if state in (GroupState.JOINED, GroupState.ALREADY_MEMBER):
+                                total_skipped_already_joined += 1
+                                continue
+                            if state == GroupState.BANNED:
+                                # ممنوعة — لا تعيد إدخالها
+                                continue
+
+                            # استخرج username
+                            username = link_info.get('username', '')
+                            if not username:
+                                m_user = _re_msg.search(r'(?:t\.me/|@)([A-Za-z0-9_]{3,})', link)
+                                if m_user:
+                                    username = m_user.group(1)
+
+                            if not username:
+                                continue
+
+                            # أعد إدخال الرابط في queue
+                            try:
+                                link_data_for_queue = {
+                                    'raw': link,
+                                    'normalized': normalized,
+                                    'link_type': 'telegram',
+                                    'username': username,
+                                    'group_name': '(من القناة المنشورة)',
+                                    'source_phone': monitor_phone,
+                                    'message_text': text[:200],
+                                }
+                                enqueued = await self.prod_db.enqueue_link(link_data_for_queue)
+                                if enqueued:
+                                    total_readded += 1
+                                    if total_readded % 50 == 0:
+                                        logging.info(f"[REJOIN] Re-added {total_readded} links so far")
+                                        await self._send(f"📖 [REJOIN] تمت إعادة {total_readded} رابط للقائمة")  # noqa: ignore result
+                            except Exception as e:
+                                logging.debug(f"[REJOIN] enqueue error for {link[:50]}: {e}")
+
+                    # حدّث offset_id
+                    offset_id = messages[-1].id
+                    if len(messages) < batch_size:
+                        break
+
+                    # انتظر قليل لتجنب FloodWait
+                    await asyncio.sleep(2)
+
+                except Exception as e:
+                    logging.error(f"[REJOIN] Error reading batch: {e}")
+                    break
+
+            report = (
+                f"✅ [REJOIN] اكتمل الفحص\n\n"
+                f"📊 الإحصائيات:\n"
+                f"  • رسائل مُفحوصة: {total_scanned}\n"
+                f"  • روابط أُعيدت للقائمة: {total_readded}\n"
+                f"  • تخطّى روابط رسائل: {total_skipped_msg_links}\n"
+                f"  • تخطّى روابط خاصة: {total_skipped_private}\n"
+                f"  • تخطّى منضم مسبقاً: {total_skipped_already_joined}\n\n"
+                f"🎯 المجدول سيبدأ معالجة الروابط الجديدة تلقائياً"
+            )
+            logging.info(f"[REJOIN] Done: {total_readded} re-added")
+            await self._send(report)  # noqa: ignore result
+            return total_readded
+
+        except Exception as e:
+            logging.error(f"[REJOIN] Fatal error: {e}", exc_info=True)
+            await self._send(f"❌ [REJOIN] خطأ: {e}")  # noqa: ignore result
+            return 0
 
     async def _bulk_join_worker(self):
         """Bulk Join Worker — يقرأ روابط القناة ويحاول الانضمام لكل واحد.
