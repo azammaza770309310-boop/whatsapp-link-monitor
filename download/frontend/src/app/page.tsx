@@ -55,7 +55,7 @@ interface CountryStat {
 
 // API base URL — البوت يخدم API endpoints على Render
 // هذا هو المصدر الوحيد للبيانات — لا نستخدم Supabase مباشرة (RLS مفعّل)
-const API_URL = process.env.NEXT_PUBLIC_API_URL || 'https://whatsapp-userbot-0xwu.onrender.com'
+const API_URL = process.env.NEXT_PUBLIC_API_URL || 'https://whatsapp-userbot-yzm7.onrender.com'
 // Supabase معطّل — RLS يمنع الوصول المباشر من الواجهة
 const SUPABASE_URL = ''
 const SUPABASE_KEY = ''
@@ -712,6 +712,14 @@ function JoinerDashboard() {
   const [joinedGroups, setJoinedGroups] = useState<JoinedGroup[]>([])
   const [joinerStats, setJoinerStats] = useState<JoinerStats | null>(null)
   const [loading, setLoading] = useState(true)
+  const [joinersData, setJoinersData] = useState<Array<{
+    phone: string; display_name: string; connected: boolean;
+    daily_joins: number; daily_limit: number; last_join_timestamp: string
+  }>>([])
+  const [joinersSummary, setJoinersSummary] = useState<{
+    total_joiners: number; connected_joiners: number;
+    total_joined_groups: number; total_already_member: number; total_banned: number
+  } | null>(null)
 
   const fetchJoinerData = useCallback(async () => {
     // استخدم API endpoint أولاً (المصدر الحقيقي من SQLite group_states)
@@ -730,43 +738,40 @@ function JoinerDashboard() {
           active_joiners: stats.active_joiners || 0
         })
         setLoading(false)
-        return
       }
     } catch {
-      // API غير متاح، جرب Supabase
+      // API غير متاح
     }
-    // Fallback: Supabase target_groups
+
+    // اجلب حالة الفدائيين من endpoint الجديد
+    try {
+      const response = await fetch(`${API_URL}/api/joiners_status`, {
+        headers: { 'Accept': 'application/json' }
+      })
+      if (response.ok) {
+        const data = await response.json()
+        setJoinersData(data.joiners || [])
+        setJoinersSummary(data.summary || null)
+        // حدّث الإحصائيات لو ما في data من /api/joined_groups
+        if (!joinerStats && data.summary) {
+          setJoinerStats({
+            total_joined: data.summary.total_joined_groups || 0,
+            pending_groups: 0,
+            active_joiners: data.summary.connected_joiners || 0
+          })
+        }
+      }
+    } catch {
+      // silent
+    }
+
+    // Fallback: لا يوجد Supabase مباشر
     if (!SUPABASE_URL || !SUPABASE_KEY) {
-      setJoinerStats({ total_joined: 0, pending_groups: 0, active_joiners: 0 })
-      setJoinedGroups([])
+      if (!joinerStats) {
+        setJoinerStats({ total_joined: 0, pending_groups: 0, active_joiners: 0 })
+      }
       setLoading(false)
       return
-    }
-    try {
-      const headers = { 'apikey': SUPABASE_KEY, 'Authorization': `Bearer ${SUPABASE_KEY}` }
-      const controller = new AbortController()
-      const timeout = setTimeout(() => controller.abort(), 10000)
-
-      const [joinedRes, pendingRes, joinersRes] = await Promise.all([
-        fetch(`${SUPABASE_URL}/rest/v1/target_groups?status=in.(JOINED,ALREADY_MEMBER)&order=join_date.desc&limit=50`, { headers, signal: controller.signal }),
-        fetch(`${SUPABASE_URL}/rest/v1/target_groups?status=eq.PENDING&select=id&limit=1`, { headers: { ...headers, Prefer: 'count=exact' } as any, signal: controller.signal }),
-        fetch(`${SUPABASE_URL}/rest/v1/watchers?role=eq.joiner&is_active=eq.true&select=id&limit=1`, { headers: { ...headers, Prefer: 'count=exact' } as any, signal: controller.signal }),
-      ])
-      clearTimeout(timeout)
-
-      const joined = joinedRes.ok ? ((await joinedRes.json()) || []) : []
-      const joinedArray = Array.isArray(joined) ? joined : []
-
-      const pendingCount = parseInt(pendingRes.headers.get('content-range')?.split('/')[1] || '0')
-      const joinerCount = parseInt(joinersRes.headers.get('content-range')?.split('/')[1] || '0')
-
-      setJoinedGroups(joinedArray)
-      setJoinerStats({ total_joined: joinedArray.length, pending_groups: isNaN(pendingCount) ? 0 : pendingCount, active_joiners: isNaN(joinerCount) ? 0 : joinerCount })
-      setLoading(false)
-    } catch {
-      setJoinerStats({ total_joined: 0, pending_groups: 0, active_joiners: 0 })
-      setJoinedGroups([])
-      setLoading(false)
     }
   }, [])
 
@@ -802,6 +807,40 @@ function JoinerDashboard() {
             <p className="text-xs text-slate-400 mt-1">حسابات فدائية نشطة</p>
           </div>
         </div>
+
+        {/* Joiners List — عرض كل الفدائيين وحالتهم */}
+        {joinersData.length > 0 && (
+          <div className="mb-4">
+            <h4 className="text-sm font-semibold text-slate-300 mb-2">🚀 حسابات الفدائيين:</h4>
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-2">
+              {joinersData.map((j) => (
+                <div key={j.phone} className="bg-slate-700/30 rounded-lg p-3 border border-slate-700">
+                  <div className="flex items-center justify-between mb-1">
+                    <span className="text-white font-mono text-xs">{j.phone}</span>
+                    <span className={`text-xs px-2 py-0.5 rounded ${
+                      j.connected ? 'bg-emerald-500/20 text-emerald-400' : 'bg-red-500/20 text-red-400'
+                    }`}>
+                      {j.connected ? '✅ متصل' : '❌ غير متصل'}
+                    </span>
+                  </div>
+                  <div className="text-xs text-slate-400 flex justify-between">
+                    <span>انضمامات اليوم: <span className="text-blue-400">{j.daily_joins}/{j.daily_limit}</span></span>
+                    {j.last_join_timestamp && (
+                      <span>آخر: {new Date(j.last_join_timestamp).toLocaleString('ar-SA', {hour: '2-digit', minute: '2-digit', day: 'numeric', month: 'short'})}</span>
+                    )}
+                  </div>
+                </div>
+              ))}
+            </div>
+            {joinersSummary && (
+              <div className="mt-2 text-xs text-slate-500 flex gap-4 flex-wrap">
+                <span>إجمالي الفدائيين: <span className="text-purple-400">{joinersSummary.total_joiners}</span></span>
+                <span>المتصلين: <span className="text-emerald-400">{joinersSummary.connected_joiners}</span></span>
+                <span>مجموعات ممنوعة: <span className="text-red-400">{joinersSummary.total_banned}</span></span>
+              </div>
+            )}
+          </div>
+        )}
 
         {/* Joined Groups Table */}
         {joinedGroups.length > 0 && (
