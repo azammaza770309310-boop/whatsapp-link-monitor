@@ -5185,16 +5185,16 @@ class Monitor:
                     f"{raw_link[:60]} (reason={filter_reason})"
                 )
 
-                # === MEMBER COUNT CHECK — لا ينضم لأقل من 500 عضو ===
+                # === MEMBER COUNT CHECK — لا ينضم لأقل من 1000 عضو ===
                 # إذا member_count معروف (تم فحصه من Priority Scorer):
-                #   - < 500 → REJECT (لا ينضم — مجموعة صغيرة جداً)
-                #   - 500+ → اقبل
-                #   - NULL (ما تم فحصه بعد) → اقبل (انتظار Scorer)
+                #   - < 1,000 → REJECT (لا ينضم — مجموعة صغيرة)
+                #   - 1,000+ → اقبل
+                #   - NULL (ما تم فحصه بعد) → انتظر Scorer (requeue)
                 member_count = link_data.get('member_count')
-                if member_count is not None and member_count < 500:
+                if member_count is not None and member_count < 1000:
                     logging.info(
                         f"[LINK id={link_id}] [PIPELINE-6] 🚫 LOW MEMBER COUNT: "
-                        f"{raw_link[:60]} (members={member_count}, threshold=500) — skipping"
+                        f"{raw_link[:60]} (members={member_count}, threshold=1000) — skipping"
                     )
                     await self.prod_db.set_group_state(
                         normalized, GroupState.BANNED, raw_link,
@@ -5249,13 +5249,32 @@ class Monitor:
                     await asyncio.sleep(60)
                     continue
 
-                # 5. Membership Cache Check
+                # 5. Membership Check — افحص كل الفدائيين، مو بس المختار
+                # هذا يمنع انضمام فدائي ثاني لنفس المجموعة
                 if link_type == 'telegram':
-                    logging.info(f"[LINK id={link_id}] [PIPELINE-6] Checking membership for {phone}...")
-                    is_member = await self.membership_cache.check_membership(phone, normalized, client)
-                    if is_member is True:
-                        logging.info(f"[LINK id={link_id}] [PIPELINE-6] {phone} already member — skipping")
-                        await self.prod_db.set_group_state(normalized, GroupState.ALREADY_MEMBER, raw_link, joined_by=phone)
+                    logging.info(f"[LINK id={link_id}] [PIPELINE-6] Checking membership across ALL joiners...")
+                    already_joined_by = None
+                    for j in joiners:
+                        jphone = j['phone']
+                        jclient = self.user_clients.get(jphone)
+                        if not jclient or not jclient.is_connected():
+                            continue
+                        try:
+                            is_member = await self.membership_cache.check_membership(jphone, normalized, jclient)
+                            if is_member is True:
+                                already_joined_by = jphone
+                                break
+                        except Exception as e:
+                            logging.debug(f"[MEMBERSHIP] check failed for {jphone}: {e}")
+                            continue
+                    if already_joined_by:
+                        logging.info(
+                            f"[LINK id={link_id}] [PIPELINE-6] 🚫 Already joined by {already_joined_by} — skipping"
+                        )
+                        await self.prod_db.set_group_state(
+                            normalized, GroupState.ALREADY_MEMBER, raw_link,
+                            joined_by=already_joined_by
+                        )
                         await self.prod_db.update_queue_status(link_data['id'], 'DONE')
                         await self.metrics.record_skip('already_member')
                         continue
@@ -5507,6 +5526,9 @@ class Monitor:
                         try:
                             entity = await monitor_client.get_entity(username)
                             member_count = 0
+                            group_title = ''
+                            if hasattr(entity, 'title') and entity.title:
+                                group_title = entity.title
                             if hasattr(entity, 'participants_count') and entity.participants_count:
                                 member_count = entity.participants_count
                             elif isinstance(entity, (Channel, Chat)):
@@ -5518,10 +5540,34 @@ class Monitor:
                                 except Exception:
                                     pass
 
+                            # === فحص فلتر قوي باستخدام group_title الحقيقي ===
+                            # نفحص: username + group_title + raw_link
+                            is_bad, bad_reason = EducationalFilter.is_blacklisted(
+                                group_title, username, raw_link, ''
+                            )
+                            if is_bad:
+                                # المجموعة سيئة (بيتكوين/عراقي/إلخ) — احظرها فوراً
+                                logging.warning(
+                                    f"[SCORER] {link_id} @{username}: 🚫 BLACKLISTED ({bad_reason}) "
+                                    f"title='{group_title[:40]}' — marking BANNED"
+                                )
+                                await self.prod_db.update_link_priority(link_id, 0)
+                                # حدّث group_states كـ BANNED
+                                from link_system import LinkNormalizer
+                                norm = LinkNormalizer.extract_links(raw_link)
+                                if norm:
+                                    norm_link = norm[0].get('normalized', raw_link.lower())
+                                    await self.prod_db.set_group_state(
+                                        norm_link, GroupState.BANNED, raw_link,
+                                        error=f'scorer_blacklist_{bad_reason}'
+                                    )
+                                continue
+
                             await self.prod_db.update_link_priority(link_id, member_count)
                             priority_label = 'HIGH' if member_count >= 5000 else ('MEDIUM' if member_count >= 1000 else ('LOW' if member_count >= 500 else 'REJECT'))
                             logging.info(
-                                f"[SCORER] {link_id} @{username}: {member_count:,} members → priority={priority_label}"
+                                f"[SCORER] {link_id} @{username}: {member_count:,} members "
+                                f"title='{group_title[:30]}' → priority={priority_label}"
                             )
                             await asyncio.sleep(1)  # تجنب rate limit
                         except Exception as e:
@@ -6735,6 +6781,92 @@ async def api_joined_groups_handler(request):
                                  headers={"Access-Control-Allow-Origin": "*"})
 
 
+async def api_joiners_status_handler(request):
+    """API endpoint: يعرض حالة كل الفدائيين والمجموعات المنضم لها.
+
+    Returns:
+        - joiners: قائمة الفدائيين مع stats (daily_joins, last_join, connected)
+        - joined_groups: قائمة المجموعات المنضم لها (مع joined_by)
+        - summary: إحصائيات إجمالية
+    """
+    monitor = request.app.get("monitor")
+    db = request.app.get("db")
+    if not monitor or not db:
+        return web.json_response({"error": "not ready"}, status=503,
+                                 headers={"Access-Control-Allow-Origin": "*"})
+
+    try:
+        # اجلب كل الفدائيين من Supabase
+        joiners = await db.get_watchers_by_role("joiner")
+        joiners_data = []
+        for j in joiners:
+            jphone = j['phone']
+            w = await db._supabase_get_watcher(jphone) if hasattr(db, '_supabase_get_watcher') else j
+            daily_joins = await db.get_daily_join_count(jphone) if hasattr(db, 'get_daily_join_count') else 0
+            daily_limit = await monitor._get_daily_limit(jphone) if hasattr(monitor, '_get_daily_limit') else 25
+            client = monitor.user_clients.get(jphone)
+            is_connected = bool(client and client.is_connected())
+            joiners_data.append({
+                'phone': jphone,
+                'display_name': w.get('display_name', '') if w else '',
+                'connected': is_connected,
+                'daily_joins': daily_joins,
+                'daily_limit': daily_limit,
+                'last_join_timestamp': str(w.get('last_join_timestamp', '')) if w else '',
+                'joiner_enabled': w.get('joiner_enabled', 1) if w else 1,
+            })
+
+        # اجلب كل المجموعات المنضم لها من group_states
+        conn = await db._ensure_conn()
+        cursor = await conn.execute(
+            "SELECT normalized_link, raw_link, group_title, state, joined_by, member_count, last_seen "
+            "FROM group_states WHERE state IN ('JOINED', 'ALREADY_MEMBER') "
+            "ORDER BY last_seen DESC LIMIT 200"
+        )
+        joined_rows = await cursor.fetchall()
+        joined_groups = []
+        for r in joined_rows:
+            joined_groups.append({
+                'group_link': r[1] or '',
+                'group_title': r[2] or 'غير معروف',
+                'state': r[3] or 'JOINED',
+                'joined_by_phone': r[4] or '',
+                'member_count': r[5] or 0,
+                'join_date': r[6] or '',
+            })
+
+        # إحصائيات
+        cursor = await conn.execute(
+            "SELECT COUNT(*) FROM group_states WHERE state = 'JOINED'"
+        )
+        total_joined = (await cursor.fetchone())[0]
+        cursor = await conn.execute(
+            "SELECT COUNT(*) FROM group_states WHERE state = 'ALREADY_MEMBER'"
+        )
+        total_already = (await cursor.fetchone())[0]
+        cursor = await conn.execute(
+            "SELECT COUNT(*) FROM group_states WHERE state = 'BANNED'"
+        )
+        total_banned = (await cursor.fetchone())[0]
+
+        return web.json_response({
+            'joiners': joiners_data,
+            'joined_groups': joined_groups,
+            'summary': {
+                'total_joiners': len(joiners_data),
+                'connected_joiners': sum(1 for j in joiners_data if j['connected']),
+                'total_joined_groups': total_joined,
+                'total_already_member': total_already,
+                'total_banned': total_banned,
+            }
+        }, status=200, headers={"Access-Control-Allow-Origin": "*"})
+
+    except Exception as e:
+        logging.error(f"[API] joiners_status error: {e}")
+        return web.json_response({"error": str(e)}, status=500,
+                                 headers={"Access-Control-Allow-Origin": "*"})
+
+
 async def api_links_handler(request):
     """API endpoint: returns recent published links from Supabase.
 
@@ -7146,6 +7278,7 @@ async def start_http_server(monitor=None, db=None):
     app.router.add_get("/api/links", api_links_handler)
     app.router.add_get("/api/stats", api_stats_handler)
     app.router.add_get("/api/deploy_check", api_deploy_check_handler)  # diagnostic
+    app.router.add_get("/api/joiners_status", api_joiners_status_handler)  # joiners + groups
     runner = web.AppRunner(app)
     await runner.setup()
     site = web.TCPSite(runner, "0.0.0.0", port)
