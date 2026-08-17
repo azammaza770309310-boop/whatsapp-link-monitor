@@ -1471,7 +1471,7 @@ class GulfFilter:
 
     BLACKLIST_GAMBLING = [
         'casino', 'gambling', 'bet', 'betting', 'lottery',
-        'رهان', 'مراهنات', 'يانصيب', 'حظ', 'قمار', 'لعبة قمار',
+        'رهان', 'مراهنات', 'يانصيب', 'قمار', 'لعبة قمار',
     ]
 
     BLACKLIST_IRAQI_UNIS = [
