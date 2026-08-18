@@ -55,3 +55,7 @@ server.log
 *.pyc
 .secrets/
 accounts.env
+
+# Z.ai skills — not needed for the bot
+skills/
+
