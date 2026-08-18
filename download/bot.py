@@ -605,6 +605,132 @@ class AIAnalyzer:
         if self._session and not self._session.closed:
             await self._session.close()
 
+    async def classify_group(self, group_title: str, username: str = '', member_count: int = 0) -> dict:
+        """يصنف مجموعة بالذكاء الاصطناعي — يحدد نوعها ودولتها ومدى صلتها بالتعليم.
+
+        Returns:
+            {
+                "is_educational": bool,
+                "group_type": "group" | "channel" | "unknown",
+                "country": str,
+                "relevance_score": int (0-100),
+                "description": str,
+                "should_monitor": bool
+            }
+        """
+        if not self.enabled:
+            # fallback بدون AI
+            return self._fallback_classify(group_title, username, member_count)
+
+        prompt = f"""أنت مساعد ذكي لتصنيف مجموعات تيليجرام وواتساب.
+
+حلل هذه المجموعة:
+- الاسم: "{group_title or 'غير معروف'}"
+- اليوزر: @{username or 'غير متوفر'}
+- الأعضاء: {member_count or 'غير معروف'}
+
+أعد JSON فقط بهذا الشكل:
+{{
+    "is_educational": true/false,
+    "group_type": "group" أو "channel" أو "unknown",
+    "country": "السعودية" أو "الكويت" أو "قطر" أو "البحرين" أو "الإمارات" أو "أخرى",
+    "relevance_score": رقم من 0 إلى 100,
+    "description": "وصف في 5 كلمات",
+    "should_monitor": true/false
+}}
+
+القواعد:
+- is_educational = true إذا كانت المجموعة لطلاب جامعيين خليجيين
+- group_type = "channel" إذا كانت قناة بث (broadcast)، "group" إذا مجموعة نقاش
+- relevance_score = 100 لمجموعة جامعة خليجية رسمية، 80 لطلابية عامة، 50 لحالة doubtful، 0 لغير تعليمية
+- should_monitor = true إذا relevance_score >= 50
+- should_monitor = false لبيتكوين/إعلانات/مقامرة/محتوى للكبار
+- country: حدد من اسم الجامعة أو المدينة أو السياق"""
+
+        for attempt in range(len(self.providers)):
+            async with self._provider_lock:
+                provider = self.providers[self._current_provider]
+            try:
+                session = await self._get_session()
+                headers = {
+                    "Authorization": f"Bearer {provider['key']}",
+                    "Content-Type": "application/json"
+                }
+                payload = {
+                    "model": provider["model"],
+                    "messages": [
+                        {"role": "system", "content": "أنت مصنف مجموعات ذكي. أعد JSON فقط."},
+                        {"role": "user", "content": prompt}
+                    ],
+                    "temperature": 0.1,
+                    "max_tokens": 200
+                }
+
+                async with session.post(provider["url"], json=payload, headers=headers,
+                                       timeout=aiohttp.ClientTimeout(total=15)) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        choices = data.get("choices", [])
+                        content = choices[0].get("message", {}).get("content", "") if choices else ""
+                        if not content:
+                            async with self._provider_lock:
+                                self._current_provider = (self._current_provider + 1) % len(self.providers)
+                            continue
+                        clean_json = _extract_clean_json(content)
+                        try:
+                            result = json_module.loads(clean_json)
+                            # تأكد من وجود كل الحقول
+                            return {
+                                "is_educational": bool(result.get("is_educational", False)),
+                                "group_type": result.get("group_type", "unknown"),
+                                "country": result.get("country", "أخرى"),
+                                "relevance_score": int(result.get("relevance_score", 0)),
+                                "description": result.get("description", ""),
+                                "should_monitor": bool(result.get("should_monitor", False)),
+                            }
+                        except (json_module.JSONDecodeError, ValueError, TypeError):
+                            async with self._provider_lock:
+                                self._current_provider = (self._current_provider + 1) % len(self.providers)
+                            continue
+                    elif resp.status in (429, 401, 403, 404):
+                        async with self._provider_lock:
+                            self._current_provider = (self._current_provider + 1) % len(self.providers)
+                        continue
+            except Exception:
+                async with self._provider_lock:
+                    self._current_provider = (self._current_provider + 1) % len(self.providers)
+                continue
+
+        return self._fallback_classify(group_title, username, member_count)
+
+    @staticmethod
+    def _fallback_classify(group_title: str, username: str = '', member_count: int = 0) -> dict:
+        """تصنيف بديل بدون AI — يستخدم GulfFilter."""
+        # استخدم GulfFilter لو متاح
+        try:
+            is_gulf = GulfFilter.is_gulf_target(group_title, username)[0]
+            is_bad = GulfFilter.is_blacklisted(group_title, username)[0]
+            is_acad = GulfFilter.is_academic_context(group_title, username)[0]
+
+            should_monitor = (is_gulf or is_acad) and not is_bad
+            return {
+                "is_educational": should_monitor,
+                "group_type": "unknown",
+                "country": "السعودية" if is_gulf else "أخرى",
+                "relevance_score": 80 if is_gulf else (50 if is_acad else 0),
+                "description": f"{'خليجية' if is_gulf else 'أكاديمية' if is_acad else 'غير مهتم'}",
+                "should_monitor": should_monitor,
+            }
+        except Exception:
+            return {
+                "is_educational": False,
+                "group_type": "unknown",
+                "country": "أخرى",
+                "relevance_score": 0,
+                "description": "",
+                "should_monitor": False,
+            }
+
 SCAN_COMMANDS = {"/scan_week": 7, "/scan_month": 30, "/scan_60": 60, "/scan_90": 90, "/scan_full": None}
 
 
@@ -3059,6 +3185,42 @@ class Monitor:
                     group_name = f"chat_{chat_id}"
             except Exception:
                 group_name = f"chat_{chat_id}"
+
+            # === MONITORED CHATS DEDUP ===
+            # سجّل المجموعة في monitored_chats (يمنع التكرار بين المراقبين)
+            try:
+                # استخرج username لو موجود
+                chat_username = ''
+                try:
+                    if chat_obj and hasattr(chat_obj, 'username') and chat_obj.username:
+                        chat_username = chat_obj.username
+                except Exception:
+                    pass
+
+                # حدد link_type
+                chat_link_type = 'telegram'  # افتراضي
+                try:
+                    if hasattr(chat_obj, 'megagroup') and chat_obj.megagroup:
+                        chat_link_type = 'group'
+                    elif hasattr(chat_obj, 'broadcast') and chat_obj.broadcast:
+                        chat_link_type = 'channel'
+                except Exception:
+                    pass
+
+                is_new = await self.prod_db.add_monitored_chat(
+                    chat_id=chat_id,
+                    chat_title=group_name,
+                    username=chat_username,
+                    link_type=chat_link_type,
+                    monitored_by=source_phone,
+                )
+                if is_new:
+                    logging.info(
+                        f"[MONITORED] ✅ New chat added: '{group_name[:40]}' "
+                        f"(id={chat_id}, type={chat_link_type}, by={source_phone})"
+                    )
+            except Exception as e:
+                logging.debug(f"[MONITORED] add error: {e}")
 
             # اسم المرسل — حاول الاسم من event.sender (بدون API إضافي) وإلا sender_id
             try:
@@ -5592,6 +5754,85 @@ class Monitor:
                 logging.error(f"[SCORER] outer error: {e}", exc_info=True)
                 await asyncio.sleep(30)
 
+    async def _chat_classifier(self):
+        """مهمة خلفية: تصنيف المجموعات المراقبة بالذكاء الاصطناعي.
+
+        كل 60 ثانية، يفحص مجموعات ما تصنفت بعد، ويصنفها بـ AI.
+        - is_educational: هل المجموعة تعليمية؟
+        - group_type: group/channel/unknown
+        - country: الدولة
+        - relevance_score: 0-100
+        - should_monitor: هل يتابع مراقبتها؟
+        """
+        await asyncio.sleep(90)  # انتظر البوت يكمل الإقلاع
+        logging.info("🧠 Chat Classifier started — classifies monitored chats every 60s")
+        while self._running:
+            try:
+                # اجلب مجموعات ما تصنفت
+                unclassified = await self.prod_db.get_unclassified_chats(limit=5)
+                if not unclassified:
+                    await asyncio.sleep(60)
+                    continue
+
+                for chat in unclassified:
+                    try:
+                        chat_id = chat['chat_id']
+                        title = chat.get('chat_title', '')
+                        username = chat.get('username', '')
+                        member_count = chat.get('member_count', 0)
+
+                        # استخدم AI لتصنيف المجموعة
+                        if hasattr(self, 'ai_analyzer') and self.ai_analyzer:
+                            classification = await self.ai_analyzer.classify_group(
+                                title, username, member_count
+                            )
+
+                            # حدّث السجل بالتصنيف
+                            await self.prod_db.update_monitored_chat(
+                                chat_id,
+                                ai_classification=classification.get('group_type', 'unknown'),
+                                ai_country=classification.get('country', 'أخرى'),
+                                ai_relevance=classification.get('relevance_score', 0),
+                                ai_description=classification.get('description', ''),
+                                should_monitor=1 if classification.get('should_monitor', True) else 0,
+                            )
+
+                            logging.info(
+                                f"[CLASSIFIER] chat_id={chat_id} '{title[:30]}': "
+                                f"type={classification.get('group_type')} "
+                                f"country={classification.get('country')} "
+                                f"score={classification.get('relevance_score')} "
+                                f"monitor={classification.get('should_monitor')}"
+                            )
+                        else:
+                            # ما عندنا AI — حدّث كـ unknown
+                            await self.prod_db.update_monitored_chat(
+                                chat_id,
+                                ai_classification='unknown',
+                                ai_country='أخرى',
+                                ai_relevance=0,
+                                ai_description='no AI',
+                            )
+
+                        await asyncio.sleep(2)  # تجنب rate limit على AI
+
+                    except Exception as e:
+                        logging.error(f"[CLASSIFIER] chat {chat.get('chat_id')}: {e}")
+                        # حدّث كـ failed عشان ما يعيد المحاولة
+                        await self.prod_db.update_monitored_chat(
+                            chat.get('chat_id'),
+                            ai_classification='error',
+                            ai_description=str(e)[:100],
+                        )
+
+                await asyncio.sleep(10)  # فاصل قصير قبل الجولة التالية
+
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logging.error(f"[CLASSIFIER] outer error: {e}", exc_info=True)
+                await asyncio.sleep(30)
+
     async def _rejoin_published_links(self, max_messages: int = 5000):
         """يقرأ رسائل القناة المنشورة سابقاً ويعيد إدخال الروابط الصالحة في queue.
 
@@ -6668,6 +6909,13 @@ class Monitor:
         else:
             logging.info("📊 Priority Scorer already running — skip duplicate")
 
+        # ابدأ Chat Classifier — يصنف المجموعات المراقبة بالـ AI
+        if not hasattr(self, '_chat_classifier_task') or self._chat_classifier_task is None or self._chat_classifier_task.done():
+            self._chat_classifier_task = asyncio.create_task(self._chat_classifier())
+            logging.info("🧠 Chat Classifier started (will classify monitored chats with AI)")
+        else:
+            logging.info("🧠 Chat Classifier already running — skip duplicate")
+
     async def stop(self):
         """إيقاف نظيف لمنع تسريب الذاكرة
 
@@ -6863,6 +7111,59 @@ async def api_joiners_status_handler(request):
 
     except Exception as e:
         logging.error(f"[API] joiners_status error: {e}")
+        return web.json_response({"error": str(e)}, status=500,
+                                 headers={"Access-Control-Allow-Origin": "*"})
+
+
+async def api_monitored_chats_handler(request):
+    """API endpoint: returns all monitored chats with AI classification.
+
+    Returns:
+        - chats: list of monitored chats with AI classification
+        - summary: total chats, classified, educational, by country
+    """
+    monitor = request.app.get("monitor")
+    db = request.app.get("db")
+    if not monitor or not db:
+        return web.json_response({"error": "not ready"}, status=503,
+                                 headers={"Access-Control-Allow-Origin": "*"})
+
+    try:
+        chats = await monitor.prod_db.get_monitored_chats(limit=500)
+
+        # إحصائيات
+        total = len(chats)
+        classified = sum(1 for c in chats if c.get('ai_classification') and c['ai_classification'] not in ('', 'unknown', 'error'))
+        educational = sum(1 for c in chats if c.get('ai_relevance', 0) >= 50)
+        high_relevance = sum(1 for c in chats if c.get('ai_relevance', 0) >= 80)
+
+        # حسب الدولة
+        by_country: dict = {}
+        for c in chats:
+            country = c.get('ai_country', 'أخرى')
+            by_country[country] = by_country.get(country, 0) + 1
+
+        # حسب النوع
+        by_type: dict = {}
+        for c in chats:
+            t = c.get('ai_classification', 'unknown')
+            by_type[t] = by_type.get(t, 0) + 1
+
+        return web.json_response({
+            'chats': chats,
+            'summary': {
+                'total': total,
+                'classified': classified,
+                'unclassified': total - classified,
+                'educational': educational,
+                'high_relevance': high_relevance,
+                'by_country': by_country,
+                'by_type': by_type,
+            }
+        }, status=200, headers={"Access-Control-Allow-Origin": "*"})
+
+    except Exception as e:
+        logging.error(f"[API] monitored_chats error: {e}")
         return web.json_response({"error": str(e)}, status=500,
                                  headers={"Access-Control-Allow-Origin": "*"})
 
@@ -7307,6 +7608,7 @@ async def start_http_server(monitor=None, db=None):
     app.router.add_get("/api/stats", api_stats_handler)
     app.router.add_get("/api/deploy_check", api_deploy_check_handler)  # diagnostic
     app.router.add_get("/api/joiners_status", api_joiners_status_handler)  # joiners + groups
+    app.router.add_get("/api/monitored_chats", api_monitored_chats_handler)  # monitored chats + AI
     runner = web.AppRunner(app)
     await runner.setup()
     site = web.TCPSite(runner, "0.0.0.0", port)

@@ -754,8 +754,29 @@ async def init_production_tables(db):
         updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     )""")
 
+    # جدول المجموعات المراقبة (monitored_chats) — يمنع التكرار بين المراقبين
+    await conn.execute("""CREATE TABLE IF NOT EXISTS monitored_chats (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        chat_id INTEGER NOT NULL,
+        chat_title TEXT,
+        username TEXT,
+        link_type TEXT,
+        monitored_by TEXT,
+        first_seen TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        last_seen TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        member_count INTEGER,
+        ai_classification TEXT,
+        ai_country TEXT,
+        ai_relevance INTEGER,
+        ai_description TEXT,
+        should_monitor INTEGER DEFAULT 1,
+        UNIQUE(chat_id)
+    )""")
+    await conn.execute("CREATE INDEX IF NOT EXISTS idx_monitored_chat_id ON monitored_chats (chat_id)")
+    await conn.execute("CREATE INDEX IF NOT EXISTS idx_monitored_should ON monitored_chats (should_monitor)")
+
     await conn.commit()
-    logging.info("✅ Production tables initialized (link_queue, group_states, membership_cache, floodwait_tracker, api_operations_log, system_settings)")
+    logging.info("✅ Production tables initialized (link_queue, group_states, membership_cache, floodwait_tracker, api_operations_log, system_settings, monitored_chats)")
 
 
 # -------------------------------------------------------------------
@@ -920,6 +941,85 @@ class ProductionDB:
         cursor = await conn.execute("SELECT COUNT(*) FROM link_queue WHERE status = 'QUEUED'")
         row = await cursor.fetchone()
         return row[0] if row else 0
+
+    # === Monitored Chats ===
+
+    async def is_chat_monitored(self, chat_id: int) -> bool:
+        """يتحقق هل المجموعة مراقبة بالفعل (يمنع التكرار)."""
+        conn = await self._conn()
+        cursor = await conn.execute(
+            "SELECT 1 FROM monitored_chats WHERE chat_id = ? AND should_monitor = 1",
+            (chat_id,))
+        row = await cursor.fetchone()
+        return row is not None
+
+    async def add_monitored_chat(self, chat_id: int, chat_title: str, username: str = '',
+                                  link_type: str = '', monitored_by: str = '',
+                                  member_count: int = 0) -> bool:
+        """يضيف مجموعة للمراقبة — يرجع True لو جديدة، False لو مكررة."""
+        conn = await self._conn()
+        try:
+            await conn.execute(
+                """INSERT OR IGNORE INTO monitored_chats
+                (chat_id, chat_title, username, link_type, monitored_by, member_count, first_seen, last_seen)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                (chat_id, chat_title, username, link_type, monitored_by, member_count,
+                 datetime.now().isoformat(), datetime.now().isoformat()))
+            await conn.commit()
+            return conn.total_changes > 0
+        except Exception as e:
+            logging.error(f"add_monitored_chat error: {e}")
+            return False
+
+    async def update_monitored_chat(self, chat_id: int, **fields):
+        """يحدّث بيانات مجموعة مراقبة (مثل AI classification)."""
+        if not fields:
+            return
+        conn = await self._conn()
+        set_parts = []
+        values = []
+        for k, v in fields.items():
+            set_parts.append(f"{k} = ?")
+            values.append(v)
+        set_parts.append("last_seen = ?")
+        values.append(datetime.now().isoformat())
+        values.append(chat_id)
+        await conn.execute(
+            f"UPDATE monitored_chats SET {', '.join(set_parts)} WHERE chat_id = ?",
+            values)
+        await conn.commit()
+
+    async def get_monitored_chats(self, limit: int = 200) -> List[dict]:
+        """يجلب كل المجموعات المراقبة."""
+        conn = await self._conn()
+        cursor = await conn.execute(
+            """SELECT chat_id, chat_title, username, link_type, monitored_by,
+                      member_count, ai_classification, ai_country, ai_relevance,
+                      ai_description, should_monitor, first_seen, last_seen
+               FROM monitored_chats
+               WHERE should_monitor = 1
+               ORDER BY ai_relevance DESC, last_seen DESC LIMIT ?""",
+            (limit,))
+        rows = await cursor.fetchall()
+        return [{'chat_id': r[0], 'chat_title': r[1] or '', 'username': r[2] or '',
+                 'link_type': r[3] or '', 'monitored_by': r[4] or '',
+                 'member_count': r[5] or 0,
+                 'ai_classification': r[6] or '', 'ai_country': r[7] or '',
+                 'ai_relevance': r[8] or 0, 'ai_description': r[9] or '',
+                 'should_monitor': r[10], 'first_seen': r[11], 'last_seen': r[12]} for r in rows]
+
+    async def get_unclassified_chats(self, limit: int = 10) -> List[dict]:
+        """يجلب مجموعات لم يُصنّفها AI بعد."""
+        conn = await self._conn()
+        cursor = await conn.execute(
+            """SELECT chat_id, chat_title, username, member_count
+               FROM monitored_chats
+               WHERE ai_classification IS NULL AND should_monitor = 1
+               ORDER BY first_seen ASC LIMIT ?""",
+            (limit,))
+        rows = await cursor.fetchall()
+        return [{'chat_id': r[0], 'chat_title': r[1] or '', 'username': r[2] or '',
+                 'member_count': r[3] or 0} for r in rows]
 
     # === Group States ===
 

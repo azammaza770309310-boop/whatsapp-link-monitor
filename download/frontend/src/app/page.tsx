@@ -82,6 +82,32 @@ interface JoinedGroup {
   join_date: string
 }
 
+interface MonitoredChat {
+  chat_id: number
+  chat_title: string
+  username: string
+  link_type: string
+  monitored_by: string
+  member_count: number
+  ai_classification: string
+  ai_country: string
+  ai_relevance: number
+  ai_description: string
+  should_monitor: number
+  first_seen: string
+  last_seen: string
+}
+
+interface MonitoredSummary {
+  total: number
+  classified: number
+  unclassified: number
+  educational: number
+  high_relevance: number
+  by_country: Record<string, number>
+  by_type: Record<string, number>
+}
+
 type ModalType =
   | 'whatsapp'
   | 'telegram'
@@ -91,6 +117,7 @@ type ModalType =
   | 'ai_ads'
   | 'joiners'
   | 'joined_groups'
+  | 'monitored_chats'
   | null
 
 // ===== Constants =====
@@ -131,6 +158,8 @@ export default function Home() {
   const [joiners, setJoiners] = useState<Joiner[]>([])
   const [joinersSummary, setJoinersSummary] = useState<JoinersSummary | null>(null)
   const [joinedGroups, setJoinedGroups] = useState<JoinedGroup[]>([])
+  const [monitoredChats, setMonitoredChats] = useState<MonitoredChat[]>([])
+  const [monitoredSummary, setMonitoredSummary] = useState<MonitoredSummary | null>(null)
   const [loading, setLoading] = useState<boolean>(true)
   const [modal, setModal] = useState<ModalType>(null)
 
@@ -199,6 +228,23 @@ export default function Home() {
     }
   }, [])
 
+  const fetchMonitoredChats = useCallback(async () => {
+    try {
+      const response = await fetch(`${API_URL}/api/monitored_chats`, {
+        headers: { Accept: 'application/json' },
+      })
+      if (response.ok) {
+        const data = await response.json()
+        setMonitoredChats(data.chats || [])
+        setMonitoredSummary(data.summary || null)
+      } else {
+        console.error('fetchMonitoredChats HTTP error:', response.status)
+      }
+    } catch (err) {
+      console.error('fetchMonitoredChats error:', err)
+    }
+  }, [])
+
   // Calculate country stats from links
   useEffect(() => {
     if (allLinks.length === 0) return
@@ -222,21 +268,22 @@ export default function Home() {
     setCountryStats(result)
   }, [allLinks])
 
-  // Initial load + auto refresh
+  // Initial load + auto refresh (real-time every 15s)
   useEffect(() => {
     const load = async () => {
-      await Promise.all([fetchLinks(), fetchStats(), fetchJoiners()])
+      await Promise.all([fetchLinks(), fetchStats(), fetchJoiners(), fetchMonitoredChats()])
     }
     load()
-    const interval = setInterval(load, 30000)
+    const interval = setInterval(load, 15000) // 15s for real-time updates
     return () => clearInterval(interval)
-  }, [fetchLinks, fetchStats, fetchJoiners])
+  }, [fetchLinks, fetchStats, fetchJoiners, fetchMonitoredChats])
 
   const refreshAll = useCallback(() => {
     fetchLinks()
     fetchStats()
     fetchJoiners()
-  }, [fetchLinks, fetchStats, fetchJoiners])
+    fetchMonitoredChats()
+  }, [fetchLinks, fetchStats, fetchJoiners, fetchMonitoredChats])
 
   const countryColors: Record<string, string> = {
     'السعودية': 'from-emerald-500 to-green-400',
@@ -432,6 +479,103 @@ export default function Home() {
             </CardContent>
           </Card>
         )}
+
+        {/* Monitored Chats Section — المجموعات المراقبة */}
+        <Card className="bg-slate-800/30 border-slate-700/50 backdrop-blur-sm mb-6">
+          <CardHeader>
+            <CardTitle className="flex items-center justify-between text-lg">
+              <span className="flex items-center gap-2">
+                <span className="text-2xl">👁️</span>
+                المجموعات المراقبة
+              </span>
+              {monitoredSummary && (
+                <Badge className="bg-blue-500/20 text-blue-400 border-blue-500/40">
+                  {monitoredSummary.total} مجموعة
+                </Badge>
+              )}
+            </CardTitle>
+          </CardHeader>
+          <CardContent>
+            {/* Stats Row */}
+            <div className="grid grid-cols-4 gap-3 mb-4">
+              <div className="bg-blue-500/10 border border-blue-500/30 rounded-lg p-3 text-center">
+                <p className="text-2xl font-bold text-blue-400">
+                  {monitoredSummary?.total ?? 0}
+                </p>
+                <p className="text-xs text-slate-400 mt-1">إجمالي المراقبة</p>
+              </div>
+              <div className="bg-emerald-500/10 border border-emerald-500/30 rounded-lg p-3 text-center">
+                <p className="text-2xl font-bold text-emerald-400">
+                  {monitoredSummary?.classified ?? 0}
+                </p>
+                <p className="text-xs text-slate-400 mt-1">مُصنّفة بـ AI</p>
+              </div>
+              <div className="bg-amber-500/10 border border-amber-500/30 rounded-lg p-3 text-center">
+                <p className="text-2xl font-bold text-amber-400">
+                  {monitoredSummary?.educational ?? 0}
+                </p>
+                <p className="text-xs text-slate-400 mt-1">تعليمية</p>
+              </div>
+              <div className="bg-purple-500/10 border border-purple-500/30 rounded-lg p-3 text-center">
+                <p className="text-2xl font-bold text-purple-400">
+                  {monitoredSummary?.high_relevance ?? 0}
+                </p>
+                <p className="text-xs text-slate-400 mt-1">صلة عالية</p>
+              </div>
+            </div>
+
+            {/* Recent Monitored Chats Preview */}
+            <button
+              onClick={() => setModal('monitored_chats')}
+              className="w-full text-right hover:scale-[1.01] transition-transform"
+            >
+              <div className="bg-slate-700/30 rounded-lg p-3 border border-slate-700">
+                <div className="flex items-center justify-between mb-2">
+                  <h4 className="text-sm font-semibold text-slate-300">
+                    📋 أحدث المجموعات المراقبة
+                  </h4>
+                  <ArrowRight className="w-4 h-4 text-slate-400" />
+                </div>
+                {monitoredChats.length > 0 ? (
+                  <div className="space-y-1">
+                    {monitoredChats.slice(0, 3).map((c) => (
+                      <div
+                        key={c.chat_id}
+                        className="bg-slate-900/50 rounded p-2 text-xs flex items-center justify-between"
+                      >
+                        <span className="text-white truncate flex-1">
+                          {c.chat_title || 'غير معروف'}
+                        </span>
+                        <div className="flex items-center gap-2 mr-2">
+                          {c.ai_classification && c.ai_classification !== 'unknown' && (
+                            <Badge variant="outline" className="text-[10px] px-1 py-0">
+                              {c.ai_classification === 'group' ? '👥' : c.ai_classification === 'channel' ? '📢' : '?'}
+                            </Badge>
+                          )}
+                          <span className="text-slate-400">
+                            {c.ai_relevance > 0 ? `${c.ai_relevance}%` : ''}
+                          </span>
+                          {c.ai_country && c.ai_country !== 'أخرى' && (
+                            <span className="text-purple-400 text-[10px]">{c.ai_country}</span>
+                          )}
+                        </div>
+                      </div>
+                    ))}
+                    {monitoredChats.length > 3 && (
+                      <p className="text-xs text-slate-500 text-center pt-1">
+                        + {monitoredChats.length - 3} مجموعة أخرى...
+                      </p>
+                    )}
+                  </div>
+                ) : (
+                  <p className="text-xs text-slate-500 text-center py-2">
+                    لا توجد مجموعات مراقبة بعد
+                  </p>
+                )}
+              </div>
+            </button>
+          </CardContent>
+        </Card>
 
         {/* Joiner Dashboard Section */}
         <Card className="bg-slate-800/30 border-slate-700/50 backdrop-blur-sm mb-6">
@@ -877,6 +1021,8 @@ function LinksModal(props: {
         return '🚀 لوحة الفدائي التفصيلية'
       case 'joined_groups':
         return '📋 المجموعات المنضم لها'
+      case 'monitored_chats':
+        return '👁️ المجموعات المراقبة (تصنيف AI)'
       default:
         return ''
     }
@@ -1064,6 +1210,101 @@ function LinksModal(props: {
                             })}
                           </span>
                         )}
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+          ) : type === 'monitored_chats' ? (
+            <div className="flex-1 overflow-y-auto p-4" style={{ maxHeight: 'calc(95vh - 100px)' }}>
+              {/* Summary Stats */}
+              {monitoredSummary && (
+                <div className="grid grid-cols-4 gap-3 mb-4">
+                  <div className="bg-blue-500/10 border border-blue-500/30 rounded-lg p-3 text-center">
+                    <p className="text-2xl font-bold text-blue-400">{monitoredSummary.total}</p>
+                    <p className="text-xs text-slate-400 mt-1">إجمالي</p>
+                  </div>
+                  <div className="bg-emerald-500/10 border border-emerald-500/30 rounded-lg p-3 text-center">
+                    <p className="text-2xl font-bold text-emerald-400">{monitoredSummary.classified}</p>
+                    <p className="text-xs text-slate-400 mt-1">مُصنّفة</p>
+                  </div>
+                  <div className="bg-amber-500/10 border border-amber-500/30 rounded-lg p-3 text-center">
+                    <p className="text-2xl font-bold text-amber-400">{monitoredSummary.educational}</p>
+                    <p className="text-xs text-slate-400 mt-1">تعليمية</p>
+                  </div>
+                  <div className="bg-purple-500/10 border border-purple-500/30 rounded-lg p-3 text-center">
+                    <p className="text-2xl font-bold text-purple-400">{monitoredSummary.high_relevance}</p>
+                    <p className="text-xs text-slate-400 mt-1">صلة عالية</p>
+                  </div>
+                </div>
+              )}
+
+              {/* Chats List */}
+              {monitoredChats.length === 0 ? (
+                <div className="text-center py-20">
+                  <Users className="w-12 h-12 mx-auto text-slate-600 mb-4" />
+                  <p className="text-slate-500">لا توجد مجموعات مراقبة بعد</p>
+                </div>
+              ) : (
+                <div className="space-y-2">
+                  {monitoredChats.map((c) => (
+                    <div
+                      key={c.chat_id}
+                      className="bg-slate-800/50 rounded-lg p-3 border border-slate-700"
+                    >
+                      <div className="flex items-start justify-between mb-2">
+                        <div className="flex-1 min-w-0">
+                          <div className="flex items-center gap-2 mb-1">
+                            <span className="text-white text-sm font-semibold truncate">
+                              {c.chat_title || 'غير معروف'}
+                            </span>
+                            {c.username && (
+                              <span className="text-xs text-blue-400 font-mono">
+                                @{c.username}
+                              </span>
+                            )}
+                          </div>
+                          {c.ai_description && (
+                            <p className="text-xs text-emerald-300/80 mb-1">
+                              🤖 {c.ai_description}
+                            </p>
+                          )}
+                          <div className="text-xs text-slate-400">
+                            👁️ بواسطة: {c.monitored_by || '?'} · {' '}
+                            {c.member_count > 0 ? `${c.member_count.toLocaleString()} عضو` : 'غير معروف'}
+                          </div>
+                        </div>
+                        <div className="flex flex-col items-end gap-1 ml-2">
+                          {/* Type Badge */}
+                          {c.ai_classification && c.ai_classification !== 'unknown' && c.ai_classification !== 'error' && (
+                            <Badge variant="outline" className="text-[10px]">
+                              {c.ai_classification === 'group' ? '👥 مجموعة' :
+                               c.ai_classification === 'channel' ? '📢 قناة' : c.ai_classification}
+                            </Badge>
+                          )}
+                          {/* Relevance Score */}
+                          {c.ai_relevance > 0 && (
+                            <Badge
+                              variant="outline"
+                              className={`text-[10px] ${
+                                c.ai_relevance >= 80
+                                  ? 'border-emerald-500/40 text-emerald-400'
+                                  : c.ai_relevance >= 50
+                                  ? 'border-amber-500/40 text-amber-400'
+                                  : 'border-red-500/40 text-red-400'
+                              }`}
+                            >
+                              {c.ai_relevance}% صلة
+                            </Badge>
+                          )}
+                          {/* Country */}
+                          {c.ai_country && c.ai_country !== 'أخرى' && (
+                            <Badge variant="outline" className="text-[10px] border-purple-500/30 text-purple-400">
+                              {c.ai_country}
+                            </Badge>
+                          )}
+                        </div>
                       </div>
                     </div>
                   ))}
