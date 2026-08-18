@@ -154,7 +154,7 @@ export default function Home() {
 
   const fetchLinks = useCallback(async () => {
     try {
-      const response = await fetch(`${API_URL}/api/links?limit=500`, {
+      const response = await fetch(`${API_URL}/api/links?limit=5000`, {
         headers: { Accept: 'application/json' },
       })
       if (response.ok) {
@@ -179,9 +179,11 @@ export default function Home() {
         const data = await response.json()
         setJoiners(data.joiners || [])
         setJoinersSummary(data.summary || null)
+      } else {
+        console.error('fetchJoiners HTTP error:', response.status)
       }
-    } catch {
-      // silent
+    } catch (err) {
+      console.error('fetchJoiners error:', err)
     }
   }, [])
 
@@ -960,8 +962,8 @@ function LinksModal(props: {
                 </div>
               </div>
 
-              {/* Links list */}
-              <ScrollArea className="flex-1 p-4">
+              {/* Links list — div عادي مع scroll بدل ScrollArea */}
+              <div className="flex-1 overflow-y-auto p-4" style={{ maxHeight: 'calc(95vh - 200px)' }}>
                 {filteredLinks.length === 0 ? (
                   <div className="text-center py-20">
                     <Link2 className="w-12 h-12 mx-auto text-slate-600 mb-4" />
@@ -974,7 +976,7 @@ function LinksModal(props: {
                     ))}
                   </div>
                 )}
-              </ScrollArea>
+              </div>
             </div>
           )}
         </motion.div>
