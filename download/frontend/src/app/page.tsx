@@ -73,6 +73,15 @@ interface CountryStat {
   percentage: number
 }
 
+interface JoinedGroup {
+  group_link: string
+  group_title: string
+  state: string
+  joined_by_phone: string
+  member_count: number
+  join_date: string
+}
+
 type ModalType =
   | 'whatsapp'
   | 'telegram'
@@ -81,6 +90,7 @@ type ModalType =
   | 'ai_rejected'
   | 'ai_ads'
   | 'joiners'
+  | 'joined_groups'
   | null
 
 // ===== Constants =====
@@ -120,6 +130,7 @@ export default function Home() {
   const [countryStats, setCountryStats] = useState<CountryStat[]>([])
   const [joiners, setJoiners] = useState<Joiner[]>([])
   const [joinersSummary, setJoinersSummary] = useState<JoinersSummary | null>(null)
+  const [joinedGroups, setJoinedGroups] = useState<JoinedGroup[]>([])
   const [loading, setLoading] = useState<boolean>(true)
   const [modal, setModal] = useState<ModalType>(null)
 
@@ -179,6 +190,7 @@ export default function Home() {
         const data = await response.json()
         setJoiners(data.joiners || [])
         setJoinersSummary(data.summary || null)
+        setJoinedGroups(data.joined_groups || [])
       } else {
         console.error('fetchJoiners HTTP error:', response.status)
       }
@@ -503,6 +515,54 @@ export default function Home() {
                     </div>
                   ))}
                 </div>
+
+                {/* المجموعات المنضم لها */}
+                <div className="mt-4">
+                  <button
+                    onClick={() => setModal('joined_groups')}
+                    className="w-full text-right hover:scale-[1.01] transition-transform"
+                  >
+                    <div className="bg-slate-700/30 rounded-lg p-3 border border-slate-700">
+                      <div className="flex items-center justify-between mb-2">
+                        <h4 className="text-sm font-semibold text-slate-300">
+                          📋 المجموعات المنضم لها ({joinedGroups.length})
+                        </h4>
+                        <ArrowRight className="w-4 h-4 text-slate-400" />
+                      </div>
+                      {joinedGroups.length > 0 ? (
+                        <div className="space-y-1">
+                          {joinedGroups.slice(0, 3).map((g, i) => (
+                            <div
+                              key={i}
+                              className="bg-slate-900/50 rounded p-2 text-xs flex items-center justify-between"
+                            >
+                              <span className="text-white truncate flex-1">
+                                {g.group_title || 'غير معروف'}
+                              </span>
+                              <div className="flex items-center gap-2 mr-2">
+                                <span className="text-slate-400">
+                                  {g.member_count > 0 ? `${g.member_count.toLocaleString()} عضو` : ''}
+                                </span>
+                                <span className="text-slate-500 font-mono">
+                                  {g.joined_by_phone || '?'}
+                                </span>
+                              </div>
+                            </div>
+                          ))}
+                          {joinedGroups.length > 3 && (
+                            <p className="text-xs text-slate-500 text-center pt-1">
+                              + {joinedGroups.length - 3} مجموعة أخرى...
+                            </p>
+                          )}
+                        </div>
+                      ) : (
+                        <p className="text-xs text-slate-500 text-center py-2">
+                          لا توجد مجموعات منضم لها بعد — البوت ينتظر مجموعات 1000+ عضو
+                        </p>
+                      )}
+                    </div>
+                  </button>
+                </div>
               </div>
             ) : (
               <div className="text-center py-8">
@@ -815,6 +875,8 @@ function LinksModal(props: {
         return '⚠️ روابط مُصنّفة كإعلانات (AI)'
       case 'joiners':
         return '🚀 لوحة الفدائي التفصيلية'
+      case 'joined_groups':
+        return '📋 المجموعات المنضم لها'
       default:
         return ''
     }
@@ -944,6 +1006,69 @@ function LinksModal(props: {
                   </div>
                 ))}
               </div>
+            </div>
+          ) : type === 'joined_groups' ? (
+            <div className="flex-1 overflow-y-auto p-4" style={{ maxHeight: 'calc(95vh - 100px)' }}>
+              {joinedGroups.length === 0 ? (
+                <div className="text-center py-20">
+                  <Users className="w-12 h-12 mx-auto text-slate-600 mb-4" />
+                  <p className="text-slate-500 mb-2">لا توجد مجموعات منضم لها بعد</p>
+                  <p className="text-slate-600 text-xs">
+                    البوت ينتظر مجموعات 1000+ عضو لينضم لها
+                  </p>
+                </div>
+              ) : (
+                <div className="space-y-2">
+                  {joinedGroups.map((g, i) => (
+                    <div
+                      key={i}
+                      className="bg-slate-800/50 rounded-lg p-3 border border-slate-700"
+                    >
+                      <div className="flex items-center justify-between mb-2">
+                        <div className="flex-1 min-w-0">
+                          <p className="text-white text-sm font-semibold truncate">
+                            {g.group_title || 'غير معروف'}
+                          </p>
+                          <a
+                            href={g.group_link}
+                            target="_blank"
+                            rel="noopener noreferrer"
+                            className="text-xs text-blue-400 hover:text-blue-300 truncate block font-mono"
+                          >
+                            {g.group_link}
+                          </a>
+                        </div>
+                        <Badge
+                          variant="outline"
+                          className={
+                            g.state === 'JOINED'
+                              ? 'border-emerald-500/30 text-emerald-400 ml-2'
+                              : 'border-blue-500/30 text-blue-400 ml-2'
+                          }
+                        >
+                          {g.state === 'JOINED' ? '✅ ناجح' : '👤 منضم مسبقاً'}
+                        </Badge>
+                      </div>
+                      <div className="flex items-center justify-between text-xs text-slate-400">
+                        <span>
+                          👥 {g.member_count > 0 ? `${g.member_count.toLocaleString()} عضو` : 'غير معروف'}
+                        </span>
+                        <span className="font-mono">{g.joined_by_phone || '?'}</span>
+                        {g.join_date && (
+                          <span>
+                            {new Date(g.join_date).toLocaleString('ar-SA', {
+                              day: 'numeric',
+                              month: 'short',
+                              hour: '2-digit',
+                              minute: '2-digit',
+                            })}
+                          </span>
+                        )}
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              )}
             </div>
           ) : (
             <div className="flex flex-col flex-1 overflow-hidden">

@@ -6876,55 +6876,83 @@ async def api_links_handler(request):
       ?ai_is_ad=true       → only flagged as ads
       ?link_type=whatsapp  → filter by link type
     Returns all columns including ai_approved, ai_description, ai_country, ai_is_ad.
+
+    Note: Supabase REST API has a hard limit of 1000 rows per request.
+    This handler implements pagination to fetch up to the requested limit
+    by making multiple requests of 1000 each.
     """
     db = request.app.get("db")
     if not db:
         return web.json_response({"error": "not ready"}, status=503)
 
     try:
-        limit = int(request.query.get("limit", "50"))
+        total_limit = int(request.query.get("limit", "50"))
         offset = int(request.query.get("offset", "0"))
 
         if not db.supabase_url or not db.supabase_key:
             return web.json_response({"links": [], "error": "supabase not configured"},
                                      status=200, headers={"Access-Control-Allow-Origin": "*"})
 
-        # Build query with explicit column selection to ensure AI fields are returned
-        # (also lets us add filters cleanly)
+        # Build query with explicit column selection
         columns = (
             "id,link,link_type,message_text,group_name,sender_name,"
             "sender_contact,source_phone,message_link,created_at,"
             "ai_approved,ai_description,ai_country,ai_is_ad"
         )
-        query_parts = [f"select={columns}", f"order=created_at.desc", f"limit={limit}"]
 
         ai_approved = request.query.get("ai_approved")  # 'true' | 'false' | None
         ai_is_ad = request.query.get("ai_is_ad")
         link_type = request.query.get("link_type")
 
+        # Build filter parts (without limit/offset — we'll handle pagination manually)
+        filter_parts = [f"select={columns}", f"order=created_at.desc"]
         if ai_approved is not None:
             val = "true" if ai_approved.lower() == "true" else "false"
-            query_parts.append(f"ai_approved=eq.{val}")
+            filter_parts.append(f"ai_approved=eq.{val}")
         if ai_is_ad is not None:
             val = "true" if ai_is_ad.lower() == "true" else "false"
-            query_parts.append(f"ai_is_ad=eq.{val}")
+            filter_parts.append(f"ai_is_ad=eq.{val}")
         if link_type in ("whatsapp", "telegram", "other"):
-            query_parts.append(f"link_type=eq.{link_type}")
+            filter_parts.append(f"link_type=eq.{link_type}")
 
-        url = f"{db.supabase_url}/rest/v1/links?" + "&".join(query_parts)
         session = await db._get_supabase_session()
-        headers = {**session.headers, "Range": f"{offset}-{offset + limit - 1}"}
 
-        async with session.get(url, headers=headers) as resp:
-            if resp.status == 200:
-                data = await resp.json()
-                return web.json_response({"links": data},
-                                        status=200, headers={"Access-Control-Allow-Origin": "*"})
-            else:
-                text = await resp.text()
-                logging.error(f"[API] /api/links supabase {resp.status}: {text[:200]}")
-                return web.json_response({"links": [], "error": f"supabase {resp.status}"},
-                                        status=200, headers={"Access-Control-Allow-Origin": "*"})
+        # === PAGINATION: fetch in batches of 1000 ===
+        # Supabase REST API hard limit is 1000 rows per request.
+        # To return up to total_limit (e.g., 5000), we make multiple requests.
+        all_links = []
+        current_offset = offset
+        batch_size = 1000  # Supabase max per request
+        remaining = total_limit
+
+        while remaining > 0:
+            batch_limit = min(batch_size, remaining)
+            # Build URL for this batch
+            batch_url = f"{db.supabase_url}/rest/v1/links?" + "&".join(filter_parts) + f"&limit={batch_limit}"
+            batch_headers = {**session.headers, "Range": f"{current_offset}-{current_offset + batch_limit - 1}"}
+
+            try:
+                async with session.get(batch_url, headers=batch_headers) as resp:
+                    if resp.status == 200:
+                        batch_data = await resp.json()
+                        if not batch_data or len(batch_data) == 0:
+                            break  # No more data
+                        all_links.extend(batch_data)
+                        # If we got fewer than requested, we've reached the end
+                        if len(batch_data) < batch_limit:
+                            break
+                        current_offset += len(batch_data)
+                        remaining -= len(batch_data)
+                    else:
+                        logging.error(f"[API] /api/links batch fetch failed: {resp.status}")
+                        break
+            except Exception as e:
+                logging.error(f"[API] /api/links batch error: {e}")
+                break
+
+        return web.json_response({"links": all_links, "count": len(all_links)},
+                                status=200, headers={"Access-Control-Allow-Origin": "*"})
+
     except Exception as e:
         logging.error(f"[API] /api/links error: {e}")
         return web.json_response({"links": [], "error": str(e)},
