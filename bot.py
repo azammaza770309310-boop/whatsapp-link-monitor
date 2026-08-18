@@ -6274,7 +6274,7 @@ class Monitor:
         role = w.get('role', 'monitor') if w else 'monitor'
 
         if role == 'joiner':
-            return int(os.getenv('DAILY_JOIN_LIMIT', '25'))  # 25/day (آمن)
+            return int(os.getenv('DAILY_JOIN_LIMIT', '45'))  # 45/day
         elif role == 'backup':
             return int(os.getenv('DAILY_BACKUP_LIMIT', '5'))  # 5/day
         else:
@@ -7357,8 +7357,8 @@ async def main():
         logging.info("📡 Production Mode: Real Telegram API calls enabled")
 
     # 4. Join limits (optimized to AVOID FloodWait)
-    daily_limit = os.getenv('DAILY_JOIN_LIMIT', '25')
-    logging.info(f"📊 Daily Join Limit: {daily_limit}/day (safe)")
+    daily_limit = os.getenv('DAILY_JOIN_LIMIT', '45')
+    logging.info(f"📊 Daily Join Limit: {daily_limit}/day")
     logging.info(f"📊 Hourly Join Limit: 5/hour (safe)")
     logging.info(f"📊 Join Cooldown: 120s (2 min between joins)")
     logging.info(f"⚠️  These limits are intentionally conservative to prevent FloodWait")
