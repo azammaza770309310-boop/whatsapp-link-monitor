@@ -62,6 +62,8 @@ class LinkNormalizer:
         """يستخرج كل الروابط من النص ويعيدها بصيغة موحدة.
         
         Returns: [{raw, normalized, link_type, username, invite_hash, msg_id}, ...]
+        
+        Note: يستبعد روابط الرسائل (t.me/username/123) لأنها مو دعوات انضمام.
         """
         if not text:
             return []
@@ -75,6 +77,11 @@ class LinkNormalizer:
                 raw = match.group(0)
                 identifier = match.group(1)
                 msg_id = match.group(2) if match.lastindex >= 2 else None
+
+                # === استبعاد روابط الرسائل (t.me/username/123) ===
+                # هذه روابط رسائل في قنوات، مو دعوات انضمام
+                if msg_id is not None:
+                    continue
 
                 # Determine type
                 if identifier.startswith('+') or identifier.startswith('joinchat/'):
@@ -93,13 +100,15 @@ class LinkNormalizer:
                     # Ensure raw starts with https://
                     if not raw.startswith('http'):
                         raw = 'https://' + raw
+                    # إزالة /msg_id من الرابط لو موجود بالخطأ
+                    raw = re.sub(r'/\d+$', '', raw)
                     links.append({
                         'raw': raw,
                         'normalized': normalized,
                         'link_type': link_type,
                         'username': username,
                         'invite_hash': invite_hash,
-                        'msg_id': msg_id,
+                        'msg_id': None,  # دايماً None — ما نريد روابط رسائل
                     })
 
         # WhatsApp links
