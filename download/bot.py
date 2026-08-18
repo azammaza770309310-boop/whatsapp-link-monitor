@@ -7110,9 +7110,29 @@ async def api_joiners_status_handler(request):
         )
         total_banned = (await cursor.fetchone())[0]
 
+        # اجلب المجموعات الممنوعة مع روابطها وأسباب المنع
+        cursor = await conn.execute(
+            "SELECT normalized_link, raw_link, group_title, state, joined_by, member_count, last_seen, last_error "
+            "FROM group_states WHERE state = 'BANNED' "
+            "ORDER BY last_seen DESC LIMIT 200"
+        )
+        banned_rows = await cursor.fetchall()
+        banned_groups = []
+        for r in banned_rows:
+            banned_groups.append({
+                'group_link': r[1] or '',
+                'group_title': r[2] or 'غير معروف',
+                'state': r[3] or 'BANNED',
+                'joined_by_phone': r[4] or '',
+                'member_count': r[5] or 0,
+                'join_date': r[6] or '',
+                'last_error': r[7] or '',
+            })
+
         return web.json_response({
             'joiners': joiners_data,
             'joined_groups': joined_groups,
+            'banned_groups': banned_groups,
             'summary': {
                 'total_joiners': len(joiners_data),
                 'connected_joiners': sum(1 for j in joiners_data if j['connected']),

@@ -108,6 +108,16 @@ interface MonitoredSummary {
   by_type: Record<string, number>
 }
 
+interface BannedGroup {
+  group_link: string
+  group_title: string
+  state: string
+  joined_by_phone: string
+  member_count: number
+  join_date: string
+  last_error: string
+}
+
 type ModalType =
   | 'whatsapp'
   | 'telegram'
@@ -118,6 +128,7 @@ type ModalType =
   | 'joiners'
   | 'joined_groups'
   | 'monitored_chats'
+  | 'banned_groups'
   | null
 
 // ===== Constants =====
@@ -160,6 +171,7 @@ export default function Home() {
   const [joinedGroups, setJoinedGroups] = useState<JoinedGroup[]>([])
   const [monitoredChats, setMonitoredChats] = useState<MonitoredChat[]>([])
   const [monitoredSummary, setMonitoredSummary] = useState<MonitoredSummary | null>(null)
+  const [bannedGroups, setBannedGroups] = useState<BannedGroup[]>([])
   const [loading, setLoading] = useState<boolean>(true)
   const [modal, setModal] = useState<ModalType>(null)
 
@@ -220,6 +232,7 @@ export default function Home() {
         setJoiners(data.joiners || [])
         setJoinersSummary(data.summary || null)
         setJoinedGroups(data.joined_groups || [])
+        setBannedGroups(data.banned_groups || [])
       } else {
         console.error('fetchJoiners HTTP error:', response.status)
       }
@@ -480,7 +493,7 @@ export default function Home() {
           </Card>
         )}
 
-        {/* Monitored Chats Section — المجموعات المراقبة */}
+        {/* Monitored Chats Section — المجموعات المراقبة (بطاقة واحدة) */}
         <Card className="bg-slate-800/30 border-slate-700/50 backdrop-blur-sm mb-6">
           <CardHeader>
             <CardTitle className="flex items-center justify-between text-lg">
@@ -488,43 +501,21 @@ export default function Home() {
                 <span className="text-2xl">👁️</span>
                 المجموعات المراقبة
               </span>
-              {monitoredSummary && (
-                <Badge className="bg-blue-500/20 text-blue-400 border-blue-500/40">
-                  {monitoredSummary.total} مجموعة
-                </Badge>
-              )}
+              <div className="flex items-center gap-2">
+                {monitoredSummary && monitoredSummary.classified > 0 && (
+                  <Badge className="bg-emerald-500/20 text-emerald-400 border-emerald-500/40 text-xs">
+                    {monitoredSummary.classified} مُصنّفة
+                  </Badge>
+                )}
+                {monitoredSummary && (
+                  <Badge className="bg-blue-500/20 text-blue-400 border-blue-500/40">
+                    {monitoredSummary.total} مجموعة
+                  </Badge>
+                )}
+              </div>
             </CardTitle>
           </CardHeader>
           <CardContent>
-            {/* Stats Row */}
-            <div className="grid grid-cols-4 gap-3 mb-4">
-              <div className="bg-blue-500/10 border border-blue-500/30 rounded-lg p-3 text-center">
-                <p className="text-2xl font-bold text-blue-400">
-                  {monitoredSummary?.total ?? 0}
-                </p>
-                <p className="text-xs text-slate-400 mt-1">إجمالي المراقبة</p>
-              </div>
-              <div className="bg-emerald-500/10 border border-emerald-500/30 rounded-lg p-3 text-center">
-                <p className="text-2xl font-bold text-emerald-400">
-                  {monitoredSummary?.classified ?? 0}
-                </p>
-                <p className="text-xs text-slate-400 mt-1">مُصنّفة بـ AI</p>
-              </div>
-              <div className="bg-amber-500/10 border border-amber-500/30 rounded-lg p-3 text-center">
-                <p className="text-2xl font-bold text-amber-400">
-                  {monitoredSummary?.educational ?? 0}
-                </p>
-                <p className="text-xs text-slate-400 mt-1">تعليمية</p>
-              </div>
-              <div className="bg-purple-500/10 border border-purple-500/30 rounded-lg p-3 text-center">
-                <p className="text-2xl font-bold text-purple-400">
-                  {monitoredSummary?.high_relevance ?? 0}
-                </p>
-                <p className="text-xs text-slate-400 mt-1">صلة عالية</p>
-              </div>
-            </div>
-
-            {/* Recent Monitored Chats Preview */}
             <button
               onClick={() => setModal('monitored_chats')}
               className="w-full text-right hover:scale-[1.01] transition-transform"
@@ -532,13 +523,13 @@ export default function Home() {
               <div className="bg-slate-700/30 rounded-lg p-3 border border-slate-700">
                 <div className="flex items-center justify-between mb-2">
                   <h4 className="text-sm font-semibold text-slate-300">
-                    📋 أحدث المجموعات المراقبة
+                    📋 أحدث المجموعات المراقبة (تصنيف AI)
                   </h4>
                   <ArrowRight className="w-4 h-4 text-slate-400" />
                 </div>
                 {monitoredChats.length > 0 ? (
                   <div className="space-y-1">
-                    {monitoredChats.slice(0, 3).map((c) => (
+                    {monitoredChats.slice(0, 5).map((c) => (
                       <div
                         key={c.chat_id}
                         className="bg-slate-900/50 rounded p-2 text-xs flex items-center justify-between"
@@ -547,23 +538,28 @@ export default function Home() {
                           {c.chat_title || 'غير معروف'}
                         </span>
                         <div className="flex items-center gap-2 mr-2">
-                          {c.ai_classification && c.ai_classification !== 'unknown' && (
+                          {c.ai_classification && c.ai_classification !== 'unknown' && c.ai_classification !== 'error' && (
                             <Badge variant="outline" className="text-[10px] px-1 py-0">
                               {c.ai_classification === 'group' ? '👥' : c.ai_classification === 'channel' ? '📢' : '?'}
                             </Badge>
                           )}
-                          <span className="text-slate-400">
-                            {c.ai_relevance > 0 ? `${c.ai_relevance}%` : ''}
-                          </span>
+                          {c.ai_relevance > 0 && (
+                            <span className={`text-[10px] ${
+                              c.ai_relevance >= 80 ? 'text-emerald-400' :
+                              c.ai_relevance >= 50 ? 'text-amber-400' : 'text-red-400'
+                            }`}>
+                              {c.ai_relevance}%
+                            </span>
+                          )}
                           {c.ai_country && c.ai_country !== 'أخرى' && (
                             <span className="text-purple-400 text-[10px]">{c.ai_country}</span>
                           )}
                         </div>
                       </div>
                     ))}
-                    {monitoredChats.length > 3 && (
+                    {monitoredChats.length > 5 && (
                       <p className="text-xs text-slate-500 text-center pt-1">
-                        + {monitoredChats.length - 3} مجموعة أخرى...
+                        + {monitoredChats.length - 5} مجموعة أخرى...
                       </p>
                     )}
                   </div>
@@ -606,12 +602,15 @@ export default function Home() {
                 </p>
                 <p className="text-xs text-slate-400 mt-1">منضم مسبقاً</p>
               </div>
-              <div className="bg-red-500/10 border border-red-500/30 rounded-lg p-3 text-center">
+              <button
+                onClick={() => setModal('banned_groups')}
+                className="bg-red-500/10 border border-red-500/30 rounded-lg p-3 text-center hover:scale-105 transition-transform w-full"
+              >
                 <p className="text-2xl font-bold text-red-400">
                   {joinersSummary?.total_banned ?? 0}
                 </p>
-                <p className="text-xs text-slate-400 mt-1">مجموعات ممنوعة</p>
-              </div>
+                <p className="text-xs text-slate-400 mt-1">مجموعات ممنوعة (اضغط للتفاصيل)</p>
+              </button>
             </div>
 
             {joiners.length > 0 ? (
@@ -768,6 +767,10 @@ export default function Home() {
         allLinks={allLinks}
         joiners={joiners}
         joinersSummary={joinersSummary}
+        joinedGroups={joinedGroups}
+        monitoredChats={monitoredChats}
+        monitoredSummary={monitoredSummary}
+        bannedGroups={bannedGroups}
       />
     </div>
   )
@@ -968,8 +971,12 @@ function LinksModal(props: {
   allLinks: LinkItem[]
   joiners: Joiner[]
   joinersSummary: JoinersSummary | null
+  joinedGroups: JoinedGroup[]
+  monitoredChats: MonitoredChat[]
+  monitoredSummary: MonitoredSummary | null
+  bannedGroups: BannedGroup[]
 }) {
-  const { type, onClose, allLinks, joiners, joinersSummary } = props
+  const { type, onClose, allLinks, joiners, joinersSummary, joinedGroups, monitoredChats, monitoredSummary, bannedGroups } = props
   const [searchQuery, setSearchQuery] = useState<string>('')
 
   const filteredLinks = useMemo((): LinkItem[] => {
@@ -1023,6 +1030,8 @@ function LinksModal(props: {
         return '📋 المجموعات المنضم لها'
       case 'monitored_chats':
         return '👁️ المجموعات المراقبة (تصنيف AI)'
+      case 'banned_groups':
+        return '🚫 المجموعات الممنوعة'
       default:
         return ''
     }
@@ -1305,6 +1314,63 @@ function LinksModal(props: {
                             </Badge>
                           )}
                         </div>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+          ) : type === 'banned_groups' ? (
+            <div className="flex-1 overflow-y-auto p-4" style={{ maxHeight: 'calc(95vh - 100px)' }}>
+              {bannedGroups.length === 0 ? (
+                <div className="text-center py-20">
+                  <XCircle className="w-12 h-12 mx-auto text-slate-600 mb-4" />
+                  <p className="text-slate-500">لا توجد مجموعات ممنوعة</p>
+                </div>
+              ) : (
+                <div className="space-y-2">
+                  {bannedGroups.map((g, i) => (
+                    <div
+                      key={i}
+                      className="bg-slate-800/50 rounded-lg p-3 border border-red-900/30"
+                    >
+                      <div className="flex items-start justify-between mb-2">
+                        <div className="flex-1 min-w-0">
+                          <p className="text-white text-sm font-semibold truncate mb-1">
+                            {g.group_title || 'غير معروف'}
+                          </p>
+                          <a
+                            href={g.group_link}
+                            target="_blank"
+                            rel="noopener noreferrer"
+                            className="text-xs text-blue-400 hover:text-blue-300 truncate block font-mono"
+                          >
+                            {g.group_link}
+                          </a>
+                        </div>
+                        <Badge variant="outline" className="border-red-500/40 text-red-400 ml-2">
+                          🚫 ممنوعة
+                        </Badge>
+                      </div>
+                      {g.last_error && (
+                        <div className="bg-red-500/5 border border-red-500/20 rounded p-2 text-xs text-red-300/80 mt-2">
+                          <span className="font-semibold">السبب:</span> {g.last_error}
+                        </div>
+                      )}
+                      <div className="flex items-center justify-between text-xs text-slate-400 mt-2">
+                        <span>
+                          👥 {g.member_count > 0 ? `${g.member_count.toLocaleString()} عضو` : 'غير معروف'}
+                        </span>
+                        {g.join_date && (
+                          <span>
+                            {new Date(g.join_date).toLocaleString('ar-SA', {
+                              day: 'numeric',
+                              month: 'short',
+                              hour: '2-digit',
+                              minute: '2-digit',
+                            })}
+                          </span>
+                        )}
                       </div>
                     </div>
                   ))}
