@@ -59,3 +59,13 @@ accounts.env
 # Z.ai skills — not needed for the bot
 skills/
 
+
+# === SECURITY ===
+.env
+.env.*
+.secrets/
+*.env
+accounts.env
+*_session_string*
+*.session
+upload/
