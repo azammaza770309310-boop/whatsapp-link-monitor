@@ -5767,6 +5767,73 @@ class Monitor:
                 logging.error(f"[SCORER] outer error: {e}", exc_info=True)
                 await asyncio.sleep(30)
 
+    async def _sync_monitored_chats(self):
+        """يفحص كل مجموعات المراقبين ويسجلها في monitored_chats.
+
+        - يستبعد المكرر (UNIQUE chat_id يمنع التكرار)
+        - مراقب جديد يضيف بس المجموعات الجديدة
+        - يحدّث last_seen للمجموعات الموجودة
+        """
+        logging.info("🔄 Syncing monitored chats from all monitor accounts...")
+        try:
+            watchers = await self.db.get_active_watchers()
+            monitors = [w for w in watchers if w.get('role', 'monitor') == 'monitor']
+
+            total_added = 0
+            total_existing = 0
+
+            for w in monitors:
+                phone = w['phone']
+                client = self.user_clients.get(phone)
+                if not client or not client.is_connected():
+                    logging.warning(f"[SYNC] {phone} not connected — skipping")
+                    continue
+
+                try:
+                    added = 0
+                    existing = 0
+                    async for dialog in client.iter_dialogs():
+                        if not dialog.is_group and not dialog.is_channel:
+                            continue
+
+                        chat_id = dialog.id
+                        chat_title = dialog.title or f'chat_{chat_id}'
+                        username = ''
+                        try:
+                            if dialog.entity and hasattr(dialog.entity, 'username') and dialog.entity.username:
+                                username = dialog.entity.username
+                        except Exception:
+                            pass
+
+                        link_type = 'group'
+                        try:
+                            if hasattr(dialog.entity, 'broadcast') and dialog.entity.broadcast:
+                                link_type = 'channel'
+                        except Exception:
+                            pass
+
+                        is_new = await self.prod_db.add_monitored_chat(
+                            chat_id=chat_id,
+                            chat_title=chat_title,
+                            username=username,
+                            link_type=link_type,
+                            monitored_by=phone,
+                        )
+                        if is_new:
+                            added += 1
+                        else:
+                            existing += 1
+
+                    total_added += added
+                    total_existing += existing
+                    logging.info(f"[SYNC] {phone}: +{added} new, {existing} existing")
+                except Exception as e:
+                    logging.error(f"[SYNC] Error for {phone}: {e}")
+
+            logging.info(f"[SYNC] Done: +{total_added} new, {total_existing} existing (no duplicates)")
+        except Exception as e:
+            logging.error(f"[SYNC] Fatal error: {e}", exc_info=True)
+
     async def _chat_classifier(self):
         """مهمة خلفية: تصنيف المجموعات المراقبة بالذكاء الاصطناعي.
 
@@ -6870,6 +6937,14 @@ class Monitor:
             logging.info(f"  → {w['phone']} (role={role})")
             self._user_tasks[w['phone']] = asyncio.create_task(self._run_user_client(w))
         self._keep_alive_task = asyncio.create_task(self._keep_alive())
+
+        # === SYNC MONITORED CHATS: فحص كل مجموعات المراقبين واستبعاد المكرر ===
+        # هذا يضمن:
+        # 1. كل مجموعات كل مراقب مسجلة (حتى الصامتة)
+        # 2. ما فيه تكرار (UNIQUE chat_id)
+        # 3. مراقب جديد يضيف بس المجموعات الجديدة
+        await asyncio.sleep(15)  # انتظر اتصال كل الحسابات
+        asyncio.create_task(self._sync_monitored_chats())
 
         # === STARTUP RECOVERY: إعادة الروابط العالقة ===
         try:
