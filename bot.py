@@ -1582,7 +1582,7 @@ class GulfFilter:
     # القوائم السوداء — مقسّمة لفئات منطقية (من DeepSeek + توسعات)
     # ==================================================================
     BLACKLIST_CRYPTO_INVEST = [
-        # إنجليزي — كلمات دقيقة فقط (تجنب false positives من الكلمات القصيرة)
+        # إنجليزي — كلمات دقيقة فقط (تجنب false positives)
         'bitcoin', 'btc', 'crypto', 'cryptocurrency', 'blockchain',
         'forex', 'trading', 'stocks', 'profit', 'airdrop',
         'binance', 'coinbase', 'defi', 'web3',
@@ -1593,6 +1593,7 @@ class GulfFilter:
         'استثمار', 'استثماري', 'تداول', 'فوركس', 'بورصة', 'اسهم', 'سهم',
         'ربح', 'ارباح', 'دولار', 'ايردروب',
         'بينانس', 'اشارات', 'رافعة',
+        'بامبات', 'بامبه', 'اكتتابات', 'اكتتاب', 'اكتابات',
     ]
 
     BLACKLIST_GAMBLING = [
@@ -5187,14 +5188,8 @@ class Monitor:
                 # 1. اجلب رابط QUEUED واحد (لا burst)
                 queued = await self.prod_db.get_queued_links(limit=1)
                 if not queued:
-                    logging.info(f"[SCHED] cycle={cycle} Queue empty — auto-refill from channel")
-                    # === AUTO-REFILL: اقرأ رسائل القناة وأضف روابط جديدة ===
-                    try:
-                        refill_count = await self._rejoin_published_links(max_messages=500)
-                        logging.info(f"[SCHED] Auto-refill added {refill_count} links")
-                    except Exception as e:
-                        logging.error(f"[SCHED] Auto-refill error: {e}")
-                    await asyncio.sleep(30)
+                    logging.debug(f"[SCHED] cycle={cycle} Queue empty — waiting for new links from monitors")
+                    await asyncio.sleep(60)
                     continue
 
                 link_data = queued[0]
