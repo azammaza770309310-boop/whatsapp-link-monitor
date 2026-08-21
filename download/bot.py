@@ -1996,11 +1996,9 @@ class GulfFilter:
             return True, edu_reason
 
         # 6. احتياطي — لو ما في أي مطابقة:
-        # البوت يراقب أصلاً مجموعات خليجية، فالروابط اللي تجي منها
-        # على الأرجح خليجية حتى لو ما فيها اسم جامعة.
-        # نقبلها بدل ما نرفضها (تجنب توقف الانضمام بالكامل).
-        # الرفض الوحيد يكون من القائمة السوداء (خطوة 1).
-        return True, f'fallback_accept_from_gulf_monitor_{edu_reason}'
+        # المراقب يراقب مجموعة تعليمية، لكن الأعضاء ينشرون روابط غير تعليمية
+        # (استشارات، بيع، فضفضة، إلخ). لازم نرفض الروابط اللي ما فيها إشارة تعليمية واضحة.
+        return False, f'no_educational_signal_{edu_reason}'
 
 # Alias — EducationalFilter هو الاسم القديم المستخدم في باقي الكود
 EducationalFilter = GulfFilter
@@ -5360,13 +5358,12 @@ class Monitor:
                     f"{raw_link[:60]} (reason={filter_reason})"
                 )
 
-                # === MEMBER COUNT CHECK — لا ينضم لأقل من 500 عضو ===
-                # لو member_count معروف:
-                #   - < 500 → REJECT (مجموعة صغيرة جداً)
-                #   - 500+ → اقبل
-                #   - NULL (Scorer فشل أو WhatsApp) → اقبل (لا توقف العملية)
+                # === MEMBER COUNT CHECK ===
+                # لو member_count = 0 (Scorer فشل) → requeue (لا ترفض نهائياً)
+                # لو member_count < 500 → REJECT
+                # لو member_count >= 500 أو NULL → اقبل
                 member_count = link_data.get('member_count')
-                if member_count is not None and member_count < 500:
+                if member_count is not None and member_count > 0 and member_count < 500:
                     logging.info(
                         f"[LINK id={link_id}] [PIPELINE-6] 🚫 LOW MEMBER COUNT: "
                         f"{raw_link[:60]} (members={member_count}, threshold=500) — skipping"
@@ -5849,7 +5846,7 @@ class Monitor:
         while self._running:
             try:
                 # اجلب مجموعات ما تصنفت
-                unclassified = await self.prod_db.get_unclassified_chats(limit=5)
+                unclassified = await self.prod_db.get_unclassified_chats(limit=15)
                 if not unclassified:
                     await asyncio.sleep(60)
                     continue
