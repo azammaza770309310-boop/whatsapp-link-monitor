@@ -3137,22 +3137,6 @@ class Monitor:
 
             sender_id = event.sender_id or 0
 
-            # === تجاهل القنوات (broadcast) — نسحب فقط من المجموعات ===
-            try:
-                chat_obj = event.chat
-                if chat_obj:
-                    # لو قناة بث (broadcast) → تجاهل
-                    if hasattr(chat_obj, 'broadcast') and chat_obj.broadcast:
-                        return
-                    # لو ما هي مجموعة → تجاهل
-                    if hasattr(chat_obj, 'megagroup') and not chat_obj.megagroup:
-                        if hasattr(chat_obj, 'gigagroup') and not chat_obj.gigagroup:
-                            # ليست megagroup ولا gigagroup — تحقق لو group عادية
-                            if not hasattr(chat_obj, 'title') or not chat_obj.title:
-                                return
-            except Exception:
-                pass
-
             # === PIPELINE STAGE 1: Event Handler received message ===
             logging.info(f"[PIPELINE-1] 📨 Event Handler received message from source={source_phone} chat_id={chat_id} (len={len(raw_text)})")
 
