@@ -1957,60 +1957,21 @@ class GulfFilter:
     def should_join(cls, text: str, link_username: str = '', link: str = '',
                     source_group_name: str = '',
                     source_phone: str = '') -> Tuple[bool, str]:
-        """الفحص الشامل قبل الانضمام.
+        """فحص بسيط: BLACKLIST فقط.
 
-        الترتيب (من الأقوى للأضعف):
-            1. HARD_BLACKLIST → رفض فوري (حتى لو المصدر خليجي)
-            2. GULF_WHITELIST → قبول فوري
-            3. مصدر خليجي/أكاديمي → قبول
-            4. سياق أكاديمي → قبول
-            5. is_educational عام → قبول
-            6. رفض احتياطي (fail-safe)
-
-        Args:
-            text: نص الرسالة اللي فيها الرابط
-            link_username: username المستخرج من الرابط (مثلاً KFUPM_students)
-            link: الرابط الكامل
-            source_group_name: اسم المجموعة المصدر
-            source_phone: رقم المراقب (احتياطي — غير مستخدم حالياً)
-
-        Returns:
-            (True, reason) لو ينضم
-            (False, reason) لو يرفض
+        لو الرابط أو نص الرسالة فيه كلمة سلبية → رفض
+        وإلا → قبول (البوت يراقب مجموعات تعليمية أصلاً)
         """
-        # استخراج username تلقائياً لو ما مرر
         if not link_username:
             link_username = cls._extract_username(link)
 
-        # 1. القائمة السوداء (أقوى رفض) — تفوز دائماً
+        # 1. القائمة السوداء → رفض فوري
         is_bad, bad_reason = cls.is_blacklisted(text, link_username, link, source_group_name)
         if is_bad:
             return False, bad_reason
 
-        # 2. القائمة البيضاء الخليجية (أقوى قبول)
-        is_gulf, gulf_reason = cls.is_gulf_target(text, link_username, link)
-        if is_gulf:
-            return True, gulf_reason
-
-        # 3. مصدر خليجي/أكاديمي
-        is_source_ok, source_reason = cls._is_source_academic_gulf(source_group_name)
-        if is_source_ok:
-            return True, source_reason
-
-        # 4. سياق أكاديمي
-        is_acad, acad_reason = cls.is_academic_context(text, link_username, link)
-        if is_acad:
-            return True, acad_reason
-
-        # 5. فلتر تعليمي عام
-        is_edu, edu_reason = cls.is_educational(text, link_username)
-        if is_edu:
-            return True, edu_reason
-
-        # 6. احتياطي — لو ما في أي مطابقة:
-        # المراقب يراقب مجموعة تعليمية، لكن الأعضاء ينشرون روابط غير تعليمية
-        # (استشارات، بيع، فضفضة، إلخ). لازم نرفض الروابط اللي ما فيها إشارة تعليمية واضحة.
-        return False, f'no_educational_signal_{edu_reason}'
+        # 2. قبول (ما فيه سبب للرفض)
+        return True, 'passed_blacklist'
 
 # Alias — EducationalFilter هو الاسم القديم المستخدم في باقي الكود
 EducationalFilter = GulfFilter
@@ -7000,12 +6961,8 @@ class Monitor:
         else:
             logging.info("📊 Priority Scorer already running — skip duplicate")
 
-        # ابدأ Chat Classifier — يصنف المجموعات المراقبة بالـ AI
-        if not hasattr(self, '_chat_classifier_task') or self._chat_classifier_task is None or self._chat_classifier_task.done():
-            self._chat_classifier_task = asyncio.create_task(self._chat_classifier())
-            logging.info("🧠 Chat Classifier started (will classify monitored chats with AI)")
-        else:
-            logging.info("🧠 Chat Classifier already running — skip duplicate")
+        # NOTE: Chat Classifier معطل — يستهلك AI بدون فائدة
+        # الفلتر الحالي يعتمد على BLACKLIST فقط (كافي)
 
     async def stop(self):
         """إيقاف نظيف لمنع تسريب الذاكرة
