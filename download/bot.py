@@ -3127,22 +3127,31 @@ class Monitor:
             logging.error(f"[RECOMMEND] Failed for {phone}: {e}")
 
     async def _on_user_message(self, event, source_phone: str):
-        """معالج رسائل المستخدم — ZERO Telegram API calls.
-
-        يستخدم فقط: event.raw_text, event.chat_id, event.sender_id
-        لا يستخدم: event.chat, event.sender, event.get_chat(), event.get_sender()
-        """
+        """معالج رسائل المستخدم — يستقبل من المجموعات فقط (تجاهل القنوات)."""
         try:
-            # استخدام raw_text مباشرة (بدون API)
             raw_text = event.raw_text
             if not raw_text: return
 
-            # استخدام chat_id مباشرة (بدون API)
             chat_id = event.chat_id
             if chat_id == self.config.channel_id: return
 
-            # استخدام sender_id مباشرة (بدون API)
             sender_id = event.sender_id or 0
+
+            # === تجاهل القنوات (broadcast) — نسحب فقط من المجموعات ===
+            try:
+                chat_obj = event.chat
+                if chat_obj:
+                    # لو قناة بث (broadcast) → تجاهل
+                    if hasattr(chat_obj, 'broadcast') and chat_obj.broadcast:
+                        return
+                    # لو ما هي مجموعة → تجاهل
+                    if hasattr(chat_obj, 'megagroup') and not chat_obj.megagroup:
+                        if hasattr(chat_obj, 'gigagroup') and not chat_obj.gigagroup:
+                            # ليست megagroup ولا gigagroup — تحقق لو group عادية
+                            if not hasattr(chat_obj, 'title') or not chat_obj.title:
+                                return
+            except Exception:
+                pass
 
             # === PIPELINE STAGE 1: Event Handler received message ===
             logging.info(f"[PIPELINE-1] 📨 Event Handler received message from source={source_phone} chat_id={chat_id} (len={len(raw_text)})")
