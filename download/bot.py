@@ -1664,6 +1664,10 @@ class GulfFilter:
         'استشارات زوجية', 'زوجية',
         'سوالف متزوجات', 'متزوجات',
         'تأهيل أسري', 'استشارات أسرية',
+        # شبكات قروبات نسائية (مو تعليمي)
+        'شبكة قروبات نسائية', 'قروبات نسائية',
+        'بنات تبوك', 'تعطير المنزل',
+        '60 قروب متنوع', 'قروبات تيليجرام نسائية',
     ]
 
     BLACKLIST_SHOPS = [
@@ -1957,10 +1961,15 @@ class GulfFilter:
     def should_join(cls, text: str, link_username: str = '', link: str = '',
                     source_group_name: str = '',
                     source_phone: str = '') -> Tuple[bool, str]:
-        """فحص بسيط: BLACKLIST فقط.
+        """فحص شامل قبل الانضمام.
 
-        لو الرابط أو نص الرسالة فيه كلمة سلبية → رفض
-        وإلا → قبول (البوت يراقب مجموعات تعليمية أصلاً)
+        الترتيب:
+            1. HARD_BLACKLIST → رفض فوري
+            2. GULF_WHITELIST → قبول فوري (جامعة خليجية معروفة)
+            3. ACADEMIC_CONTEXT → قبول (سياق أكاديمي)
+            4. مصدر أكاديمي → قبول
+            5. is_educational → قبول
+            6. احتياطي → قبول (البوت يراقك مجموعات تعليمية)
         """
         if not link_username:
             link_username = cls._extract_username(link)
@@ -1970,8 +1979,28 @@ class GulfFilter:
         if is_bad:
             return False, bad_reason
 
-        # 2. قبول (ما فيه سبب للرفض)
-        return True, 'passed_blacklist'
+        # 2. القائمة البيضاء الخليجية → قبول فوري
+        is_gulf, gulf_reason = cls.is_gulf_target(text, link_username, link)
+        if is_gulf:
+            return True, gulf_reason
+
+        # 3. سياق أكاديمي → قبول
+        is_acad, acad_reason = cls.is_academic_context(text, link_username, link)
+        if is_acad:
+            return True, acad_reason
+
+        # 4. مصدر أكاديمي → قبول
+        is_source_ok, source_reason = cls._is_source_academic_gulf(source_group_name)
+        if is_source_ok:
+            return True, source_reason
+
+        # 5. فلتر تعليمي عام → قبول
+        is_edu, edu_reason = cls.is_educational(text, link_username)
+        if is_edu:
+            return True, edu_reason
+
+        # 6. احتياطي → قبول (البوت يراقب مجموعات تعليمية)
+        return True, f'fallback_accept_{edu_reason}'
 
 # Alias — EducationalFilter هو الاسم القديم المستخدم في باقي الكود
 EducationalFilter = GulfFilter
