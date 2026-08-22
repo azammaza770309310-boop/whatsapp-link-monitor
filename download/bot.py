@@ -200,17 +200,35 @@ def extract_whatsapp_telegram_links(text: str) -> list:
         # استبعاد روابط الانضمام للمجموعات الخاصة (t.me/+xxx)
         if "/+" in link or "joinchat" in link_lower:
             continue
-        # استبعاد روابط الرسائل المباشرة (t.me/c/xxx) - هذه روابط رسائل خاصة
+        # استبعاد روابط الرسائل المباشرة (t.me/c/xxx)
         if "/c/" in link_lower:
             continue
         # استبعاد روابط الدردشة المباشرة (t.me/username?start=xxx)
         if "?start=" in link_lower or "?text=" in link_lower:
             continue
-        # استبعاد روابط الرسائل داخل القنوات (t.me/username/123)
-        # هذه روابط رسائل وليست دعوات لمجموعات
-        # الـ username صحيح لكن الرابط يشير لرسالة محددة
+        # استبعاد روابط الرسائل (t.me/username/123)
         if re.search(r'^https?://t(?:elegram)?\.me/[A-Za-z0-9_]+/\d+', link, re.IGNORECASE):
             continue
+
+        # === استبعاد يوزرات الأشخاص (بروفايلات) ===
+        # الرسائل المنسوخة تحتوي على: [@username](https://t.me/username)
+        # أو: 👤 [@username](https://t.me/username)
+        # هذه يوزرات أشخاص، مو روابط مجموعات
+        # استخرج username من الرابط
+        username_match = re.search(r't(?:elegram)?\.me/([A-Za-z0-9_]+)', link, re.IGNORECASE)
+        if username_match:
+            username = username_match.group(1)
+            # لو الرابط داخل Markdown [@username](url) → يوزر شخص
+            if f'[@{username}]' in text or f'[@{username.lower()}]' in text.lower():
+                continue
+            # لو الرابط مذكور بعد "المرسل" أو "ID المرسل" → يوزر شخص
+            text_before = text[:text.find(link)]
+            if 'المرسل' in text_before[-100:] or 'ID المرسل' in text_before[-100:]:
+                continue
+            # لو الرابط مذكور بعد "👤" → يوزر شخص
+            if '👤' in text_before[-50:]:
+                continue
+
         if link and link not in links:
             links.append(link)
 
