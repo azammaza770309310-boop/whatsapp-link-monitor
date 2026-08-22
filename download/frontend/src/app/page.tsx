@@ -10,7 +10,7 @@ import { ScrollArea } from '@/components/ui/scroll-area'
 import { Skeleton } from '@/components/ui/skeleton'
 import {
   MessageCircle, Send, Search, Users, Link2,
-  RefreshCw, ExternalLink, Phone, MapPin, Clock, Globe, ArrowRight,
+  RefreshCw, ExternalLink, Phone, MapPin, Clock, ArrowRight,
   X, Activity, CheckCircle2, XCircle, AlertTriangle, Clock3,
 } from 'lucide-react'
 import type { ReactNode, MouseEvent as ReactMouseEvent, ChangeEvent } from 'react'
@@ -65,12 +65,6 @@ interface JoinersSummary {
   total_joined_groups: number
   total_already_member: number
   total_banned: number
-}
-
-interface CountryStat {
-  country: string
-  count: number
-  percentage: number
 }
 
 interface JoinedGroup {
@@ -135,25 +129,6 @@ type ModalType =
 const API_URL: string =
   process.env.NEXT_PUBLIC_API_URL || 'https://whatsapp-userbot-yzm7.onrender.com'
 
-const COUNTRY_KEYWORDS: Record<string, string[]> = {
-  'السعودية': ['السعودية', 'saudi', 'ksa', 'السعودي', 'KAU', 'KSU', 'KFU', 'KFUPM', 'PSAU', 'UQU', 'IAU', 'SEU'],
-  'الكويت': ['الكويت', 'kuwait', 'AUM', 'AUK', 'GUST'],
-  'قطر': ['قطر', 'qatar', 'QU', 'HBKU'],
-  'البحرين': ['البحرين', 'bahrain'],
-  'الإمارات': ['الإمارات', 'UAE', 'Khalifa', 'Zayed', 'UAEU'],
-}
-
-function detectCountry(text: string): string | null {
-  if (!text) return null
-  const lower = text.toLowerCase()
-  for (const [country, keywords] of Object.entries(COUNTRY_KEYWORDS)) {
-    for (const kw of keywords) {
-      if (lower.includes(kw.toLowerCase())) return country
-    }
-  }
-  return null
-}
-
 function safeUrl(url: string | null | undefined): string | null {
   if (!url || typeof url !== 'string') return null
   const trimmed = url.trim()
@@ -165,7 +140,6 @@ function safeUrl(url: string | null | undefined): string | null {
 export default function Home() {
   const [allLinks, setAllLinks] = useState<LinkItem[]>([])
   const [stats, setStats] = useState<Stats | null>(null)
-  const [countryStats, setCountryStats] = useState<CountryStat[]>([])
   const [joiners, setJoiners] = useState<Joiner[]>([])
   const [joinersSummary, setJoinersSummary] = useState<JoinersSummary | null>(null)
   const [joinedGroups, setJoinedGroups] = useState<JoinedGroup[]>([])
@@ -258,29 +232,6 @@ export default function Home() {
     }
   }, [])
 
-  // Calculate country stats from links
-  useEffect(() => {
-    if (allLinks.length === 0) return
-    const counts: Record<string, number> = {}
-    let total = 0
-    for (const item of allLinks) {
-      const text = `${item.message_text || ''} ${item.group_name || ''} ${item.ai_country || ''}`
-      const country = item.ai_country || detectCountry(text)
-      if (country) {
-        counts[country] = (counts[country] || 0) + 1
-        total++
-      }
-    }
-    const result: CountryStat[] = Object.entries(counts)
-      .map(([country, count]) => ({
-        country,
-        count,
-        percentage: total > 0 ? Math.round((count / total) * 100) : 0,
-      }))
-      .sort((a, b) => b.count - a.count)
-    setCountryStats(result)
-  }, [allLinks])
-
   // Initial load + auto refresh (real-time every 15s)
   useEffect(() => {
     const load = async () => {
@@ -297,15 +248,6 @@ export default function Home() {
     fetchJoiners()
     fetchMonitoredChats()
   }, [fetchLinks, fetchStats, fetchJoiners, fetchMonitoredChats])
-
-  const countryColors: Record<string, string> = {
-    'السعودية': 'from-emerald-500 to-green-400',
-    'الكويت': 'from-blue-500 to-cyan-400',
-    'قطر': 'from-purple-500 to-pink-400',
-    'البحرين': 'from-amber-500 to-orange-400',
-    'الإمارات': 'from-rose-500 to-red-400',
-  }
-
   return (
     <div className="min-h-screen bg-gradient-to-br from-slate-950 via-slate-900 to-slate-950 text-white">
       <div className="fixed inset-0 overflow-hidden pointer-events-none">
@@ -449,50 +391,6 @@ export default function Home() {
             </CardContent>
           </Card>
         )}
-
-        {/* Country Stats */}
-        {countryStats.length > 0 && (
-          <Card className="bg-slate-800/30 border-slate-700/50 backdrop-blur-sm mb-6">
-            <CardHeader>
-              <CardTitle className="flex items-center gap-2 text-lg">
-                <Globe className="w-5 h-5 text-emerald-400" />
-                التحليل الإحصائي حسب الدولة
-              </CardTitle>
-            </CardHeader>
-            <CardContent>
-              <div className="grid grid-cols-2 md:grid-cols-3 gap-3">
-                {countryStats.map((cs) => (
-                  <button
-                    key={cs.country}
-                    onClick={() => setModal('all_links')}
-                    className="text-right hover:scale-105 transition-transform"
-                  >
-                    <Card
-                      className={`bg-gradient-to-br ${
-                        countryColors[cs.country] || 'from-slate-600 to-slate-700'
-                      } border-0 overflow-hidden`}
-                    >
-                      <CardContent className="p-4">
-                        <div className="flex items-center justify-between mb-2">
-                          <span className="text-sm font-bold text-white">{cs.country}</span>
-                          <Badge className="bg-black/30 text-white border-0">{cs.count}</Badge>
-                        </div>
-                        <div className="w-full bg-black/30 rounded-full h-2 overflow-hidden">
-                          <div
-                            className="h-full bg-white/80 rounded-full"
-                            style={{ width: `${cs.percentage}%` }}
-                          />
-                        </div>
-                        <span className="text-xs text-white/80 mt-1 block">{cs.percentage}%</span>
-                      </CardContent>
-                    </Card>
-                  </button>
-                ))}
-              </div>
-            </CardContent>
-          </Card>
-        )}
-
         {/* Monitored Chats Section — المجموعات المراقبة (بطاقة واحدة) */}
         <Card className="bg-slate-800/30 border-slate-700/50 backdrop-blur-sm mb-6">
           <CardHeader>
@@ -821,7 +719,7 @@ function LinkCard(props: { link: LinkItem; compact?: boolean }) {
     minute: '2-digit',
   })
   const country =
-    link.ai_country || detectCountry(`${link.message_text || ''} ${link.group_name || ''}`)
+    null
   const href = safeUrl(link.link)
 
   if (compact) {
