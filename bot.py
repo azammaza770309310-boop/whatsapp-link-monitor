@@ -5774,19 +5774,18 @@ class Monitor:
     async def _sync_monitored_chats(self):
         """يفحص كل مجموعات المراقبين ويسجلها في monitored_chats.
 
-        - يستبعد المكرر (UNIQUE chat_id يمنع التكرار)
-        - مراقب جديد يضيف بس المجموعات الجديدة
-        - يحدّث last_seen للمجموعات الموجودة
+        - يستبعد المكرر (UNIQUE chat_id)
+        - يسجل كل المجموعات والقنوات من كل المراقبين
+        - ما ينتظر رسالة — يفحص الـ dialogs مباشرة
         """
-        logging.info("🔄 Syncing monitored chats from all monitor accounts...")
+        logging.info("🔄 Syncing monitored chats from all accounts...")
         try:
             watchers = await self.db.get_active_watchers()
-            monitors = [w for w in watchers if w.get('role', 'monitor') == 'monitor']
-
+            # كل الحسابات (مراقبين + فدائيين) — الفدائيين عندهم مجموعات بعد
             total_added = 0
             total_existing = 0
 
-            for w in monitors:
+            for w in watchers:
                 phone = w['phone']
                 client = self.user_clients.get(phone)
                 if not client or not client.is_connected():
@@ -5797,6 +5796,7 @@ class Monitor:
                     added = 0
                     existing = 0
                     async for dialog in client.iter_dialogs():
+                        # سجل كل المجموعات والقنوات (تجاهل المحادثات الخاصة فقط)
                         if not dialog.is_group and not dialog.is_channel:
                             continue
 
@@ -5837,6 +5837,15 @@ class Monitor:
             logging.info(f"[SYNC] Done: +{total_added} new, {total_existing} existing (no duplicates)")
         except Exception as e:
             logging.error(f"[SYNC] Fatal error: {e}", exc_info=True)
+
+    async def _periodic_sync(self):
+        """يكرر sync كل ساعة لضمان تسجيل كل المجموعات الجديدة."""
+        while self._running:
+            await asyncio.sleep(3600)  # كل ساعة
+            try:
+                await self._sync_monitored_chats()
+            except Exception as e:
+                logging.error(f"[PERIODIC_SYNC] Error: {e}")
 
     async def _chat_classifier(self):
         """مهمة خلفية: تصنيف المجموعات المراقبة بالذكاء الاصطناعي.
@@ -6942,13 +6951,12 @@ class Monitor:
             self._user_tasks[w['phone']] = asyncio.create_task(self._run_user_client(w))
         self._keep_alive_task = asyncio.create_task(self._keep_alive())
 
-        # === SYNC MONITORED CHATS: فحص كل مجموعات المراقبين واستبعاد المكرر ===
-        # هذا يضمن:
-        # 1. كل مجموعات كل مراقب مسجلة (حتى الصامتة)
-        # 2. ما فيه تكرار (UNIQUE chat_id)
-        # 3. مراقب جديد يضيف بس المجموعات الجديدة
+        # === SYNC MONITORED CHATS: فحص كل مجموعات المراقبين ===
+        # يشتغل عند بدء التشغيل + كل ساعة لضمان تسجيل كل المجموعات
         await asyncio.sleep(15)  # انتظر اتصال كل الحسابات
         asyncio.create_task(self._sync_monitored_chats())
+        # كرر كل ساعة
+        asyncio.create_task(self._periodic_sync())
 
         # === STARTUP RECOVERY: إعادة الروابط العالقة ===
         try:
