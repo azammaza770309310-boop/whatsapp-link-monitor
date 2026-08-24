@@ -2519,6 +2519,17 @@ class Monitor:
         self._msg_cache: Dict[Tuple[int, int], dict] = {}
         self._msg_cache_lock = asyncio.Lock()
         self._msg_cache_ttl = 120  # ثانية — نبقي الرسائل لمدة دقيقتين
+        # === ACTIVE POLLING WORKER ===
+        # بدل الاعتماد على NewMessage events فقط (اللي قد تتأخر أو تُحذف قبل ما توصل),
+        # نضيف polling نشط: كل 3 ثواني نسحب آخر 3 رسائل من كل مجموعة نشطة
+        # هذا يضمن التقاط الرسائل خلال 3 ثواني حتى لو بوت حماية حذفها بسرعة
+        # Key: chat_id → آخر msg_id شافه البوت
+        self._polling_state: Dict[int, int] = {}
+        self._polling_lock = asyncio.Lock()
+        self._active_polling_task = None
+        # المجموعات النشطة المرشحة للـ polling (تُحدَّث ديناميكياً من monitored_chats)
+        self._active_polling_chats: List[dict] = []
+        self._polling_interval = 3  # ثواني
 
     @staticmethod
     def _get_chat_name(chat):
@@ -2545,12 +2556,19 @@ class Monitor:
                               auto_reconnect=True, sequential_updates=False)
 
     def _create_user_client(self, session_string, phone):
-        """إنشاء user_client من StringSession"""
+        """إنشاء user_client من StringSession
+        
+        مهم: catch_up=True يخلي Telethon يسحب updates الفائتة بعد أي انقطاع.
+        flood_sleep_threshold=60 يخلي البوت ينتظر 60s تلقائياً وقت FloodWait بدل ما يفقد updates.
+        """
         return TelegramClient(
             StringSession(session_string),
             self.config.api_id, self.config.api_hash,
             connection_retries=None, retry_delay=5, request_retries=5,
-            auto_reconnect=True, sequential_updates=False)
+            auto_reconnect=True, sequential_updates=False,
+            catch_up=True,  # ← يسحب updates الفائتة بعد أي انقطاع
+            flood_sleep_threshold=60,  # ← ينتظر 60s تلقائياً وقت FloodWait
+        )
 
     def _register_handlers(self):
         if self._handlers_registered: return
@@ -3478,6 +3496,251 @@ class Monitor:
                 break
             except Exception as e:
                 logging.debug(f"[CACHE] cleanup error: {e}")
+
+    async def _refresh_active_polling_chats(self):
+        """يحدّث قائمة المجموعات النشطة للـ polling.
+        
+        نختار أهم 30 مجموعة (الأكثر نشاطاً):
+        - آخر 10 مجموعات نشطة (last_seen الأخيرة)
+        - المجموعات اللي فيها رسائل في آخر ساعة (لو موجودة)
+        """
+        try:
+            chats = await self.prod_db.get_monitored_chats(limit=5000)
+            # فلترة: فقط المجموعات (مو القنوات) + اللي لها username أو chat_id سالب
+            candidate_chats = [
+                c for c in chats
+                if c.get('link_type') == 'group' and c.get('chat_id')
+            ]
+            # ترتيب حسب last_seen تنازلياً
+            candidate_chats.sort(key=lambda c: c.get('last_seen', ''), reverse=True)
+            # خذ أهم 30
+            self._active_polling_chats = candidate_chats[:30]
+            logging.info(
+                f"[POLLING] Refreshed active chats list: {len(self._active_polling_chats)} groups "
+                f"(top: {(self._active_polling_chats[0].get('chat_title') if self._active_polling_chats else 'none')[:30]})"
+            )
+        except Exception as e:
+            logging.error(f"[POLLING] refresh error: {e}")
+
+    async def _active_polling_worker(self):
+        """Active Polling Worker — يسحب آخر 3 رسائل من كل مجموعة نشطة كل 3 ثواني.
+        
+        الحل الجذري لمشكلة بوتات الحماية:
+        - بوتات الحماية (جبل/صقير) admin وتحذف الرسائل بسرعة (100-300ms)
+        - بوتنا عضو عادي، ما يحصل على MessageDeleted event
+        - NewMessage event قد يتأخر أو يصل بعد الحذف
+        - الحل: polling نشط كل 3 ثواني يلتقط الرسائل قبل ما تُحذف
+        
+        الاستراتيجية:
+        1. لكل مجموعة نشطة، نتذكر آخر msg_id شفناه
+        2. نسحب الرسائل الجديدة فقط (min_id=last_msg_id)
+        3. نخزن كل رسالة في cache + نعالجها كأنها NewMessage
+        """
+        await asyncio.sleep(20)  # انتظر البوت يكمل الإقلاع
+        logging.info(f"🔄 Active Polling Worker started — interval={self._polling_interval}s")
+        # أول تشغيل: حدّث قائمة المجموعات النشطة
+        await self._refresh_active_polling_chats()
+        last_refresh = time.time()
+        
+        while self._running:
+            try:
+                # حدّث القائمة كل 5 دقايق
+                if time.time() - last_refresh > 300:
+                    await self._refresh_active_polling_chats()
+                    last_refresh = time.time()
+                
+                # لو ما فيه مجموعات، انتظر
+                if not self._active_polling_chats:
+                    await asyncio.sleep(self._polling_interval)
+                    continue
+                
+                # اختيار مراقب نشط (نلف على المراقبين)
+                active_phones = [
+                    p for p, c in self.user_clients.items()
+                    if c and c.is_connected()
+                ]
+                if not active_phones:
+                    await asyncio.sleep(self._polling_interval)
+                    continue
+                
+                # قسّم المجموعات على المراقبين (كل مراقب يأخذ شريحة)
+                phones_count = len(active_phones)
+                tasks = []
+                for idx, chat in enumerate(self._active_polling_chats):
+                    phone = active_phones[idx % phones_count]
+                    tasks.append(self._poll_one_chat(phone, chat))
+                
+                # شغّل كل الـ polling بالتوازي
+                if tasks:
+                    await asyncio.gather(*tasks, return_exceptions=True)
+                
+                await asyncio.sleep(self._polling_interval)
+                
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logging.error(f"[POLLING] worker error: {e}", exc_info=True)
+                await asyncio.sleep(self._polling_interval)
+
+    async def _poll_one_chat(self, phone: str, chat: dict):
+        """يسحب آخر 3 رسائل من مجموعة واحدة ويستخرج أي روابط جديدة."""
+        chat_id = chat.get('chat_id')
+        chat_title = chat.get('chat_title', f'chat_{chat_id}')
+        if not chat_id:
+            return
+        
+        client = self.user_clients.get(phone)
+        if not client or not client.is_connected():
+            return
+        
+        # آخر msg_id شفناه لهذي المجموعة
+        async with self._polling_lock:
+            last_msg_id = self._polling_state.get(chat_id, 0)
+        
+        try:
+            # اسحب آخر 3 رسائل بـ id > last_msg_id
+            # limit=3 + min_id=last_msg_id = كفاءة عالية (صفر payload لو ما فيه جديد)
+            messages = await client.get_messages(
+                chat_id, limit=3, min_id=last_msg_id
+            )
+            if not messages:
+                return  # ما فيه جديد
+            
+            # حدّث آخر msg_id شفناه
+            new_max_id = max(m.id for m in messages)
+            async with self._polling_lock:
+                if new_max_id > self._polling_state.get(chat_id, 0):
+                    self._polling_state[chat_id] = new_max_id
+            
+            # عالج كل رسالة جديدة
+            for msg in messages:
+                if not msg or not msg.raw_text:
+                    continue
+                # تجاهل رسائل البوت نفسه
+                if msg.out:
+                    continue
+                
+                # تحقق أنها مو مكررة في cache
+                cache_key = (chat_id, msg.id)
+                async with self._msg_cache_lock:
+                    if cache_key in self._msg_cache:
+                        continue  # سبق عالجناها
+                
+                # استخرج الروابط
+                links = LinkNormalizer.extract_links(msg.raw_text)
+                if not links:
+                    # خزّنها في cache (لو بوت حماية حذفها بعدين)
+                    async with self._msg_cache_lock:
+                        self._msg_cache[cache_key] = {
+                            'raw_text': msg.raw_text,
+                            'source_phone': phone,
+                            'received_at': time.time(),
+                            'chat_id': chat_id,
+                            'msg_id': msg.id,
+                            'sender_id': msg.sender_id or 0,
+                            'chat_title': chat_title,
+                            'chat_username': chat.get('username', ''),
+                            'chat_link_type': 'group',
+                            'sender_name': self._get_sender_name(msg.sender) if msg.sender else 'Unknown',
+                            'processed': False,
+                            'via_polling': True,  # ← علامة أنها جت من polling
+                        }
+                    continue
+                
+                # الرسالة فيها روابط — عالجها كأنها NewMessage
+                logging.info(
+                    f"[POLLING] 📨🔗 New link found via polling from '{chat_title[:30]}' "
+                    f"msg_id={msg.id} (last_seen={last_msg_id})"
+                )
+                
+                # خزّن في cache
+                async with self._msg_cache_lock:
+                    self._msg_cache[cache_key] = {
+                        'raw_text': msg.raw_text,
+                        'source_phone': phone,
+                        'received_at': time.time(),
+                        'chat_id': chat_id,
+                        'msg_id': msg.id,
+                        'sender_id': msg.sender_id or 0,
+                        'chat_title': chat_title,
+                        'chat_username': chat.get('username', ''),
+                        'chat_link_type': 'group',
+                        'sender_name': self._get_sender_name(msg.sender) if msg.sender else 'Unknown',
+                        'processed': False,
+                        'via_polling': True,
+                    }
+                
+                # سجل المجموعة
+                try:
+                    is_new = await self.prod_db.add_monitored_chat(
+                        chat_id=chat_id,
+                        chat_title=chat_title,
+                        username=chat.get('username', ''),
+                        link_type='group',
+                        monitored_by=phone,
+                    )
+                except Exception as e:
+                    logging.debug(f"[POLLING] add_monitored error: {e}")
+                
+                # enqueue كل رابط
+                sender_name = self._get_sender_name(msg.sender) if msg.sender else 'Unknown'
+                for link_info in links:
+                    link_data = {
+                        **link_info,
+                        'group_name': chat_title,
+                        'sender_name': sender_name,
+                        'sender_contact': extract_sender_contact(msg.raw_text),
+                        'source_phone': phone,
+                        'message_text': msg.raw_text,
+                        'message_link': f"https://t.me/c/{str(chat_id).replace('-100', '')}/{msg.id}" if chat_id else None,
+                    }
+                    
+                    # Blacklist
+                    link_raw = link_info['raw'].lower()
+                    username_raw = (link_info.get('username') or '').lower()
+                    full_text_check = f"{msg.raw_text} {link_raw} {username_raw}".lower()
+                    is_bad, bad_reason = GulfFilter.is_blacklisted(
+                        full_text_check, username_raw, link_info['raw'], chat_title
+                    )
+                    if is_bad:
+                        logging.info(
+                            f"[POLLING] 🚫 BLACKLISTED: {link_info['raw'][:50]} ({bad_reason})"
+                        )
+                        await self.metrics.record_skip(f'blacklist_{bad_reason}')
+                        continue
+                    
+                    # enqueue
+                    is_new = await self.prod_db.enqueue_link(link_data)
+                    if is_new:
+                        await self.prod_db.set_group_state(
+                            link_info['normalized'], GroupState.DISCOVERED,
+                            link_info['raw'], chat_title)
+                        logging.info(
+                            f"[POLLING-PIPELINE] ✅ Link enqueued: {link_info['raw'][:60]} "
+                            f"(via polling from '{chat_title[:30]}')"
+                        )
+                    else:
+                        await self.metrics.record_duplicate()
+                        logging.info(f"[POLLING-PIPELINE] ⏭️ Duplicate: {link_info['normalized'][:60]}")
+                
+                # علّم الرسالة كـ معالَجة
+                async with self._msg_cache_lock:
+                    if cache_key in self._msg_cache:
+                        self._msg_cache[cache_key]['processed'] = True
+                
+        except FloodWaitError as e:
+            logging.warning(f"[POLLING] FloodWait {e.seconds}s for chat={chat_id} ({phone}) — sleeping")
+            await asyncio.sleep(min(e.seconds, 30))
+        except Exception as e:
+            # تجاهل أخطاء "chat not found" / "private" — ما تكررها
+            err_str = str(e).lower()
+            if any(s in err_str for s in ['chat not found', 'channel private', 'forbidden', 'banned']):
+                # شيل المجموعة من قائمة الـ polling (مو مفيدة)
+                if chat in self._active_polling_chats:
+                    self._active_polling_chats.remove(chat)
+                    logging.info(f"[POLLING] Removed chat '{chat_title[:30]}' from polling list (error: {err_str[:50]})")
+            else:
+                logging.debug(f"[POLLING] chat={chat_id} error: {e}")
 
     async def _send(self, text, retries=3, buttons=None, parse_mode='html') -> Tuple[bool, Optional[int]]:
         """يرسل رسالة للقناة ويتحقق من قبولها.
@@ -7156,6 +7419,15 @@ class Monitor:
         else:
             logging.info("🧹 Message Cache Cleanup already running — skip duplicate")
 
+        # ابدأ Active Polling Worker — الحل الجذري لمشكلة بوتات الحماية
+        # بدل الاعتماد على events فقط (اللي قد تتأخر أو تُحذف قبل ما توصل),
+        # polling نشط كل 3 ثواني يلتقط الرسائل من أهم 30 مجموعة نشطة
+        if not hasattr(self, '_active_polling_task') or self._active_polling_task is None or self._active_polling_task.done():
+            self._active_polling_task = asyncio.create_task(self._active_polling_worker())
+            logging.info("🔄 Active Polling Worker started (polls top 30 active groups every 3s)")
+        else:
+            logging.info("🔄 Active Polling Worker already running — skip duplicate")
+
         # NOTE: Chat Classifier معطل — يستهلك AI بدون فائدة
         # الفلتر الحالي يعتمد على BLACKLIST فقط (كافي)
 
@@ -7190,7 +7462,8 @@ class Monitor:
         # إلغاء المهام مع timeout لمنع التعليق
         scorer_task = getattr(self, '_priority_scorer_task', None)
         cache_cleanup_task = getattr(self, '_msg_cache_cleanup_task', None)
-        tasks = [self._bot_task, self._keep_alive_task, self._joiner_task, scorer_task, cache_cleanup_task] + list(self._user_tasks.values()) + self._current_scan_tasks
+        polling_task = getattr(self, '_active_polling_task', None)
+        tasks = [self._bot_task, self._keep_alive_task, self._joiner_task, scorer_task, cache_cleanup_task, polling_task] + list(self._user_tasks.values()) + self._current_scan_tasks
         for t in tasks:
             if t and not t.done():
                 t.cancel()
@@ -7502,6 +7775,50 @@ async def api_link_source_check_handler(request):
 
     except Exception as e:
         logging.error(f"[API] link_source_check error: {e}")
+        return web.json_response({"error": str(e)}, status=500,
+                                 headers={"Access-Control-Allow-Origin": "*"})
+
+
+async def api_polling_status_handler(request):
+    """API endpoint: يعرض حالة Active Polling Worker.
+    
+    Returns:
+        - polling_enabled: bool
+        - polling_interval: int (seconds)
+        - active_chats_count: int
+        - active_chats: list of {chat_id, chat_title, last_msg_id}
+        - cache_size: int (messages currently in cache)
+    """
+    monitor = request.app.get("monitor")
+    if not monitor:
+        return web.json_response({"error": "not ready"}, status=503,
+                                 headers={"Access-Control-Allow-Origin": "*"})
+
+    try:
+        active_chats = []
+        for chat in monitor._active_polling_chats[:30]:
+            chat_id = chat.get('chat_id')
+            last_msg_id = monitor._polling_state.get(chat_id, 0)
+            active_chats.append({
+                'chat_id': chat_id,
+                'chat_title': chat.get('chat_title', ''),
+                'username': chat.get('username', ''),
+                'last_msg_id': last_msg_id,
+            })
+        
+        cache_size = len(monitor._msg_cache)
+        
+        return web.json_response({
+            'polling_enabled': True,
+            'polling_interval': monitor._polling_interval,
+            'active_chats_count': len(monitor._active_polling_chats),
+            'active_chats': active_chats,
+            'cache_size': cache_size,
+            'cache_ttl': monitor._msg_cache_ttl,
+        }, status=200, headers={"Access-Control-Allow-Origin": "*"})
+
+    except Exception as e:
+        logging.error(f"[API] polling_status error: {e}")
         return web.json_response({"error": str(e)}, status=500,
                                  headers={"Access-Control-Allow-Origin": "*"})
 
@@ -7950,6 +8267,7 @@ async def start_http_server(monitor=None, db=None):
     app.router.add_get("/api/joiners_status", api_joiners_status_handler)  # joiners + groups
     app.router.add_get("/api/monitored_chats", api_monitored_chats_handler)  # monitored chats + AI
     app.router.add_get("/api/link_source_check", api_link_source_check_handler)  # check if source is monitored
+    app.router.add_get("/api/polling_status", api_polling_status_handler)  # active polling status
     runner = web.AppRunner(app)
     await runner.setup()
     site = web.TCPSite(runner, "0.0.0.0", port)
