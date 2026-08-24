@@ -7312,9 +7312,9 @@ async def api_links_handler(request):
 
         session = await db._get_supabase_session()
 
-        # === PAGINATION: fetch in batches of 1000 ===
-        # Supabase REST API hard limit is 1000 rows per request.
-        # To return up to total_limit (e.g., 5000), we make multiple requests.
+        # === PAGINATION: fetch in batches ===
+        # Supabase REST API: استخدم limit + offset بدل Range header
+        # Range header يسبب خطأ 416 لو الـ offset يتجاوز عدد الصفوف
         all_links = []
         current_offset = offset
         batch_size = 1000  # Supabase max per request
@@ -7322,12 +7322,11 @@ async def api_links_handler(request):
 
         while remaining > 0:
             batch_limit = min(batch_size, remaining)
-            # Build URL for this batch
-            batch_url = f"{db.supabase_url}/rest/v1/links?" + "&".join(filter_parts) + f"&limit={batch_limit}"
-            batch_headers = {**session.headers, "Range": f"{current_offset}-{current_offset + batch_limit - 1}"}
+            # استخدم offset parameter بدل Range header
+            batch_url = f"{db.supabase_url}/rest/v1/links?" + "&".join(filter_parts) + f"&limit={batch_limit}&offset={current_offset}"
 
             try:
-                async with session.get(batch_url, headers=batch_headers) as resp:
+                async with session.get(batch_url) as resp:
                     if resp.status == 200:
                         batch_data = await resp.json()
                         if not batch_data or len(batch_data) == 0:
@@ -7338,6 +7337,9 @@ async def api_links_handler(request):
                             break
                         current_offset += len(batch_data)
                         remaining -= len(batch_data)
+                    elif resp.status == 416:
+                        # Range not satisfiable — no more data
+                        break
                     else:
                         logging.error(f"[API] /api/links batch fetch failed: {resp.status}")
                         break
