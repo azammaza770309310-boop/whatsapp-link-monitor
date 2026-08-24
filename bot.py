@@ -3173,7 +3173,7 @@ class Monitor:
             logging.error(f"[RECOMMEND] Failed for {phone}: {e}")
 
     async def _on_user_message(self, event, source_phone: str):
-        """معالج رسائل المستخدم — يستقبل من المجموعات فقط (تجاهل القنوات)."""
+        """معالج رسائل فوري — يسحب الروابط قبل ما تحذفها بوتات أخرى."""
         try:
             raw_text = event.raw_text
             if not raw_text: return
@@ -3183,10 +3183,16 @@ class Monitor:
 
             sender_id = event.sender_id or 0
 
-            # === PIPELINE STAGE 1: Event Handler received message ===
-            logging.info(f"[PIPELINE-1] 📨 Event Handler received message from source={source_phone} chat_id={chat_id} (len={len(raw_text)})")
+            # === الخطوة 1: استخرج الروابط فوراً (قبل أي شي ثاني) ===
+            # هذا يضمن سحب الرابط قبل ما بوت جبل أو صقير يحذفه
+            links = LinkNormalizer.extract_links(raw_text)
+            if not links:
+                return
 
-            # اسم المجموعة — حاول العنوان من event.chat (بدون API إضافي) وإلا chat_id
+            # === الخطوة 2: سجل الرسالة + اسحب الروابط (صفر API calls) ===
+            logging.info(f"[PIPELINE-1] 📨🔗 Link found from source={source_phone} chat_id={chat_id} (len={len(raw_text)})")
+
+            # اسم المجموعة — من event.chat بدون API
             try:
                 chat_obj = event.chat
                 if chat_obj and hasattr(chat_obj, 'title') and chat_obj.title:
@@ -3196,43 +3202,7 @@ class Monitor:
             except Exception:
                 group_name = f"chat_{chat_id}"
 
-            # === MONITORED CHATS DEDUP ===
-            # سجّل المجموعة في monitored_chats (يمنع التكرار بين المراقبين)
-            try:
-                # استخرج username لو موجود
-                chat_username = ''
-                try:
-                    if chat_obj and hasattr(chat_obj, 'username') and chat_obj.username:
-                        chat_username = chat_obj.username
-                except Exception:
-                    pass
-
-                # حدد link_type
-                chat_link_type = 'telegram'  # افتراضي
-                try:
-                    if hasattr(chat_obj, 'megagroup') and chat_obj.megagroup:
-                        chat_link_type = 'group'
-                    elif hasattr(chat_obj, 'broadcast') and chat_obj.broadcast:
-                        chat_link_type = 'channel'
-                except Exception:
-                    pass
-
-                is_new = await self.prod_db.add_monitored_chat(
-                    chat_id=chat_id,
-                    chat_title=group_name,
-                    username=chat_username,
-                    link_type=chat_link_type,
-                    monitored_by=source_phone,
-                )
-                if is_new:
-                    logging.info(
-                        f"[MONITORED] ✅ New chat added: '{group_name[:40]}' "
-                        f"(id={chat_id}, type={chat_link_type}, by={source_phone})"
-                    )
-            except Exception as e:
-                logging.debug(f"[MONITORED] add error: {e}")
-
-            # اسم المرسل — حاول الاسم من event.sender (بدون API إضافي) وإلا sender_id
+            # اسم المرسل — من event.sender بدون API
             try:
                 sender_obj = event.sender
                 if sender_obj:
@@ -3251,46 +3221,42 @@ class Monitor:
             except Exception:
                 sender_name = f"user_{sender_id}"
 
-            # الخطوة 1: استخراج الروابط محلياً (صفر API calls)
-            links = LinkNormalizer.extract_links(raw_text)
-            if not links:
-                logging.debug(f"[PIPELINE-1] No links found in message from {chat_id}")
-                return
+            # === MONITORED CHATS DEDUP — سجل المجموعة ===
+            try:
+                chat_username = ''
+                try:
+                    if chat_obj and hasattr(chat_obj, 'username') and chat_obj.username:
+                        chat_username = chat_obj.username
+                except Exception:
+                    pass
+
+                chat_link_type = 'telegram'
+                try:
+                    if hasattr(chat_obj, 'megagroup') and chat_obj.megagroup:
+                        chat_link_type = 'group'
+                    elif hasattr(chat_obj, 'broadcast') and chat_obj.broadcast:
+                        chat_link_type = 'channel'
+                except Exception:
+                    pass
+
+                is_new = await self.prod_db.add_monitored_chat(
+                    chat_id=chat_id,
+                    chat_title=group_name,
+                    username=chat_username,
+                    link_type=chat_link_type,
+                    monitored_by=source_phone,
+                )
+                if is_new:
+                    logging.info(
+                        f"[MONITORED] ✅ New chat: '{group_name[:40]}' (id={chat_id}, by={source_phone})"
+                    )
+            except Exception as e:
+                logging.debug(f"[MONITORED] add error: {e}")
 
             logging.info(f"[PIPELINE-1] 🔗 Found {len(links)} link(s) in message from {group_name}")
 
-            # الخطوة 2: enqueue كل رابط (صفر API calls)
+            # === الخطوة 3: enqueue كل رابط فوراً ===
             for link_info in links:
-                # === فلتر صارم قبل الـ Queue — يرفض الخدمات الطلابية والإعلانات ===
-                link_raw = link_info['raw'].lower()
-                username_raw = (link_info.get('username') or '').lower()
-                full_text_check = f"{raw_text} {link_raw} {username_raw}".lower()
-
-                # قائمة كلمات ترفض الرابط فوراً (خدمات مدفوعة فقط — قائمة محددة جداً)
-                REJECT_KEYWORDS = [
-                    'مكتب حل', 'مكتب واجب', 'مكتب دراسي',
-                    'خدمات طلابية مدفوعة',
-                    'حل واجب بمقابل', 'حل واجبات مدفوع', 'حل بحث مدفوع',
-                    'توصيل مشروع مدفوع', 'تسليم واجب بمقابل',
-                    'خدمة اونلاين مدفوع',
-                    'اعذار طبية جاهزة',
-                ]
-
-                is_rejected = False
-                reject_reason = ''
-                for kw in REJECT_KEYWORDS:
-                    if kw in full_text_check:
-                        is_rejected = True
-                        reject_reason = kw
-                        break
-
-                if is_rejected:
-                    logging.info(
-                        f"[PIPELINE-1] 🚫 REJECTED link (keyword={reject_reason}): {link_info['raw'][:50]}"
-                    )
-                    await self.metrics.record_skip(f'reject_keyword_{reject_reason}')
-                    continue  # لا تدخله للقائمة
-
                 link_data = {
                     **link_info,
                     'group_name': group_name,
@@ -3301,19 +3267,32 @@ class Monitor:
                     'message_link': f"https://t.me/c/{str(chat_id).replace('-100', '')}/{event.id}" if chat_id else None,
                 }
 
-                # === PIPELINE STAGE 2: Enqueue link ===
-                # إضافة لقائمة الانتظار (UNIQUE constraint يمنع التكرار)
+                # === فلتر BLACKLIST فقط (سريع) ===
+                link_raw = link_info['raw'].lower()
+                username_raw = (link_info.get('username') or '').lower()
+                full_text_check = f"{raw_text} {link_raw} {username_raw}".lower()
+
+                # فحص القائمة السوداء
+                is_bad, bad_reason = GulfFilter.is_blacklisted(
+                    full_text_check, username_raw, link_info['raw'], group_name
+                )
+                if is_bad:
+                    logging.info(
+                        f"[PIPELINE-1] 🚫 BLACKLISTED: {link_info['raw'][:50]} ({bad_reason})"
+                    )
+                    await self.metrics.record_skip(f'blacklist_{bad_reason}')
+                    continue
+
+                # === enqueue فوراً ===
                 is_new = await self.prod_db.enqueue_link(link_data)
                 if is_new:
                     await self.prod_db.set_group_state(
                         link_info['normalized'], GroupState.DISCOVERED,
                         link_info['raw'], group_name)
-                    logging.info(f"[PIPELINE-2] ✅ Link enqueued: {link_info['raw'][:60]} (state=DISCOVERED)")
+                    logging.info(f"[PIPELINE-2] ✅ Link enqueued: {link_info['raw'][:60]}")
                 else:
                     await self.metrics.record_duplicate()
-                    logging.info(f"[PIPELINE-2] ⏭️ Duplicate skipped: {link_info['normalized'][:60]}")
-
-            # الخطوة 3: انتهى — صفر استدعاءات Telegram API
+                    logging.info(f"[PIPELINE-2] ⏭️ Duplicate: {link_info['normalized'][:60]}")
 
         except Exception as e:
             logging.error(f"Event handler error: {e}", exc_info=True)
