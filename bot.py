@@ -2529,7 +2529,7 @@ class Monitor:
         self._active_polling_task = None
         # المجموعات النشطة المرشحة للـ polling (تُحدَّث ديناميكياً من monitored_chats)
         self._active_polling_chats: List[dict] = []
-        self._polling_interval = 3  # ثواني
+        self._polling_interval = 5  # ثواني
 
     @staticmethod
     def _get_chat_name(chat):
@@ -3529,8 +3529,8 @@ class Monitor:
             # ترتيب inactive حسب last_seen (الأحدث أولاً)
             inactive.sort(key=lambda c: c.get('last_seen', ''), reverse=True)
             
-            # اجمع: active أولاً ثم inactive (لحد 100)
-            self._active_polling_chats = (active + inactive)[:100]
+            # اجمع: active أولاً ثم inactive (لحد 200)
+            self._active_polling_chats = (active + inactive)[:200]
             
             # نظّف _polling_state من المجموعات اللي ما عادت في القائمة
             current_ids = {c.get('chat_id') for c in self._active_polling_chats}
@@ -7445,10 +7445,10 @@ class Monitor:
 
         # ابدأ Active Polling Worker — الحل الجذري لمشكلة بوتات الحماية
         # بدل الاعتماد على events فقط (اللي قد تتأخر أو تُحذف قبل ما توصل),
-        # polling نشط كل 3 ثواني يلتقط الرسائل من أهم 100 مجموعة نشطة
+        # polling نشط كل 5 ثواني يلتقط الرسائل من أهم 200 مجموعة نشطة
         if not hasattr(self, '_active_polling_task') or self._active_polling_task is None or self._active_polling_task.done():
             self._active_polling_task = asyncio.create_task(self._active_polling_worker())
-            logging.info("🔄 Active Polling Worker started (polls top 100 active groups every 3s)")
+            logging.info("🔄 Active Polling Worker started (polls top 200 active groups every 5s)")
         else:
             logging.info("🔄 Active Polling Worker already running — skip duplicate")
 
@@ -7820,7 +7820,7 @@ async def api_polling_status_handler(request):
 
     try:
         active_chats = []
-        for chat in monitor._active_polling_chats[:100]:
+        for chat in monitor._active_polling_chats[:200]:
             chat_id = chat.get('chat_id')
             last_msg_id = monitor._polling_state.get(chat_id, 0)
             active_chats.append({
