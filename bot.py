@@ -5212,27 +5212,7 @@ class Monitor:
                 link_id = link_data.get('id', '?')
                 logging.info(f"[LINK id={link_id}] [PIPELINE-3] 🔄 cycle={cycle} Scheduler picked link: {raw_link[:60]} (type={link_type})")
 
-                # === WAIT FOR SCORER — لو member_count غير معروف ===
-                # عوّل: لو member_count=NULL و attempt_count >= 3 → اقبل بدون member_count
-                # (بدل ما يعيد التأجيل لالأبد)
-                attempt_count = link_data.get('attempt_count', 0)
-                if link_data.get('member_count') is None and link_type == 'telegram':
-                    if attempt_count < 3:
-                        # أول 3 محاولات: أعد للقائمة بانتظار Scorer
-                        logging.info(
-                            f"[LINK id={link_id}] [PIPELINE-3] ⏳ Waiting for Scorer (attempt {attempt_count+1}/3) — requeue in 30s"
-                        )
-                        await self.prod_db.update_queue_status(
-                            link_data['id'], 'QUEUED',
-                            next_retry=datetime.now() + timedelta(seconds=30)
-                        )
-                        await asyncio.sleep(2)
-                        continue
-                    else:
-                        # بعد 3 محاولات: اقبل بدون member_count (تجنب اللوب اللانهائي)
-                        logging.info(
-                            f"[LINK id={link_id}] [PIPELINE-3] ⏭️ Scorer timed out — proceeding without member_count"
-                        )
+                # لا ننتظر Scorer — عالج فوراً
 
                 # 2. تحقق من حالة المجموعة في State Machine
                 state = await self.prod_db.get_group_state(normalized)
