@@ -3408,10 +3408,54 @@ class Monitor:
 
             # === الخطوة 2: معالجة فورية (sync, سريعة جداً) ===
             # نسجّل المجموعة + نضع الرابط في queue فوراً (العملية كلها DB، بدون API)
-            group_name = self._msg_cache[(chat_id, msg_id)].get('chat_title') or f"chat_{chat_id}"
-            sender_name = self._msg_cache[(chat_id, msg_id)].get('sender_name') or f"user_{sender_id}"
-            chat_username = self._msg_cache[(chat_id, msg_id)].get('chat_username', '')
-            chat_link_type = self._msg_cache[(chat_id, msg_id)].get('chat_link_type', 'telegram')
+            # SAFETY: لا نفترض أن الرسالة لا تزال في _msg_cache — فقد تُحذف بين
+            # تخزينها (أعلاه) وهنا بواسطة _on_message_deleted أو _msg_cache_cleanup.
+            # الأولوية: cache → event.chat/event.sender → fallback آمن.
+            cached_entry = None
+            async with self._msg_cache_lock:
+                cached_entry = self._msg_cache.get((chat_id, msg_id))
+
+            if cached_entry:
+                group_name = cached_entry.get('chat_title') or f"chat_{chat_id}"
+                sender_name = cached_entry.get('sender_name') or f"user_{sender_id}"
+                chat_username = cached_entry.get('chat_username', '')
+                chat_link_type = cached_entry.get('chat_link_type', 'telegram')
+            else:
+                # Cache miss — استخرج metadata من event مباشرة (fallback آمن)
+                group_name = f"chat_{chat_id}"
+                sender_name = f"user_{sender_id}"
+                chat_username = ''
+                chat_link_type = 'telegram'
+                try:
+                    chat_obj = event.chat
+                    if chat_obj:
+                        if hasattr(chat_obj, 'title') and chat_obj.title:
+                            group_name = chat_obj.title
+                        if hasattr(chat_obj, 'username') and chat_obj.username:
+                            chat_username = chat_obj.username
+                        if hasattr(chat_obj, 'megagroup') and chat_obj.megagroup:
+                            chat_link_type = 'group'
+                        elif hasattr(chat_obj, 'broadcast') and chat_obj.broadcast:
+                            chat_link_type = 'channel'
+                except Exception:
+                    pass  # ابقَ على fallback
+                try:
+                    sender_obj = event.sender
+                    if sender_obj:
+                        if hasattr(sender_obj, 'first_name') and sender_obj.first_name:
+                            sender_name = sender_obj.first_name
+                            if hasattr(sender_obj, 'last_name') and sender_obj.last_name:
+                                sender_name += f" {sender_obj.last_name}"
+                        elif hasattr(sender_obj, 'title') and sender_obj.title:
+                            sender_name = sender_obj.title
+                        elif hasattr(sender_obj, 'username') and sender_obj.username:
+                            sender_name = f"@{sender_obj.username}"
+                except Exception:
+                    pass  # ابقَ على fallback
+                logging.debug(
+                    f"[PIPELINE-1] cache miss for ({chat_id}, {msg_id}) — using event fallback "
+                    f"(group='{group_name[:30]}', sender='{sender_name[:20]}')"
+                )
 
             logging.info(f"[PIPELINE-1] 📨🔗 Link found from source={source_phone} chat_id={chat_id} msg_id={msg_id} (len={len(raw_text)})")
             logging.info(f"[PIPELINE-1] 🔗 Found {len(links)} link(s) in message from {group_name}")
@@ -3538,17 +3582,34 @@ class Monitor:
                 chat_link_type = cached_msg.get('chat_link_type', 'telegram')
                 orig_chat_id = cached_msg.get('chat_id')
                 orig_source_phone = cached_msg.get('source_phone', source_phone)
-                
+
                 # استخرج الروابط
                 links = LinkNormalizer.extract_links(raw_text)
                 if not links:
                     continue
-                
+
+                # === ATOMIC CLAIM (يمنع duplicate rescue عبر monitors متعددة) ===
+                # قبل أي معالجة، نطالب بـ claim على (chat_id, msg_id). لو فشل،
+                # يعني أن worker آخر (NewMessage/Polling/Scanner أو delete-handler آخر)
+                # سبقنا → نتخطى لتجنب المعالجة المكررة.
+                # هذا يحل مشكلة duplicate rescue التي ظهرت في production.
+                claim_token = None
+                if self.message_claim:
+                    claim_token = await self.message_claim.claim(
+                        orig_chat_id, deleted_msg_id, 'delete_handler', orig_source_phone
+                    )
+                    if claim_token is None:
+                        logging.info(
+                            f"[DELETE-HANDLER] ⏭️ Duplicate message claim: "
+                            f"chat_id={orig_chat_id} msg_id={deleted_msg_id} — skip"
+                        )
+                        continue
+
                 logging.warning(
                     f"[DELETE-HANDLER] 🚨⏰ RESCUED deleted msg_id={deleted_msg_id} "
                     f"from '{group_name[:30]}' (had {len(links)} links) — processing NOW"
                 )
-                
+
                 # سجل المجموعة (لو ما سُجلت بعد)
                 try:
                     is_new = await self.prod_db.add_monitored_chat(
@@ -3565,45 +3626,69 @@ class Monitor:
                         )
                 except Exception as e:
                     logging.debug(f"[MONITORED] add error (delete): {e}")
-                
+
                 # enqueue كل رابط
-                for link_info in links:
-                    link_data = {
-                        **link_info,
-                        'group_name': group_name,
-                        'sender_name': sender_name,
-                        'sender_contact': extract_sender_contact(raw_text),
-                        'source_phone': orig_source_phone,
-                        'message_text': raw_text,
-                        'message_link': f"https://t.me/c/{str(orig_chat_id).replace('-100', '')}/{deleted_msg_id}" if orig_chat_id else None,
-                    }
-                    
-                    # Blacklist
-                    link_raw = link_info['raw'].lower()
-                    username_raw = (link_info.get('username') or '').lower()
-                    full_text_check = f"{raw_text} {link_raw} {username_raw}".lower()
-                    is_bad, bad_reason = GulfFilter.is_blacklisted(
-                        full_text_check, username_raw, link_info['raw'], group_name
+                try:
+                    for link_info in links:
+                        link_data = {
+                            **link_info,
+                            'group_name': group_name,
+                            'sender_name': sender_name,
+                            'sender_contact': extract_sender_contact(raw_text),
+                            'source_phone': orig_source_phone,
+                            'message_text': raw_text,
+                            'message_link': f"https://t.me/c/{str(orig_chat_id).replace('-100', '')}/{deleted_msg_id}" if orig_chat_id else None,
+                        }
+
+                        # Blacklist
+                        link_raw = link_info['raw'].lower()
+                        username_raw = (link_info.get('username') or '').lower()
+                        full_text_check = f"{raw_text} {link_raw} {username_raw}".lower()
+                        is_bad, bad_reason = GulfFilter.is_blacklisted(
+                            full_text_check, username_raw, link_info['raw'], group_name
+                        )
+                        if is_bad:
+                            logging.info(
+                                f"[DELETE-HANDLER] 🚫 BLACKLISTED: {link_info['raw'][:50]} ({bad_reason})"
+                            )
+                            await self.metrics.record_skip(f'blacklist_{bad_reason}')
+                            continue
+
+                        is_new = await self.prod_db.enqueue_link(link_data)
+                        if is_new:
+                            await self.prod_db.set_group_state(
+                                link_info['normalized'], GroupState.DISCOVERED,
+                                link_info['raw'], group_name)
+                            logging.info(
+                                f"[DELETE-HANDLER] ✅ RESCUED & enqueued: {link_info['raw'][:60]} "
+                                f"(would have been LOST without cache)"
+                            )
+                        else:
+                            await self.metrics.record_duplicate()
+                            logging.info(f"[DELETE-HANDLER] ⏭️ Duplicate: {link_info['normalized'][:60]}")
+
+                    # === Mark as PROCESSED (claim_token verified) ===
+                    # يتحقق من claim_token لمنع stale worker من إكمال processing
+                    # بعد أن انتهى lease وحصل worker آخر على claim جديد.
+                    if self.message_claim and claim_token:
+                        ok = await self.message_claim.mark_processed(
+                            orig_chat_id, deleted_msg_id, claim_token
+                        )
+                        if not ok:
+                            logging.warning(
+                                f"[DELETE-HANDLER] mark_processed rejected (stale token) "
+                                f"for msg ({orig_chat_id}, {deleted_msg_id})"
+                            )
+
+                except Exception as inner_e:
+                    # === Mark as FAILED (allows retry by Polling/Scanner/another delete) ===
+                    if self.message_claim and claim_token:
+                        await self.message_claim.mark_failed(
+                            orig_chat_id, deleted_msg_id, claim_token, str(inner_e)
+                        )
+                    logging.error(
+                        f"[DELETE-HANDLER] processing error for msg ({orig_chat_id}, {deleted_msg_id}): {inner_e}"
                     )
-                    if is_bad:
-                        logging.info(
-                            f"[DELETE-HANDLER] 🚫 BLACKLISTED: {link_info['raw'][:50]} ({bad_reason})"
-                        )
-                        await self.metrics.record_skip(f'blacklist_{bad_reason}')
-                        continue
-                    
-                    is_new = await self.prod_db.enqueue_link(link_data)
-                    if is_new:
-                        await self.prod_db.set_group_state(
-                            link_info['normalized'], GroupState.DISCOVERED,
-                            link_info['raw'], group_name)
-                        logging.info(
-                            f"[DELETE-HANDLER] ✅ RESCUED & enqueued: {link_info['raw'][:60]} "
-                            f"(would have been LOST without cache)"
-                        )
-                    else:
-                        await self.metrics.record_duplicate()
-                        logging.info(f"[DELETE-HANDLER] ⏭️ Duplicate: {link_info['normalized'][:60]}")
                 
         except Exception as e:
             logging.error(f"Delete handler error: {e}", exc_info=True)
