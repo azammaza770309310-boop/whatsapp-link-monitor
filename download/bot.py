@@ -2512,6 +2512,13 @@ class Monitor:
         self._bulk_join_stop = False
         self._bulk_join_task = None
         self._bulk_join_stats = {'total': 0, 'joined': 0, 'already': 0, 'failed': 0, 'skipped': 0, 'current': ''}
+        # === MESSAGE PRE-CACHE (anti-delete protection) ===
+        # يحفظ آخر رسالة لكل (chat_id, msg_id) لمدة 60 ثانية
+        # لو بوت حماية حذف الرسالة، نقدر نسحبها من الـ cache
+        # Key: (chat_id, msg_id) → {raw_text, source_phone, received_at, sender_id, chat_obj_cache}
+        self._msg_cache: Dict[Tuple[int, int], dict] = {}
+        self._msg_cache_lock = asyncio.Lock()
+        self._msg_cache_ttl = 120  # ثانية — نبقي الرسائل لمدة دقيقتين
 
     @staticmethod
     def _get_chat_name(chat):
@@ -3069,14 +3076,25 @@ class Monitor:
                 pass
 
     def _register_user_handlers(self, phone: str):
-        """تسجيل معالجات الرسائل لكل user_client"""
+        """تسجيل معالجات الرسائل لكل user_client.
+        
+        معالجان رئيسيان:
+        1. NewMessage — يخزن كل رسالة في cache فور وصولها (قبل أي معالجة بطيئة)
+        2. MessageDeleted — لو حُذفت رسالة، نسحبها من cache ونعالجها فوراً
+        """
         client = self.user_clients.get(phone)
         if not client: return
+        # معالج الرسائل الجديدة — يخزن في cache أولاً، ثم يعالج
         client.add_event_handler(
             lambda e: self._on_user_message(e, phone),
             events.NewMessage(incoming=True)
         )
-        logging.info(f"User handlers registered for {phone}")
+        # معالج الحذف — يلتقط الرسائل المحذوفة قبل ما نعالجها
+        client.add_event_handler(
+            lambda e: self._on_message_deleted(e, phone),
+            events.MessageDeleted()
+        )
+        logging.info(f"User handlers registered for {phone} (NewMessage + MessageDeleted)")
 
     async def _check_telegram_membership(self, link: str) -> dict:
         """
@@ -3173,7 +3191,16 @@ class Monitor:
             logging.error(f"[RECOMMEND] Failed for {phone}: {e}")
 
     async def _on_user_message(self, event, source_phone: str):
-        """معالج رسائل فوري — يسحب الروابط قبل ما تحذفها بوتات أخرى."""
+        """معالج رسائل فوري — يسحب الروابط قبل ما تحذفها بوتات أخرى.
+        
+        الاستراتيجية (3 طبقات حماية ضد الحذف):
+        1. PRE-CACHE: نخزن الرسالة في ذاكرة فور وصولها (تستغفض أقل من ميلي ثانية)
+        2. EXTRACT: نستخرج الروابط فوراً (regex سريع، بدون API)
+        3. BACKGROUND: نطلق مهمة خلفية للمعالجة (DB, Blacklist, Enqueue) — لا نوقف event loop
+        
+        لو بوت حماية حذف الرسالة قبل خطوة 2، الـ MessageDeleted handler
+        يقدر يسحب الرسالة من cache ويعالجها بنفسه.
+        """
         try:
             raw_text = event.raw_text
             if not raw_text: return
@@ -3182,29 +3209,23 @@ class Monitor:
             if chat_id == self.config.channel_id: return
 
             sender_id = event.sender_id or 0
+            msg_id = event.id
 
-            # === الخطوة 1: استخرج الروابط فوراً (قبل أي شي ثاني) ===
-            # هذا يضمن سحب الرابط قبل ما بوت جبل أو صقير يحذفه
-            links = LinkNormalizer.extract_links(raw_text)
-            if not links:
-                return
-
-            # === الخطوة 2: سجل الرسالة + اسحب الروابط (صفر API calls) ===
-            logging.info(f"[PIPELINE-1] 📨🔗 Link found from source={source_phone} chat_id={chat_id} (len={len(raw_text)})")
-
-            # اسم المجموعة — من event.chat بدون API
+            # === الخطوة 0: PRE-CACHE (أول شي قبل أي شي ثاني) ===
+            # نخزن الرسالة كاملة في الذاكرة فوراً — لو حُذفت لاحقاً، نقدر نعالجها
             try:
                 chat_obj = event.chat
-                if chat_obj and hasattr(chat_obj, 'title') and chat_obj.title:
-                    group_name = chat_obj.title
-                else:
-                    group_name = f"chat_{chat_id}"
-            except Exception:
-                group_name = f"chat_{chat_id}"
-
-            # اسم المرسل — من event.sender بدون API
-            try:
+                chat_title = ''
+                chat_username = ''
+                if chat_obj:
+                    if hasattr(chat_obj, 'title') and chat_obj.title:
+                        chat_title = chat_obj.title
+                    if hasattr(chat_obj, 'username') and chat_obj.username:
+                        chat_username = chat_obj.username
+                
+                # استخراج معلومات المرسل بدون API
                 sender_obj = event.sender
+                sender_name = f"user_{sender_id}"
                 if sender_obj:
                     if hasattr(sender_obj, 'first_name') and sender_obj.first_name:
                         sender_name = sender_obj.first_name
@@ -3214,31 +3235,51 @@ class Monitor:
                         sender_name = sender_obj.title
                     elif hasattr(sender_obj, 'username') and sender_obj.username:
                         sender_name = f"@{sender_obj.username}"
-                    else:
-                        sender_name = f"user_{sender_id}"
-                else:
-                    sender_name = f"user_{sender_id}"
-            except Exception:
-                sender_name = f"user_{sender_id}"
-
-            # === MONITORED CHATS DEDUP — سجل المجموعة ===
-            try:
-                chat_username = ''
-                try:
-                    if chat_obj and hasattr(chat_obj, 'username') and chat_obj.username:
-                        chat_username = chat_obj.username
-                except Exception:
-                    pass
-
+                
+                # نوع المجموعة
                 chat_link_type = 'telegram'
-                try:
+                if chat_obj:
                     if hasattr(chat_obj, 'megagroup') and chat_obj.megagroup:
                         chat_link_type = 'group'
                     elif hasattr(chat_obj, 'broadcast') and chat_obj.broadcast:
                         chat_link_type = 'channel'
-                except Exception:
-                    pass
+                
+                # خزّن في cache (async lock سريع)
+                async with self._msg_cache_lock:
+                    self._msg_cache[(chat_id, msg_id)] = {
+                        'raw_text': raw_text,
+                        'source_phone': source_phone,
+                        'received_at': time.time(),
+                        'chat_id': chat_id,
+                        'msg_id': msg_id,
+                        'sender_id': sender_id,
+                        'chat_title': chat_title,
+                        'chat_username': chat_username,
+                        'chat_link_type': chat_link_type,
+                        'sender_name': sender_name,
+                        'processed': False,  # هل عُولجت في NewMessage؟
+                    }
+            except Exception as cache_err:
+                logging.debug(f"[CACHE] store error: {cache_err}")
+                # حتى لو فشل cache، نكمل المعالجة
 
+            # === الخطوة 1: استخرج الروابط فوراً (regex سريع، بدون API) ===
+            links = LinkNormalizer.extract_links(raw_text)
+            if not links:
+                return  # ما فيها روابط — لا نعالج (cache ينظف تلقائياً)
+
+            # === الخطوة 2: معالجة فورية (sync, سريعة جداً) ===
+            # نسجّل المجموعة + نضع الرابط في queue فوراً (العملية كلها DB، بدون API)
+            group_name = self._msg_cache[(chat_id, msg_id)].get('chat_title') or f"chat_{chat_id}"
+            sender_name = self._msg_cache[(chat_id, msg_id)].get('sender_name') or f"user_{sender_id}"
+            chat_username = self._msg_cache[(chat_id, msg_id)].get('chat_username', '')
+            chat_link_type = self._msg_cache[(chat_id, msg_id)].get('chat_link_type', 'telegram')
+
+            logging.info(f"[PIPELINE-1] 📨🔗 Link found from source={source_phone} chat_id={chat_id} msg_id={msg_id} (len={len(raw_text)})")
+            logging.info(f"[PIPELINE-1] 🔗 Found {len(links)} link(s) in message from {group_name}")
+
+            # === MONITORED CHATS DEDUP — سجل المجموعة المصدر ===
+            try:
                 is_new = await self.prod_db.add_monitored_chat(
                     chat_id=chat_id,
                     chat_title=group_name,
@@ -3253,8 +3294,6 @@ class Monitor:
             except Exception as e:
                 logging.debug(f"[MONITORED] add error: {e}")
 
-            logging.info(f"[PIPELINE-1] 🔗 Found {len(links)} link(s) in message from {group_name}")
-
             # === الخطوة 3: enqueue كل رابط فوراً ===
             for link_info in links:
                 link_data = {
@@ -3264,7 +3303,7 @@ class Monitor:
                     'sender_contact': extract_sender_contact(raw_text),
                     'source_phone': source_phone,
                     'message_text': raw_text,
-                    'message_link': f"https://t.me/c/{str(chat_id).replace('-100', '')}/{event.id}" if chat_id else None,
+                    'message_link': f"https://t.me/c/{str(chat_id).replace('-100', '')}/{msg_id}" if chat_id else None,
                 }
 
                 # === فلتر BLACKLIST فقط (سريع) ===
@@ -3294,8 +3333,151 @@ class Monitor:
                     await self.metrics.record_duplicate()
                     logging.info(f"[PIPELINE-2] ⏭️ Duplicate: {link_info['normalized'][:60]}")
 
+            # علّم الرسالة كـ "معالجة" في cache
+            try:
+                async with self._msg_cache_lock:
+                    if (chat_id, msg_id) in self._msg_cache:
+                        self._msg_cache[(chat_id, msg_id)]['processed'] = True
+            except Exception:
+                pass
+
         except Exception as e:
             logging.error(f"Event handler error: {e}", exc_info=True)
+
+    async def _on_message_deleted(self, event, source_phone: str):
+        """يلتقط الرسائل المحذوفة — يعالجها لو ما عولجت قبل.
+        
+        سيناريو: بوت حماية (جبل/صقير) يحذف الرسالة قبل ما _on_user_message يخلص.
+        الـ MessageDeleted event يجي بعد الحذف بثواني.
+        نحن مخزنين الرسالة في _msg_cache فنقدر نسحبها ونعالجها.
+        """
+        try:
+            # MessageDeleted event فيه: deleted_ids (list) + chat_id (اختياري)
+            deleted_ids = getattr(event, 'deleted_ids', []) or []
+            if not deleted_ids:
+                return
+
+            # نحاول نسحب chat_id من event (مو دايماً متوفر في MessageDeleted)
+            chat_id = getattr(event, 'chat_id', None)
+            
+            for deleted_msg_id in deleted_ids:
+                # ابحث عن الرسالة في cache
+                cached_msg = None
+                async with self._msg_cache_lock:
+                    if chat_id:
+                        cached_msg = self._msg_cache.pop((chat_id, deleted_msg_id), None)
+                    else:
+                        # لو ما عندنا chat_id، ابحث في كل الـ keys
+                        for key, val in list(self._msg_cache.items()):
+                            if key[1] == deleted_msg_id:
+                                cached_msg = self._msg_cache.pop(key, None)
+                                break
+                
+                if not cached_msg:
+                    continue  # ما عندنا الرسالة في cache — تجاهل
+                
+                if cached_msg.get('processed'):
+                    # الرسالة عُولجت بالفعل في _on_user_message — ما نحتاج شي
+                    logging.debug(f"[DELETE-HANDLER] msg_id={deleted_msg_id} already processed — skip")
+                    continue
+                
+                # الرسالة محذوفة قبل المعالجة! سحبها من cache وعالجها فوراً
+                raw_text = cached_msg.get('raw_text', '')
+                group_name = cached_msg.get('chat_title') or f"chat_{cached_msg.get('chat_id')}"
+                sender_name = cached_msg.get('sender_name', 'Unknown')
+                chat_username = cached_msg.get('chat_username', '')
+                chat_link_type = cached_msg.get('chat_link_type', 'telegram')
+                orig_chat_id = cached_msg.get('chat_id')
+                orig_source_phone = cached_msg.get('source_phone', source_phone)
+                
+                # استخرج الروابط
+                links = LinkNormalizer.extract_links(raw_text)
+                if not links:
+                    continue
+                
+                logging.warning(
+                    f"[DELETE-HANDLER] 🚨⏰ RESCUED deleted msg_id={deleted_msg_id} "
+                    f"from '{group_name[:30]}' (had {len(links)} links) — processing NOW"
+                )
+                
+                # سجل المجموعة (لو ما سُجلت بعد)
+                try:
+                    is_new = await self.prod_db.add_monitored_chat(
+                        chat_id=orig_chat_id,
+                        chat_title=group_name,
+                        username=chat_username,
+                        link_type=chat_link_type,
+                        monitored_by=orig_source_phone,
+                    )
+                    if is_new:
+                        logging.info(
+                            f"[MONITORED] ✅ New chat (via delete-handler): '{group_name[:40]}' "
+                            f"(id={orig_chat_id}, by={orig_source_phone})"
+                        )
+                except Exception as e:
+                    logging.debug(f"[MONITORED] add error (delete): {e}")
+                
+                # enqueue كل رابط
+                for link_info in links:
+                    link_data = {
+                        **link_info,
+                        'group_name': group_name,
+                        'sender_name': sender_name,
+                        'sender_contact': extract_sender_contact(raw_text),
+                        'source_phone': orig_source_phone,
+                        'message_text': raw_text,
+                        'message_link': f"https://t.me/c/{str(orig_chat_id).replace('-100', '')}/{deleted_msg_id}" if orig_chat_id else None,
+                    }
+                    
+                    # Blacklist
+                    link_raw = link_info['raw'].lower()
+                    username_raw = (link_info.get('username') or '').lower()
+                    full_text_check = f"{raw_text} {link_raw} {username_raw}".lower()
+                    is_bad, bad_reason = GulfFilter.is_blacklisted(
+                        full_text_check, username_raw, link_info['raw'], group_name
+                    )
+                    if is_bad:
+                        logging.info(
+                            f"[DELETE-HANDLER] 🚫 BLACKLISTED: {link_info['raw'][:50]} ({bad_reason})"
+                        )
+                        await self.metrics.record_skip(f'blacklist_{bad_reason}')
+                        continue
+                    
+                    is_new = await self.prod_db.enqueue_link(link_data)
+                    if is_new:
+                        await self.prod_db.set_group_state(
+                            link_info['normalized'], GroupState.DISCOVERED,
+                            link_info['raw'], group_name)
+                        logging.info(
+                            f"[DELETE-HANDLER] ✅ RESCUED & enqueued: {link_info['raw'][:60]} "
+                            f"(would have been LOST without cache)"
+                        )
+                    else:
+                        await self.metrics.record_duplicate()
+                        logging.info(f"[DELETE-HANDLER] ⏭️ Duplicate: {link_info['normalized'][:60]}")
+                
+        except Exception as e:
+            logging.error(f"Delete handler error: {e}", exc_info=True)
+
+    async def _msg_cache_cleanup(self):
+        """ينظف الرسائل القديمة من cache كل 30 ثانية (لتجنب تضخم الذاكرة)."""
+        while self._running:
+            try:
+                await asyncio.sleep(30)
+                now = time.time()
+                expired_keys = []
+                async with self._msg_cache_lock:
+                    for key, val in list(self._msg_cache.items()):
+                        if now - val.get('received_at', 0) > self._msg_cache_ttl:
+                            expired_keys.append(key)
+                    for key in expired_keys:
+                        self._msg_cache.pop(key, None)
+                if expired_keys:
+                    logging.debug(f"[CACHE] cleaned {len(expired_keys)} expired messages (size={len(self._msg_cache)})")
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logging.debug(f"[CACHE] cleanup error: {e}")
 
     async def _send(self, text, retries=3, buttons=None, parse_mode='html') -> Tuple[bool, Optional[int]]:
         """يرسل رسالة للقناة ويتحقق من قبولها.
@@ -6966,6 +7148,14 @@ class Monitor:
         else:
             logging.info("📊 Priority Scorer already running — skip duplicate")
 
+        # ابدأ Message Cache Cleanup — ينظف الرسائل القديمة من cache كل 30 ثانية
+        # هذا يمنع تضخم الذاكرة بسبب الرسائل التي ما تحوي روابط
+        if not hasattr(self, '_msg_cache_cleanup_task') or self._msg_cache_cleanup_task is None or self._msg_cache_cleanup_task.done():
+            self._msg_cache_cleanup_task = asyncio.create_task(self._msg_cache_cleanup())
+            logging.info("🧹 Message Cache Cleanup started (anti-delete protection active)")
+        else:
+            logging.info("🧹 Message Cache Cleanup already running — skip duplicate")
+
         # NOTE: Chat Classifier معطل — يستهلك AI بدون فائدة
         # الفلتر الحالي يعتمد على BLACKLIST فقط (كافي)
 
@@ -6999,7 +7189,8 @@ class Monitor:
 
         # إلغاء المهام مع timeout لمنع التعليق
         scorer_task = getattr(self, '_priority_scorer_task', None)
-        tasks = [self._bot_task, self._keep_alive_task, self._joiner_task, scorer_task] + list(self._user_tasks.values()) + self._current_scan_tasks
+        cache_cleanup_task = getattr(self, '_msg_cache_cleanup_task', None)
+        tasks = [self._bot_task, self._keep_alive_task, self._joiner_task, scorer_task, cache_cleanup_task] + list(self._user_tasks.values()) + self._current_scan_tasks
         for t in tasks:
             if t and not t.done():
                 t.cancel()
@@ -7237,6 +7428,80 @@ async def api_monitored_chats_handler(request):
 
     except Exception as e:
         logging.error(f"[API] monitored_chats error: {e}")
+        return web.json_response({"error": str(e)}, status=500,
+                                 headers={"Access-Control-Allow-Origin": "*"})
+
+
+async def api_link_source_check_handler(request):
+    """API endpoint: يتحقق هل مصدر رابط معيّن من ضمن المجموعات المراقبة.
+    
+    Query params:
+        ?message_link=https://t.me/c/123456/789  → رابط الرسالة الأصلية
+        ?chat_id=-1001234567890                  → chat_id مباشر
+        ?group_name=S_boot                       → اسم المجموعة المصدر
+    
+    Returns:
+        - is_monitored: bool
+        - chat: معلومات المجموعة (لو موجودة)
+        - total_monitored: عدد كل المجموعات المراقبة
+    """
+    monitor = request.app.get("monitor")
+    db = request.app.get("db")
+    if not monitor or not db:
+        return web.json_response({"error": "not ready"}, status=503,
+                                 headers={"Access-Control-Allow-Origin": "*"})
+
+    try:
+        message_link = request.query.get("message_link", "").strip()
+        chat_id_str = request.query.get("chat_id", "").strip()
+        group_name_query = request.query.get("group_name", "").strip()
+
+        # استخراج chat_id من message_link (t.me/c/X/Y → -100X)
+        chat_id = None
+        if chat_id_str:
+            try:
+                chat_id = int(chat_id_str)
+            except ValueError:
+                pass
+        if not chat_id and message_link:
+            # pattern: t.me/c/123456/789 → chat_id = -100123456
+            import re as _re
+            m = _re.search(r'/c/(\d+)', message_link)
+            if m:
+                chat_id = int(f"-100{m.group(1)}")
+
+        # ابحث عن المجموعة في monitored_chats
+        chat_info = None
+        if chat_id:
+            chats = await monitor.prod_db.get_monitored_chats(limit=5000)
+            for c in chats:
+                if c.get('chat_id') == chat_id:
+                    chat_info = c
+                    break
+        if not chat_info and group_name_query:
+            # ابحث بالاسم لو ما لقينا بالـ id
+            chats = await monitor.prod_db.get_monitored_chats(limit=5000)
+            for c in chats:
+                if c.get('chat_title', '') == group_name_query:
+                    chat_info = c
+                    break
+
+        total_monitored = len(chats) if 'chats' in locals() else 0
+        is_monitored = chat_info is not None
+
+        return web.json_response({
+            'is_monitored': is_monitored,
+            'chat': chat_info,
+            'query': {
+                'message_link': message_link,
+                'chat_id': chat_id,
+                'group_name': group_name_query,
+            },
+            'total_monitored': total_monitored,
+        }, status=200, headers={"Access-Control-Allow-Origin": "*"})
+
+    except Exception as e:
+        logging.error(f"[API] link_source_check error: {e}")
         return web.json_response({"error": str(e)}, status=500,
                                  headers={"Access-Control-Allow-Origin": "*"})
 
@@ -7684,11 +7949,12 @@ async def start_http_server(monitor=None, db=None):
     app.router.add_get("/api/deploy_check", api_deploy_check_handler)  # diagnostic
     app.router.add_get("/api/joiners_status", api_joiners_status_handler)  # joiners + groups
     app.router.add_get("/api/monitored_chats", api_monitored_chats_handler)  # monitored chats + AI
+    app.router.add_get("/api/link_source_check", api_link_source_check_handler)  # check if source is monitored
     runner = web.AppRunner(app)
     await runner.setup()
     site = web.TCPSite(runner, "0.0.0.0", port)
     await site.start()
-    logging.info(f"HTTP server listening on port {port} (endpoints: /health /ready /metrics /api/joined_groups /api/links /api/stats /api/deploy_check)")
+    logging.info(f"HTTP server listening on port {port} (endpoints: /health /ready /metrics /api/joined_groups /api/links /api/stats /api/deploy_check /api/monitored_chats /api/link_source_check)")
     return runner
 
 

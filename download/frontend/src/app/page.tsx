@@ -646,7 +646,19 @@ export default function Home() {
             ) : (
               <div className="space-y-2">
                 {allLinks.slice(0, 5).map((link) => (
-                  <LinkCard key={link.id} link={link} compact />
+                  <LinkCard
+                    key={link.id}
+                    link={link}
+                    compact
+                    isMonitored={monitoredChats.some(
+                      (c) =>
+                        c.chat_title === link.group_name ||
+                        (link.message_link &&
+                          link.message_link.includes(
+                            `/c/${String(c.chat_id).replace('-100', '')}/`
+                          ))
+                    )}
+                  />
                 ))}
               </div>
             )}
@@ -707,8 +719,8 @@ function StatCard(props: {
 }
 
 // ===== LinkCard Component =====
-function LinkCard(props: { link: LinkItem; compact?: boolean }) {
-  const { link, compact = false } = props
+function LinkCard(props: { link: LinkItem; compact?: boolean; isMonitored?: boolean }) {
+  const { link, compact = false, isMonitored = false } = props
   const isWhatsapp = link.link_type === 'whatsapp'
   const date = new Date(link.created_at)
   const timeStr = date.toLocaleString('ar-SA', {
@@ -731,6 +743,9 @@ function LinkCard(props: { link: LinkItem; compact?: boolean }) {
           />
           <span className="text-xs text-slate-300 truncate flex-1">
             {link.group_name || 'غير معروف'}
+            {isMonitored && (
+              <span className="mr-1 text-emerald-400" title="المجموعة مصدر مراقَب">●</span>
+            )}
           </span>
           <span className="text-xs text-slate-500">{timeStr}</span>
         </div>
@@ -795,6 +810,23 @@ function LinkCard(props: { link: LinkItem; compact?: boolean }) {
                 className="border-amber-500/40 text-amber-400 bg-amber-500/10"
               >
                 ⚠️ إعلان
+              </Badge>
+            )}
+            {isMonitored ? (
+              <Badge
+                variant="outline"
+                className="border-cyan-500/40 text-cyan-400 bg-cyan-500/10"
+                title="المجموعة المصدر مسجّلة في قائمة المراقبة"
+              >
+                👁️ مصدر مراقَب
+              </Badge>
+            ) : (
+              <Badge
+                variant="outline"
+                className="border-slate-600/40 text-slate-500 bg-slate-700/10"
+                title="المجموعة المصدر غير مسجّلة في قائمة المراقبة"
+              >
+                ⚪ مصدر غير مراقَب
               </Badge>
             )}
           </div>
@@ -1302,7 +1334,18 @@ function LinksModal(props: {
                 ) : (
                   <div>
                     {filteredLinks.map((link) => (
-                      <LinkCard key={link.id} link={link} />
+                      <LinkCard
+                        key={link.id}
+                        link={link}
+                        isMonitored={monitoredChats.some(
+                          (c) =>
+                            c.chat_title === link.group_name ||
+                            (link.message_link &&
+                              link.message_link.includes(
+                                `/c/${String(c.chat_id).replace('-100', '')}/`
+                              ))
+                        )}
+                      />
                     ))}
                   </div>
                 )}

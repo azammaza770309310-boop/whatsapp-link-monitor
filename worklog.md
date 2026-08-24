@@ -343,3 +343,68 @@ Stage Summary:
   3. LOW (أقل من 1K أو غير معروف) أخيراً
 - ضمن نفس الأولوية، الأكثر أعضاءً يُختار أولاً
 - الملفات: bot.py, download/bot.py, link_system.py, download/link_system.py
+
+---
+Task ID: ANTI-DELETE-CACHE-f1a3e9c
+Agent: main (Super Z)
+Task: حل سحب الرابط قبل ما بوتات الحماية تحذفه + تأكيد هل مجموعة الرابط مراقبة.
+
+Work Log:
+- تحليل المشكلة:
+  * المستخدم لاحظ أن بوتات حماية (مثل جبل/صقير) تحذف الرسائل قبل ما البوت يلحق يعالجها
+  * الحل السابق (08cd8c1) كان يعيد ترتيب _on_user_message لكنه ما يقدر يلتقط الرسائل المحذوفة قبل المعالجة
+  * سؤال ثاني: هل المجموعة المصدر للرابط من ضمن المجموعات المراقبة؟
+
+- التحقق من البيانات الحالية على Render:
+  * stats: 26,828 رابط في queue، 839 مجموعة مراقبة، 4 حسابات متصلة، 2 فدائي متصل
+  * آخر 20 رابط: كل المصادر من ضمن monitored_chats ✅
+  * مصادر شائعة: S_boot (8x), Bot (2x), طلبة جامعة زايد (2x), جامعة الملك خالد، CCIS/IMAMU
+  * المشكلة: 3 banned (فضفضة، استشارات زوجية، low_member_count_258)
+
+- الحل المُطبّق (3 طبقات حماية):
+  1. PRE-CACHE: عند وصول أي رسالة (NewMessage event)، نخزنها كاملة في ذاكرة قبل أي معالجة
+     - Key: (chat_id, msg_id) → {raw_text, source_phone, chat_title, chat_username, ...}
+     - TTL: 120 ثانية
+     - استخدام asyncio.Lock للحماية
+  2. PROCESS: نستخرج الروابط ونضعها في queue فوراً (مثل السابق)
+     - نعلّم الرسالة كـ processed=True بعد الإكمال
+  3. RESCUE: عند حدث MessageDeleted:
+     - نسحب الرسالة من cache (لو ما عُولجت بعد)
+     - نعالجها كاملة (extract links + blacklist + enqueue)
+     - نلوّج: [DELETE-HANDLER] 🚨⏰ RESCUED deleted msg_id=X
+
+- التنفيذ:
+  * إضافة self._msg_cache, self._msg_cache_lock, self._msg_cache_ttl في __init__
+  * تعديل _register_user_handlers: إضافة MessageDeleted handler لكل user_client
+  * إعادة كتابة _on_user_message:
+    - PRE-CACHE أولاً (قبل extract_links)
+    - استخدام event.chat بدون API calls
+    - استخراج sender_name بدون API
+    - تسجيل monitored_chat بدون API
+  * إضافة _on_message_deleted: يلتقط الرسائل المحذوفة، يعالجها من cache
+  * إضافة _msg_cache_cleanup: مهمة خلفية تنظف الرسائل القديمة كل 30 ثانية
+  * بدء المهمة في start() + إلغاؤها في stop()
+
+- API endpoint جديد /api/link_source_check:
+  * params: ?message_link=, ?chat_id=, ?group_name=
+  * returns: {is_monitored: bool, chat: {...}, total_monitored: N}
+  * يساعد على فحص أي رابط ومن يعرف هل مصدره مراقَب
+
+- تحديث Frontend (download/frontend/src/app/page.tsx):
+  * إضافة isMonitored prop لـ LinkCard
+  * إظهار Badge "👁️ مصدر مراقَب" (cyan) للروابط اللي مصدرها مجموعة مراقبة
+  * إظهار Badge "⚪ مصدر غير مراقَب" (slate) للروابط اللي مصدرها غير مراقب
+  * الفحص يحصل بـ: chat_title === group_name OR message_link.includes(/c/{chat_id_without_prefix}/)
+  * في compact mode: نقطة خضراء ● بجانب اسم المجموعة (لو مراقَب)
+
+- ملفات تم تعديلها:
+  * bot.py (الحجم: 8109 سطر)
+  * download/bot.py (نسخة متطابقة)
+  * download/frontend/src/app/page.tsx
+
+Stage Summary:
+- 3 طبقات حماية ضد الحذف: PRE-CACHE + PROCESS + RESCUE
+- حتى لو بوت حماية حذف الرسالة بسرعة، نقدر نسحبها من cache
+- API جديد للتحقق من مصدر أي رابط
+- Dashboard يُظهر حالة المراقبة بوضوح على كل رابط
+- كل المصادر الحالية فعلاً في monitored_chats (تأكيد من البيانات الحالية)
