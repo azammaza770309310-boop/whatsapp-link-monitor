@@ -80,8 +80,15 @@ class LinkNormalizer:
 
                 # === استبعاد روابط الرسائل (t.me/username/123) ===
                 # هذه روابط رسائل في قنوات، مو دعوات انضمام
+                # لكن نستخرج username وننسخ الرابط بدون /msg_id
                 if msg_id is not None:
-                    continue
+                    # نظّف الرابط من /msg_id
+                    raw = re.sub(r'/\d+$', '', raw)
+                    # أعد استخراج identifier بدون msg_id
+                    clean_match = re.match(r'(?:https?://)?t(?:elegram)?\.me/([A-Za-z0-9_]+)', raw, re.I)
+                    if clean_match:
+                        identifier = clean_match.group(1)
+                    msg_id = None  # أعد التعيين لـ None عشان يُقبل
 
                 # Determine type
                 if identifier.startswith('+') or identifier.startswith('joinchat/'):
