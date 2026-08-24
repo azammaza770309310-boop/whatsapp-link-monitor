@@ -2245,7 +2245,8 @@ class MessageFormatter:
 class HistoryScanner:
     def __init__(self, user_client, bot_client, db, channel_id,
                  days_back, max_per_chat, batch_size, skip_channel_posts,
-                 source_phone, source_name, progress_callback=None):
+                 source_phone, source_name, progress_callback=None,
+                 message_claim=None, prod_db=None):
         self.user_client = user_client
         self.bot_client = bot_client
         self.db = db
@@ -2257,6 +2258,11 @@ class HistoryScanner:
         self.source_phone = source_phone
         self.source_name = source_name
         self.progress_callback = progress_callback
+        # === Unified dedup layer (atomic message claim with lease + token) ===
+        # When provided, HistoryScanner uses MessageClaim to prevent re-processing
+        # of messages already handled by NewMessage or Polling.
+        self.message_claim = message_claim
+        self.prod_db = prod_db  # for enqueue_link + set_group_state
 
         self.total_scanned = 0
         self.total_found = 0
@@ -2332,50 +2338,138 @@ class HistoryScanner:
                 if md and (last_date is None or md > last_date): last_date = md
                 if not msg or not msg.text: continue
 
-                # استخراج روابط واتساب وتيليجرام
-                links = extract_whatsapp_telegram_links(msg.text)
-                if not links: continue
+                # === ATOMIC CLAIM (prevents re-processing vs NewMessage/Polling) ===
+                # If message_claim is available, claim the message atomically.
+                # If claim returns None, the message was already processed → skip.
+                claim_token = None
+                if self.message_claim:
+                    claim_token = await self.message_claim.claim(
+                        dialog.id, msg.id, 'scanner', self.source_phone
+                    )
+                    if claim_token is None:
+                        # Already processed by NewMessage or Polling → skip
+                        continue
 
-                # فلتر: السماح فقط برسائل الجامعات الأهلية المستهدفة
-                if not is_target_university_message(msg.text):
-                    continue
-
-                # استبعاد الرسائل الإعلانية
-                if is_advertiser_message(msg.text):
-                    continue
-
-                self.total_found += len(links)
                 try:
-                    sender = await msg.get_sender()
-                    sn = Monitor._get_sender_name(sender)
-                except Exception: sn = "Unknown"
+                    # === Unified link extraction (LinkNormalizer) ===
+                    # Replaces old extract_whatsapp_telegram_links for consistency.
+                    links_info = LinkNormalizer.extract_links(msg.text)
+                    if not links_info:
+                        # No links — mark as processed so we don't retry
+                        if self.message_claim and claim_token:
+                            await self.message_claim.mark_processed(
+                                dialog.id, msg.id, claim_token
+                            )
+                        continue
 
-                # استخراج بيانات تواصل المرسل
-                contact = extract_sender_contact(msg.text)
-                if not contact and sender and hasattr(sender, 'username') and sender.username:
-                    contact = f"✈️ @{sender.username}"
+                    # === Unified filter (GulfFilter.is_blacklisted) ===
+                    # Replaces old is_target_university_message + is_advertiser_message.
+                    # Note: GulfFilter is blacklist-based (reject only bad content),
+                    # so it accepts all educational/gulf content without requiring
+                    # a specific university name.
+                    full_text = msg.text or ''
+                    is_bad = False
+                    bad_reason = ''
+                    for link_info in links_info:
+                        link_raw = link_info['raw'].lower()
+                        username_raw = (link_info.get('username') or '').lower()
+                        full_text_check = f"{full_text} {link_raw} {username_raw}".lower()
+                        is_bad, bad_reason = GulfFilter.is_blacklisted(
+                            full_text_check, username_raw, link_info['raw'], name
+                        )
+                        if is_bad:
+                            break
+                    if is_bad:
+                        logging.debug(
+                            f"[SCAN {self.source_phone}] BLACKLISTED: {bad_reason} in '{name[:30]}'"
+                        )
+                        # Mark as processed so we don't retry blacklisted messages
+                        if self.message_claim and claim_token:
+                            await self.message_claim.mark_processed(
+                                dialog.id, msg.id, claim_token
+                            )
+                        continue
 
-                # رابط الرسالة
-                msg_link = None
-                try:
-                    msg_link = f"https://t.me/c/{str(dialog.id).replace('-100', '')}/{msg.id}"
-                except Exception: pass
+                    self.total_found += len(links_info)
+                    try:
+                        sender = await msg.get_sender()
+                        sn = Monitor._get_sender_name(sender)
+                    except Exception: sn = "Unknown"
 
-                # إدراج كل رابط
-                for link in links:
-                    inserted = await self.db.insert_request(
-                        link, md, name, sn, self.source_phone, msg_link,
-                        message_text=msg.text, sender_contact=contact)
-                    if inserted:
-                        self.new_count += 1
-                        batch.append({
-                            'link': link, 'text': msg.text, 'date': md,
-                            'group': name, 'sender': sn, 'msg_link': msg_link,
-                            'contact': contact
-                        })
-                        if len(batch) >= self.batch_size:
-                            await self._send_batch(batch)
-                            batch = []
+                    # استخراج بيانات تواصل المرسل
+                    contact = extract_sender_contact(msg.text)
+                    if not contact and sender and hasattr(sender, 'username') and sender.username:
+                        contact = f"✈️ @{sender.username}"
+
+                    # رابط الرسالة
+                    msg_link = None
+                    try:
+                        msg_link = f"https://t.me/c/{str(dialog.id).replace('-100', '')}/{msg.id}"
+                    except Exception: pass
+
+                    # === Enqueue links (URL dedup via link_queue.UNIQUE) ===
+                    if self.prod_db:
+                        # Use new production path: enqueue_link + set_group_state
+                        for link_info in links_info:
+                            link_data = {
+                                **link_info,
+                                'group_name': name,
+                                'sender_name': sn,
+                                'sender_contact': contact,
+                                'source_phone': self.source_phone,
+                                'message_text': msg.text,
+                                'message_link': msg_link,
+                            }
+                            is_new = await self.prod_db.enqueue_link(link_data)
+                            if is_new:
+                                await self.prod_db.set_group_state(
+                                    link_info['normalized'], GroupState.DISCOVERED,
+                                    link_info['raw'], name
+                                )
+                                self.new_count += 1
+                                # Still publish to channel via _send_batch (legacy behavior)
+                                batch.append({
+                                    'link': link_info['raw'], 'text': msg.text, 'date': md,
+                                    'group': name, 'sender': sn, 'msg_link': msg_link,
+                                    'contact': contact
+                                })
+                                if len(batch) >= self.batch_size:
+                                    await self._send_batch(batch)
+                                    batch = []
+                    else:
+                        # Fallback: legacy insert_request path (for backward compat
+                        # if prod_db was not provided)
+                        for link_info in links_info:
+                            inserted = await self.db.insert_request(
+                                link_info['raw'], md, name, sn, self.source_phone, msg_link,
+                                message_text=msg.text, sender_contact=contact)
+                            if inserted:
+                                self.new_count += 1
+                                batch.append({
+                                    'link': link_info['raw'], 'text': msg.text, 'date': md,
+                                    'group': name, 'sender': sn, 'msg_link': msg_link,
+                                    'contact': contact
+                                })
+                                if len(batch) >= self.batch_size:
+                                    await self._send_batch(batch)
+                                    batch = []
+
+                    # === Mark as PROCESSED ===
+                    if self.message_claim and claim_token:
+                        await self.message_claim.mark_processed(
+                            dialog.id, msg.id, claim_token
+                        )
+
+                except Exception as inner_e:
+                    # === Mark as FAILED (allows retry on next scan) ===
+                    if self.message_claim and claim_token:
+                        await self.message_claim.mark_failed(
+                            dialog.id, msg.id, claim_token, str(inner_e)
+                        )
+                    logging.error(
+                        f"[SCAN {self.source_phone}] msg ({dialog.id}, {msg.id}) error: {inner_e}"
+                    )
+                    # Don't re-raise — continue with next message
         except FloodWaitError: raise
         except Exception as e:
             logging.error(f"[SCAN {self.source_phone}] iter error: {e}")
@@ -5541,7 +5635,8 @@ class Monitor:
             scanner = HistoryScanner(
                 client, self.bot_client, self.db, self.config.channel_id,
                 days, self.config.history_max_per_chat, self.config.history_batch_size,
-                self.config.history_skip_channel_posts, phone, watcher.get('display_name', ''), p)
+                self.config.history_skip_channel_posts, phone, watcher.get('display_name', ''), p,
+                message_claim=self.message_claim, prod_db=self.prod_db)
             self._current_scanners[phone] = scanner
             await scanner.scan()
         except asyncio.CancelledError: pass
@@ -5680,7 +5775,8 @@ class Monitor:
                 self.config.channel_id, self.config.startup_scan_days,
                 self.config.history_max_per_chat, self.config.history_batch_size,
                 self.config.history_skip_channel_posts, watcher['phone'],
-                watcher.get('display_name', ''))
+                watcher.get('display_name', ''),
+                message_claim=self.message_claim, prod_db=self.prod_db)
             self._current_scanners[watcher['phone']] = scanner
             await scanner.scan()
         except asyncio.CancelledError: pass
@@ -7567,14 +7663,19 @@ class Monitor:
         else:
             logging.info("🧹 Message Cache Cleanup already running — skip duplicate")
 
-        # ابدأ Active Polling Worker — الحل الجذري لمشكلة بوتات الحماية
-        # بدل الاعتماد على events فقط (اللي قد تتأخر أو تُحذف قبل ما توصل),
-        # polling نشط كل 5 ثواني يلتقط الرسائل من أهم 200 مجموعة نشطة
-        if not hasattr(self, '_active_polling_task') or self._active_polling_task is None or self._active_polling_task.done():
-            self._active_polling_task = asyncio.create_task(self._active_polling_worker())
-            logging.info("🔄 Active Polling Worker started (polls top 200 active groups every 5s)")
-        else:
-            logging.info("🔄 Active Polling Worker already running — skip duplicate")
+        # === LEGACY POLLING WORKER — DISABLED ===
+        # The legacy _active_polling_worker is superseded by PollingScheduler
+        # (which covers ALL sources, not just Top-200, and uses fair scheduling).
+        # The function itself is kept for backward compatibility, but we no longer
+        # start it. Both workers running together would cause duplicate API calls
+        # and duplicate MessageClaim attempts on the same chats.
+        # To re-enable: uncomment the block below.
+        # if not hasattr(self, '_active_polling_task') or self._active_polling_task is None or self._active_polling_task.done():
+        #     self._active_polling_task = asyncio.create_task(self._active_polling_worker())
+        #     logging.info("🔄 Legacy Active Polling Worker started (top 200 groups)")
+        # else:
+        #     logging.info("🔄 Legacy Active Polling Worker already running — skip duplicate")
+        logging.info("⏸️ Legacy Active Polling Worker DISABLED — PollingScheduler handles polling (covers all sources)")
 
         # NOTE: Chat Classifier معطل — يستهلك AI بدون فائدة
         # الفلتر الحالي يعتمد على BLACKLIST فقط (كافي)

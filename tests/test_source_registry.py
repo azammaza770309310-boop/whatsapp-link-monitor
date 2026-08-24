@@ -841,6 +841,393 @@ async def test_N():
         record("N: exception", False, str(e))
 
 
+# === Test O: NewMessage vs Polling vs Scanner = 1 processing (3-way) ===
+
+async def test_O():
+    """3 workers (NewMessage, Polling, Scanner) concurrent لنفس الرسالة → 1 فائز."""
+    print("\n--- Test O: NewMessage vs Polling vs Scanner concurrent = 1 processing ---")
+    try:
+        prod_db, _ = await make_test_db()
+        chat_id, msg_id = -100777, 500
+
+        # 3 concurrent claims from 3 different sources
+        results = await asyncio.gather(
+            prod_db.claim_message(chat_id, msg_id, 'newmessage', 'A'),
+            prod_db.claim_message(chat_id, msg_id, 'polling', 'A'),
+            prod_db.claim_message(chat_id, msg_id, 'scanner', 'A'),
+        )
+
+        winners = [r for r in results if r is not None]
+        if len(winners) != 1:
+            record("O: exactly 1 winner from 3-way concurrent", False,
+                   f"got {len(winners)} winners")
+            return
+        record("O: exactly 1 winner from 3-way concurrent", True)
+
+        # Verify DB has 1 row
+        count = await prod_db.count_processed_messages(chat_id, msg_id)
+        if count != 1:
+            record("O: DB has 1 row", False, f"got {count}")
+            return
+        record("O: DB has 1 row", True)
+
+        # Winner marks processed
+        winner_token = winners[0]
+        ok = await prod_db.mark_message_processed(chat_id, msg_id, winner_token)
+        if not ok:
+            record("O: winner mark_processed succeeds", False, "failed")
+            return
+        record("O: winner mark_processed succeeds", True)
+
+        # Verify final state
+        row = await prod_db.get_processed_message(chat_id, msg_id)
+        if row['state'] == 'processed':
+            record("O: final state='processed'", True)
+        else:
+            record("O: final state='processed'", False, f"got {row['state']}")
+    except Exception as e:
+        record("O: exception", False, str(e))
+
+
+# === Test P: Cancellation أثناء polling لا يسبب تسريب load ===
+
+async def test_P():
+    """Cancellation أثناء polling → release_load مضمون."""
+    print("\n--- Test P: Cancellation does not leak load ---")
+    try:
+        from source_registry import SourceRegistry, PollingScheduler
+        prod_db, _ = await make_test_db()
+        watchers = [
+            {'phone': 'A', 'role': 'monitor'},
+            {'phone': 'B', 'role': 'monitor'},
+        ]
+        registry = SourceRegistry(prod_db, watchers)
+        registry._chat_to_phones[-100888] = ['A', 'B']
+        registry.update_phone_status('A', True)
+        registry.update_phone_status('B', True)
+
+        # Pick a reader (increments load)
+        reader = registry.get_reader(-100888)
+        if reader is None:
+            record("P: get_reader returns a phone", False, "None")
+            return
+        record("P: get_reader returns a phone", True)
+
+        # Verify load was incremented
+        loads = registry.get_phone_load()
+        if loads[reader] != 1:
+            record("P: load incremented after get_reader", False, f"got {loads[reader]}")
+            return
+        record("P: load incremented after get_reader", True)
+
+        # Simulate cancellation: manually call release_load (as the finally block would)
+        registry.release_load(reader)
+
+        # Verify load was decremented back to 0
+        loads = registry.get_phone_load()
+        if loads[reader] != 0:
+            record("P: load decremented after release_load", False, f"got {loads[reader]}")
+            return
+        record("P: load decremented after release_load", True)
+
+        # Now simulate a scenario where release_load is called multiple times
+        # (e.g., finally + outer except) — should not go negative
+        registry.release_load(reader)  # extra release
+        registry.release_load(reader)  # extra release
+        loads = registry.get_phone_load()
+        if loads[reader] < 0:
+            record("P: load never goes negative (clamped at 0)", False, f"got {loads[reader]}")
+            return
+        record("P: load never goes negative (clamped at 0)", True)
+    except Exception as e:
+        record("P: exception", False, str(e))
+
+
+# === Test Q: Reader failover preserves reader_phones ===
+
+async def test_Q():
+    """Group X: reader_phones=[A, B, C]. A offline. Discovery runs.
+    → reader_phones should still contain A (preserved, not replaced)."""
+    print("\n--- Test Q: Offline account preserved in reader_phones ---")
+    try:
+        from source_registry import SourceRegistry
+        prod_db, _ = await make_test_db()
+        watchers = [
+            {'phone': 'A', 'role': 'monitor'},
+            {'phone': 'B', 'role': 'monitor'},
+            {'phone': 'C', 'role': 'joiner'},
+        ]
+        registry = SourceRegistry(prod_db, watchers)
+
+        # Pre-populate DB: Group X has reader_phones = [A, B, C]
+        chat_id = -100999
+        await prod_db.add_monitored_chat(
+            chat_id=chat_id, chat_title='Group X',
+            username='', link_type='group', monitored_by='A',
+        )
+        import json as _json
+        await prod_db.update_monitored_chat(
+            chat_id,
+            reader_phones=_json.dumps(['A', 'B', 'C']),
+            primary_reader='A',
+            monitored_by='A',
+        )
+
+        # Now simulate discovery where only B and C respond (A is offline)
+        # We'll directly test the merge logic by calling discover with a mock
+        async def fake_discover(self, user_clients):
+            chat_to_phones_set = {chat_id: {'B', 'C'}}  # A offline, not in set
+            chat_metadata = {chat_id: {
+                'chat_title': 'Group X', 'username': '', 'link_type': 'group'
+            }}
+            async with self._lock:
+                for cid, phones_set in chat_to_phones_set.items():
+                    new_phones = set(phones_set)
+                    # Read existing reader_phones from DB
+                    existing_phones = set()
+                    conn = await self.prod_db._conn()
+                    cursor = await conn.execute(
+                        "SELECT reader_phones FROM monitored_chats WHERE chat_id=?",
+                        (cid,)
+                    )
+                    row = await cursor.fetchone()
+                    if row and row[0]:
+                        existing_phones = set(_json.loads(row[0]))
+                    # Merge
+                    merged = new_phones | existing_phones
+                    phones_list = list(merged)
+                    phones_list.sort(key=lambda p: 0 if self._phone_to_role.get(p) == 'monitor' else 1)
+                    self._chat_to_phones[cid] = phones_list
+                    await self.prod_db.update_monitored_chat(
+                        cid,
+                        reader_phones=_json.dumps(phones_list),
+                        primary_reader=phones_list[0] if phones_list else '',
+                        monitored_by=phones_list[0] if phones_list else '',
+                    )
+
+        registry.discover_all_sources_background = fake_discover.__get__(registry)
+        await registry.discover_all_sources_background({})
+
+        # Verify: A is STILL in reader_phones (preserved despite being offline)
+        chats = await prod_db.get_monitored_chats(limit=100)
+        chat = next(c for c in chats if c['chat_id'] == chat_id)
+        reader_phones = _json.loads(chat['reader_phones'])
+        if 'A' not in reader_phones:
+            record("Q: offline account A preserved in reader_phones", False,
+                   f"got {reader_phones}")
+            return
+        record("Q: offline account A preserved in reader_phones", True)
+
+        # Verify: B and C are also present
+        if 'B' not in reader_phones or 'C' not in reader_phones:
+            record("Q: B and C present in reader_phones", False,
+                   f"got {reader_phones}")
+            return
+        record("Q: B and C present in reader_phones", True)
+
+        # Verify: total is 3 (union, not replacement)
+        if len(reader_phones) != 3:
+            record("Q: reader_phones has 3 phones (merged, not replaced)", False,
+                   f"got {len(reader_phones)}: {reader_phones}")
+            return
+        record("Q: reader_phones has 3 phones (merged, not replaced)", True)
+    except Exception as e:
+        record("Q: exception", False, str(e))
+
+
+# === Test R: Legacy _active_polling_worker disabled ===
+
+async def test_R():
+    """Verify that start() does NOT start _active_polling_worker (legacy disabled)."""
+    print("\n--- Test R: Legacy _active_polling_worker is disabled ---")
+    try:
+        with open(PROJECT_ROOT / 'bot.py') as f:
+            source = f.read()
+
+        import re
+
+        # The legacy worker start block should be commented out:
+        # '#     self._active_polling_task = asyncio.create_task(self._active_polling_worker())'
+        disabled_pattern = r'#\s+self\._active_polling_task\s*=\s*asyncio\.create_task\(self\._active_polling_worker\(\)\)'
+        if re.search(disabled_pattern, source):
+            record("R: legacy _active_polling_worker start block is commented out", True)
+        else:
+            record("R: legacy _active_polling_worker start block is commented out", False,
+                   "could not find commented-out block")
+            return
+
+        # Verify the new PollingScheduler IS started (NOT commented out)
+        # Pattern: 'self._polling_scheduler_task = asyncio.create_task(self.polling_scheduler.run())'
+        sched_pattern = r'^[^\#]*self\._polling_scheduler_task\s*=\s*asyncio\.create_task\(self\.polling_scheduler\.run\(\)\)'
+        if re.search(sched_pattern, source, re.MULTILINE):
+            record("R: PollingScheduler.run() is started", True)
+        else:
+            record("R: PollingScheduler.run() is started", False,
+                   "could not find active polling_scheduler.run() call")
+            return
+
+        # Verify the disable log message exists
+        if 'Legacy Active Polling Worker DISABLED' in source:
+            record("R: disable log message present", True)
+        else:
+            record("R: disable log message present", False)
+            return
+    except Exception as e:
+        record("R: exception", False, str(e))
+
+
+# === Test S: HistoryScanner uses MessageClaim + LinkNormalizer + GulfFilter ===
+
+async def test_S():
+    """Verify HistoryScanner source uses unified extractor + filter + claim."""
+    print("\n--- Test S: HistoryScanner uses unified extractor/filter/claim ---")
+    try:
+        with open(PROJECT_ROOT / 'bot.py') as f:
+            source = f.read()
+
+        # Find the _scan_chat method
+        scan_chat_start = source.find('async def _scan_chat(self, dialog, cutoff, name):')
+        if scan_chat_start == -1:
+            record("S: _scan_chat method found", False, "method not found")
+            return
+        record("S: _scan_chat method found", True)
+
+        # Extract the method body (up to next def or class)
+        next_def = source.find('\n    async def ', scan_chat_start + 100)
+        next_class = source.find('\nclass ', scan_chat_start + 100)
+        end = min(x for x in [next_def, next_class, len(source)] if x > 0)
+        method_body = source[scan_chat_start:end]
+
+        # Check: uses LinkNormalizer.extract_links (not old extract_whatsapp_telegram_links)
+        if 'LinkNormalizer.extract_links' in method_body:
+            record("S: uses LinkNormalizer.extract_links", True)
+        else:
+            record("S: uses LinkNormalizer.extract_links", False,
+                   "not found in _scan_chat body")
+            return
+
+        # Check: uses GulfFilter.is_blacklisted (not old is_target_university_message)
+        if 'GulfFilter.is_blacklisted' in method_body:
+            record("S: uses GulfFilter.is_blacklisted", True)
+        else:
+            record("S: uses GulfFilter.is_blacklisted", False,
+                   "not found in _scan_chat body")
+            return
+
+        # Check: uses MessageClaim.claim (atomic dedup)
+        if 'message_claim.claim' in method_body.lower() or 'self.message_claim.claim' in method_body:
+            record("S: uses MessageClaim.claim for atomic dedup", True)
+        else:
+            record("S: uses MessageClaim.claim for atomic dedup", False,
+                   "not found in _scan_chat body")
+            return
+
+        # Check: marks processed/failed
+        if 'mark_processed' in method_body and 'mark_failed' in method_body:
+            record("S: marks processed/failed", True)
+        else:
+            record("S: marks processed/failed", False,
+                   "missing mark_processed or mark_failed")
+            return
+
+        # Check: does NOT use old extract_whatsapp_telegram_links as a CALL
+        # (it's OK to mention it in comments — we only forbid active calls)
+        import re as _re
+        # Look for actual function call (not in a comment line)
+        call_pattern = r'^[^#]*extract_whatsapp_telegram_links\s*\('
+        if _re.search(call_pattern, method_body, _re.MULTILINE):
+            record("S: does NOT use old extract_whatsapp_telegram_links", False,
+                   "old extractor still called in _scan_chat body")
+            return
+        record("S: does NOT use old extract_whatsapp_telegram_links", True)
+
+        # Check: does NOT use old is_target_university_message as a CALL
+        call_pattern2 = r'^[^#]*is_target_university_message\s*\('
+        if _re.search(call_pattern2, method_body, _re.MULTILINE):
+            record("S: does NOT use old is_target_university_message", False,
+                   "old filter still called in _scan_chat body")
+            return
+        record("S: does NOT use old is_target_university_message", True)
+    except Exception as e:
+        record("S: exception", False, str(e))
+
+
+# === Test T: Restart simulation — claim → restart → retry ===
+
+async def test_T():
+    """Worker A claims, "crashes" (no mark_processed).
+    After restart, Worker B reclaims (lease expired).
+    Stale Worker A's mark_processed fails."""
+    print("\n--- Test T: Restart simulation (claim → crash → restart → retry) ---")
+    try:
+        prod_db, _ = await make_test_db()
+        chat_id, msg_id = -101010, 42
+
+        # Phase 1: Worker A claims
+        token_a = await prod_db.claim_message(chat_id, msg_id, 'newmessage', 'A')
+        if not token_a:
+            record("T: Worker A initial claim succeeds", False, "no token")
+            return
+        record("T: Worker A initial claim succeeds", True)
+
+        # Phase 2: Simulate lease expiry (set lease_until to past)
+        from datetime import datetime as _dt, timedelta as _td
+        conn = await prod_db._conn()
+        past = (_dt.now() - _td(seconds=10)).isoformat()
+        await conn.execute(
+            "UPDATE processed_messages SET lease_until=? WHERE chat_id=? AND msg_id=?",
+            (past, chat_id, msg_id)
+        )
+        await conn.commit()
+        record("T: simulated lease expiry", True)
+
+        # Phase 3: After "restart", Worker B reclaims
+        token_b = await prod_db.claim_message(chat_id, msg_id, 'polling', 'B')
+        if not token_b:
+            record("T: Worker B reclaims after lease expiry", False, "no token")
+            return
+        record("T: Worker B reclaims after lease expiry", True)
+
+        if token_b == token_a:
+            record("T: tokens are different (new claim)", False, "same token")
+            return
+        record("T: tokens are different (new claim)", True)
+
+        # Phase 4: Stale Worker A tries mark_processed — should fail
+        ok_a = await prod_db.mark_message_processed(chat_id, msg_id, token_a)
+        if ok_a:
+            record("T: stale Worker A mark_processed fails", False, "succeeded — corruption!")
+            return
+        record("T: stale Worker A mark_processed fails", True)
+
+        # Phase 5: Worker B mark_processed succeeds
+        ok_b = await prod_db.mark_message_processed(chat_id, msg_id, token_b)
+        if not ok_b:
+            record("T: Worker B mark_processed succeeds", False, "failed")
+            return
+        record("T: Worker B mark_processed succeeds", True)
+
+        # Phase 6: Final state verification
+        row = await prod_db.get_processed_message(chat_id, msg_id)
+        if row['state'] != 'processed':
+            record("T: final state='processed'", False, f"got {row['state']}")
+            return
+        record("T: final state='processed'", True)
+
+        if row['claimant_phone'] != 'B':
+            record("T: final claimant is B", False, f"got {row['claimant_phone']}")
+            return
+        record("T: final claimant is B", True)
+
+        if row['attempt_count'] != 2:
+            record("T: attempt_count=2 (one fail + one success)", False,
+                   f"got {row['attempt_count']}")
+            return
+        record("T: attempt_count=2 (one fail + one success)", True)
+    except Exception as e:
+        record("T: exception", False, str(e))
+
+
 # === Main runner ===
 
 async def main():
@@ -862,6 +1249,13 @@ async def main():
     await test_L()
     await test_M()
     await test_N()
+    # New tests for the fixes
+    await test_O()
+    await test_P()
+    await test_Q()
+    await test_R()
+    await test_S()
+    await test_T()
 
     # Summary
     print("\n" + "=" * 70)

@@ -293,15 +293,53 @@ class SourceRegistry:
                     logging.error(f"[REGISTRY] {phone} discovery error: {e}")
 
             # Update DB + in-memory indices
+            # IMPORTANT: We MERGE newly-discovered phones with existing reader_phones
+            # from DB, rather than replacing them. This ensures that accounts which
+            # are temporarily offline (and thus not in this discovery round) are
+            # NOT removed from reader_phones. They will still be available as
+            # fallback readers when they come back online.
             async with self._lock:
                 for chat_id, phones_set in chat_to_phones_set.items():
-                    phones_list = list(phones_set)
-                    # Sort: monitors first
+                    # Newly discovered phones (accounts that responded this round)
+                    new_phones = set(phones_set)
+
+                    # Preserve existing reader_phones from DB (merge)
+                    existing_phones = set()
+                    try:
+                        conn = await self.prod_db._conn()
+                        cursor = await conn.execute(
+                            "SELECT reader_phones FROM monitored_chats WHERE chat_id=?",
+                            (chat_id,)
+                        )
+                        row = await cursor.fetchone()
+                        if row and row[0]:
+                            existing_phones = set(json.loads(row[0]))
+                    except Exception:
+                        pass
+
+                    # Merge: union of new + existing (offline accounts preserved)
+                    merged_phones = new_phones | existing_phones
+                    phones_list = list(merged_phones)
+                    # Sort: monitors first, then joiners
                     phones_list.sort(key=lambda p: 0 if self._phone_to_role.get(p) == 'monitor' else 1)
                     self._chat_to_phones[chat_id] = phones_list
 
                     meta = chat_metadata.get(chat_id, {})
-                    primary_reader = phones_list[0] if phones_list else ''
+                    # primary_reader = first connected Monitor, else first connected phone,
+                    # else first phone in list (even if offline — for reference)
+                    primary_reader = ''
+                    for p in phones_list:
+                        if (self._phone_to_role.get(p) == 'monitor'
+                                and self._phone_health.get(p, False)):
+                            primary_reader = p
+                            break
+                    if not primary_reader:
+                        for p in phones_list:
+                            if self._phone_health.get(p, False):
+                                primary_reader = p
+                                break
+                    if not primary_reader and phones_list:
+                        primary_reader = phones_list[0]
 
                     # INSERT OR IGNORE for new, then UPDATE reader_phones/primary_reader
                     is_new = await self.prod_db.add_monitored_chat(
@@ -320,7 +358,7 @@ class SourceRegistry:
                     )
 
             total = len(chat_to_phones_set)
-            logging.info(f"[REGISTRY] Discovery complete: {total} unique sources in registry")
+            logging.info(f"[REGISTRY] Discovery complete: {total} unique sources updated (reader_phones merged with existing)")
         except Exception as e:
             logging.error(f"[REGISTRY] discovery fatal: {e}", exc_info=True)
 
@@ -505,21 +543,34 @@ class PollingScheduler:
                         await self.update_next_poll(chat_id, 'cold')
                         continue
 
-                    # 2b. Rate limit check
-                    allowed = await self.rate_limiter.acquire(reader, 'polling')
-                    if not allowed:
-                        # Rate limit or FloodWait active — delay
-                        await self.update_next_poll(chat_id, 'cool')
-                        self.registry.release_load(reader)
-                        continue
-
-                    # 2c. Poll one chat (sequential, with per-chat lock)
+                    # 2b. Rate limit check + poll + release — all in try/finally
+                    # to guarantee release_load() on exception/FloodWait/CancelledError.
                     try:
+                        # Rate limit check (may sleep for min_delay)
+                        allowed = await self.rate_limiter.acquire(reader, 'polling')
+                        if not allowed:
+                            # Rate limit or FloodWait active — delay this chat
+                            await self.update_next_poll(chat_id, 'cool')
+                            continue  # release_load in finally
+
+                        # 2c. Poll one chat (sequential, with per-chat lock)
                         async with self.registry.get_chat_lock(chat_id):
                             await self.monitor._poll_one_chat(reader, chat)
+
+                    except asyncio.CancelledError:
+                        # Cancellation during polling — release load and re-raise
+                        # so the outer loop breaks cleanly.
+                        raise
                     except Exception as e:
+                        # FloodWaitError, RPCError, etc. — log and continue
                         logging.debug(f"[POLL] chat={chat_id} error: {e}")
                     finally:
+                        # GUARANTEED release_load — covers:
+                        # - success path
+                        # - rate limit rejection (allowed=False)
+                        # - exception in _poll_one_chat
+                        # - FloodWaitError
+                        # - CancelledError (before re-raise)
                         self.registry.release_load(reader)
 
                     # 2d. Update next_poll_at based on tier
