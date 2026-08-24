@@ -183,6 +183,7 @@ class RateLimiter:
         'get_entity':        {'max': 30,  'window': 60,   'min_delay': 2},
         'membership_check':  {'max': 20,  'window': 60,   'min_delay': 3},
         'message_send':      {'max': 20,  'window': 60,   'min_delay': 3},
+        'polling':           {'max': 25,  'window': 60,   'min_delay': 2},  # 25 get_messages/دقيقة لكل حساب
         'generic':           {'max': 20,  'window': 60,   'min_delay': 3},
     }
 
@@ -791,6 +792,43 @@ async def init_production_tables(db):
     await conn.execute("CREATE INDEX IF NOT EXISTS idx_monitored_chat_id ON monitored_chats (chat_id)")
     await conn.execute("CREATE INDEX IF NOT EXISTS idx_monitored_should ON monitored_chats (should_monitor)")
 
+    # === MIGRATION: أعمدة جديدة على monitored_chats لـ SourceRegistry ===
+    # Safe ALTER (try/except per column — same pattern as member_count/priority above)
+    new_columns = [
+        ("reader_phones", "TEXT"),               # JSON list of phones that can read this chat
+        ("primary_reader", "TEXT"),              # best reader phone (Monitor preferred)
+        ("last_msg_id", "INTEGER DEFAULT 0"),    # last msg_id seen by polling
+        ("last_activity", "TIMESTAMP"),          # last time a new message was detected
+        ("poll_tier", "TEXT DEFAULT 'cold'"),    # 'hot' | 'active' | 'cool' | 'cold'
+        ("next_poll_at", "TIMESTAMP"),           # when to poll this source next
+    ]
+    for col_name, col_type in new_columns:
+        try:
+            await conn.execute(f"ALTER TABLE monitored_chats ADD COLUMN {col_name} {col_type}")
+        except Exception:
+            pass  # Column already exists
+
+    # === جدول جديد: processed_messages (atomic dedup + retry-safe) ===
+    # State machine: 'claimed' → 'processed' (success) | 'failed' (retryable)
+    # claim_token + lease_until prevent stale workers from corrupting fresh claims
+    await conn.execute("""CREATE TABLE IF NOT EXISTS processed_messages (
+        chat_id INTEGER NOT NULL,
+        msg_id INTEGER NOT NULL,
+        state TEXT NOT NULL DEFAULT 'claimed',
+        source TEXT,
+        claimant_phone TEXT,
+        claim_token TEXT,
+        claimed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        lease_until TIMESTAMP,
+        processed_at TIMESTAMP,
+        attempt_count INTEGER DEFAULT 1,
+        last_error TEXT,
+        PRIMARY KEY (chat_id, msg_id)
+    )""")
+    await conn.execute("CREATE INDEX IF NOT EXISTS idx_pm_state ON processed_messages (state)")
+    await conn.execute("CREATE INDEX IF NOT EXISTS idx_pm_lease ON processed_messages (lease_until)")
+    await conn.execute("CREATE INDEX IF NOT EXISTS idx_pm_claimed_at ON processed_messages (claimed_at)")
+
     await conn.commit()
     logging.info("✅ Production tables initialized (link_queue, group_states, membership_cache, floodwait_tracker, api_operations_log, system_settings, monitored_chats)")
 
@@ -1005,13 +1043,15 @@ class ProductionDB:
             values)
         await conn.commit()
 
-    async def get_monitored_chats(self, limit: int = 200) -> List[dict]:
+    async def get_monitored_chats(self, limit: int = 50000) -> List[dict]:
         """يجلب كل المجموعات المراقبة."""
         conn = await self._conn()
         cursor = await conn.execute(
             """SELECT chat_id, chat_title, username, link_type, monitored_by,
                       member_count, ai_classification, ai_country, ai_relevance,
-                      ai_description, should_monitor, first_seen, last_seen
+                      ai_description, should_monitor, first_seen, last_seen,
+                      reader_phones, primary_reader, last_msg_id, last_activity,
+                      poll_tier, next_poll_at
                FROM monitored_chats
                WHERE should_monitor = 1
                ORDER BY ai_relevance DESC, last_seen DESC LIMIT ?""",
@@ -1022,7 +1062,10 @@ class ProductionDB:
                  'member_count': r[5] or 0,
                  'ai_classification': r[6] or '', 'ai_country': r[7] or '',
                  'ai_relevance': r[8] or 0, 'ai_description': r[9] or '',
-                 'should_monitor': r[10], 'first_seen': r[11], 'last_seen': r[12]} for r in rows]
+                 'should_monitor': r[10], 'first_seen': r[11], 'last_seen': r[12],
+                 'reader_phones': r[13] or '[]', 'primary_reader': r[14] or '',
+                 'last_msg_id': r[15] or 0, 'last_activity': r[16],
+                 'poll_tier': r[17] or 'cold', 'next_poll_at': r[18]} for r in rows]
 
     async def get_unclassified_chats(self, limit: int = 10) -> List[dict]:
         """يجلب مجموعات لم يُصنّفها AI بعد."""
@@ -1210,3 +1253,155 @@ class ProductionDB:
                     return is_member  # لو ما نقدر نحلل التاريخ، استخدم القيمة
             return is_member
         return None  # غير موجود
+
+
+    # === Processed Messages (atomic dedup with claim_token + lease) ===
+
+    async def claim_message(self, chat_id: int, msg_id: int, source: str, phone: str,
+                             lease_duration_s: int = 60) -> Optional[str]:
+        """Atomic claim — returns claim_token if winner, None if already claimed/processed.
+
+        State machine:
+        - INSERT OR IGNORE for new messages → winner
+        - state='failed' → re-claimable (CAS UPDATE)
+        - state='claimed' + lease_until < now → stale, re-claimable (CAS UPDATE)
+        - state='claimed' + lease_until >= now → busy, return None
+        - state='processed' → return None
+
+        Race-safe via SQLite PRIMARY KEY + CAS UPDATE.
+        """
+        import uuid as _uuid
+        token = str(_uuid.uuid4())
+        now = datetime.now()
+        lease_until = now + timedelta(seconds=lease_duration_s)
+
+        conn = await self._conn()
+
+        # 1. Try INSERT (for brand-new messages)
+        cursor = await conn.execute(
+            """INSERT OR IGNORE INTO processed_messages
+               (chat_id, msg_id, state, source, claimant_phone, claim_token,
+                claimed_at, lease_until, attempt_count)
+               VALUES (?, ?, 'claimed', ?, ?, ?, ?, ?, 1)""",
+            (chat_id, msg_id, source, phone, token,
+             now.isoformat(), lease_until.isoformat())
+        )
+        await conn.commit()
+        if cursor.rowcount > 0:
+            return token
+
+        # 2. Already exists — check state + lease
+        cursor = await conn.execute(
+            "SELECT state, lease_until FROM processed_messages WHERE chat_id=? AND msg_id=?",
+            (chat_id, msg_id)
+        )
+        row = await cursor.fetchone()
+        if not row:
+            return None
+
+        state = row[0]
+        lease_until_str = row[1]
+        can_retry = False
+
+        if state == 'failed':
+            can_retry = True
+        elif state == 'claimed' and lease_until_str:
+            try:
+                lease_until_dt = datetime.fromisoformat(lease_until_str)
+                if now > lease_until_dt:
+                    can_retry = True
+            except Exception:
+                can_retry = True
+
+        if not can_retry:
+            return None
+
+        # 3. CAS UPDATE
+        cursor = await conn.execute(
+            """UPDATE processed_messages
+               SET state='claimed', source=?, claimant_phone=?, claim_token=?,
+                   claimed_at=?, lease_until=?, attempt_count=attempt_count+1
+               WHERE chat_id=? AND msg_id=?
+               AND (state='failed'
+                    OR (state='claimed' AND lease_until < ?))""",
+            (source, phone, token, now.isoformat(), lease_until.isoformat(),
+             chat_id, msg_id, now.isoformat())
+        )
+        await conn.commit()
+        if cursor.rowcount > 0:
+            return token
+        return None
+
+    async def mark_message_processed(self, chat_id: int, msg_id: int, claim_token: str) -> bool:
+        """Mark as processed — verifies claim_token (prevents stale worker corruption)."""
+        conn = await self._conn()
+        cursor = await conn.execute(
+            """UPDATE processed_messages
+               SET state='processed', processed_at=?
+               WHERE chat_id=? AND msg_id=? AND state='claimed' AND claim_token=?""",
+            (datetime.now().isoformat(), chat_id, msg_id, claim_token)
+        )
+        await conn.commit()
+        return cursor.rowcount > 0
+
+    async def mark_message_failed(self, chat_id: int, msg_id: int, claim_token: str, error: str) -> bool:
+        """Mark as failed — verifies claim_token. Allows retry by another worker."""
+        conn = await self._conn()
+        cursor = await conn.execute(
+            """UPDATE processed_messages
+               SET state='failed', last_error=?, processed_at=?
+               WHERE chat_id=? AND msg_id=? AND state='claimed' AND claim_token=?""",
+            (error[:500], datetime.now().isoformat(), chat_id, msg_id, claim_token)
+        )
+        await conn.commit()
+        return cursor.rowcount > 0
+
+    async def get_processed_message(self, chat_id: int, msg_id: int) -> Optional[dict]:
+        """Get a processed_messages row (for tests/diagnostics)."""
+        conn = await self._conn()
+        cursor = await conn.execute(
+            """SELECT chat_id, msg_id, state, source, claimant_phone, claim_token,
+                      claimed_at, lease_until, processed_at, attempt_count, last_error
+               FROM processed_messages WHERE chat_id=? AND msg_id=?""",
+            (chat_id, msg_id)
+        )
+        row = await cursor.fetchone()
+        if not row:
+            return None
+        cols = [d[0] for d in cursor.description]
+        return dict(zip(cols, row))
+
+    async def count_processed_messages(self, chat_id: int = None, msg_id: int = None) -> int:
+        """Count rows in processed_messages (for tests)."""
+        conn = await self._conn()
+        if chat_id is not None and msg_id is not None:
+            cursor = await conn.execute(
+                "SELECT COUNT(*) FROM processed_messages WHERE chat_id=? AND msg_id=?",
+                (chat_id, msg_id))
+        elif chat_id is not None:
+            cursor = await conn.execute(
+                "SELECT COUNT(*) FROM processed_messages WHERE chat_id=?",
+                (chat_id,))
+        else:
+            cursor = await conn.execute("SELECT COUNT(*) FROM processed_messages")
+        row = await cursor.fetchone()
+        return row[0] if row else 0
+
+    async def cleanup_processed_messages(self):
+        """Periodic cleanup:
+        - 'claimed' with lease_until < now → DELETE (re-claimable)
+        - 'processed' older than 7 days → DELETE
+        - 'failed' older than 30 days → DELETE
+        """
+        conn = await self._conn()
+        now = datetime.now().isoformat()
+        await conn.execute(
+            "DELETE FROM processed_messages WHERE state='claimed' AND lease_until < ?",
+            (now,))
+        await conn.execute(
+            "DELETE FROM processed_messages WHERE state='processed' AND processed_at < datetime('now', '-7 days')"
+        )
+        await conn.execute(
+            "DELETE FROM processed_messages WHERE state='failed' AND claimed_at < datetime('now', '-30 days')"
+        )
+        await conn.commit()

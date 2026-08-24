@@ -49,6 +49,9 @@ from link_system import (
     MembershipCache, Metrics, ProductionDB, init_production_tables
 )
 
+# Source Registry + Polling Scheduler + Message Claim (unified dedup layer)
+from source_registry import SourceRegistry, PollingScheduler, MessageClaim
+
 # -------------------------------------------------------------------
 # Constants
 # -------------------------------------------------------------------
@@ -2530,6 +2533,14 @@ class Monitor:
         # المجموعات النشطة المرشحة للـ polling (تُحدَّث ديناميكياً من monitored_chats)
         self._active_polling_chats: List[dict] = []
         self._polling_interval = 5  # ثواني
+        # === SOURCE REGISTRY + POLLING SCHEDULER + MESSAGE CLAIM ===
+        # طبقة موحدة لـ: اكتشاف المصادر، اختيار القارئ، atomic dedup
+        self.source_registry: Optional[SourceRegistry] = None
+        self.polling_scheduler: Optional[PollingScheduler] = None
+        self.message_claim: Optional[MessageClaim] = None
+        self._registry_task: Optional[asyncio.Task] = None
+        self._polling_scheduler_task: Optional[asyncio.Task] = None
+        self._claim_cleanup_task: Optional[asyncio.Task] = None
 
     @staticmethod
     def _get_chat_name(chat):
@@ -3284,7 +3295,22 @@ class Monitor:
             # === الخطوة 1: استخرج الروابط فوراً (regex سريع، بدون API) ===
             links = LinkNormalizer.extract_links(raw_text)
             if not links:
+                # ما فيها روابط — لكن سجل claim مع lease قصير (يمنع إعادة المعالجة الفورية)
+                if self.message_claim:
+                    claim_token = await self.message_claim.claim(chat_id, msg_id, 'newmessage', source_phone)
+                    if claim_token:
+                        # سجل كـ processed (لا روابط → لا enqueue)
+                        await self.message_claim.mark_processed(chat_id, msg_id, claim_token)
                 return  # ما فيها روابط — لا نعالج (cache ينظف تلقائياً)
+
+            # === ATOMIC CLAIM (يمنع التكرار من Polling + Scanner + حسابات أخرى) ===
+            claim_token = None
+            if self.message_claim:
+                claim_token = await self.message_claim.claim(chat_id, msg_id, 'newmessage', source_phone)
+                if claim_token is None:
+                    # سبق معالجتها بواسطة Polling أو Scanner أو حساب آخر
+                    logging.debug(f"[PIPELINE-1] ⏭️ msg ({chat_id}, {msg_id}) already claimed — skip")
+                    return
 
             # === الخطوة 2: معالجة فورية (sync, سريعة جداً) ===
             # نسجّل المجموعة + نضع الرابط في queue فوراً (العملية كلها DB، بدون API)
@@ -3313,43 +3339,54 @@ class Monitor:
                 logging.debug(f"[MONITORED] add error: {e}")
 
             # === الخطوة 3: enqueue كل رابط فوراً ===
-            for link_info in links:
-                link_data = {
-                    **link_info,
-                    'group_name': group_name,
-                    'sender_name': sender_name,
-                    'sender_contact': extract_sender_contact(raw_text),
-                    'source_phone': source_phone,
-                    'message_text': raw_text,
-                    'message_link': f"https://t.me/c/{str(chat_id).replace('-100', '')}/{msg_id}" if chat_id else None,
-                }
+            try:
+                for link_info in links:
+                    link_data = {
+                        **link_info,
+                        'group_name': group_name,
+                        'sender_name': sender_name,
+                        'sender_contact': extract_sender_contact(raw_text),
+                        'source_phone': source_phone,
+                        'message_text': raw_text,
+                        'message_link': f"https://t.me/c/{str(chat_id).replace('-100', '')}/{msg_id}" if chat_id else None,
+                    }
 
-                # === فلتر BLACKLIST فقط (سريع) ===
-                link_raw = link_info['raw'].lower()
-                username_raw = (link_info.get('username') or '').lower()
-                full_text_check = f"{raw_text} {link_raw} {username_raw}".lower()
+                    # === فلتر BLACKLIST فقط (سريع) ===
+                    link_raw = link_info['raw'].lower()
+                    username_raw = (link_info.get('username') or '').lower()
+                    full_text_check = f"{raw_text} {link_raw} {username_raw}".lower()
 
-                # فحص القائمة السوداء
-                is_bad, bad_reason = GulfFilter.is_blacklisted(
-                    full_text_check, username_raw, link_info['raw'], group_name
-                )
-                if is_bad:
-                    logging.info(
-                        f"[PIPELINE-1] 🚫 BLACKLISTED: {link_info['raw'][:50]} ({bad_reason})"
+                    # فحص القائمة السوداء
+                    is_bad, bad_reason = GulfFilter.is_blacklisted(
+                        full_text_check, username_raw, link_info['raw'], group_name
                     )
-                    await self.metrics.record_skip(f'blacklist_{bad_reason}')
-                    continue
+                    if is_bad:
+                        logging.info(
+                            f"[PIPELINE-1] 🚫 BLACKLISTED: {link_info['raw'][:50]} ({bad_reason})"
+                        )
+                        await self.metrics.record_skip(f'blacklist_{bad_reason}')
+                        continue
 
-                # === enqueue فوراً ===
-                is_new = await self.prod_db.enqueue_link(link_data)
-                if is_new:
-                    await self.prod_db.set_group_state(
-                        link_info['normalized'], GroupState.DISCOVERED,
-                        link_info['raw'], group_name)
-                    logging.info(f"[PIPELINE-2] ✅ Link enqueued: {link_info['raw'][:60]}")
-                else:
-                    await self.metrics.record_duplicate()
-                    logging.info(f"[PIPELINE-2] ⏭️ Duplicate: {link_info['normalized'][:60]}")
+                    # === enqueue فوراً ===
+                    is_new = await self.prod_db.enqueue_link(link_data)
+                    if is_new:
+                        await self.prod_db.set_group_state(
+                            link_info['normalized'], GroupState.DISCOVERED,
+                            link_info['raw'], group_name)
+                        logging.info(f"[PIPELINE-2] ✅ Link enqueued: {link_info['raw'][:60]}")
+                    else:
+                        await self.metrics.record_duplicate()
+                        logging.info(f"[PIPELINE-2] ⏭️ Duplicate: {link_info['normalized'][:60]}")
+
+                # === Mark message as PROCESSED (claim_token verified) ===
+                if claim_token:
+                    await self.message_claim.mark_processed(chat_id, msg_id, claim_token)
+
+            except Exception as inner_e:
+                # === Mark as FAILED (allows retry by Polling/Scanner) ===
+                if claim_token:
+                    await self.message_claim.mark_failed(chat_id, msg_id, claim_token, str(inner_e))
+                raise  # re-raise to outer handler
 
             # علّم الرسالة كـ "معالجة" في cache
             try:
@@ -3496,6 +3533,25 @@ class Monitor:
                 break
             except Exception as e:
                 logging.debug(f"[CACHE] cleanup error: {e}")
+
+    async def _cleanup_processed_messages_loop(self):
+        """ينظف processed_messages كل ساعة.
+        
+        - 'claimed' بـ lease منتهي → DELETE (يسمح بإعادة المحاولة)
+        - 'processed' older than 7 days → DELETE
+        - 'failed' older than 30 days → DELETE (للتحليل)
+        """
+        while self._running:
+            try:
+                await asyncio.sleep(3600)  # كل ساعة
+                await self.prod_db.cleanup_processed_messages()
+                count = await self.prod_db.count_processed_messages()
+                logging.info(f"[CLEANUP] processed_messages count after cleanup: {count}")
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logging.error(f"[CLEANUP] error: {e}")
+                await asyncio.sleep(60)
 
     async def _refresh_active_polling_chats(self):
         """يحدّث قائمة المجموعات النشطة للـ polling.
@@ -3668,12 +3724,23 @@ class Monitor:
                 cache_key = (chat_id, msg.id)
                 async with self._msg_cache_lock:
                     if cache_key in self._msg_cache:
-                        continue  # سبق عالجناها
-                
+                        continue  # سبق عالجناها via NewMessage
+
+                # === ATOMIC CLAIM (يمنع التكرار من NewMessage + Scanner + حسابات أخرى) ===
+                claim_token = None
+                if self.message_claim:
+                    claim_token = await self.message_claim.claim(chat_id, msg.id, 'polling', phone)
+                    if claim_token is None:
+                        # سبق معالجتها بواسطة NewMessage أو Scanner أو حساب آخر
+                        continue
+
                 # استخرج الروابط
                 links = LinkNormalizer.extract_links(msg.raw_text)
                 if not links:
-                    # خزّنها في cache (لو بوت حماية حذفها بعدين)
+                    # ما فيها روابط — سجل كـ processed
+                    if self.message_claim:
+                        await self.message_claim.mark_processed(chat_id, msg.id, claim_token)
+                    # خزّن في cache (لو بوت حماية حذفها بعدين)
                     async with self._msg_cache_lock:
                         self._msg_cache[cache_key] = {
                             'raw_text': msg.raw_text,
@@ -3686,8 +3753,8 @@ class Monitor:
                             'chat_username': chat.get('username', ''),
                             'chat_link_type': 'group',
                             'sender_name': self._get_sender_name(msg.sender) if msg.sender else 'Unknown',
-                            'processed': False,
-                            'via_polling': True,  # ← علامة أنها جت من polling
+                            'processed': True,
+                            'via_polling': True,
                         }
                     continue
                 
@@ -3714,60 +3781,71 @@ class Monitor:
                         'via_polling': True,
                     }
                 
-                # سجل المجموعة
                 try:
-                    is_new = await self.prod_db.add_monitored_chat(
-                        chat_id=chat_id,
-                        chat_title=chat_title,
-                        username=chat.get('username', ''),
-                        link_type='group',
-                        monitored_by=phone,
-                    )
-                except Exception as e:
-                    logging.debug(f"[POLLING] add_monitored error: {e}")
-                
-                # enqueue كل رابط
-                sender_name = self._get_sender_name(msg.sender) if msg.sender else 'Unknown'
-                for link_info in links:
-                    link_data = {
-                        **link_info,
-                        'group_name': chat_title,
-                        'sender_name': sender_name,
-                        'sender_contact': extract_sender_contact(msg.raw_text),
-                        'source_phone': phone,
-                        'message_text': msg.raw_text,
-                        'message_link': f"https://t.me/c/{str(chat_id).replace('-100', '')}/{msg.id}" if chat_id else None,
-                    }
-                    
-                    # Blacklist
-                    link_raw = link_info['raw'].lower()
-                    username_raw = (link_info.get('username') or '').lower()
-                    full_text_check = f"{msg.raw_text} {link_raw} {username_raw}".lower()
-                    is_bad, bad_reason = GulfFilter.is_blacklisted(
-                        full_text_check, username_raw, link_info['raw'], chat_title
-                    )
-                    if is_bad:
-                        logging.info(
-                            f"[POLLING] 🚫 BLACKLISTED: {link_info['raw'][:50]} ({bad_reason})"
+                    # سجل المجموعة
+                    try:
+                        is_new = await self.prod_db.add_monitored_chat(
+                            chat_id=chat_id,
+                            chat_title=chat_title,
+                            username=chat.get('username', ''),
+                            link_type='group',
+                            monitored_by=phone,
                         )
-                        await self.metrics.record_skip(f'blacklist_{bad_reason}')
-                        continue
+                    except Exception as e:
+                        logging.debug(f"[POLLING] add_monitored error: {e}")
                     
-                    # enqueue
-                    is_new = await self.prod_db.enqueue_link(link_data)
-                    if is_new:
-                        await self.prod_db.set_group_state(
-                            link_info['normalized'], GroupState.DISCOVERED,
-                            link_info['raw'], chat_title)
-                        logging.info(
-                            f"[POLLING-PIPELINE] ✅ Link enqueued: {link_info['raw'][:60]} "
-                            f"(via polling from '{chat_title[:30]}')"
+                    # enqueue كل رابط
+                    sender_name = self._get_sender_name(msg.sender) if msg.sender else 'Unknown'
+                    for link_info in links:
+                        link_data = {
+                            **link_info,
+                            'group_name': chat_title,
+                            'sender_name': sender_name,
+                            'sender_contact': extract_sender_contact(msg.raw_text),
+                            'source_phone': phone,
+                            'message_text': msg.raw_text,
+                            'message_link': f"https://t.me/c/{str(chat_id).replace('-100', '')}/{msg.id}" if chat_id else None,
+                        }
+                        
+                        # Blacklist
+                        link_raw = link_info['raw'].lower()
+                        username_raw = (link_info.get('username') or '').lower()
+                        full_text_check = f"{msg.raw_text} {link_raw} {username_raw}".lower()
+                        is_bad, bad_reason = GulfFilter.is_blacklisted(
+                            full_text_check, username_raw, link_info['raw'], chat_title
                         )
-                    else:
-                        await self.metrics.record_duplicate()
-                        logging.info(f"[POLLING-PIPELINE] ⏭️ Duplicate: {link_info['normalized'][:60]}")
-                
-                # علّم الرسالة كـ معالَجة
+                        if is_bad:
+                            logging.info(
+                                f"[POLLING] 🚫 BLACKLISTED: {link_info['raw'][:50]} ({bad_reason})"
+                            )
+                            await self.metrics.record_skip(f'blacklist_{bad_reason}')
+                            continue
+                        
+                        # enqueue
+                        is_new = await self.prod_db.enqueue_link(link_data)
+                        if is_new:
+                            await self.prod_db.set_group_state(
+                                link_info['normalized'], GroupState.DISCOVERED,
+                                link_info['raw'], chat_title)
+                            logging.info(
+                                f"[POLLING-PIPELINE] ✅ Link enqueued: {link_info['raw'][:60]} "
+                                f"(via polling from '{chat_title[:30]}')"
+                            )
+                        else:
+                            await self.metrics.record_duplicate()
+                            logging.info(f"[POLLING-PIPELINE] ⏭️ Duplicate: {link_info['normalized'][:60]}")
+
+                    # === Mark as PROCESSED ===
+                    if self.message_claim:
+                        await self.message_claim.mark_processed(chat_id, msg.id, claim_token)
+
+                except Exception as inner_e:
+                    # === Mark as FAILED (allows retry) ===
+                    if self.message_claim:
+                        await self.message_claim.mark_failed(chat_id, msg.id, claim_token, str(inner_e))
+                    logging.error(f"[POLLING] processing error for msg ({chat_id}, {msg.id}): {inner_e}")
+
+                # علّم الرسالة كـ معالَجة في cache
                 async with self._msg_cache_lock:
                     if cache_key in self._msg_cache:
                         self._msg_cache[cache_key]['processed'] = True
@@ -5548,6 +5626,9 @@ class Monitor:
                             f"[ACCOUNT] role=joiner\n"
                             f"[ACCOUNT] handlers=none (joiner only)"
                         )
+                    # === Notify SourceRegistry of phone status ===
+                    if self.source_registry:
+                        self.source_registry.update_phone_status(phone, True)
                     backoff = 5
                 await client.run_until_disconnected()
             except FloodWaitError as e: await asyncio.sleep(e.seconds + 1)
@@ -5557,6 +5638,9 @@ class Monitor:
             except Exception as e:
                 logging.error(f"[ACCOUNT] {phone} unexpected: {e}", exc_info=True)
             finally:
+                # === Notify SourceRegistry of disconnect ===
+                if self.source_registry:
+                    self.source_registry.update_phone_status(phone, False)
                 client = self.user_clients.get(phone)
                 if client and client.is_connected():
                     try: await client.disconnect()
@@ -7404,6 +7488,26 @@ class Monitor:
         # كرر كل ساعة
         asyncio.create_task(self._periodic_sync())
 
+        # === SOURCE REGISTRY + POLLING SCHEDULER + MESSAGE CLAIM ===
+        # 1. أنشئ MessageClaim (atomic dedup مع claim_token + lease)
+        self.message_claim = MessageClaim(self.prod_db)
+        # 2. أنشئ SourceRegistry + تحميل سريع من DB (موافق للـ startup)
+        self.source_registry = SourceRegistry(self.prod_db, watchers)
+        await self.source_registry.load_from_db()  # < 1 ثانية — لا يوقف startup
+        # 3. ابدأ discovery في الخلفية (يحدّث reader_phones تدريجياً)
+        self._registry_task = asyncio.create_task(
+            self.source_registry.discover_all_sources_background(self.user_clients)
+        )
+        # 4. ابدأ PollingScheduler (يستخدم المصادر المحملة من DB)
+        self.polling_scheduler = PollingScheduler(
+            self.source_registry, self.prod_db, self.rate_limiter,
+            self.floodwait_mgr, self.message_claim, self
+        )
+        self._polling_scheduler_task = asyncio.create_task(self.polling_scheduler.run())
+        logging.info("🔄 PollingScheduler + SourceRegistry + MessageClaim started")
+        # 5. ابدأ cleanup task للـ processed_messages (كل ساعة)
+        self._claim_cleanup_task = asyncio.create_task(self._cleanup_processed_messages_loop())
+
         # === STARTUP RECOVERY: إعادة الروابط العالقة ===
         try:
             conn = await self.db._ensure_conn()
@@ -7507,7 +7611,13 @@ class Monitor:
         scorer_task = getattr(self, '_priority_scorer_task', None)
         cache_cleanup_task = getattr(self, '_msg_cache_cleanup_task', None)
         polling_task = getattr(self, '_active_polling_task', None)
-        tasks = [self._bot_task, self._keep_alive_task, self._joiner_task, scorer_task, cache_cleanup_task, polling_task] + list(self._user_tasks.values()) + self._current_scan_tasks
+        registry_task = getattr(self, '_registry_task', None)
+        polling_scheduler_task = getattr(self, '_polling_scheduler_task', None)
+        claim_cleanup_task = getattr(self, '_claim_cleanup_task', None)
+        tasks = [self._bot_task, self._keep_alive_task, self._joiner_task,
+                 scorer_task, cache_cleanup_task, polling_task,
+                 registry_task, polling_scheduler_task, claim_cleanup_task
+                 ] + list(self._user_tasks.values()) + self._current_scan_tasks
         for t in tasks:
             if t and not t.done():
                 t.cancel()
