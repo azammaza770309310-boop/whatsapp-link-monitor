@@ -7272,7 +7272,7 @@ async def api_monitored_chats_handler(request):
                                  headers={"Access-Control-Allow-Origin": "*"})
 
     try:
-        chats = await monitor.prod_db.get_monitored_chats(limit=500)
+        chats = await monitor.prod_db.get_monitored_chats(limit=5000)
 
         # إحصائيات
         total = len(chats)
