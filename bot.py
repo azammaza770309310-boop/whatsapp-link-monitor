@@ -3545,6 +3545,13 @@ class Monitor:
                     current_ids.add(c.get('chat_id'))
                     logging.info(f"[POLLING] Force-added test chat: {c.get('chat_title', '')[:30]} (id={c.get('chat_id')})")
             
+            # تحقق من حالة test chats
+            for test_id in TEST_CHAT_IDS:
+                if test_id in current_ids:
+                    logging.info(f"[POLLING] Test chat {test_id} is IN polling list (total={len(self._active_polling_chats)})")
+                else:
+                    logging.warning(f"[POLLING] Test chat {test_id} is NOT in polling list!")
+            
             # نظّف _polling_state من المجموعات اللي ما عادت في القائمة
             current_ids = {c.get('chat_id') for c in self._active_polling_chats}
             stale = [k for k in self._polling_state if k not in current_ids]
@@ -7833,7 +7840,7 @@ async def api_polling_status_handler(request):
 
     try:
         active_chats = []
-        for chat in monitor._active_polling_chats[:200]:
+        for chat in monitor._active_polling_chats[:250]:
             chat_id = chat.get('chat_id')
             last_msg_id = monitor._polling_state.get(chat_id, 0)
             active_chats.append({
