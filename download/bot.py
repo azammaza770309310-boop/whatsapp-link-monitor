@@ -5363,7 +5363,7 @@ class Monitor:
 
                 if member_count is not None:
                     logging.info(
-                        f"[LINK id={link_id}] [PIPELINE-6] 👥 Member count OK: {member_count:,} (>= 1000)"
+                        f"[LINK id={link_id}] [PIPELINE-6] 👥 Member count: {member_count if member_count else 'unknown'}"
                     )
 
                 joiners = await self.db.get_watchers_by_role("joiner")

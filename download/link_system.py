@@ -170,9 +170,9 @@ class RateLimiter:
 
     # حدود كل نوع عملية (مخففة)
     OP_LIMITS = {
-        'join':              {'max': 5,   'window': 3600, 'min_delay': 120},  # 5/ساعة, 120 ثانية بين كل واحد
-        'import_invite':     {'max': 5,   'window': 3600, 'min_delay': 120},
-        'join_channel':      {'max': 5,   'window': 3600, 'min_delay': 120},
+        'join':              {'max': 15,  'window': 3600, 'min_delay': 60},  # 15/ساعة, 60 ثانية بين كل واحد
+        'import_invite':     {'max': 15,  'window': 3600, 'min_delay': 60},
+        'join_channel':      {'max': 15,  'window': 3600, 'min_delay': 60},
         'get_entity':        {'max': 30,  'window': 60,   'min_delay': 2},
         'membership_check':  {'max': 20,  'window': 60,   'min_delay': 3},
         'message_send':      {'max': 20,  'window': 60,   'min_delay': 3},
