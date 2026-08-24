@@ -3500,24 +3500,48 @@ class Monitor:
     async def _refresh_active_polling_chats(self):
         """يحدّث قائمة المجموعات النشطة للـ polling.
         
-        نختار أهم 30 مجموعة (الأكثر نشاطاً):
-        - آخر 10 مجموعات نشطة (last_seen الأخيرة)
-        - المجموعات اللي فيها رسائل في آخر ساعة (لو موجودة)
+        نختار أهم 60 مجموعة (الأكثر نشاطاً):
+        - priority: المجموعات اللي سبق شفنا فيها رسائل (من _polling_state)
+        - ثم: آخر المجموعات المسجّلة (حسب last_seen)
+        هذا يضمن إن المجموعات النشطة فعلاً تكون دائماً في القائمة
         """
         try:
             chats = await self.prod_db.get_monitored_chats(limit=5000)
-            # فلترة: فقط المجموعات (مو القنوات) + اللي لها username أو chat_id سالب
+            # فلترة: فقط المجموعات (مو القنوات) + اللي لها chat_id
             candidate_chats = [
                 c for c in chats
                 if c.get('link_type') == 'group' and c.get('chat_id')
             ]
-            # ترتيب حسب last_seen تنازلياً
-            candidate_chats.sort(key=lambda c: c.get('last_seen', ''), reverse=True)
-            # خذ أهم 30
-            self._active_polling_chats = candidate_chats[:30]
+            
+            # Partition: مجموعات لها polling state سابق (نشطة) + الباقي
+            active = []
+            inactive = []
+            for c in candidate_chats:
+                cid = c.get('chat_id')
+                if cid in self._polling_state and self._polling_state[cid] > 0:
+                    c['_last_polled_msg_id'] = self._polling_state[cid]
+                    active.append(c)
+                else:
+                    inactive.append(c)
+            
+            # ترتيب active حسب آخر msg_id (الأحدث أولاً)
+            active.sort(key=lambda c: c.get('_last_polled_msg_id', 0), reverse=True)
+            # ترتيب inactive حسب last_seen (الأحدث أولاً)
+            inactive.sort(key=lambda c: c.get('last_seen', ''), reverse=True)
+            
+            # اجمع: active أولاً ثم inactive (لحد 60)
+            self._active_polling_chats = (active + inactive)[:60]
+            
+            # نظّف _polling_state من المجموعات اللي ما عادت في القائمة
+            current_ids = {c.get('chat_id') for c in self._active_polling_chats}
+            stale = [k for k in self._polling_state if k not in current_ids]
+            for k in stale:
+                self._polling_state.pop(k, None)
+            
             logging.info(
                 f"[POLLING] Refreshed active chats list: {len(self._active_polling_chats)} groups "
-                f"(top: {(self._active_polling_chats[0].get('chat_title') if self._active_polling_chats else 'none')[:30]})"
+                f"({len(active)} active + {len(self._active_polling_chats) - len(active)} new) — "
+                f"top: {(self._active_polling_chats[0].get('chat_title') if self._active_polling_chats else 'none')[:30]}"
             )
         except Exception as e:
             logging.error(f"[POLLING] refresh error: {e}")
@@ -7421,10 +7445,10 @@ class Monitor:
 
         # ابدأ Active Polling Worker — الحل الجذري لمشكلة بوتات الحماية
         # بدل الاعتماد على events فقط (اللي قد تتأخر أو تُحذف قبل ما توصل),
-        # polling نشط كل 3 ثواني يلتقط الرسائل من أهم 30 مجموعة نشطة
+        # polling نشط كل 3 ثواني يلتقط الرسائل من أهم 60 مجموعة نشطة
         if not hasattr(self, '_active_polling_task') or self._active_polling_task is None or self._active_polling_task.done():
             self._active_polling_task = asyncio.create_task(self._active_polling_worker())
-            logging.info("🔄 Active Polling Worker started (polls top 30 active groups every 3s)")
+            logging.info("🔄 Active Polling Worker started (polls top 60 active groups every 3s)")
         else:
             logging.info("🔄 Active Polling Worker already running — skip duplicate")
 
