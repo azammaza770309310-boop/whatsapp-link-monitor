@@ -5359,43 +5359,14 @@ class Monitor:
                     await self.metrics.record_skip(f'gulf_filter_{filter_reason}')
                     continue
 
-                # === فحص القنوات قبل النشر ===
-                # لو الرابط لقناة (broadcast) — لا تنشره ولا تنضم له
-                if link_type == 'telegram' and filter_username:
-                    try:
-                        check_client = None
-                        for c_phone, c_client in self.user_clients.items():
-                            if c_client and c_client.is_connected():
-                                check_client = c_client
-                                break
-                        if check_client:
-                            entity = await asyncio.wait_for(
-                                check_client.get_entity(filter_username), timeout=10)
-                            if entity and hasattr(entity, 'broadcast') and entity.broadcast:
-                                logging.info(
-                                    f"[LINK id={link_id}] [PIPELINE-5] 📢 SKIPPED CHANNEL: "
-                                    f"{raw_link[:50]} (broadcast=true)"
-                                )
-                                await self.prod_db.set_group_state(
-                                    normalized, GroupState.BANNED, raw_link, error='is_channel'
-                                )
-                                await self.prod_db.update_queue_status(link_data['id'], 'DONE')
-                                await self.metrics.record_skip('is_channel_precheck')
-                                continue
-                    except asyncio.TimeoutError:
-                        logging.debug(f"[CHANNEL_CHECK] Timeout for {filter_username}")
-                    except Exception as e:
-                        logging.debug(f"[CHANNEL_CHECK] Error for {filter_username}: {e}")
-
                 logging.info(
                     f"[LINK id={link_id}] [PIPELINE-6] ✅ GULF FILTER PASSED: "
                     f"{raw_link[:60]} (reason={filter_reason})"
                 )
 
                 # === MEMBER COUNT CHECK ===
-                # لو member_count = 0 (Scorer فشل) → requeue (لا ترفض نهائياً)
-                # لو member_count < 500 → REJECT
-                # لو member_count >= 500 أو NULL → اقبل
+                # لو member_count معروف و < 500 → ارفض
+                # لو member_count = 0 أو NULL → اقبل (لا توقف)
                 member_count = link_data.get('member_count')
                 if member_count is not None and member_count > 0 and member_count < 500:
                     logging.info(
