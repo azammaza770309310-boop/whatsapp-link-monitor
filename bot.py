@@ -3532,6 +3532,19 @@ class Monitor:
             # اجمع: active أولاً ثم inactive (لحد 200)
             self._active_polling_chats = (active + inactive)[:200]
             
+            # === ضمان إن مجموعات الاختبار تكون دائماً في القائمة ===
+            # حتى لو كانت خارج أول 200 حسب الترتيب
+            TEST_CHAT_IDS = {
+                -1001181518634,  # G_TaibahuD (جامعة طيبة | المناقشة) — مجموعة اختبار
+                -1002207747724,  # SummerSEU (الفصل الصيفي للتحضيري SEU) — مجموعة هدف
+            }
+            current_ids = {c.get('chat_id') for c in self._active_polling_chats}
+            for c in candidate_chats:
+                if c.get('chat_id') in TEST_CHAT_IDS and c.get('chat_id') not in current_ids:
+                    self._active_polling_chats.append(c)
+                    current_ids.add(c.get('chat_id'))
+                    logging.info(f"[POLLING] Force-added test chat: {c.get('chat_title', '')[:30]} (id={c.get('chat_id')})")
+            
             # نظّف _polling_state من المجموعات اللي ما عادت في القائمة
             current_ids = {c.get('chat_id') for c in self._active_polling_chats}
             stale = [k for k in self._polling_state if k not in current_ids]
