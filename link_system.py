@@ -1286,7 +1286,7 @@ class ProductionDB:
     # === Processed Messages (atomic dedup with claim_token + lease) ===
 
     async def claim_message(self, chat_id: int, msg_id: int, source: str, phone: str,
-                             lease_duration_s: int = 60) -> Optional[str]:
+                             lease_duration_s: Optional[int] = None) -> Optional[str]:
         """Atomic claim — returns claim_token if winner, None if already claimed/processed.
 
         State machine:
@@ -1297,11 +1297,17 @@ class ProductionDB:
         - state='processed' → return None
 
         Race-safe via SQLite PRIMARY KEY + CAS UPDATE.
+
+        [L07] lease_duration_s is env-configurable: if None (the default) it
+        resolves to LEASE_DURATION_S env (default 180s). Callers may still pass
+        an explicit override for testing/special cases.
         """
         import uuid as _uuid
         token = str(_uuid.uuid4())
         now = datetime.now()
-        lease_until = now + timedelta(seconds=lease_duration_s)
+        # [L07] resolve lease from env at call time (was hardcoded 60s default)
+        _lease = lease_duration_s if lease_duration_s is not None else int(os.environ.get('LEASE_DURATION_S', '180'))
+        lease_until = now + timedelta(seconds=_lease)
 
         conn = await self._conn()
 

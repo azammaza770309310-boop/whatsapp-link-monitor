@@ -22,6 +22,7 @@ This module is additive: it does not modify or delete any existing function.
 import asyncio
 import json
 import logging
+import os
 import time
 import uuid
 from datetime import datetime, timedelta
@@ -50,7 +51,7 @@ class MessageClaim:
       can re-claim after LEASE_DURATION_S seconds.
     """
 
-    LEASE_DURATION_S = 60  # 60 seconds to finish processing
+    LEASE_DURATION_S = int(os.environ.get('LEASE_DURATION_S', '180'))  # [L07] was hardcoded 60s — too short for a 4-account fan-out under FloodWait; 180s avoids premature re-claim of in-flight work.
 
     def __init__(self, prod_db):
         self.prod_db = prod_db

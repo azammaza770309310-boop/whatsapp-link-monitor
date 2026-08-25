@@ -41,12 +41,26 @@ logging.disable(logging.CRITICAL)
 
 RESULTS = []
 
+# [infra] track open aiosqlite connections for clean shutdown
+_OPEN_DBS = []
+
 def record(name, passed, detail=""):
     RESULTS.append({'name': name, 'passed': passed, 'detail': detail})
     status = "✅ PASS" if passed else "❌ FAIL"
     print(f"  {status}: {name}")
     if detail and not passed:
         print(f"         {detail}")
+
+
+async def close_all_test_dbs():
+    """Close every aiosqlite connection opened by make_test_db()."""
+    for fdb in _OPEN_DBS:
+        try:
+            if getattr(fdb, '_conn', None) is not None:
+                await fdb._conn.close()
+        except Exception:
+            pass
+    _OPEN_DBS.clear()
 
 
 # === Test DB Helper ===
@@ -72,6 +86,7 @@ async def make_test_db():
     fake_db = FakeDB(db_path)
     prod_db = ProductionDB(fake_db)
     await init_production_tables(fake_db)
+    _OPEN_DBS.append(fake_db)
     return prod_db, fake_db
 
 
@@ -1559,6 +1574,9 @@ async def main():
     await test_W()
     await test_X()
     await test_Y()
+
+    # [infra] close all aiosqlite connections before the loop tears down
+    await close_all_test_dbs()
 
     # Summary
     print("\n" + "=" * 70)

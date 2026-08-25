@@ -52,12 +52,30 @@ import bot  # noqa: E402  (AFTER env setup)
 
 RESULTS = []
 
+# [infra] track open aiosqlite connections so the test runner can close them
+# at shutdown — without this, aiosqlite's worker threads keep running after
+# the event loop closes and pytest/the shell reports "Task was destroyed but
+# it is pending" + dangling thread warnings.
+_OPEN_DBS = []
+
+
 def record(name, passed, detail=""):
     RESULTS.append({'name': name, 'passed': passed, 'detail': detail})
     status = "✅ PASS" if passed else "❌ FAIL"
     print(f"  {status}: {name}")
     if detail and not passed:
         print(f"         {detail}")
+
+
+async def close_all_test_dbs():
+    """Close every aiosqlite connection opened by make_test_db()."""
+    for fdb in _OPEN_DBS:
+        try:
+            if getattr(fdb, '_conn', None) is not None:
+                await fdb._conn.close()
+        except Exception:
+            pass
+    _OPEN_DBS.clear()
 
 
 # === Test DB Helper ===
@@ -83,6 +101,7 @@ async def make_test_db():
     fake_db = FakeDB(db_path)
     prod_db = ProductionDB(fake_db)
     await init_production_tables(fake_db)
+    _OPEN_DBS.append(fake_db)
     return prod_db, fake_db
 
 
@@ -711,8 +730,20 @@ async def test_N():
         import bot as bot_mod
         _orig_sleep = bot_mod.asyncio.sleep
 
+        # [B05] _journal_recovery is now a recurring loop (while self._running).
+        # To run exactly ONE recovery sweep then exit, set _running=True and flip
+        # it to False on the 2nd skipped long-sleep (the per-cycle 60s sleep that
+        # follows the first sweep body).
+        fm._running = True
+        _long_sleep_count = {'n': 0}
+
         async def _fast_sleep(s, *a, **k):
             if isinstance(s, (int, float)) and s >= 10:
+                _long_sleep_count['n'] += 1
+                # 1st long sleep = initial 45s startup wait (skip, stay running).
+                # 2nd long sleep = per-cycle 60s after the first sweep body → exit.
+                if _long_sleep_count['n'] >= 2:
+                    fm._running = False
                 return
             return await _orig_sleep(s, *a, **k)
 
@@ -893,6 +924,9 @@ async def main():
     await test_P()
     await test_Q()
     await test_R()
+
+    # [infra] close all aiosqlite connections before the loop tears down
+    await close_all_test_dbs()
 
     # Summary
     print("\n" + "=" * 70)

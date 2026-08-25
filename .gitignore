@@ -69,3 +69,14 @@ accounts.env
 *_session_string*
 *.session
 upload/
+
+# === Test/CI infrastructure (Task 8a) ===
+.venv-test/
+.venv*/
+__pycache__/
+*.pyc
+# Local SQLite DBs created at runtime (DATA_DIR defaults to ./data)
+/data/
+/data/
+*.db-journal
+*.db-wal

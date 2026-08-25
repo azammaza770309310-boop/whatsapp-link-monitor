@@ -47,3 +47,19 @@ services:
         value: "10000"
       - key: PYTHON_VERSION
         value: "3.11.9"
+      # === [B01] DATA_DIR — MUST point to a persistent Render Disk (attach a
+      # Disk ≥1GB; path /data). Without it, message_journal/processed_messages/
+      # group_states/link_queue are wiped on every restart → fast-deleted
+      # messages become un-rescuable + polling max-id resets to 0. ===
+      - key: DATA_DIR
+        sync: false
+      # === [B06] DASHBOARD_API_KEY — optional shared-secret gating /api/*. If
+      # UNSET (default), the dashboard API stays OPEN (backward-compatible). Set
+      # it to lock /api/* behind an X-Api-Key header. Leave empty for open access. ===
+      - key: DASHBOARD_API_KEY
+        sync: false
+      # === [L07] LEASE_DURATION_S — MessageClaim lease window (was hardcoded
+      # 60s). 180s tolerates a 4-account fan-out under FloodWait without
+      # prematurely re-claiming in-flight work. ===
+      - key: LEASE_DURATION_S
+        value: "180"

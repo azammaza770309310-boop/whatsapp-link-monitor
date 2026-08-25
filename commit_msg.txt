@@ -1,0 +1,17 @@
+AUDIT-FIX(8a): 12 original production-hardening fixes
+
+B02: persist last_msg_id/last_activity in _poll_one_chat
+B03: /api/polling_status reads due-chats from DB
+B04: _periodic_sync refreshes SourceRegistry (unblocks UQU_Medicine1)
+B05: _journal_recovery recurring loop
+B06: optional DASHBOARD_API_KEY on /api/* (backward-compatible)
+B07: _supervisor_loop restarts 5 critical dead tasks
+B08: journal errors WARNING (were silent debug)
+B09: rescue lookup_any guarded for no-chat_id deletes
+B01(code): DATA_DIR env configurable sqlite path
+L03: _polling_watchdog_loop (30s) restarts dead scheduler
+L04: _supabase_ensure_schema attempts ALTER
+L07: LEASE_DURATION_S env-configurable (60->180)
+Regression tests: tests/test_audit_regressions.py
+render.yaml: +DATA_DIR +DASHBOARD_API_KEY +LEASE_DURATION_S
+No secrets. No push (no GH creds).

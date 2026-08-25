@@ -57,7 +57,12 @@ from source_registry import SourceRegistry, PollingScheduler, MessageClaim
 # -------------------------------------------------------------------
 
 SESSIONS_DIR = "sessions"
-DATA_DIR = "data"
+# [B01] DATA_DIR is env-configurable so the SQLite DB (link_queue, group_states,
+# message_journal, processed_messages) can live on a PERSISTENT Render Disk (/data)
+# instead of the ephemeral container filesystem. Without this, every restart wipes
+# the local journal/queue — fast-deleted messages become un-rescuable and the
+# polling max-id resets to 0 (re-processing + duplicate claims).
+DATA_DIR = os.environ.get('DATA_DIR', 'data')
 LOGS_DIR = "logs"
 DB_FILE = os.path.join(DATA_DIR, "help_requests.db")
 LOG_FILE = os.path.join(LOGS_DIR, "app.log")
@@ -1136,36 +1141,86 @@ class DatabaseManager:
     async def _supabase_ensure_schema(self):
         """Migration: تأكد من وجود أعمدة role و joiner_enabled في جدول watchers.
 
-        يستخدم Supabase RPC لتنفيذ ALTER TABLE. لو الـ RPC غير متاح،
-        يسجّل تحذير ويكتفي بالـ fallback في _supabase_get_watchers.
+        [L04] attempt to ALTER the watchers table via a Supabase RPC function
+        (per-column try/except). If the RPC is unavailable (no such function /
+        permission denied / network error), log the exact ALTER SQL so the
+        operator can run it in the Supabase SQL Editor. NEVER breaks startup —
+        _supabase_get_watchers has a column-list fallback that works without
+        these columns.
         """
         if not self.supabase_url or not self.supabase_key:
             return
+        # The columns this migration ensures exist on the watchers table.
+        _ALTER_COLUMNS = [
+            ("role", "TEXT DEFAULT 'monitor'"),
+            ("joiner_enabled", "INTEGER DEFAULT 1"),
+            ("last_join_timestamp", "TIMESTAMP"),
+            ("health_score", "INTEGER DEFAULT 100"),
+        ]
         try:
             session = await self._get_supabase_session()
-            # Supabase REST API لا يدعم ALTER TABLE مباشرة — نحتاج RPC function.
-            # لكننا نتحقق هل الأعمدة موجودة عبر query عادي.
-            # لو role/joiner_enabled غير موجودين، الـ _supabase_get_watchers
-            # يستخدم fallback تلقائياً.
-            # هنا نسجل فقط حالة الـ schema للتحقق.
+            # 1. Probe whether the columns already exist (cheap select).
             async with session.get(
                 f"{self.supabase_url}/rest/v1/watchers?select=phone,role,joiner_enabled&limit=1"
             ) as resp:
                 if resp.status == 200:
                     logging.info("[SUPABASE] Schema OK: role + joiner_enabled columns exist")
-                elif resp.status == 400:
-                    logging.warning("[SUPABASE] Schema MISSING: role/joiner_enabled columns NOT found!")
-                    logging.warning("[SUPABASE] → Run this SQL in Supabase Dashboard → SQL Editor:")
-                    logging.warning("[SUPABASE]   ALTER TABLE watchers ADD COLUMN IF NOT EXISTS role TEXT DEFAULT 'monitor';")
-                    logging.warning("[SUPABASE]   ALTER TABLE watchers ADD COLUMN IF NOT EXISTS joiner_enabled INTEGER DEFAULT 1;")
-                    logging.warning("[SUPABASE]   ALTER TABLE watchers ADD COLUMN IF NOT EXISTS last_join_timestamp TIMESTAMP;")
-                    logging.warning("[SUPABASE]   ALTER TABLE watchers ADD COLUMN IF NOT EXISTS health_score INTEGER DEFAULT 100;")
-                    logging.warning("[SUPABASE] Bot will continue with fallback defaults (role=monitor, joiner_enabled=1)")
-                else:
+                    return
+                if resp.status != 400:
+                    # Unexpected status (auth/network) — don't attempt ALTER.
                     text = await resp.text()
                     logging.warning(f"[SUPABASE] Schema check: {resp.status} - {text[:80]}")
+                    return
+                # 400 → columns missing. Fall through to ALTER attempt.
+                logging.warning("[SUPABASE] Schema MISSING: role/joiner_enabled columns NOT found — attempting auto-migration")
+            # 2. Attempt ALTER per-column via an RPC function. Supabase REST cannot
+            #    run DDL directly; we rely on a (optional) `exec_sql` RPC. Each
+            #    column is attempted independently so one failure doesn't block
+            #    the rest. On any failure we log the exact ALTER SQL as fallback.
+            migrated_any = False
+            for col_name, col_def in _ALTER_COLUMNS:
+                alter_sql = (
+                    f"ALTER TABLE watchers ADD COLUMN IF NOT EXISTS "
+                    f"{col_name} {col_def};"
+                )
+                try:
+                    async with session.post(
+                        f"{self.supabase_url}/rest/v1/rpc/exec_sql",
+                        headers={
+                            "apikey": self.supabase_key,
+                            "Authorization": f"Bearer {self.supabase_key}",
+                            "Content-Type": "application/json",
+                        },
+                        json={"query": alter_sql},
+                    ) as rpc_resp:
+                        if rpc_resp.status == 200:
+                            migrated_any = True
+                            logging.info(f"[SUPABASE] auto-migrated column: {col_name}")
+                        else:
+                            body = await rpc_resp.text()
+                            logging.warning(
+                                f"[SUPABASE] ALTER RPC failed for {col_name} "
+                                f"(status={rpc_resp.status}): {body[:120]}"
+                            )
+                            logging.warning(f"[SUPABASE]   {alter_sql}")
+                except Exception as col_e:
+                    logging.warning(
+                        f"[SUPABASE] ALTER RPC exception for {col_name}: {col_e}")
+                    logging.warning(f"[SUPABASE]   {alter_sql}")
+            if not migrated_any:
+                logging.warning(
+                    "[SUPABASE] Auto-migration RPC unavailable — run this SQL "
+                    "in Supabase Dashboard → SQL Editor:")
+                for col_name, col_def in _ALTER_COLUMNS:
+                    logging.warning(
+                        f"[SUPABASE]   ALTER TABLE watchers ADD COLUMN "
+                        f"IF NOT EXISTS {col_name} {col_def};")
+            logging.info(
+                "[SUPABASE] Bot will continue with fallback defaults "
+                "(role=monitor, joiner_enabled=1)")
         except Exception as e:
-            logging.warning(f"[SUPABASE] Schema check exception: {e}")
+            # [L04] must NOT break startup — schema migration is best-effort.
+            logging.warning(f"[SUPABASE] Schema migration exception (non-fatal): {e}")
 
     async def _sqlite_list_tables(self) -> List[str]:
         """List all tables in SQLite — used by /verify to PROVE watchers is not among them."""
@@ -2649,6 +2704,9 @@ class Monitor:
         self._reconcile_inflight: Set[int] = set()         # شاتات قيد reconcile
         self._chat_poll_failures: Dict[int, int] = {}      # chat_id → إخفاقات polling متتالية
         self._journal_recovery_task: Optional[asyncio.Task] = None
+        # [B07] supervisor + [L03] polling-watchdog task handles
+        self._supervisor_task: Optional[asyncio.Task] = None
+        self._polling_watchdog_task: Optional[asyncio.Task] = None
 
     @staticmethod
     def _get_chat_name(chat):
@@ -3350,7 +3408,9 @@ class Monitor:
                 'sender_name': sender_name, 'state': state,
             })
         except Exception as e:
-            logging.debug(f"[JOURNAL] write error ({chat_id},{msg_id}): {e}")
+            # [B08] was logging.debug — silent swallow hid disk-full / locked-DB
+            # conditions that break message durability. WARNING surfaces them.
+            logging.warning(f"[JOURNAL] write FAILED: ({chat_id},{msg_id}) {e}")
 
     async def _journal_set_state_safe(self, chat_id, msg_id, state,
                                       error=None, mark_deleted=False):
@@ -3360,7 +3420,7 @@ class Monitor:
             await self.prod_db.journal_set_state(
                 chat_id, msg_id, state, error=error, mark_deleted=mark_deleted)
         except Exception as e:
-            logging.debug(f"[JOURNAL] set_state error ({chat_id},{msg_id}): {e}")
+            logging.warning(f"[JOURNAL] set_state FAILED: ({chat_id},{msg_id}) {e}")
 
     async def _journal_mark_deleted_safe(self, chat_id, msg_id):
         if chat_id is None or not self._journal_enabled():
@@ -3368,7 +3428,7 @@ class Monitor:
         try:
             await self.prod_db.journal_mark_deleted(chat_id, msg_id)
         except Exception as e:
-            logging.debug(f"[JOURNAL] mark_deleted error ({chat_id},{msg_id}): {e}")
+            logging.warning(f"[JOURNAL] mark_deleted FAILED: ({chat_id},{msg_id}) {e}")
 
     async def _record_delete_miss(self, chat_id, msg_id, source_phone):
         """يسجّل حذف رسالة لم نرَ NewMessage لها أبدًا — دليل على فجوة تسليم أحداث.
@@ -3393,7 +3453,7 @@ class Monitor:
                     'state': 'delete_miss',
                 })
             except Exception as e:
-                logging.debug(f"[JOURNAL] delete_miss write error: {e}")
+                logging.warning(f"[JOURNAL] delete_miss write FAILED: {e}")
 
     async def _rescue_enqueue_links(self, links, raw_text, group_name, sender_name,
                                     chat_username, chat_link_type, orig_chat_id,
@@ -3554,50 +3614,140 @@ class Monitor:
         """استرجاع الانهيار: صفوف journal بحالة pending عمرها > 120 ثانية تعني
         أن النظام انهار/أُعيد تشغيله بعد كتابة الرسالة وقبل اكتمال معالجتها.
         نعيد معالجتها — MessageClaim يمنع أي تكرار."""
-        try:
-            await asyncio.sleep(45)  # انتظر اكتمال الإقلاع
-            rows = await self.prod_db.journal_pending_older_than(120)
-            if not rows:
-                logging.info("[JOURNAL-RECOVERY] no stale pending rows — clean")
-                return
-            logging.warning(f"[JOURNAL-RECOVERY] {len(rows)} stale pending row(s) — reprocessing")
-            recovered = 0
-            for row in rows:
-                try:
-                    raw_text = row.get('raw_text') or ''
-                    if not raw_text:
-                        continue
-                    orig_chat_id = row.get('chat_id')
-                    msg_id = row.get('msg_id')
-                    links = LinkNormalizer.extract_links(raw_text)
-                    if not links:
-                        await self._journal_set_state_safe(orig_chat_id, msg_id, 'no_links')
-                        continue
-                    claim_token = None
-                    if self.message_claim:
-                        claim_token = await self.message_claim.claim(
-                            orig_chat_id, msg_id, 'journal_recovery',
-                            row.get('source_phone') or '')
-                        if claim_token is None:
-                            await self._journal_set_state_safe(orig_chat_id, msg_id, 'dup_claim')
-                            continue
-                    group_name = row.get('chat_title') or f"chat_{orig_chat_id}"
-                    await self._rescue_enqueue_links(
-                        links, raw_text, group_name,
-                        row.get('sender_name') or 'Unknown',
-                        row.get('chat_username') or '',
-                        row.get('chat_link_type') or 'telegram',
-                        orig_chat_id, row.get('source_phone') or '', msg_id,
-                        pipeline_tag='JOURNAL-RECOVERY')
-                    if self.message_claim and claim_token:
-                        await self.message_claim.mark_processed(orig_chat_id, msg_id, claim_token)
-                    await self._journal_set_state_safe(orig_chat_id, msg_id, 'processed')
-                    recovered += 1
-                except Exception as e:
-                    logging.error(f"[JOURNAL-RECOVERY] row error: {e}")
-            logging.info(f"[JOURNAL-RECOVERY] done — {recovered} row(s) reprocessed")
-        except Exception as e:
-            logging.error(f"[JOURNAL-RECOVERY] fatal: {e}", exc_info=True)
+        # [B05] RECURRING loop — was fire-once at startup. A single startup sweep
+        # misses pending rows created AFTER startup or left pending by a mid-flight
+        # crash between sweeps. Re-sweep every 60s; MessageClaim prevents duplicate
+        # processing across cycles.
+        await asyncio.sleep(45)  # انتظر اكتمال الإقلاع (مرة واحدة عند البدء)
+        while self._running:
+            try:
+                rows = await self.prod_db.journal_pending_older_than(120)
+                if not rows:
+                    logging.info("[JOURNAL-RECOVERY] no stale pending rows — clean")
+                else:
+                    logging.warning(f"[JOURNAL-RECOVERY] {len(rows)} stale pending row(s) — reprocessing")
+                    recovered = 0
+                    for row in rows:
+                        try:
+                            raw_text = row.get('raw_text') or ''
+                            if not raw_text:
+                                continue
+                            orig_chat_id = row.get('chat_id')
+                            msg_id = row.get('msg_id')
+                            links = LinkNormalizer.extract_links(raw_text)
+                            if not links:
+                                await self._journal_set_state_safe(orig_chat_id, msg_id, 'no_links')
+                                continue
+                            claim_token = None
+                            if self.message_claim:
+                                claim_token = await self.message_claim.claim(
+                                    orig_chat_id, msg_id, 'journal_recovery',
+                                    row.get('source_phone') or '')
+                                if claim_token is None:
+                                    await self._journal_set_state_safe(orig_chat_id, msg_id, 'dup_claim')
+                                    continue
+                            group_name = row.get('chat_title') or f"chat_{orig_chat_id}"
+                            await self._rescue_enqueue_links(
+                                links, raw_text, group_name,
+                                row.get('sender_name') or 'Unknown',
+                                row.get('chat_username') or '',
+                                row.get('chat_link_type') or 'telegram',
+                                orig_chat_id, row.get('source_phone') or '', msg_id,
+                                pipeline_tag='JOURNAL-RECOVERY')
+                            if self.message_claim and claim_token:
+                                await self.message_claim.mark_processed(orig_chat_id, msg_id, claim_token)
+                            await self._journal_set_state_safe(orig_chat_id, msg_id, 'processed')
+                            recovered += 1
+                        except Exception as e:
+                            logging.error(f"[JOURNAL-RECOVERY] row error: {e}")
+                    logging.info(f"[JOURNAL-RECOVERY] done — {recovered} row(s) reprocessed")
+            except Exception as e:
+                logging.error(f"[JOURNAL-RECOVERY] fatal: {e}", exc_info=True)
+            # [B05] per-cycle sleep before the next sweep (was fire-once → return)
+            await asyncio.sleep(60)
+
+    # ===================================================================
+    # [B07] Supervisor loop — recreates dead critical background tasks
+    # ===================================================================
+    async def _supervisor_loop(self):
+        """60s supervisor: checks 5 critical background tasks and recreates any
+        that are done/cancelled. A bug, an unhandled exception, or an OOM kill
+        can silently terminate a worker task; without a supervisor it stays dead
+        until a full process restart (which on Render free can be hours/days).
+
+        Critical tasks: polling, journal_recovery, journal_snapshot, ai_drainer,
+        joiner. Logs WARNING [SUPERVISOR] restarted <name> on each restart.
+
+        Note (task 8a): journal_snapshot + ai_drainer methods may not exist yet
+        (task 8b adds them). Each is guarded with hasattr so the supervisor
+        degrades to watching polling + journal_recovery + joiner until 8b lands.
+        """
+        await asyncio.sleep(60)  # let startup settle before first check
+        logging.info("[SUPERVISOR] started — 60s cycle, watching critical tasks")
+        while self._running:
+            try:
+                # 1. PollingScheduler
+                if (getattr(self, '_polling_scheduler_task', None) is None
+                        or self._polling_scheduler_task.done()):
+                    if getattr(self, 'polling_scheduler', None) and self._running:
+                        self._polling_scheduler_task = asyncio.create_task(
+                            self.polling_scheduler.run())
+                        logging.warning("[SUPERVISOR] restarted polling_scheduler")
+                # 2. Journal recovery
+                if (getattr(self, '_journal_recovery_task', None) is None
+                        or self._journal_recovery_task.done()) and self._running:
+                    self._journal_recovery_task = asyncio.create_task(
+                        self._journal_recovery())
+                    logging.warning("[SUPERVISOR] restarted journal_recovery")
+                # 3. Journal snapshot (persistence) — guarded: 8b adds the method
+                if hasattr(self, '_journal_snapshot_loop') and self._running:
+                    if (getattr(self, '_journal_snapshot_task', None) is None
+                            or self._journal_snapshot_task.done()):
+                        self._journal_snapshot_task = asyncio.create_task(
+                            self._journal_snapshot_loop())
+                        logging.warning("[SUPERVISOR] restarted journal_snapshot")
+                # 4. AI drainer — guarded: 8b adds the method
+                if hasattr(self, '_ai_drainer_worker') and self._running:
+                    if (getattr(self, '_ai_drainer_task', None) is None
+                            or self._ai_drainer_task.done()):
+                        self._ai_drainer_task = asyncio.create_task(
+                            self._ai_drainer_worker())
+                        logging.warning("[SUPERVISOR] restarted ai_drainer")
+                # 5. Joiner
+                if (getattr(self, '_joiner_task', None) is None
+                        or self._joiner_task.done()) and self._running:
+                    self._joiner_task = asyncio.create_task(self._joiner_worker())
+                    logging.warning("[SUPERVISOR] restarted joiner")
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logging.error(f"[SUPERVISOR] error: {e}", exc_info=True)
+            await asyncio.sleep(60)
+
+    # ===================================================================
+    # [L03] Polling-watchdog — dedicated, more frequent scheduler restart
+    # ===================================================================
+    async def _polling_watchdog_loop(self):
+        """30s watchdog: checks ONLY the PollingScheduler task. Distinct from
+        _supervisor_loop (which also checks it, but at 60s and bundled with 4
+        others). Polling is the system's heartbeat — a dead scheduler means NO
+        new links are discovered — so it gets its own faster watchdog. Logs
+        WARNING [POLLING-WATCHDOG] scheduler was dead — restarted.
+        """
+        await asyncio.sleep(30)
+        logging.info("[POLLING-WATCHDOG] started — 30s cycle, scheduler-only")
+        while self._running:
+            try:
+                t = getattr(self, '_polling_scheduler_task', None)
+                if (t is None or t.done()) and getattr(self, 'polling_scheduler', None) and self._running:
+                    self._polling_scheduler_task = asyncio.create_task(
+                        self.polling_scheduler.run())
+                    logging.warning("[POLLING-WATCHDOG] scheduler was dead — restarted")
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logging.error(f"[POLLING-WATCHDOG] error: {e}", exc_info=True)
+            await asyncio.sleep(30)
 
     async def _on_user_message(self, event, source_phone: str):
         """معالج رسائل فوري — يسحب الروابط قبل ما تحذفها بوتات أخرى.
@@ -3887,7 +4037,13 @@ class Monitor:
                 if not cached_msg and self._journal_enabled():
                     try:
                         row = None
-                        if chat_id:
+                        # [B09] guard the journal_lookup_any non-deterministic path:
+                        # lookup_any searches across ALL chats for a msg_id and may
+                        # return a row from a DIFFERENT chat (wrong rescue target).
+                        # Only use the deterministic chat_id-keyed journal_get when
+                        # chat_id is not None; fall back to lookup_any only when the
+                        # delete event carries no chat_id at all.
+                        if chat_id is not None:
                             row = await self.prod_db.journal_get(chat_id, deleted_msg_id)
                         else:
                             rows = await self.prod_db.journal_lookup_any(deleted_msg_id)
@@ -4210,6 +4366,15 @@ class Monitor:
             async with self._polling_lock:
                 if new_max_id > self._polling_state.get(chat_id, 0):
                     self._polling_state[chat_id] = new_max_id
+            # [B02] persist last_msg_id + last_activity to monitored_chats so a
+            # restart/reschedule resumes from the real high-water mark (was
+            # in-memory _polling_state only → reset to 0 → re-fetch + dup claims).
+            try:
+                await self.prod_db.update_monitored_chat(
+                    chat_id, last_msg_id=new_max_id,
+                    last_activity=datetime.utcnow().isoformat())
+            except Exception as _b02e:
+                logging.debug(f"[POLLING] update_monitored_chat last_msg_id failed: {_b02e}")
             
             # عالج كل رسالة جديدة
             for msg in messages:
@@ -6913,6 +7078,14 @@ class Monitor:
             await asyncio.sleep(3600)  # كل ساعة
             try:
                 await self._sync_monitored_chats()
+                # [B04] refresh the in-memory SourceRegistry from the freshly-synced
+                # monitored_chats table. Without this, sources discovered this cycle
+                # (e.g. UQU_Medicine1) are NOT visible to PollingScheduler until a
+                # full process restart — a 1h discovery→polling gap per new source.
+                try:
+                    await self.source_registry.load_from_db()
+                except Exception as _b04e:
+                    logging.warning(f"[PERIODIC_SYNC] source_registry.load_from_db failed: {_b04e}")
             except Exception as e:
                 logging.error(f"[PERIODIC_SYNC] Error: {e}")
 
@@ -8112,6 +8285,16 @@ class Monitor:
                 self._journal_recovery_task = asyncio.create_task(self._journal_recovery())
                 logging.info("📓 Journal Recovery started (crash-safe message rescue)")
 
+        # === [B07] SUPERVISOR — recreates dead critical background tasks (60s) ===
+        if not hasattr(self, '_supervisor_task') or self._supervisor_task is None or self._supervisor_task.done():
+            self._supervisor_task = asyncio.create_task(self._supervisor_loop())
+            logging.info("🛡️ Supervisor started (60s cycle — watches polling/journal_recovery/joiner)")
+
+        # === [L03] POLLING-WATCHDOG — dedicated 30s scheduler restart ===
+        if not hasattr(self, '_polling_watchdog_task') or self._polling_watchdog_task is None or self._polling_watchdog_task.done():
+            self._polling_watchdog_task = asyncio.create_task(self._polling_watchdog_loop())
+            logging.info("🐕 Polling Watchdog started (30s cycle — scheduler-only)")
+
         # === LEGACY POLLING WORKER — DISABLED ===
         # The legacy _active_polling_worker is superseded by PollingScheduler
         # (which covers ALL sources, not just Top-200, and uses fair scheduling).
@@ -8165,10 +8348,13 @@ class Monitor:
         polling_scheduler_task = getattr(self, '_polling_scheduler_task', None)
         claim_cleanup_task = getattr(self, '_claim_cleanup_task', None)
         journal_recovery_task = getattr(self, '_journal_recovery_task', None)
+        # [B07]/[L03] supervisor + polling-watchdog tasks
+        supervisor_task = getattr(self, '_supervisor_task', None)
+        polling_watchdog_task = getattr(self, '_polling_watchdog_task', None)
         tasks = [self._bot_task, self._keep_alive_task, self._joiner_task,
                  scorer_task, cache_cleanup_task, polling_task,
                  registry_task, polling_scheduler_task, claim_cleanup_task,
-                 journal_recovery_task
+                 journal_recovery_task, supervisor_task, polling_watchdog_task
                  ] + list(self._user_tasks.values()) + self._current_scan_tasks
         for t in tasks:
             if t and not t.done():
@@ -8487,38 +8673,72 @@ async def api_link_source_check_handler(request):
 
 async def api_polling_status_handler(request):
     """API endpoint: يعرض حالة Active Polling Worker.
-    
+
+    [B03] reads due-chats directly from the monitored_chats DB table instead
+    of the in-memory `_active_polling_chats` set (which was always empty
+    because the legacy _active_polling_worker is DISABLED — superseded by
+    PollingScheduler). The old handler reported active_chats_count=0 even
+    while 800+ sources were being polled. Now it reports the count of chats
+    whose next_poll_at <= now (i.e. due/being polled right now) plus a real
+    scheduler_running flag derived from the PollingScheduler task state.
+
     Returns:
         - polling_enabled: bool
         - polling_interval: int (seconds)
-        - active_chats_count: int
+        - active_chats_count: int (due-chats from DB)
         - active_chats: list of {chat_id, chat_title, last_msg_id}
+        - scheduler_running: bool
         - cache_size: int (messages currently in cache)
     """
     monitor = request.app.get("monitor")
+    db = request.app.get("db")
     if not monitor:
         return web.json_response({"error": "not ready"}, status=503,
                                  headers={"Access-Control-Allow-Origin": "*"})
 
     try:
+        # [B03] scheduler_running: derived from the real PollingScheduler task,
+        # not a static True. A dead scheduler must be visible to operators.
+        sched_task = getattr(monitor, '_polling_scheduler_task', None)
+        scheduler_running = bool(
+            sched_task is not None and not sched_task.done()
+            and getattr(monitor, 'polling_scheduler', None) is not None)
+
         active_chats = []
-        for chat in monitor._active_polling_chats[:250]:
-            chat_id = chat.get('chat_id')
-            last_msg_id = monitor._polling_state.get(chat_id, 0)
-            active_chats.append({
-                'chat_id': chat_id,
-                'chat_title': chat.get('chat_title', ''),
-                'username': chat.get('username', ''),
-                'last_msg_id': last_msg_id,
-            })
-        
+        active_chats_count = 0
+        if db:
+            try:
+                conn = await db._ensure_conn()
+                now_iso = datetime.utcnow().isoformat()
+                # Count chats whose next_poll_at is due (<= now) — these are
+                # the sources the scheduler is actively polling right now.
+                cur = await conn.execute(
+                    "SELECT COUNT(*) FROM monitored_chats WHERE next_poll_at <= ?",
+                    (now_iso,))
+                row = await cur.fetchone()
+                active_chats_count = int(row[0]) if row else 0
+                # Surface up to 250 due chats for the dashboard list.
+                cur = await conn.execute(
+                    "SELECT chat_id, chat_title, last_msg_id FROM monitored_chats "
+                    "WHERE next_poll_at <= ? ORDER BY last_activity DESC LIMIT 250",
+                    (now_iso,))
+                for r in await cur.fetchall():
+                    active_chats.append({
+                        'chat_id': r[0],
+                        'chat_title': r[1] or '',
+                        'last_msg_id': r[2] or 0,
+                    })
+            except Exception as db_e:
+                logging.warning(f"[API] polling_status DB query failed: {db_e}")
+
         cache_size = len(monitor._msg_cache)
-        
+
         return web.json_response({
             'polling_enabled': True,
             'polling_interval': monitor._polling_interval,
-            'active_chats_count': len(monitor._active_polling_chats),
+            'active_chats_count': active_chats_count,
             'active_chats': active_chats,
+            'scheduler_running': scheduler_running,
             'cache_size': cache_size,
             'cache_ttl': monitor._msg_cache_ttl,
         }, status=200, headers={"Access-Control-Allow-Origin": "*"})
@@ -8954,9 +9174,57 @@ async def api_deploy_check_handler(request):
                              headers={"Access-Control-Allow-Origin": "*"})
 
 
+# -------------------------------------------------------------------
+# [B06] Optional DASHBOARD_API_KEY shared-secret for /api/* routes
+# -------------------------------------------------------------------
+# If DASHBOARD_API_KEY env is SET (non-empty), every /api/* request must
+# carry an `X-Api-Key` header matching it; mismatch → 401 JSON. If UNSET,
+# the dashboard stays open (backward-compatible) and we emit ONE startup
+# WARNING so operators know the API is publicly readable. Non-/api routes
+# (/health, /ready, /metrics) are never gated — probes must stay open.
+
+_DASHBOARD_API_KEY_WARNED = {"open": False}
+
+
+def _get_dashboard_api_key() -> Optional[str]:
+    """Return the configured shared secret, or None if the API is open."""
+    return os.environ.get("DASHBOARD_API_KEY") or None
+
+
+def _warn_dashboard_api_key_open_once() -> None:
+    """Emit a single WARNING if the dashboard API is running without a key."""
+    if _DASHBOARD_API_KEY_WARNED["open"]:
+        return
+    _DASHBOARD_API_KEY_WARNED["open"] = True
+    if _get_dashboard_api_key() is None:
+        logging.warning(
+            "[DASHBOARD] DASHBOARD_API_KEY is UNSET — /api/* endpoints are "
+            "OPEN (no X-Api-Key required). Set DASHBOARD_API_KEY to lock "
+            "down the dashboard (backward-compatible: unset = open).")
+
+
+@web.middleware
+async def dashboard_api_key_middleware(request, handler):
+    """Gates /api/* routes behind an optional X-Api-Key shared secret."""
+    path = request.path
+    if path.startswith("/api/"):
+        key = _get_dashboard_api_key()
+        if key is not None:
+            provided = request.headers.get("X-Api-Key") or request.headers.get("X-API-Key")
+            if not provided or provided != key:
+                return web.json_response(
+                    {"error": "unauthorized: missing or invalid X-Api-Key"},
+                    status=401, headers={"Access-Control-Allow-Origin": "*"})
+    return await handler(request)
+
+
 async def start_http_server(monitor=None, db=None):
     port = int(os.getenv("PORT", "10000"))
     app = web.Application()
+    # [B06] register the optional X-Api-Key middleware (gates /api/* only)
+    app.middlewares.append(dashboard_api_key_middleware)
+    # Emit the one-time "API is open" warning if no key is configured.
+    _warn_dashboard_api_key_open_once()
     # Attach monitor and db for health/readiness checks
     if monitor:
         app["monitor"] = monitor
