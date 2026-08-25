@@ -7222,16 +7222,21 @@ class Monitor:
                             raw_link, link_data.get('message_text', ''),
                             link_data.get('source_phone', ''), link_data.get('message_link'))
                         buttons = MessageFormatter.get_link_buttons(raw_link)
+                        logging.info(f"[LINK id={link_id}] [PUBLISH] started link={raw_link[:60]}")
                         published, msg_id = await self._send(formatted, buttons=buttons)
                         if published:
+                            logging.info(f"[LINK id={link_id}] [PUBLISH] success message_id={msg_id}")
                             logging.info(f"[LINK id={link_id}] [PIPELINE-5] ✅ PUBLISHED_VERIFIED message_id={msg_id}")
                         else:
+                            logging.error(f"[LINK id={link_id}] [PUBLISH] failed reason=send_failed link={raw_link[:60]}")
                             logging.error(f"[LINK id={link_id}] [PIPELINE-5] ❌ PUBLISH_FAILED — retry in 5 min")
                             await self.prod_db.update_queue_status(link_data['id'], 'QUEUED',
                                                                    next_retry=datetime.now() + timedelta(minutes=5))
                             continue
                     else:
                         logging.info(f"[LINK id={link_id}] [PIPELINE-5] ⏭️ Already published (duplicate)")
+                else:
+                    logging.debug(f"[LINK id={link_id}] [PIPELINE-5] ⏭️ state={state} — publish block skipped (already queued, no re-publish)")
 
                 # 4. اختر حساب فدائي
                 logging.info(f"[LINK id={link_id}] [PIPELINE-6] Selecting joiner...")
@@ -7303,46 +7308,15 @@ class Monitor:
 
                 joiners = await self.db.get_watchers_by_role("joiner")
                 if not joiners:
-                    logging.warning(f"[SCHED] cycle={cycle} ⚠️ No joiner accounts!")
+                    logging.warning(f"[LINK id={link_id}] [JOINER] no joiner accounts configured — retry in 5 min")
                     await self.prod_db.update_queue_status(link_data['id'], 'QUEUED',
                                                            next_retry=datetime.now() + timedelta(minutes=5))
-                    await asyncio.sleep(60)
+                    await asyncio.sleep(30)
                     continue
 
-                selected_joiner = None
-                for joiner in joiners:
-                    jphone = joiner['phone']
-                    is_blocked, wait = await self.floodwait_mgr.is_blocked(jphone)
-                    if is_blocked:
-                        logging.info(f"[SCHED] cycle={cycle} {jphone} blocked for {wait}s (FloodWait)")
-                        continue
-                    await self.db.reset_daily_joins_if_needed(jphone)
-                    daily_joins = await self.db.get_daily_join_count(jphone)
-                    daily_limit = await self._get_daily_limit(jphone)
-                    if daily_joins >= daily_limit:
-                        logging.info(f"[SCHED] cycle={cycle} {jphone} daily limit ({daily_joins}/{daily_limit})")
-                        continue
-                    selected_joiner = joiner
-                    break
-
-                if not selected_joiner:
-                    logging.info(f"[SCHED] cycle={cycle} All joiners blocked/limited — sleeping 60s")
-                    await self.prod_db.update_queue_status(link_data['id'], 'QUEUED',
-                                                           next_retry=datetime.now() + timedelta(minutes=5))
-                    await asyncio.sleep(60)
-                    continue
-
-                phone = selected_joiner['phone']
-                client = self.user_clients.get(phone)
-                if not client or not client.is_connected():
-                    logging.warning(f"[SCHED] {phone} not connected — skipping")
-                    await self.prod_db.update_queue_status(link_data['id'], 'QUEUED',
-                                                           next_retry=datetime.now() + timedelta(minutes=2))
-                    await asyncio.sleep(60)
-                    continue
-
-                # 5. Membership Check — افحص كل الفدائيين، مو بس المختار
-                # هذا يمنع انضمام فدائي ثاني لنفس المجموعة
+                # 5. Membership Check — across ALL joiners BEFORE selecting one.
+                # This prevents a second joiner from re-joining a group that
+                # another joiner already joined.
                 if link_type == 'telegram':
                     logging.info(f"[LINK id={link_id}] [PIPELINE-6] Checking membership across ALL joiners...")
                     already_joined_by = None
@@ -7371,43 +7345,102 @@ class Monitor:
                         await self.metrics.record_skip('already_member')
                         continue
 
-                # 6. Rate Limiter
-                logging.info(f"[LINK id={link_id}] [PIPELINE-6] Rate limiter check for {phone}...")
-                allowed = await self.rate_limiter.check(phone, 'join')
-                if not allowed:
-                    logging.info(f"[SCHED] Rate limiter blocked {phone} — sleeping 60s")
+                # 6. Joiner selection — try EACH joiner until one passes ALL checks.
+                #
+                # FIX (PUBLISH-INCIDENT-1): connection check, rate limiter, and
+                # safety guard are INSIDE the loop. Previously the connection
+                # check was AFTER the loop and only tested the FIRST selected
+                # joiner. If that joiner was disconnected, the scheduler would
+                # NOT try any other joiner — it set next_retry=+2min, slept 60s,
+                # and re-picked the SAME link with the SAME disconnected joiner
+                # on the next cycle → infinite retry loop, no JOIN, no PUBLISH.
+                # The same anti-pattern existed for rate-limiter and safety-guard
+                # (aborting the whole cycle instead of trying the next joiner).
+                selected_joiner = None
+                selected_client = None
+                last_skip_reason = 'none'
+                for joiner in joiners:
+                    jphone = joiner['phone']
+
+                    # 6a. FloodWait DB check
+                    is_blocked, wait = await self.floodwait_mgr.is_blocked(jphone)
+                    if is_blocked:
+                        logging.info(
+                            f"[LINK id={link_id}] [JOINER] unavailable account={jphone} reason=floodwait wait={wait}s"
+                        )
+                        last_skip_reason = f'floodwait_{jphone}'
+                        continue
+
+                    # 6b. Daily join limit
+                    await self.db.reset_daily_joins_if_needed(jphone)
+                    daily_joins = await self.db.get_daily_join_count(jphone)
+                    daily_limit = await self._get_daily_limit(jphone)
+                    if daily_joins >= daily_limit:
+                        logging.info(
+                            f"[LINK id={link_id}] [JOINER] unavailable account={jphone} reason=daily_limit ({daily_joins}/{daily_limit})"
+                        )
+                        last_skip_reason = f'daily_limit_{jphone}'
+                        continue
+
+                    # 6c. Connection check — MOVED INSIDE LOOP (root-cause fix)
+                    jclient = self.user_clients.get(jphone)
+                    if not jclient or not jclient.is_connected():
+                        logging.warning(
+                            f"[LINK id={link_id}] [JOINER] unavailable account={jphone} reason=not_connected"
+                        )
+                        last_skip_reason = f'not_connected_{jphone}'
+                        continue
+
+                    # 6d. Rate limiter — MOVED INSIDE LOOP (same anti-pattern fix)
+                    logging.info(f"[LINK id={link_id}] [PIPELINE-6] Rate limiter check for {jphone}...")
+                    allowed = await self.rate_limiter.check(jphone, 'join')
+                    if not allowed:
+                        logging.info(
+                            f"[LINK id={link_id}] [JOINER] unavailable account={jphone} reason=rate_limited"
+                        )
+                        last_skip_reason = f'rate_limited_{jphone}'
+                        continue
+
+                    # 6e. Safety Guard — MOVED INSIDE LOOP (same anti-pattern fix)
+                    logging.info(f"[LINK id={link_id}] [PIPELINE-6] 🛡️ Safety Guard checking {jphone}...")
+                    guard_ok, guard_reason = await self._safety_guard(jphone, normalized, link_data)
+                    if not guard_ok:
+                        logging.info(
+                            f"[LINK id={link_id}] [JOINER] unavailable account={jphone} reason=safety_guard ({guard_reason})"
+                        )
+                        last_skip_reason = f'guard_{guard_reason}_{jphone}'
+                        continue
+
+                    # All checks passed — select this joiner
+                    selected_joiner = joiner
+                    selected_client = jclient
+                    break
+
+                if not selected_joiner:
+                    logging.info(
+                        f"[LINK id={link_id}] [JOINER] no eligible joiner (last_reason={last_skip_reason}) — retry in 5 min"
+                    )
+                    logging.info(
+                        f"[LINK id={link_id}] [RETRY] state=QUEUED "
+                        f"retry_count={link_data.get('attempt_count', 0) + 1} reason=no_joiner next_retry=+5min"
+                    )
+                    await self.metrics.record_skip(f'no_joiner_{last_skip_reason}')
                     await self.prod_db.update_queue_status(link_data['id'], 'QUEUED',
                                                            next_retry=datetime.now() + timedelta(minutes=5))
-                    await asyncio.sleep(60)
+                    await asyncio.sleep(30)
                     continue
 
-                # 7. Safety Guard
-                logging.info(f"[LINK id={link_id}] [PIPELINE-6] 🛡️ Safety Guard checking {phone}...")
-                guard_ok, guard_reason = await self._safety_guard(phone, normalized, link_data)
-                if not guard_ok:
-                    logging.info(f"[LINK id={link_id}] [PIPELINE-6] 🚫 Safety Guard BLOCKED: {guard_reason}")
-                    await self.metrics.record_skip(f'guard_{guard_reason}')
-                    if 'floodwait' in guard_reason:
-                        floodwait_until = await self.prod_db.get_floodwait(phone)
-                        if floodwait_until:
-                            next_retry_dt = datetime.fromtimestamp(floodwait_until)
-                            await self.prod_db.update_queue_status(link_data['id'], 'QUEUED', next_retry=next_retry_dt)
-                        else:
-                            await self.prod_db.update_queue_status(link_data['id'], 'QUEUED',
-                                                                   next_retry=datetime.now() + timedelta(minutes=30))
-                    else:
-                        await self.prod_db.update_queue_status(link_data['id'], 'QUEUED',
-                                                               next_retry=datetime.now() + timedelta(minutes=5))
-                    await asyncio.sleep(60)
-                    continue
+                phone = selected_joiner['phone']
+                client = selected_client
+                logging.info(f"[LINK id={link_id}] [JOINER] selected account={phone}")
                 logging.info(f"[LINK id={link_id}] [PIPELINE-6] ✅ Safety Guard PASSED for {phone}")
 
-                # 8. Join attempt
+                # 7. Join attempt
                 await self.metrics.record_join_attempt(phone)
                 await self.prod_db.set_group_state(normalized, GroupState.JOINING, raw_link)
                 await self.prod_db.update_queue_status(link_data['id'], 'PROCESSING')
 
-                logging.info(f"[LINK id={link_id}] [PIPELINE-6] 🚀 Joiner {phone} attempting to join: {raw_link[:60]}")
+                logging.info(f"[LINK id={link_id}] [JOIN] started account={phone} link={raw_link[:60]}")
                 success, status, member_count = await self._join_group_safe(client, link_data, phone)
 
                 # === SINGLE QUEUE STATE UPDATE ===
@@ -7423,6 +7456,7 @@ class Monitor:
                     final_status = 'DONE'
                     await self.metrics.record_join_success(phone)
                     await self.db.increment_joiner_stats(phone, success=True)
+                    logging.info(f"[LINK id={link_id}] [JOIN] success account={phone} members={member_count}")
                     logging.info(
                         f"[LINK id={link_id}] [PIPELINE-6] ✅✅ {phone} JOINED_VERIFIED: {raw_link[:60]} "
                         f"(members={member_count})"
@@ -7455,6 +7489,10 @@ class Monitor:
                     # لا توقف النظام كامل — فقط أوقف هذا الحساب مؤقتاً
                     # FloodWait لرابط واحد لا يوقف 127 رابط آخر
                     logging.warning(f"[FLOODWAIT] {phone} got FloodWait — link requeued in 30 min (system continues)")
+                    logging.info(
+                        f"[LINK id={link_id}] [RETRY] state=FLOODWAIT "
+                        f"retry_count={link_data.get('attempt_count', 0) + 1} reason=floodwait next_retry=+30min"
+                    )
 
                 elif status == "BANNED":
                     state_to_set = GroupState.BANNED

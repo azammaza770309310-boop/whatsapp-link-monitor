@@ -167,8 +167,11 @@ async def test_safety_guard_no_double_counting():
         source = (PROJECT_ROOT / "bot.py").read_text(encoding='utf-8')
 
         # Scheduler uses check() not acquire()
+        # NOTE: variable is `jphone` inside the joiner-selection loop (PUBLISH-INCIDENT-1
+        # fix moved the check inside the loop), or `phone` in older code — accept both.
         record("SG-1: Scheduler uses rate_limiter.check()",
-               "rate_limiter.check(phone, 'join')" in source,
+               ("rate_limiter.check(jphone, 'join')" in source
+                or "rate_limiter.check(phone, 'join')" in source),
                "check instead of acquire in scheduler")
 
         # _join_group_safe uses acquire()

@@ -2425,6 +2425,157 @@ async def test_6a_scheduler_select_due_includes_null():
 
 
 # =========================================================================
+# [PUBLISH-INCIDENT-1] Joiner selection tries ALL eligible joiners
+# (connection / rate-limiter / safety-guard moved INSIDE the loop)
+# =========================================================================
+
+async def test_publish_incident_1_connection_check_inside_loop():
+    """[P1] Connection check must be INSIDE the for-joiner loop so a
+    disconnected first joiner is skipped and the next joiner is tried.
+    Root cause of the production publishing incident: the connection
+    check was AFTER the loop and only tested the first selected joiner,
+    causing an infinite retry loop (same link + same disconnected joiner).
+    """
+    try:
+        src = (PROJECT_ROOT / "bot.py").read_text(encoding="utf-8")
+        # Locate the joiner-selection loop
+        marker = "# 6. Joiner selection — try EACH joiner until one passes ALL checks."
+        idx = src.find(marker)
+        if idx < 0:
+            record("P1-1: connection check inside loop", False,
+                   "joiner-selection section marker not found — fix may have been reverted")
+            return
+        # Extract the loop body (up to the join attempt)
+        loop_end = src.find("# 7. Join attempt", idx)
+        if loop_end < 0:
+            loop_end = src.find("success, status, member_count", idx)
+        body = src[idx:loop_end] if loop_end > idx else src[idx:idx + 4000]
+        # The connection check must be inside the loop body
+        has_conn_check = "is_connected()" in body and "reason=not_connected" in body
+        record("P1-1: connection check inside joiner loop",
+               has_conn_check, "connection check missing from loop body")
+    except Exception as e:
+        record("P1-1: exception", False, str(e))
+
+
+async def test_publish_incident_1_old_anti_pattern_gone():
+    """[P1] The OLD anti-pattern must be GONE: a bare connection check
+    that appears AFTER `if not selected_joiner:` (outside the loop) and
+    aborts the whole cycle with `continue` would cause the infinite retry.
+    """
+    try:
+        src = (PROJECT_ROOT / "bot.py").read_text(encoding="utf-8")
+        # The old pattern was:
+        #   phone = selected_joiner['phone']
+        #   client = self.user_clients.get(phone)
+        #   if not client or not client.is_connected():
+        #       logging.warning(f"[SCHED] {phone} not connected — skipping")
+        #       await self.prod_db.update_queue_status(link_data['id'], 'QUEUED',
+        #                                              next_retry=datetime.now() + timedelta(minutes=2))
+        #       await asyncio.sleep(60)
+        #       continue
+        # This exact block (with +2min next_retry) must NOT appear after the
+        # 'if not selected_joiner:' guard.
+        old_pattern = 'next_retry=datetime.now() + timedelta(minutes=2))\n                    await asyncio.sleep(60)\n                    continue'
+        # Search for the OLD pattern anywhere in the file
+        old_present = old_pattern in src
+        record("P1-2: old connection-after-loop anti-pattern removed",
+               not old_present, "old +2min-sleep-continue pattern still present — regression")
+    except Exception as e:
+        record("P1-2: exception", False, str(e))
+
+
+async def test_publish_incident_1_rate_limiter_inside_loop():
+    """[P1] Rate limiter check must be INSIDE the for-joiner loop so a
+    rate-limited joiner is skipped and the next one is tried."""
+    try:
+        src = (PROJECT_ROOT / "bot.py").read_text(encoding="utf-8")
+        marker = "# 6. Joiner selection — try EACH joiner until one passes ALL checks."
+        idx = src.find(marker)
+        loop_end = src.find("# 7. Join attempt", idx)
+        body = src[idx:loop_end] if idx >= 0 and loop_end > idx else ""
+        has_rl = "rate_limiter.check(jphone, 'join')" in body and "reason=rate_limited" in body
+        record("P1-3: rate limiter check inside joiner loop",
+               has_rl, "rate limiter not inside loop body")
+    except Exception as e:
+        record("P1-3: exception", False, str(e))
+
+
+async def test_publish_incident_1_safety_guard_inside_loop():
+    """[P1] Safety guard check must be INSIDE the for-joiner loop."""
+    try:
+        src = (PROJECT_ROOT / "bot.py").read_text(encoding="utf-8")
+        marker = "# 6. Joiner selection — try EACH joiner until one passes ALL checks."
+        idx = src.find(marker)
+        loop_end = src.find("# 7. Join attempt", idx)
+        body = src[idx:loop_end] if idx >= 0 and loop_end > idx else ""
+        has_sg = "_safety_guard(jphone," in body and "reason=safety_guard" in body
+        record("P1-4: safety guard check inside joiner loop",
+               has_sg, "safety guard not inside loop body")
+    except Exception as e:
+        record("P1-4: exception", False, str(e))
+
+
+async def test_publish_incident_1_each_check_continues_loop():
+    """[P1] Each check inside the loop must `continue` (skip to next joiner),
+    NOT abort the cycle with `asyncio.sleep(60); continue` (which would
+    re-pick the same link next cycle)."""
+    try:
+        src = (PROJECT_ROOT / "bot.py").read_text(encoding="utf-8")
+        marker = "# 6. Joiner selection — try EACH joiner until one passes ALL checks."
+        idx = src.find(marker)
+        loop_end = src.find("# 7. Join attempt", idx)
+        body = src[idx:loop_end] if idx >= 0 and loop_end > idx else ""
+        # The loop body must NOT contain asyncio.sleep(60) — that would
+        # abort the cycle instead of trying the next joiner.
+        has_cycle_abort = "asyncio.sleep(60)" in body
+        record("P1-5: no cycle-abort sleep inside joiner loop",
+               not has_cycle_abort, "asyncio.sleep(60) inside loop — would abort cycle, not try next joiner")
+    except Exception as e:
+        record("P1-5: exception", False, str(e))
+
+
+async def test_publish_incident_1_joiner_selected_log_marker():
+    """[P1] [JOINER] selected account=... log marker must be present
+    so operators can see which joiner was chosen."""
+    try:
+        src = (PROJECT_ROOT / "bot.py").read_text(encoding="utf-8")
+        has_marker = "[JOINER] selected account=" in src
+        record("P1-6: [JOINER] selected log marker present",
+               has_marker, "marker missing")
+    except Exception as e:
+        record("P1-6: exception", False, str(e))
+
+
+async def test_publish_incident_1_publish_started_log_marker():
+    """[P1] [PUBLISH] started/success/failed log markers must be present
+    so operators can trace whether the publish pipeline ran."""
+    try:
+        src = (PROJECT_ROOT / "bot.py").read_text(encoding="utf-8")
+        has_started = "[PUBLISH] started" in src
+        has_success = "[PUBLISH] success" in src
+        has_failed = "[PUBLISH] failed" in src
+        record("P1-7: [PUBLISH] started/success/failed markers present",
+               has_started and has_success and has_failed,
+               f"started={has_started} success={has_success} failed={has_failed}")
+    except Exception as e:
+        record("P1-7: exception", False, str(e))
+
+
+async def test_publish_incident_1_join_started_log_marker():
+    """[P1] [JOIN] started/success log markers must be present."""
+    try:
+        src = (PROJECT_ROOT / "bot.py").read_text(encoding="utf-8")
+        has_started = "[JOIN] started account=" in src
+        has_success = "[JOIN] success account=" in src
+        record("P1-8: [JOIN] started/success markers present",
+               has_started and has_success,
+               f"started={has_started} success={has_success}")
+    except Exception as e:
+        record("P1-8: exception", False, str(e))
+
+
+# =========================================================================
 # [Task 9a] Supervisor coverage regression guards
 # =========================================================================
 
@@ -2774,6 +2925,16 @@ async def main():
     await test_6a_add_monitored_chat_seeds_next_poll_at()
     await test_6a_backfill_seeds_null_next_poll_at_rows()
     await test_6a_scheduler_select_due_includes_null()
+
+    # === PUBLISH-INCIDENT-1 — Joiner selection tries ALL eligible joiners ===
+    await test_publish_incident_1_connection_check_inside_loop()
+    await test_publish_incident_1_old_anti_pattern_gone()
+    await test_publish_incident_1_rate_limiter_inside_loop()
+    await test_publish_incident_1_safety_guard_inside_loop()
+    await test_publish_incident_1_each_check_continues_loop()
+    await test_publish_incident_1_joiner_selected_log_marker()
+    await test_publish_incident_1_publish_started_log_marker()
+    await test_publish_incident_1_join_started_log_marker()
 
     # === Task 9a — Supervisor coverage ===
     await test_9a_supervisor_watches_nine_critical_tasks()
