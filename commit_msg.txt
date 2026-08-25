@@ -1,17 +1,22 @@
-AUDIT-FIX(8a): 12 original production-hardening fixes
+AUDIT-FIX(8b): 10 new edge-case fixes + journal durability snapshot + AI drainer
 
-B02: persist last_msg_id/last_activity in _poll_one_chat
-B03: /api/polling_status reads due-chats from DB
-B04: _periodic_sync refreshes SourceRegistry (unblocks UQU_Medicine1)
-B05: _journal_recovery recurring loop
-B06: optional DASHBOARD_API_KEY on /api/* (backward-compatible)
-B07: _supervisor_loop restarts 5 critical dead tasks
-B08: journal errors WARNING (were silent debug)
-B09: rescue lookup_any guarded for no-chat_id deletes
-B01(code): DATA_DIR env configurable sqlite path
-L03: _polling_watchdog_loop (30s) restarts dead scheduler
-L04: _supabase_ensure_schema attempts ALTER
-L07: LEASE_DURATION_S env-configurable (60->180)
-Regression tests: tests/test_audit_regressions.py
-render.yaml: +DATA_DIR +DASHBOARD_API_KEY +LEASE_DURATION_S
+Re-audit pass 2 (Task 7) findings:
+- N01: journal_cleanup preserves pending/failed rows (was deleting all >24h)
+- N02: reconcile writes journal BEFORE claim (was after — crash lost msg)
+- N03: LOSER no longer overwrites WINNER's pending state
+- N04: mass-delete per-iteration try/except (one error aborted remaining 49)
+- N05: journal_write consecutive-failure counter + rate-limited ERROR burst
+- N06: enqueue_link re-raises non-IntegrityError (was swallowing SQLITE_BUSY)
+- N07: _ai_drainer_worker processes ai_pending backlog (26475 structural)
+- N08: FloodWait registered with floodwait_mgr in polling+reconcile
+- N09: PollingScheduler gather return_exceptions (one FloodWait no longer blocks batch)
+- N10: _ensure_conn uses self._lock (was check-then-act race leaking connections)
+
+Persistence Option C (survives Render ephemeral-disk restart WITHOUT buying disk):
+- _journal_snapshot_loop (30s): snapshots at-risk journal rows to Supabase message_journal_snapshot
+- _restore_journal_from_supabase on startup: restores pending/no_text/delete_miss
+- ~120 lines + 2 tests. Additive, idempotent, doesn't replace SQLite journal.
+
+Regression tests appended to tests/test_audit_regressions.py (12 new scenarios).
+render.yaml: +AI_DRAIN_ENABLED.
 No secrets. No push (no GH creds).

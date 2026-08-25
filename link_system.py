@@ -34,6 +34,7 @@ import hashlib
 import logging
 import os
 import re
+import sqlite3
 import time
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Tuple
@@ -925,8 +926,16 @@ class ProductionDB:
                     return True
 
             return False
-        except Exception as e:
-            logging.error(f"Enqueue error: {e}")
+        except sqlite3.IntegrityError as ie:
+            # [N06] UNIQUE violation only (duplicate link). INSERT OR IGNORE
+            # normally swallows duplicates silently via rowcount=0, but a race
+            # between two concurrent enqueues can still surface IntegrityError
+            # — that's a duplicate, return False. Every OTHER exception
+            # (sqlite3.OperationalError: SQLITE_BUSY / disk-full / locked DB,
+            # sqlite3.DatabaseError: corrupt, etc.) MUST propagate so the
+            # caller can retry or surface the failure instead of treating it
+            # as a benign "duplicate" (which silently loses the message).
+            logging.debug(f"[ENQUEUE] IntegrityError (duplicate): {ie}")
             return False
 
     async def get_link_status(self, normalized_link: str) -> Optional[str]:
@@ -1555,8 +1564,14 @@ class ProductionDB:
         والصفوف الخفيفة (no_text/delete_miss) أعمق من short_retention_s."""
         conn = await self._conn()
         now = time.time()
+        # [N01] Preserve pending/failed rows past the retention window: those
+        # represent in-flight or recoverable messages that journal_recovery /
+        # _reconcile must still rescue. Deleting them as part of the regular
+        # 24h sweep would silently lose messages that crashed mid-processing.
         cursor = await conn.execute(
-            "DELETE FROM message_journal WHERE received_at < ?", (now - retention_s,))
+            "DELETE FROM message_journal WHERE received_at < ? "
+            "AND state NOT IN ('pending','failed')",
+            (now - retention_s,))
         removed_old = cursor.rowcount
         cursor = await conn.execute(
             "DELETE FROM message_journal WHERE state IN ('no_text','delete_miss') "

@@ -1231,16 +1231,28 @@ class DatabaseManager:
         return [r[0] for r in rows]
 
     async def _ensure_conn(self):
-        if self._conn is None:
-            Path(self.db_path).parent.mkdir(parents=True, exist_ok=True)
-            self._conn = await aiosqlite.connect(self.db_path, timeout=30.0)
-            await self._conn.execute("PRAGMA journal_mode=WAL")
-            # Reduced from 30000 to 5000: a 30s busy_timeout would freeze
-            # the entire bot (all DB ops share one connection + asyncio lock).
-            # 5s is enough for normal contention; longer locks indicate a
-            # real problem that should surface as an error, not a hang.
-            await self._conn.execute("PRAGMA busy_timeout=5000")
-            await self._conn.execute("PRAGMA synchronous=NORMAL")
+        # [N10] Serialize the check-then-act window. self._lock was declared
+        # (DatabaseManager.__init__) but UNUSED — so two concurrent callers
+        # both saw _conn is None, both called aiosqlite.connect, and the
+        # first connection was leaked (overwritten by the second). Under
+        # heavy event-loop contention this surfaced as "aiosqlite thread
+        # still running" warnings + DB-file handle exhaustion after days
+        # of uptime. The double-check inside the lock avoids the lock
+        # becoming a serialization bottleneck in the common (already-open)
+        # path.
+        if self._conn is not None:
+            return self._conn
+        async with self._lock:
+            if self._conn is None:
+                Path(self.db_path).parent.mkdir(parents=True, exist_ok=True)
+                self._conn = await aiosqlite.connect(self.db_path, timeout=30.0)
+                await self._conn.execute("PRAGMA journal_mode=WAL")
+                # Reduced from 30000 to 5000: a 30s busy_timeout would freeze
+                # the entire bot (all DB ops share one connection + asyncio lock).
+                # 5s is enough for normal contention; longer locks indicate a
+                # real problem that should surface as an error, not a hang.
+                await self._conn.execute("PRAGMA busy_timeout=5000")
+                await self._conn.execute("PRAGMA synchronous=NORMAL")
         return self._conn
 
     async def init_db(self):
@@ -3399,6 +3411,13 @@ class Monitor:
         """كتابة journal متحمّلة للأخطاء — لا ترمي استثناء أبدًا."""
         if not self._journal_enabled():
             return
+        # [N05] Consecutive-failure counter: a sustained burst of journal_write
+        # failures (disk full, locked DB, schema drift) was previously hidden
+        # because each failure logged only a single WARNING. We keep logging
+        # each (don't permanently disable the journal), but ALSO emit a
+        # rate-limited ERROR burst once the consecutive-failure count crosses
+        # 50 — so operators see a single ERROR per minute instead of being
+        # drowned in 50 WARNING-per-second lines OR a silent failure.
         try:
             await self.prod_db.journal_message({
                 'chat_id': chat_id, 'msg_id': msg_id, 'raw_text': raw_text,
@@ -3407,10 +3426,23 @@ class Monitor:
                 'chat_link_type': chat_link_type, 'sender_id': sender_id,
                 'sender_name': sender_name, 'state': state,
             })
+            # success — reset the burst counter
+            self._journal_fail_count = 0
         except Exception as e:
             # [B08] was logging.debug — silent swallow hid disk-full / locked-DB
             # conditions that break message durability. WARNING surfaces them.
             logging.warning(f"[JOURNAL] write FAILED: ({chat_id},{msg_id}) {e}")
+            # [N05] increment + rate-limited ERROR burst
+            self._journal_fail_count = getattr(self, '_journal_fail_count', 0) + 1
+            self._journal_last_burst_log = getattr(self, '_journal_last_burst_log', 0.0)
+            now = time.time()
+            if self._journal_fail_count > 50 and (now - self._journal_last_burst_log) > 60:
+                logging.error(
+                    f"[JOURNAL] circuit-stressed: {self._journal_fail_count} "
+                    f"consecutive failures (last error: {e}) — investigate disk "
+                    f"space / DB lock / schema. Retrying continues."
+                )
+                self._journal_last_burst_log = now
 
     async def _journal_set_state_safe(self, chat_id, msg_id, state,
                                       error=None, mark_deleted=False):
@@ -3562,39 +3594,57 @@ class Monitor:
                 async with self._msg_cache_lock:
                     if (chat_id, msg.id) in self._msg_cache:
                         continue
+                # [N02] Write the journal row FIRST (state='pending') so a crash
+                # anywhere between here and set_state('rescued') below leaves a
+                # recoverable row for journal_recovery to re-rescue. The previous
+                # order (claim → journal_write) lost the message if the process
+                # died between the claim and the journal write.
+                chat_title_early = ''
+                try:
+                    chat_obj_early = getattr(msg, 'chat', None)
+                    if chat_obj_early is not None and getattr(chat_obj_early, 'title', None):
+                        chat_title_early = chat_obj_early.title
+                except Exception:
+                    pass
+                chat_title_early = chat_title_early or f"chat_{chat_id}"
+                sender_name_early = (self._get_sender_name(msg.sender)
+                                     if getattr(msg, 'sender', None) else 'Unknown')
+                await self._journal_write(chat_id, msg.id, msg.raw_text, reader,
+                                          chat_title=chat_title_early,
+                                          sender_name=sender_name_early,
+                                          state='pending')
                 claim_token = None
                 if self.message_claim:
                     claim_token = await self.message_claim.claim(chat_id, msg.id, 'reconcile', reader)
                     if claim_token is None:
+                        # [N03] Lost the claim race — another worker (NewMessage /
+                        # polling / journal_recovery) is processing. Leave the
+                        # journal row as 'pending' (the winner will overwrite it).
+                        # Do NOT set 'dup_claim' — that would overwrite the winner's
+                        # 'pending' state and hide the row from journal_recovery
+                        # (journal_pending_older_than filters state='pending').
                         continue
                 links = LinkNormalizer.extract_links(msg.raw_text)
                 if not links:
                     if self.message_claim:
                         await self.message_claim.mark_processed(chat_id, msg.id, claim_token)
+                    await self._journal_set_state_safe(chat_id, msg.id, 'no_links')
                     continue
-                chat_title = ''
-                try:
-                    chat_obj = getattr(msg, 'chat', None)
-                    if chat_obj is not None and getattr(chat_obj, 'title', None):
-                        chat_title = chat_obj.title
-                except Exception:
-                    pass
-                chat_title = chat_title or f"chat_{chat_id}"
+                chat_title = chat_title_early
                 logging.info(
                     f"[RECONCILE] 📨🔗 Recovered missed message msg_id={msg.id} "
                     f"from '{chat_title[:30]}' ({len(links)} links)"
                 )
-                sender_name = self._get_sender_name(msg.sender) if getattr(msg, 'sender', None) else 'Unknown'
-                await self._journal_write(chat_id, msg.id, msg.raw_text, reader,
-                                          chat_title=chat_title, sender_name=sender_name,
-                                          state='pending')
+                sender_name = sender_name_early
                 await self._rescue_enqueue_links(
                     links, msg.raw_text, chat_title, sender_name,
                     '', 'group', chat_id, reader, msg.id,
                     pipeline_tag='RECONCILE')
                 if self.message_claim:
                     await self.message_claim.mark_processed(chat_id, msg.id, claim_token)
-                await self._journal_set_state_safe(chat_id, msg.id, 'processed')
+                # [N02] 'rescued' (was 'processed') — semantically accurate:
+                # reconcile rescues a message that was MISSED by NewMessage.
+                await self._journal_set_state_safe(chat_id, msg.id, 'rescued')
                 recovered += 1
             # حدّث آخر msg_id مشاهد (يمنع polling من إعادة المعالجة)
             if messages:
@@ -3604,6 +3654,21 @@ class Monitor:
                         self._polling_state[chat_id] = new_max
             if recovered:
                 logging.info(f"[RECONCILE] chat={chat_id}: recovered {recovered} missed message(s)")
+        except FloodWaitError as e:
+            # [N08] Register the FloodWait with floodwait_mgr before
+            # propagating — reconcile runs as a background _spawn_reconcile
+            # task whose broad except Exception (above) previously swallowed
+            # FloodWait silently, so the joiner would re-pick the same phone
+            # moments later and double the next FloodWait penalty. We re-raise
+            # after registering so the broad except still logs it as debug.
+            try:
+                if reader and getattr(self, 'floodwait_mgr', None):
+                    await self.floodwait_mgr.block(reader, e.seconds)
+            except Exception as _fwe:
+                logging.debug(f"[RECONCILE] floodwait_mgr.block failed: {_fwe}")
+            logging.warning(
+                f"[RECONCILE] FloodWait {e.seconds}s chat={chat_id} ({reader}) — registered + sleeping")
+            await asyncio.sleep(min(e.seconds, 30))
         except Exception as e:
             logging.debug(f"[RECONCILE] chat={chat_id} error: {e}")
         finally:
@@ -3749,6 +3814,234 @@ class Monitor:
                 logging.error(f"[POLLING-WATCHDOG] error: {e}", exc_info=True)
             await asyncio.sleep(30)
 
+    # ===================================================================
+    # [N07] AI drainer — processes the ai_pending backlog (26,475 structural).
+    # Respects AI_BATCH_MODE: the drainer runs ONLY when explicitly enabled
+    # via AI_DRAIN_ENABLED (default false), since batch mode intentionally
+    # skips AI on the hot path for speed. Toggling AI_DRAIN_ENABLED=true +
+    # AI_BATCH_MODE=true lets the drainer catch up the backlog in the
+    # background without slowing the live enqueue/join pipeline.
+    # ===================================================================
+    async def _ai_drainer_worker(self):
+        """Every 30s: fetch up to 10 links where ai_approved IS NULL from
+        Supabase, run AI on each, PATCH the verdict back. 429 → 60s backoff.
+        Empty queue → 60s sleep. Disabled unless AI_DRAIN_ENABLED=true."""
+        if not os.getenv('AI_DRAIN_ENABLED', 'false').lower() in ('true', '1', 'yes'):
+            logging.info("[AI-DRAIN] disabled (AI_DRAIN_ENABLED != true) — worker idle")
+            return
+        await asyncio.sleep(45)  # let startup settle
+        logging.info("[AI-DRAIN] started — 30s cycle, 10 links/batch")
+        while self._running:
+            try:
+                if not (getattr(self, 'ai_analyzer', None) and self.ai_analyzer.enabled):
+                    # No AI configured — nothing to do
+                    await asyncio.sleep(60)
+                    continue
+                if not self.db.supabase_url or not self.db.supabase_key:
+                    await asyncio.sleep(60)
+                    continue
+                session = await self.db._get_supabase_session()
+                # Fetch up to 10 links where ai_approved IS NULL
+                fetch_url = (
+                    f"{self.db.supabase_url}/rest/v1/links?"
+                    f"ai_approved=is.null&select=id,link,link_type,message_text,"
+                    f"group_name,sender_name,source_phone&limit=10"
+                )
+                async with session.get(fetch_url) as resp:
+                    if resp.status == 429:
+                        logging.warning("[AI-DRAIN] 429 rate-limited — backing off 60s")
+                        await asyncio.sleep(60)
+                        continue
+                    if resp.status != 200:
+                        body = await resp.text()
+                        logging.warning(f"[AI-DRAIN] fetch status={resp.status}: {body[:120]}")
+                        await asyncio.sleep(60)
+                        continue
+                    rows = await resp.json()
+                if not rows:
+                    await asyncio.sleep(60)  # empty queue
+                    continue
+                for row in rows:
+                    try:
+                        link_id = row.get('id')
+                        link = row.get('link')
+                        if not link:
+                            continue
+                        ai_text = (row.get('message_text') or '') + ' ' + (row.get('group_name') or '')
+                        ai_result = await self.ai_analyzer.analyze_message((ai_text or '')[:1500])
+                        if not ai_result:
+                            continue
+                        patch_data = {
+                            'ai_approved': bool(ai_result.get('should_save', True)),
+                            'ai_description': (ai_result.get('description') or '')[:200] or None,
+                            'ai_country': ai_result.get('country') or None,
+                            'ai_is_ad': bool(ai_result.get('is_advertisement', False)),
+                        }
+                        safe_link = url_quote(link, safe='')
+                        async with session.patch(
+                            f"{self.db.supabase_url}/rest/v1/links?link=eq.{safe_link}",
+                            json=patch_data
+                        ) as patch_resp:
+                            if patch_resp.status in (200, 204):
+                                logging.info(
+                                    f"[AI-DRAIN] patched link id={link_id} "
+                                    f"approved={patch_data['ai_approved']} "
+                                    f"country={patch_data['ai_country']}"
+                                )
+                            else:
+                                pbody = await patch_resp.text()
+                                logging.warning(
+                                    f"[AI-DRAIN] patch status={patch_resp.status} "
+                                    f"link_id={link_id}: {pbody[:120]}"
+                                )
+                    except Exception as row_e:
+                        logging.error(f"[AI-DRAIN] row error (id={row.get('id')}): {row_e}")
+                        continue
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logging.error(f"[AI-DRAIN] error: {e}", exc_info=True)
+            await asyncio.sleep(30)
+
+    # ===================================================================
+    # [PERSISTENCE Option C] Journal snapshot to Supabase — survives
+    # Render ephemeral-disk restart WITHOUT requiring a paid persistent
+    # disk. Every 30s, snapshots at-risk journal rows (state IN pending /
+    # no_text / delete_miss) to Supabase `message_journal_snapshot` table.
+    # On startup, _restore_journal_from_supabase restores them into the
+    # local SQLite before _journal_recovery runs. Additive + idempotent —
+    # doesn't replace the SQLite journal, just mirrors at-risk rows.
+    # ===================================================================
+    async def _journal_snapshot_loop(self):
+        """30s background loop: mirror at-risk journal rows to Supabase.
+        On failure (table missing / 404), logs a rate-limited WARNING with
+        the exact SQL to run, then keeps retrying every 30s."""
+        await asyncio.sleep(40)  # let startup settle (before _journal_recovery)
+        logging.info("[JOURNAL-SNAPSHOT] started — 30s cycle, 500 rows/batch")
+        last_warn_ts = 0.0
+        while self._running:
+            try:
+                if not self.db.supabase_url or not self.db.supabase_key:
+                    await asyncio.sleep(60)
+                    continue
+                conn = await self.prod_db._conn()
+                cursor = await conn.execute(
+                    """SELECT chat_id, msg_id, raw_text, source_phone, chat_title,
+                              chat_username, chat_link_type, sender_id, sender_name,
+                              state, received_at
+                       FROM message_journal
+                       WHERE state IN ('pending','no_text','delete_miss')
+                       LIMIT 500""")
+                rows = await cursor.fetchall()
+                if not rows:
+                    await asyncio.sleep(30)
+                    continue
+                batch = [
+                    {
+                        'chat_id': r[0], 'msg_id': r[1], 'raw_text': r[2],
+                        'source_phone': r[3], 'chat_title': r[4] or '',
+                        'chat_username': r[5] or '', 'chat_link_type': r[6] or 'telegram',
+                        'sender_id': r[7] or 0, 'sender_name': r[8] or '',
+                        'state': r[9], 'received_at': r[10],
+                    }
+                    for r in rows
+                ]
+                session = await self.db._get_supabase_session()
+                async with session.post(
+                    f"{self.db.supabase_url}/rest/v1/message_journal_snapshot",
+                    headers={
+                        "Prefer": "resolution=merge-duplicates",
+                        # apikey + Authorization are already on the shared session
+                        # (set in _get_supabase_session); we add Prefer here.
+                    },
+                    json=batch,
+                ) as resp:
+                    if resp.status not in (200, 201, 204):
+                        body = await resp.text()
+                        # 404 / table-missing — rate-limit the warning to once/hour
+                        now = time.time()
+                        if 'relation' in body.lower() or 'does not exist' in body.lower() \
+                                or resp.status == 404:
+                            if now - last_warn_ts > 3600:
+                                logging.warning(
+                                    "[JOURNAL-SNAPSHOT] table message_journal_snapshot "
+                                    "missing — run this SQL in Supabase SQL Editor:\n"
+                                    "CREATE TABLE IF NOT EXISTS message_journal_snapshot "
+                                    "(chat_id BIGINT NOT NULL, msg_id BIGINT NOT NULL, "
+                                    "raw_text TEXT, source_phone TEXT, chat_title TEXT, "
+                                    "chat_username TEXT, chat_link_type TEXT, "
+                                    "sender_id BIGINT, sender_name TEXT, state TEXT NOT NULL, "
+                                    "received_at DOUBLE PRECISION, "
+                                    "PRIMARY KEY (chat_id, msg_id));\n"
+                                    "CREATE UNIQUE INDEX IF NOT EXISTS "
+                                    "idx_journal_snapshot_pk ON message_journal_snapshot "
+                                    "(chat_id, msg_id);"
+                                )
+                                last_warn_ts = now
+                        else:
+                            logging.warning(
+                                f"[JOURNAL-SNAPSHOT] POST status={resp.status}: {body[:200]}"
+                            )
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logging.warning(f"[JOURNAL-SNAPSHOT] error: {e}")
+            await asyncio.sleep(30)
+
+    async def _restore_journal_from_supabase(self):
+        """Startup: SELECT at-risk rows from Supabase snapshot, INSERT OR
+        IGNORE into local message_journal. Called BEFORE _journal_recovery
+        so the recovery sweep can pick them up. Idempotent — INSERT OR
+        IGNORE dedups against any rows that survived the local SQLite."""
+        try:
+            if not self.db.supabase_url or not self.db.supabase_key:
+                return 0
+            if not self._journal_enabled():
+                return 0
+            session = await self.db._get_supabase_session()
+            url = (
+                f"{self.db.supabase_url}/rest/v1/message_journal_snapshot?"
+                f"state=in.(pending,no_text,delete_miss)&"
+                f"select=chat_id,msg_id,raw_text,source_phone,chat_title,"
+                f"chat_username,chat_link_type,sender_id,sender_name,state,received_at"
+            )
+            async with session.get(url) as resp:
+                if resp.status != 200:
+                    body = await resp.text()
+                    logging.info(
+                        f"[JOURNAL-SNAPSHOT] restore skipped (status={resp.status}): {body[:120]}"
+                    )
+                    return 0
+                rows = await resp.json()
+            if not rows:
+                logging.info("[JOURNAL-SNAPSHOT] nothing to restore (snapshot empty)")
+                return 0
+            restored = 0
+            for r in rows:
+                try:
+                    await self.prod_db.journal_message({
+                        'chat_id': r.get('chat_id'), 'msg_id': r.get('msg_id'),
+                        'raw_text': r.get('raw_text'),
+                        'source_phone': r.get('source_phone'),
+                        'received_at': r.get('received_at') or time.time(),
+                        'chat_title': r.get('chat_title') or '',
+                        'chat_username': r.get('chat_username') or '',
+                        'chat_link_type': r.get('chat_link_type') or 'telegram',
+                        'sender_id': r.get('sender_id') or 0,
+                        'sender_name': r.get('sender_name') or '',
+                        'state': r.get('state') or 'pending',
+                    })
+                    restored += 1
+                except Exception:
+                    # journal_message uses INSERT OR IGNORE internally for
+                    # the at-risk states; concurrent inserts dedup safely.
+                    pass
+            logging.info(f"[JOURNAL-SNAPSHOT] restored {restored} row(s) from Supabase")
+            return restored
+        except Exception as e:
+            logging.warning(f"[JOURNAL-SNAPSHOT] restore error: {e}")
+            return 0
+
     async def _on_user_message(self, event, source_phone: str):
         """معالج رسائل فوري — يسحب الروابط قبل ما تحذفها بوتات أخرى.
         
@@ -3852,9 +4145,15 @@ class Monitor:
             if self.message_claim:
                 claim_token = await self.message_claim.claim(chat_id, msg_id, 'newmessage', source_phone)
                 if claim_token is None:
-                    # سبق معالجتها بواسطة Polling أو Scanner أو حساب آخر
-                    logging.debug(f"[PIPELINE-1] ⏭️ msg ({chat_id}, {msg_id}) already claimed — skip")
-                    await self._journal_set_state_safe(chat_id, msg_id, 'dup_claim')
+                    # [N03] Lost the claim race — another worker (Polling /
+                    # Scanner / journal_recovery / reconcile) won. The WINNER
+                    # has ALREADY written (or will write) a 'pending' journal
+                    # row that journal_recovery rescues if the winner crashes.
+                    # Setting 'dup_claim' here would OVERWRITE that 'pending'
+                    # row → journal_pending_older_than (filters state='pending')
+                    # never sees it → message silently lost if the winner also
+                    # crashes. Just log + return silently; do NOT touch state.
+                    logging.debug(f"[PIPELINE-1] ⏭️ msg ({chat_id}, {msg_id}) already claimed — LOSER silently skipping (preserving WINNER's pending journal row)")
                     return
 
             # === الخطوة 2: معالجة فورية (sync, سريعة جداً) ===
@@ -4020,127 +4319,141 @@ class Monitor:
             reconcile_chats: Set[int] = set()
 
             for deleted_msg_id in deleted_ids:
-                # === المصدر 1: _msg_cache (ذاكرة) ===
-                cached_msg = None
-                rescue_source = None
-                async with self._msg_cache_lock:
-                    if chat_id:
-                        cached_msg = self._msg_cache.pop((chat_id, deleted_msg_id), None)
-                    else:
-                        # لو ما عندنا chat_id، ابحث في كل الـ keys
-                        for key, val in list(self._msg_cache.items()):
-                            if key[1] == deleted_msg_id:
-                                cached_msg = self._msg_cache.pop(key, None)
-                                break
-
-                # === المصدر 2: message_journal (durable — يصمد بعد restart/TTL) ===
-                if not cached_msg and self._journal_enabled():
-                    try:
-                        row = None
-                        # [B09] guard the journal_lookup_any non-deterministic path:
-                        # lookup_any searches across ALL chats for a msg_id and may
-                        # return a row from a DIFFERENT chat (wrong rescue target).
-                        # Only use the deterministic chat_id-keyed journal_get when
-                        # chat_id is not None; fall back to lookup_any only when the
-                        # delete event carries no chat_id at all.
-                        if chat_id is not None:
-                            row = await self.prod_db.journal_get(chat_id, deleted_msg_id)
+                # [N04] Per-iteration try/except isolation: a single iteration
+                # failure (DB error, regex bug, locked journal, etc.) must NOT
+                # abort the remaining 49 ids in a mass-delete batch. Without
+                # this, one bad row silently skipped processing for 49 messages
+                # that were never rescued.
+                try:
+                    # === المصدر 1: _msg_cache (ذاكرة) ===
+                    cached_msg = None
+                    rescue_source = None
+                    async with self._msg_cache_lock:
+                        if chat_id:
+                            cached_msg = self._msg_cache.pop((chat_id, deleted_msg_id), None)
                         else:
-                            rows = await self.prod_db.journal_lookup_any(deleted_msg_id)
-                            row = rows[0] if rows else None
-                        if row and row.get('raw_text'):
-                            cached_msg = dict(row)
-                            rescue_source = 'journal'
-                    except Exception as e:
-                        logging.debug(f"[JOURNAL] lookup error: {e}")
+                            # لو ما عندنا chat_id، ابحث في كل الـ keys
+                            for key, val in list(self._msg_cache.items()):
+                                if key[1] == deleted_msg_id:
+                                    cached_msg = self._msg_cache.pop(key, None)
+                                    break
 
-                # === DELETE-MISS: NewMessage لم يصل أبدًا ===
-                if not cached_msg:
-                    await self._record_delete_miss(chat_id, deleted_msg_id, source_phone)
-                    if chat_id:
-                        reconcile_chats.add(chat_id)
-                    continue
+                    # === المصدر 2: message_journal (durable — يصمد بعد restart/TTL) ===
+                    if not cached_msg and self._journal_enabled():
+                        try:
+                            row = None
+                            # [B09] guard the journal_lookup_any non-deterministic path:
+                            # lookup_any searches across ALL chats for a msg_id and may
+                            # return a row from a DIFFERENT chat (wrong rescue target).
+                            # Only use the deterministic chat_id-keyed journal_get when
+                            # chat_id is not None; fall back to lookup_any only when the
+                            # delete event carries no chat_id at all.
+                            if chat_id is not None:
+                                row = await self.prod_db.journal_get(chat_id, deleted_msg_id)
+                            else:
+                                rows = await self.prod_db.journal_lookup_any(deleted_msg_id)
+                                row = rows[0] if rows else None
+                            if row and row.get('raw_text'):
+                                cached_msg = dict(row)
+                                rescue_source = 'journal'
+                        except Exception as e:
+                            logging.debug(f"[JOURNAL] lookup error: {e}")
 
-                # عولجت مسبقًا؟ (لا حاجة لإنقاذ — فقط علّم الحذف للتحقيق)
-                already_done = bool(cached_msg.get('processed')) or cached_msg.get('state') in (
-                    'processed', 'no_links', 'no_text', 'dup_claim', 'rescued'
-                )
-                if already_done:
-                    await self._journal_mark_deleted_safe(
-                        chat_id if chat_id else cached_msg.get('chat_id'), deleted_msg_id)
-                    logging.debug(
-                        f"[DELETE-HANDLER] msg_id={deleted_msg_id} already processed — skip"
-                    )
-                    continue
-
-                # الرسالة محذوفة قبل المعالجة! عالجها الآن (من cache أو journal)
-                raw_text = cached_msg.get('raw_text') or ''
-                group_name = cached_msg.get('chat_title') or f"chat_{cached_msg.get('chat_id')}"
-                sender_name = cached_msg.get('sender_name', 'Unknown')
-                chat_username = cached_msg.get('chat_username', '')
-                chat_link_type = cached_msg.get('chat_link_type', 'telegram')
-                orig_chat_id = cached_msg.get('chat_id')
-                orig_source_phone = cached_msg.get('source_phone', source_phone)
-
-                # استخرج الروابط
-                links = LinkNormalizer.extract_links(raw_text)
-                if not links:
-                    await self._journal_set_state_safe(
-                        orig_chat_id, deleted_msg_id, 'no_links', mark_deleted=True)
-                    continue
-
-                # === ATOMIC CLAIM (يمنع duplicate rescue عبر monitors متعددة) ===
-                claim_token = None
-                if self.message_claim:
-                    claim_token = await self.message_claim.claim(
-                        orig_chat_id, deleted_msg_id, 'delete_handler', orig_source_phone
-                    )
-                    if claim_token is None:
-                        logging.info(
-                            f"[DELETE-HANDLER] ⏭️ Duplicate message claim: "
-                            f"chat_id={orig_chat_id} msg_id={deleted_msg_id} — skip"
-                        )
-                        await self._journal_set_state_safe(
-                            orig_chat_id, deleted_msg_id, 'dup_claim', mark_deleted=True)
+                    # === DELETE-MISS: NewMessage لم يصل أبدًا ===
+                    if not cached_msg:
+                        await self._record_delete_miss(chat_id, deleted_msg_id, source_phone)
+                        if chat_id:
+                            reconcile_chats.add(chat_id)
                         continue
 
-                logging.warning(
-                    f"[DELETE-HANDLER] 🚨⏰ RESCUED deleted msg_id={deleted_msg_id} "
-                    f"from '{group_name[:30]}' (had {len(links)} links, "
-                    f"source={rescue_source or 'cache'}) — processing NOW"
-                )
-
-                try:
-                    rescued = await self._rescue_enqueue_links(
-                        links, raw_text, group_name, sender_name, chat_username,
-                        chat_link_type, orig_chat_id, orig_source_phone, deleted_msg_id,
-                        pipeline_tag='DELETE-HANDLER')
-
-                    # === Mark as PROCESSED (claim_token verified) ===
-                    if self.message_claim and claim_token:
-                        ok = await self.message_claim.mark_processed(
-                            orig_chat_id, deleted_msg_id, claim_token
-                        )
-                        if not ok:
-                            logging.warning(
-                                f"[DELETE-HANDLER] mark_processed rejected (stale token) "
-                                f"for msg ({orig_chat_id}, {deleted_msg_id})"
-                            )
-                    await self._journal_set_state_safe(
-                        orig_chat_id, deleted_msg_id,
-                        'rescued' if rescued else 'processed', mark_deleted=True)
-                except Exception as inner_e:
-                    # === Mark as FAILED (allows retry by Polling/Scanner/another delete) ===
-                    if self.message_claim and claim_token:
-                        await self.message_claim.mark_failed(
-                            orig_chat_id, deleted_msg_id, claim_token, str(inner_e))
-                    await self._journal_set_state_safe(
-                        orig_chat_id, deleted_msg_id, 'pending',
-                        error=str(inner_e), mark_deleted=True)
-                    logging.error(
-                        f"[DELETE-HANDLER] processing error for msg "
-                        f"({orig_chat_id}, {deleted_msg_id}): {inner_e}"
+                    # عولجت مسبقًا؟ (لا حاجة لإنقاذ — فقط علّم الحذف للتحقيق)
+                    already_done = bool(cached_msg.get('processed')) or cached_msg.get('state') in (
+                        'processed', 'no_links', 'no_text', 'dup_claim', 'rescued'
                     )
+                    if already_done:
+                        await self._journal_mark_deleted_safe(
+                            chat_id if chat_id else cached_msg.get('chat_id'), deleted_msg_id)
+                        logging.debug(
+                            f"[DELETE-HANDLER] msg_id={deleted_msg_id} already processed — skip"
+                        )
+                        continue
+
+                    # الرسالة محذوفة قبل المعالجة! عالجها الآن (من cache أو journal)
+                    raw_text = cached_msg.get('raw_text') or ''
+                    group_name = cached_msg.get('chat_title') or f"chat_{cached_msg.get('chat_id')}"
+                    sender_name = cached_msg.get('sender_name', 'Unknown')
+                    chat_username = cached_msg.get('chat_username', '')
+                    chat_link_type = cached_msg.get('chat_link_type', 'telegram')
+                    orig_chat_id = cached_msg.get('chat_id')
+                    orig_source_phone = cached_msg.get('source_phone', source_phone)
+
+                    # استخرج الروابط
+                    links = LinkNormalizer.extract_links(raw_text)
+                    if not links:
+                        await self._journal_set_state_safe(
+                            orig_chat_id, deleted_msg_id, 'no_links', mark_deleted=True)
+                        continue
+
+                    # === ATOMIC CLAIM (يمنع duplicate rescue عبر monitors متعددة) ===
+                    claim_token = None
+                    if self.message_claim:
+                        claim_token = await self.message_claim.claim(
+                            orig_chat_id, deleted_msg_id, 'delete_handler', orig_source_phone
+                        )
+                        if claim_token is None:
+                            logging.info(
+                                f"[DELETE-HANDLER] ⏭️ Duplicate message claim: "
+                                f"chat_id={orig_chat_id} msg_id={deleted_msg_id} — skip"
+                            )
+                            await self._journal_set_state_safe(
+                                orig_chat_id, deleted_msg_id, 'dup_claim', mark_deleted=True)
+                            continue
+
+                    logging.warning(
+                        f"[DELETE-HANDLER] 🚨⏰ RESCUED deleted msg_id={deleted_msg_id} "
+                        f"from '{group_name[:30]}' (had {len(links)} links, "
+                        f"source={rescue_source or 'cache'}) — processing NOW"
+                    )
+
+                    try:
+                        rescued = await self._rescue_enqueue_links(
+                            links, raw_text, group_name, sender_name, chat_username,
+                            chat_link_type, orig_chat_id, orig_source_phone, deleted_msg_id,
+                            pipeline_tag='DELETE-HANDLER')
+
+                        # === Mark as PROCESSED (claim_token verified) ===
+                        if self.message_claim and claim_token:
+                            ok = await self.message_claim.mark_processed(
+                                orig_chat_id, deleted_msg_id, claim_token
+                            )
+                            if not ok:
+                                logging.warning(
+                                    f"[DELETE-HANDLER] mark_processed rejected (stale token) "
+                                    f"for msg ({orig_chat_id}, {deleted_msg_id})"
+                                )
+                        await self._journal_set_state_safe(
+                            orig_chat_id, deleted_msg_id,
+                            'rescued' if rescued else 'processed', mark_deleted=True)
+                    except Exception as inner_e:
+                        # === Mark as FAILED (allows retry by Polling/Scanner/another delete) ===
+                        if self.message_claim and claim_token:
+                            await self.message_claim.mark_failed(
+                                orig_chat_id, deleted_msg_id, claim_token, str(inner_e))
+                        await self._journal_set_state_safe(
+                            orig_chat_id, deleted_msg_id, 'pending',
+                            error=str(inner_e), mark_deleted=True)
+                        logging.error(
+                            f"[DELETE-HANDLER] processing error for msg "
+                            f"({orig_chat_id}, {deleted_msg_id}): {inner_e}"
+                        )
+                except Exception as iter_e:
+                    # [N04] Isolation: log + continue so the remaining ids in
+                    # the mass-delete batch still get processed.
+                    logging.error(
+                        f"[DELETE-HANDLER] iteration error for msg_id={deleted_msg_id} "
+                        f"chat_id={chat_id} — skipping (continuing batch): {iter_e}"
+                    )
+                    continue
 
             # === RECONCILE: التقط أي رسائل أخرى فاتتنا في الشات ===
             if reconcile_chats and getattr(
@@ -4527,7 +4840,16 @@ class Monitor:
                         self._msg_cache[cache_key]['processed'] = True
                 
         except FloodWaitError as e:
-            logging.warning(f"[POLLING] FloodWait {e.seconds}s for chat={chat_id} ({phone}) — sleeping")
+            # [N08] Register the FloodWait with floodwait_mgr so the joiner
+            # scheduler and other workers see the account as blocked (the
+            # old behavior slept here but never persisted the wait — the
+            # joiner would re-pick this account moments later, doubling the
+            # next FloodWait penalty).
+            try:
+                await self.floodwait_mgr.block(phone, e.seconds)
+            except Exception as _fwe:
+                logging.debug(f"[POLLING] floodwait_mgr.block failed: {_fwe}")
+            logging.warning(f"[POLLING] FloodWait {e.seconds}s for chat={chat_id} ({phone}) — sleeping + registered")
             await asyncio.sleep(min(e.seconds, 30))
         except Exception as e:
             # تجاهل أخطاء "chat not found" / "private" — ما تكررها
@@ -8280,10 +8602,39 @@ class Monitor:
             logging.info("🧹 Message Cache Cleanup already running — skip duplicate")
 
         # === JOURNAL RECOVERY — استرجاع رسائل انهار النظام قبل معالجتها ===
+        # [PERSISTENCE Option C] First restore at-risk journal rows from
+        # Supabase snapshot (an ephemeral-disk restart wipes the local SQLite,
+        # so this is what keeps fast-deleted messages rescuable across
+        # Render free-tier restarts WITHOUT buying a persistent disk).
+        try:
+            restored_n = await self._restore_journal_from_supabase()
+            if restored_n:
+                logging.info(f"📓 [JOURNAL-SNAPSHOT] pre-recovery: restored {restored_n} row(s) from Supabase")
+        except Exception as _restore_e:
+            logging.warning(f"📓 [JOURNAL-SNAPSHOT] restore at startup failed: {_restore_e}")
         if self.config.journal_recovery_enabled:
             if not hasattr(self, '_journal_recovery_task') or self._journal_recovery_task is None or self._journal_recovery_task.done():
                 self._journal_recovery_task = asyncio.create_task(self._journal_recovery())
                 logging.info("📓 Journal Recovery started (crash-safe message rescue)")
+
+        # === [PERSISTENCE Option C] JOURNAL SNAPSHOT LOOP (30s) ===
+        # Mirrors at-risk journal rows to Supabase message_journal_snapshot.
+        # Survives ephemeral-disk restart; supervisor will resurrect on death.
+        if not hasattr(self, '_journal_snapshot_task') or self._journal_snapshot_task is None or self._journal_snapshot_task.done():
+            self._journal_snapshot_task = asyncio.create_task(self._journal_snapshot_loop())
+            logging.info("📓 Journal Snapshot started (30s cycle — Supabase durability mirror)")
+
+        # === [N07] AI DRAINER (30s) — processes ai_pending backlog ===
+        # Self-disables when AI_DRAIN_ENABLED != 'true' (default), so it's
+        # always safe to start. Operator flips AI_DRAIN_ENABLED=true to
+        # start draining the 26K backlog; supervisor resurrects on death.
+        if not hasattr(self, '_ai_drainer_task') or self._ai_drainer_task is None or self._ai_drainer_task.done():
+            self._ai_drainer_task = asyncio.create_task(self._ai_drainer_worker())
+            drain_on = os.getenv('AI_DRAIN_ENABLED', 'false').lower() in ('true', '1', 'yes')
+            if drain_on:
+                logging.info("🤖 AI Drainer started (AI_DRAIN_ENABLED=true — processing ai_pending backlog)")
+            else:
+                logging.info("🤖 AI Drainer started (idle — AI_DRAIN_ENABLED unset/false)")
 
         # === [B07] SUPERVISOR — recreates dead critical background tasks (60s) ===
         if not hasattr(self, '_supervisor_task') or self._supervisor_task is None or self._supervisor_task.done():
@@ -8351,10 +8702,14 @@ class Monitor:
         # [B07]/[L03] supervisor + polling-watchdog tasks
         supervisor_task = getattr(self, '_supervisor_task', None)
         polling_watchdog_task = getattr(self, '_polling_watchdog_task', None)
+        # [PERSISTENCE Option C] journal snapshot + [N07] ai drainer tasks
+        journal_snapshot_task = getattr(self, '_journal_snapshot_task', None)
+        ai_drainer_task = getattr(self, '_ai_drainer_task', None)
         tasks = [self._bot_task, self._keep_alive_task, self._joiner_task,
                  scorer_task, cache_cleanup_task, polling_task,
                  registry_task, polling_scheduler_task, claim_cleanup_task,
-                 journal_recovery_task, supervisor_task, polling_watchdog_task
+                 journal_recovery_task, supervisor_task, polling_watchdog_task,
+                 journal_snapshot_task, ai_drainer_task
                  ] + list(self._user_tasks.values()) + self._current_scan_tasks
         for t in tasks:
             if t and not t.done():

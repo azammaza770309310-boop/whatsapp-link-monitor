@@ -405,7 +405,11 @@ async def test_E():
         result = await prod_db.journal_cleanup(retention_s=86400, short_retention_s=21600)
 
         old_pending = await prod_db.journal_get(chat, 4200)
-        record("E: old pending removed (retention_s)", old_pending is None,
+        # [N01] old pending SURVIVES cleanup — pending rows represent
+        # in-flight / recoverable messages that journal_recovery must still
+        # rescue. The previous behavior (DELETE all rows > retention_s)
+        # silently lost messages that crashed mid-processing.
+        record("E: old pending PRESERVED by cleanup (N01)", old_pending is not None,
                f"got {old_pending!r}")
 
         old_no_text = await prod_db.journal_get(chat, 4202)
@@ -418,13 +422,18 @@ async def test_E():
         fresh_no_text = await prod_db.journal_get(chat, 4203)
         record("E: fresh no_text remains", fresh_no_text is not None)
 
-        # تأكيد عبر SQL مباشرة
+        # تأكيد عبر SQL مباشرة — 3 rows survive (old pending, fresh pending,
+        # fresh no_text). Old no_text (4202) is removed by short_retention_s.
         row = await sql_one(prod_db, "SELECT COUNT(*) FROM message_journal WHERE chat_id=?", (chat,))
-        record("E: exactly 2 rows left in journal", row[0] == 2, f"got {row[0]}")
+        record("E: exactly 3 rows left in journal (old pending preserved by N01)",
+               row[0] == 3, f"got {row[0]}")
 
-        record("E: cleanup returns removed counts dict",
-               isinstance(result, dict) and result.get('removed_old', 0) >= 1
-               and result.get('removed_light', 0) >= 1,
+        # [N01] removed_old is 0 because the only "old" row (4200) is pending
+        # and thus excluded by `state NOT IN ('pending','failed')`. removed_light
+        # is 1 (only 4202, the old no_text, exceeds short_retention).
+        record("E: cleanup returns removed counts dict with N01-aware counts",
+               isinstance(result, dict) and result.get('removed_old', -1) == 0
+               and result.get('removed_light', -1) == 1,
                f"got {result!r}")
     except Exception as e:
         record("E: exception", False, str(e))

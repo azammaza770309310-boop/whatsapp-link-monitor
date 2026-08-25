@@ -609,8 +609,23 @@ class PollingScheduler:
                         tier = self.classify_tier(last_activity)
                         await self.update_next_poll(chat_id, tier)
 
-                await asyncio.gather(*[_poll_one(c) for c in due_chats],
-                                     return_exceptions=True)
+                # [N09] gather(return_exceptions=True) is already set so one
+                # task's failure doesn't abort the whole batch — but the results
+                # were never iterated, so per-task errors were silently dropped
+                # (especially since _poll_one's inner except logs at DEBUG,
+                # suppressed in production). Iterate + log at WARNING so a
+                # single FloodWait / RPCError / connection-reset surfaces in
+                # the operator's logs without killing the batch.
+                results = await asyncio.gather(
+                    *[_poll_one(c) for c in due_chats],
+                    return_exceptions=True)
+                for _chat, _result in zip(due_chats, results):
+                    if isinstance(_result, Exception):
+                        logging.warning(
+                            f"[POLL-SCHED] chat={_chat.get('chat_id')} "
+                            f"task failed (continuing batch): "
+                            f"{type(_result).__name__}: {_result}"
+                        )
                 # 2e. Small pause between batches
                 await asyncio.sleep(self.BATCH_PAUSE_S)
 

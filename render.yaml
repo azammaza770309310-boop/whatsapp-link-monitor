@@ -37,6 +37,14 @@ services:
         sync: false
       - key: AI_BATCH_MODE
         value: "true"  # true = تخطّي AI للسرعة | false = فحص كامل
+      # === [N07] AI_DRAIN_ENABLED — opt-in background drainer for the
+      # ai_pending backlog (26,475 pending links in production). Default
+      # false: batch mode intentionally skips AI on the hot path; flipping
+      # this to true starts a 30s drainer that runs AI on up to 10 NULL-
+      # ai_approved rows per cycle and PATCHes the verdict back. Leave
+      # false unless AI_BATCH_MODE=true is also set. ===
+      - key: AI_DRAIN_ENABLED
+        value: "false"
       # === اختياري ===
       - key: OWNER_ID
         sync: false
