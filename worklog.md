@@ -408,3 +408,32 @@ Stage Summary:
 - API جديد للتحقق من مصدر أي رابط
 - Dashboard يُظهر حالة المراقبة بوضوح على كل رابط
 - كل المصادر الحالية فعلاً في monitored_chats (تأكيد من البيانات الحالية)
+
+---
+Task ID: DURABILITY-MESSAGE-JOURNAL
+Agent: main (Super Z)
+Task: حل جذري لمشكلة فقدان الروابط بسبب الحذف السريع من بوتات الحماية — Message Journal durable + rescue ثلاثي المصادر + delete-miss forensics + تحسين تغطية polling.
+
+Work Log:
+- المشكلة (من التحقيق الجنائي لاختبار UQU_Medicine1 2026-08-25): الرسائل المحذوفة خلال ثوانٍ كانت تُفقد لأن:
+  1) _msg_cache في الذاكرة فقط (TTL 120s) — يضيع عند إعادة التشغيل أو انتهاء المدة.
+  2) Delete Handler يعتمد كليًا على الـ cache — لو NewMessage لم يصل أو انتهى TTL لا إنقاذ.
+  3) لا يوجد أي دليل جنائي على وصول الأحداث (silent returns بلا logs).
+  4) Polling لا يمكنه استرجاع رسائل حذفها Telegram نهائيًا (get_messages لا يعيد المحذوف).
+- الحل المُنفّذ (عام لكل المجموعات):
+  * message_journal (SQLite WAL): جدول جديد يُكتب فور وصول أي رسالة (raw_text كامل + metadata) قبل أي معالجة — INSERT OR IGNORE (chat_id, msg_id). يصمد بعد إعادة التشغيل وبعد انتهاء TTL الذاكرة.
+  * _on_user_message: journal write-ahead لكل رسالة (pending/no_text/no_links/dup_claim/processed) — يوفر دليلًا جنائيًا دائمًا على وصول كل حدث.
+  * _on_message_deleted (rewrite): إنقاذ ثلاثي المصادر — _msg_cache ← message_journal ← DELETE-MISS (تحذير WARNING مقيّد + صف delete_miss في journal + reconcile). mass-delete cap 50.
+  * _reconcile_chat_after_delete_miss: بعد DELETE-MISS يسحب آخر 15 رسالة من الشات (عبر الحساب الذي رأى الحذف أو registry reader) لالتقاط أي رسائل أخوات فاتتها فجوة الأحداث.
+  * _journal_recovery: مهمة إقلاع تعيد معالجة صفوف pending الأقدم من 120 ثانية (رسائل انهار النظام قبل اكتمال معالجتها) — MessageClaim يمنع التكرار.
+  * PollingScheduler: BATCH_SIZE 10←25 + تزامن محدود (Semaphore 4) — تغطية 800+ مصدر أسرع ~4x مع بقاء RateLimiter (قفل لكل هاتف + min_delay) يسلسل عمليات نفس الحساب.
+  * _poll_one_chat: إزالة reader فقد وصوله (channel private/forbidden/banned) من reader_phones للشات فقط + تأجيل الشات الميت ساعتين بعد 5 إخفاقات متتالية.
+  * journal_cleanup كل ساعة (24h عام / 6h للصفوف الخفيفة no_text/delete_miss).
+  * Config knobs (كلها default-on): MESSAGE_JOURNAL, JOURNAL_RETENTION_S, JOURNAL_NO_TEXT_RETENTION_S, DELETE_MISS_RECONCILE, JOURNAL_RECOVERY.
+- الاختبارات: tests/test_message_journal.py جديد — 18 سيناريو / 66 assertion (إنقاذ بعد إعادة تشغيل محاكاة، delete-miss، استرجاع الانهيار، dedup متعدد الحسابات، chat_id=None، mass-delete cap، remove_reader...). كل الاختبارات القديمة تمر بلا تعديل: 103+96+35+3.
+- ملاحظة مكتشفة أثناء الاختبار (pre-existing): GulfFilter.is_blacklisted يستخدم substring matching — أسماء حساسة تحتوي كلمات قصيرة في blacklist (مثل "bet" داخل "beta") تُرفض خطأً. لم تُغيَّر في هذا الـcommit (خارج النطاق).
+
+Stage Summary:
+- أي رابط يصل عبر NewMessage لأي حساب مراقب يُكتب الآن في journal فورًا — لا يمكن فقدانه بالحذف السريع حتى لو انتهى TTL الذاكرة أو أعيد تشغيل النظام.
+- الحالة الوحيدة المتبقية غير القابلة للاسترجاع: رسالة حُذفت قبل أن يستلمها أي من حساباتنا على الإطلاق (فجوة تسليم كاملة) — أصبحت الآن مرئية (DELETE-MISS warning + صف journal) بدل أن تختفي بصمت، و reconcile يلتقط الرسائل الأخوات.
+- الملفات: bot.py, link_system.py, source_registry.py, tests/test_message_journal.py, download/{bot,link_system,source_registry}.py

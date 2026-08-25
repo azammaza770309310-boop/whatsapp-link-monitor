@@ -829,8 +829,36 @@ async def init_production_tables(db):
     await conn.execute("CREATE INDEX IF NOT EXISTS idx_pm_lease ON processed_messages (lease_until)")
     await conn.execute("CREATE INDEX IF NOT EXISTS idx_pm_claimed_at ON processed_messages (claimed_at)")
 
+    # === جدول جديد: message_journal (durable write-ahead log لكل رسالة واردة) ===
+    # يُكتب فور وصول NewMessage/Polling قبل أي معالجة — يسمح بالإنقاذ بعد:
+    # انتهاء TTL الذاكرة (120s)، إعادة تشغيل النظام، أو انقطاع تسليم الأحداث.
+    # الفروق عن processed_messages:
+    #   - يحفظ raw_text كاملًا (يُستعمل للإنقاذ، مو بس للحالة)
+    #   - دورة حياة أطول (24 ساعة) بدل 7 أيام فقط للحالة النهائية
+    await conn.execute("""CREATE TABLE IF NOT EXISTS message_journal (
+        chat_id INTEGER NOT NULL,
+        msg_id INTEGER NOT NULL,
+        raw_text TEXT,
+        source_phone TEXT,
+        received_at REAL,
+        chat_title TEXT,
+        chat_username TEXT,
+        chat_link_type TEXT,
+        sender_id INTEGER,
+        sender_name TEXT,
+        state TEXT DEFAULT 'pending',
+        processed_at REAL,
+        rescued_at REAL,
+        deleted_at REAL,
+        attempt_count INTEGER DEFAULT 0,
+        error TEXT,
+        PRIMARY KEY (chat_id, msg_id)
+    )""")
+    await conn.execute("CREATE INDEX IF NOT EXISTS idx_journal_state ON message_journal (state)")
+    await conn.execute("CREATE INDEX IF NOT EXISTS idx_journal_received ON message_journal (received_at)")
+
     await conn.commit()
-    logging.info("✅ Production tables initialized (link_queue, group_states, membership_cache, floodwait_tracker, api_operations_log, system_settings, monitored_chats)")
+    logging.info("✅ Production tables initialized (link_queue, group_states, membership_cache, floodwait_tracker, api_operations_log, system_settings, monitored_chats, message_journal)")
 
 
 # -------------------------------------------------------------------
@@ -1405,3 +1433,136 @@ class ProductionDB:
             "DELETE FROM processed_messages WHERE state='failed' AND claimed_at < datetime('now', '-30 days')"
         )
         await conn.commit()
+
+    # === Message Journal (durable write-ahead log) ===
+    #
+    # الغرض: حماية الرسائل من الفقد عند الحذف السريع من بوتات الحماية.
+    # كل رسالة تُكتب هنا فير وصولها (قبل أي معالجة)، ويستطيع Delete Handler
+    # إنقاذها حتى لو انتهى TTL الذاكرة أو أُعيد تشغيل النظام.
+
+    async def journal_message(self, entry: dict) -> None:
+        """يخزن رسالة في الـ journal (INSERT OR IGNORE — أول كاتب يفوز).
+        فشل الكتابة لا يوقف الـ pipeline — caller يغلفها بـ try/except.
+        """
+        conn = await self._conn()
+        await conn.execute(
+            """INSERT OR IGNORE INTO message_journal
+               (chat_id, msg_id, raw_text, source_phone, received_at,
+                chat_title, chat_username, chat_link_type, sender_id, sender_name, state)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
+            (entry.get('chat_id'), entry.get('msg_id'), entry.get('raw_text'),
+             entry.get('source_phone'), entry.get('received_at', time.time()),
+             entry.get('chat_title'), entry.get('chat_username'),
+             entry.get('chat_link_type'), entry.get('sender_id'),
+             entry.get('sender_name'), entry.get('state', 'pending')))
+        await conn.commit()
+
+    async def journal_get(self, chat_id: int, msg_id: int) -> Optional[dict]:
+        """يجيب صف journal واحد (chat_id, msg_id) — أو None."""
+        conn = await self._conn()
+        cursor = await conn.execute(
+            """SELECT chat_id, msg_id, raw_text, source_phone, received_at, chat_title,
+                      chat_username, chat_link_type, sender_id, sender_name, state,
+                      processed_at, rescued_at, deleted_at, attempt_count, error
+               FROM message_journal WHERE chat_id=? AND msg_id=?""",
+            (chat_id, msg_id))
+        row = await cursor.fetchone()
+        if not row:
+            return None
+        cols = ['chat_id', 'msg_id', 'raw_text', 'source_phone', 'received_at',
+                'chat_title', 'chat_username', 'chat_link_type', 'sender_id',
+                'sender_name', 'state', 'processed_at', 'rescued_at',
+                'deleted_at', 'attempt_count', 'error']
+        return dict(zip(cols, row))
+
+    async def journal_lookup_any(self, msg_id: int, limit: int = 5) -> List[dict]:
+        """يبحث عن msg_id عبر كل الشاتات (لأحداث الحذف بدون chat_id).
+        ملاحظة: msg_id ليس فريدًا عالميًا — نعيد أحدث الصفوف ذات raw_text."""
+        conn = await self._conn()
+        cursor = await conn.execute(
+            """SELECT chat_id, msg_id, raw_text, source_phone, received_at, chat_title,
+                      chat_username, chat_link_type, sender_id, sender_name, state
+               FROM message_journal WHERE msg_id=? AND raw_text IS NOT NULL
+               ORDER BY received_at DESC LIMIT ?""",
+            (msg_id, limit))
+        rows = await cursor.fetchall()
+        cols = ['chat_id', 'msg_id', 'raw_text', 'source_phone', 'received_at',
+                'chat_title', 'chat_username', 'chat_link_type', 'sender_id',
+                'sender_name', 'state']
+        return [dict(zip(cols, r)) for r in rows]
+
+    async def journal_set_state(self, chat_id: int, msg_id: int, state: str,
+                                error: Optional[str] = None,
+                                mark_deleted: bool = False) -> None:
+        """يحدّث حالة صف journal + طوابق الوقت المناسبة."""
+        now = time.time()
+        terminal = ('processed', 'no_links', 'no_text', 'dup_claim', 'rescued',
+                    'blacklisted', 'delete_miss')
+        fields = ["state=?", "attempt_count=attempt_count+1"]
+        values: list = [state]
+        if state in terminal:
+            fields.append("processed_at=?")
+            values.append(now)
+        if state == 'rescued':
+            fields.append("rescued_at=?")
+            values.append(now)
+        if mark_deleted:
+            fields.append("deleted_at=?")
+            values.append(now)
+        if error is not None:
+            fields.append("error=?")
+            values.append(str(error)[:500])
+        values.extend([chat_id, msg_id])
+        conn = await self._conn()
+        await conn.execute(
+            f"UPDATE message_journal SET {', '.join(fields)} WHERE chat_id=? AND msg_id=?",
+            values)
+        await conn.commit()
+
+    async def journal_mark_deleted(self, chat_id: int, msg_id: int) -> None:
+        """يسجل أن حدث حذف رُاصد لهذه الرسالة (للتحقيق الجنائي)."""
+        conn = await self._conn()
+        await conn.execute(
+            "UPDATE message_journal SET deleted_at=? WHERE chat_id=? AND msg_id=?",
+            (time.time(), chat_id, msg_id))
+        await conn.commit()
+
+    async def journal_pending_older_than(self, seconds: float) -> List[dict]:
+        """صفوف pending عمرها > seconds (رسائل انهار النظام قبل اكتمال معالجتها)."""
+        conn = await self._conn()
+        cutoff = time.time() - seconds
+        cursor = await conn.execute(
+            """SELECT chat_id, msg_id, raw_text, source_phone, received_at, chat_title,
+                      chat_username, chat_link_type, sender_id, sender_name, state
+               FROM message_journal
+               WHERE state='pending' AND raw_text IS NOT NULL AND received_at < ?""",
+            (cutoff,))
+        rows = await cursor.fetchall()
+        cols = ['chat_id', 'msg_id', 'raw_text', 'source_phone', 'received_at',
+                'chat_title', 'chat_username', 'chat_link_type', 'sender_id',
+                'sender_name', 'state']
+        return [dict(zip(cols, r)) for r in rows]
+
+    async def journal_cleanup(self, retention_s: float = 86400,
+                              short_retention_s: float = 21600) -> dict:
+        """ينظف journal: كل الصفوف أعمق من retention_s،
+        والصفوف الخفيفة (no_text/delete_miss) أعمق من short_retention_s."""
+        conn = await self._conn()
+        now = time.time()
+        cursor = await conn.execute(
+            "DELETE FROM message_journal WHERE received_at < ?", (now - retention_s,))
+        removed_old = cursor.rowcount
+        cursor = await conn.execute(
+            "DELETE FROM message_journal WHERE state IN ('no_text','delete_miss') "
+            "AND received_at < ?", (now - short_retention_s,))
+        removed_light = cursor.rowcount
+        await conn.commit()
+        return {'removed_old': removed_old or 0, 'removed_light': removed_light or 0}
+
+    async def journal_stats(self) -> dict:
+        """إحصائيات journal حسب الحالة (للمراقبة والتشخيص)."""
+        conn = await self._conn()
+        cursor = await conn.execute(
+            "SELECT state, COUNT(*) FROM message_journal GROUP BY state")
+        rows = await cursor.fetchall()
+        return {r[0]: r[1] for r in rows}

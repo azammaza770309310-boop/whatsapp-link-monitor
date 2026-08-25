@@ -421,6 +421,35 @@ class SourceRegistry:
         if self._phone_load.get(phone, 0) > 0:
             self._phone_load[phone] -= 1
 
+    async def remove_reader(self, chat_id: int, phone: str) -> bool:
+        """يحذف هاتفًا من reader_phones لشات محدد (عند فقدان الحساب وصوله).
+
+        يحدّث الذاكرة + DB (reader_phones JSON). يُستدعى مثلاً عند
+        ChannelPrivateError/forbidden/banned أثناء polling — الحساب لم يعد
+        قادرًا على قراءة الشات، وبقاءه في reader_phones يهدر محاولات polling.
+        Returns True لو حُذف الهاتف فعليًا.
+        """
+        async with self._lock:
+            phones = self._chat_to_phones.get(chat_id, [])
+            if phone not in phones:
+                return False
+            phones = [p for p in phones if p != phone]
+            self._chat_to_phones[chat_id] = phones
+        # حدّث DB (best-effort) — أصلح primary_reader لو كان هو الهاتف المحذوف
+        try:
+            import json as _json
+            conn = await self.prod_db._conn()
+            await conn.execute(
+                """UPDATE monitored_chats
+                   SET reader_phones=?,
+                       primary_reader=CASE WHEN primary_reader=? THEN '' ELSE primary_reader END
+                   WHERE chat_id=?""",
+                (_json.dumps(phones), phone, chat_id))
+            await conn.commit()
+        except Exception as e:
+            logging.debug(f"[REGISTRY] remove_reader DB update error: {e}")
+        return True
+
     def get_chat_lock(self, chat_id: int) -> asyncio.Lock:
         """Per-chat lock — prevents parallel reads of same source."""
         if chat_id not in self._chat_locks:
@@ -460,9 +489,12 @@ class PollingScheduler:
         'cold':   {'max_age_min': None, 'poll_interval_s': 600},
     }
 
-    BATCH_SIZE = 10
+    BATCH_SIZE = 25
     BATCH_PAUSE_S = 0.3
     CYCLE_SLEEP_S = 2
+    # Polling متزامن محدود — التوازي عبر الحسابات المختلفة فقط
+    # (RateLimiter يسلسل عمليات نفس الحساب عبر قفل لكل هاتف + min_delay=2s)
+    MAX_CONCURRENT_POLLS = 4
 
     def __init__(self, source_registry, prod_db, rate_limiter, floodwait_mgr,
                  message_claim, monitor_ref):
@@ -532,58 +564,54 @@ class PollingScheduler:
                     await asyncio.sleep(self.CYCLE_SLEEP_S)
                     continue
 
-                # 2. Poll sequentially with BATCH_PAUSE (no parallel burst)
-                for chat in due_chats:
+                # 2. Poll with bounded concurrency — التوازي عبر الحسابات فقط.
+                #    RateLimiter يسلسل عمليات نفس الحساب (قفل لكل هاتف + min_delay)،
+                #    لذا التزامن هنا يزيد الإنتاجية بدون تجاوز حدود Telegram.
+                sem = asyncio.Semaphore(self.MAX_CONCURRENT_POLLS)
+
+                async def _poll_one(chat):
                     chat_id = chat['chat_id']
+                    async with sem:
+                        # 2a. Pick reader (Monitor preferred, load-balanced)
+                        reader = self.registry.get_reader(chat_id)
+                        if reader is None:
+                            # No reader available — retry after cold interval
+                            await self.update_next_poll(chat_id, 'cold')
+                            return
+                        try:
+                            # Rate limit check (serializes per-account ops)
+                            allowed = await self.rate_limiter.acquire(reader, 'polling')
+                            if not allowed:
+                                # Rate limit or FloodWait active — delay this chat
+                                await self.update_next_poll(chat_id, 'cool')
+                                return
 
-                    # 2a. Pick reader (Monitor preferred, load-balanced)
-                    reader = self.registry.get_reader(chat_id)
-                    if reader is None:
-                        # No reader available — short delay, retry soon
-                        await self.update_next_poll(chat_id, 'cold')
-                        continue
+                            # 2c. Poll one chat (sequential per chat via lock)
+                            async with self.registry.get_chat_lock(chat_id):
+                                await self.monitor._poll_one_chat(reader, chat)
 
-                    # 2b. Rate limit check + poll + release — all in try/finally
-                    # to guarantee release_load() on exception/FloodWait/CancelledError.
-                    try:
-                        # Rate limit check (may sleep for min_delay)
-                        allowed = await self.rate_limiter.acquire(reader, 'polling')
-                        if not allowed:
-                            # Rate limit or FloodWait active — delay this chat
-                            await self.update_next_poll(chat_id, 'cool')
-                            continue  # release_load in finally
+                        except asyncio.CancelledError:
+                            raise
+                        except Exception as e:
+                            # FloodWaitError, RPCError, etc. — log and continue
+                            logging.debug(f"[POLL] chat={chat_id} error: {e}")
+                        finally:
+                            # GUARANTEED release_load
+                            self.registry.release_load(reader)
 
-                        # 2c. Poll one chat (sequential, with per-chat lock)
-                        async with self.registry.get_chat_lock(chat_id):
-                            await self.monitor._poll_one_chat(reader, chat)
+                        # 2d. Update next_poll_at based on tier
+                        last_activity_str = chat.get('last_activity')
+                        try:
+                            last_activity = datetime.fromisoformat(last_activity_str) if last_activity_str else None
+                        except Exception:
+                            last_activity = None
+                        tier = self.classify_tier(last_activity)
+                        await self.update_next_poll(chat_id, tier)
 
-                    except asyncio.CancelledError:
-                        # Cancellation during polling — release load and re-raise
-                        # so the outer loop breaks cleanly.
-                        raise
-                    except Exception as e:
-                        # FloodWaitError, RPCError, etc. — log and continue
-                        logging.debug(f"[POLL] chat={chat_id} error: {e}")
-                    finally:
-                        # GUARANTEED release_load — covers:
-                        # - success path
-                        # - rate limit rejection (allowed=False)
-                        # - exception in _poll_one_chat
-                        # - FloodWaitError
-                        # - CancelledError (before re-raise)
-                        self.registry.release_load(reader)
-
-                    # 2d. Update next_poll_at based on tier
-                    last_activity_str = chat.get('last_activity')
-                    try:
-                        last_activity = datetime.fromisoformat(last_activity_str) if last_activity_str else None
-                    except Exception:
-                        last_activity = None
-                    tier = self.classify_tier(last_activity)
-                    await self.update_next_poll(chat_id, tier)
-
-                    # 2e. Pause between polls
-                    await asyncio.sleep(self.BATCH_PAUSE_S)
+                await asyncio.gather(*[_poll_one(c) for c in due_chats],
+                                     return_exceptions=True)
+                # 2e. Small pause between batches
+                await asyncio.sleep(self.BATCH_PAUSE_S)
 
                 # 3. Short cycle sleep
                 await asyncio.sleep(self.CYCLE_SLEEP_S)

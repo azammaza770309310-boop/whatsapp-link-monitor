@@ -789,6 +789,13 @@ class Config:
         self.min_message_length = int(os.getenv("MIN_MESSAGE_LENGTH", "20"))
         self.max_message_length = int(os.getenv("MAX_MESSAGE_LENGTH_FILTER", "2000"))
 
+        # === Message Journal (anti-delete durability) ===
+        self.journal_enabled = os.getenv("MESSAGE_JOURNAL", "true").lower() == "true"
+        self.journal_retention_s = int(os.getenv("JOURNAL_RETENTION_S", "86400"))
+        self.journal_no_text_retention_s = int(os.getenv("JOURNAL_NO_TEXT_RETENTION_S", "21600"))
+        self.delete_miss_reconcile = os.getenv("DELETE_MISS_RECONCILE", "true").lower() == "true"
+        self.journal_recovery_enabled = os.getenv("JOURNAL_RECOVERY", "true").lower() == "true"
+
     def validate(self):
         errors = []
         if not self.api_id: errors.append("API_ID required")
@@ -2635,6 +2642,13 @@ class Monitor:
         self._registry_task: Optional[asyncio.Task] = None
         self._polling_scheduler_task: Optional[asyncio.Task] = None
         self._claim_cleanup_task: Optional[asyncio.Task] = None
+        # === DELETE-MISS FORENSICS + RECONCILE + POLL FAILURE TRACKING ===
+        self._delete_miss_log_ts: Dict[int, float] = {}   # chat_id → آخر WARNING
+        self._delete_miss_count: Dict[int, int] = {}      # chat_id → عدد miss منذ آخر WARNING
+        self._no_text_count = 0                            # رسائل بلا نص منذ آخر ملخص
+        self._reconcile_inflight: Set[int] = set()         # شاتات قيد reconcile
+        self._chat_poll_failures: Dict[int, int] = {}      # chat_id → إخفاقات polling متتالية
+        self._journal_recovery_task: Optional[asyncio.Task] = None
 
     @staticmethod
     def _get_chat_name(chat):
@@ -3313,6 +3327,278 @@ class Monitor:
         except Exception as e:
             logging.error(f"[RECOMMEND] Failed for {phone}: {e}")
 
+    # ------------------------------------------------------------------
+    # Message Journal helpers (durable write-ahead log)
+    # ------------------------------------------------------------------
+
+    def _journal_enabled(self) -> bool:
+        return bool(getattr(getattr(self, 'config', None), 'journal_enabled', True)) \
+            and getattr(self, 'prod_db', None) is not None
+
+    async def _journal_write(self, chat_id, msg_id, raw_text, source_phone,
+                             chat_title='', chat_username='', chat_link_type='telegram',
+                             sender_id=0, sender_name='', state='pending'):
+        """كتابة journal متحمّلة للأخطاء — لا ترمي استثناء أبدًا."""
+        if not self._journal_enabled():
+            return
+        try:
+            await self.prod_db.journal_message({
+                'chat_id': chat_id, 'msg_id': msg_id, 'raw_text': raw_text,
+                'source_phone': source_phone, 'received_at': time.time(),
+                'chat_title': chat_title, 'chat_username': chat_username,
+                'chat_link_type': chat_link_type, 'sender_id': sender_id,
+                'sender_name': sender_name, 'state': state,
+            })
+        except Exception as e:
+            logging.debug(f"[JOURNAL] write error ({chat_id},{msg_id}): {e}")
+
+    async def _journal_set_state_safe(self, chat_id, msg_id, state,
+                                      error=None, mark_deleted=False):
+        if not self._journal_enabled() or chat_id is None:
+            return
+        try:
+            await self.prod_db.journal_set_state(
+                chat_id, msg_id, state, error=error, mark_deleted=mark_deleted)
+        except Exception as e:
+            logging.debug(f"[JOURNAL] set_state error ({chat_id},{msg_id}): {e}")
+
+    async def _journal_mark_deleted_safe(self, chat_id, msg_id):
+        if chat_id is None or not self._journal_enabled():
+            return
+        try:
+            await self.prod_db.journal_mark_deleted(chat_id, msg_id)
+        except Exception as e:
+            logging.debug(f"[JOURNAL] mark_deleted error ({chat_id},{msg_id}): {e}")
+
+    async def _record_delete_miss(self, chat_id, msg_id, source_phone):
+        """يسجّل حذف رسالة لم نرَ NewMessage لها أبدًا — دليل على فجوة تسليم أحداث.
+        تحذير WARNING مقيّد (مرة/دقيقة لكل شات) + صف delete_miss في journal."""
+        key = chat_id if chat_id is not None else 0
+        now = time.time()
+        self._delete_miss_count[key] = self._delete_miss_count.get(key, 0) + 1
+        if now - self._delete_miss_log_ts.get(key, 0) > 60:
+            logging.warning(
+                f"[DELETE-HANDLER] ⚠️ DELETE-MISS msg_id={msg_id} chat_id={chat_id} "
+                f"— NewMessage never received "
+                f"({self._delete_miss_count[key]} miss(es) in window) "
+                f"(delete seen by {source_phone})"
+            )
+            self._delete_miss_log_ts[key] = now
+            self._delete_miss_count[key] = 0
+        if chat_id is not None and self._journal_enabled():
+            try:
+                await self.prod_db.journal_message({
+                    'chat_id': chat_id, 'msg_id': msg_id, 'raw_text': None,
+                    'source_phone': source_phone, 'received_at': time.time(),
+                    'state': 'delete_miss',
+                })
+            except Exception as e:
+                logging.debug(f"[JOURNAL] delete_miss write error: {e}")
+
+    async def _rescue_enqueue_links(self, links, raw_text, group_name, sender_name,
+                                    chat_username, chat_link_type, orig_chat_id,
+                                    orig_source_phone, msg_id,
+                                    pipeline_tag='DELETE-HANDLER') -> bool:
+        """إنقاذ روابط رسالة (مشترك بين Delete Handler و Journal Recovery و Reconcile).
+        يسجّل المجموعة + فحص blacklist + enqueue + set_group_state.
+        Returns True لو أُضيف رابط جديد واحد على الأقل."""
+        any_new = False
+        try:
+            is_new = await self.prod_db.add_monitored_chat(
+                chat_id=orig_chat_id,
+                chat_title=group_name,
+                username=chat_username,
+                link_type=chat_link_type,
+                monitored_by=orig_source_phone,
+            )
+            if is_new:
+                logging.info(
+                    f"[{pipeline_tag}] ✅ New chat: '{group_name[:40]}' "
+                    f"(id={orig_chat_id}, by={orig_source_phone})"
+                )
+        except Exception as e:
+            logging.debug(f"[{pipeline_tag}] add_monitored error: {e}")
+
+        for link_info in links:
+            link_data = {
+                **link_info,
+                'group_name': group_name,
+                'sender_name': sender_name,
+                'sender_contact': extract_sender_contact(raw_text),
+                'source_phone': orig_source_phone,
+                'message_text': raw_text,
+                'message_link': f"https://t.me/c/{str(orig_chat_id).replace('-100', '')}/{msg_id}" if orig_chat_id else None,
+            }
+
+            # Blacklist
+            link_raw = link_info['raw'].lower()
+            username_raw = (link_info.get('username') or '').lower()
+            full_text_check = f"{raw_text} {link_raw} {username_raw}".lower()
+            is_bad, bad_reason = GulfFilter.is_blacklisted(
+                full_text_check, username_raw, link_info['raw'], group_name
+            )
+            if is_bad:
+                logging.info(
+                    f"[{pipeline_tag}] 🚫 BLACKLISTED: {link_info['raw'][:50]} ({bad_reason})"
+                )
+                await self.metrics.record_skip(f'blacklist_{bad_reason}')
+                continue
+
+            is_new = await self.prod_db.enqueue_link(link_data)
+            if is_new:
+                any_new = True
+                await self.prod_db.set_group_state(
+                    link_info['normalized'], GroupState.DISCOVERED,
+                    link_info['raw'], group_name)
+                logging.info(
+                    f"[{pipeline_tag}] ✅ RESCUED & enqueued: {link_info['raw'][:60]} "
+                    f"(would have been LOST without journal/cache)"
+                )
+            else:
+                await self.metrics.record_duplicate()
+                logging.info(f"[{pipeline_tag}] ⏭️ Duplicate: {link_info['normalized'][:60]}")
+        return any_new
+
+    def _spawn_reconcile(self, chat_id: int, hint_phone: str = None):
+        """يطلق reconcile خلفي للشات (مع حماية من التكرار المتزامن)."""
+        if chat_id in self._reconcile_inflight:
+            return
+        self._reconcile_inflight.add(chat_id)
+
+        async def _runner():
+            try:
+                await self._reconcile_chat_after_delete_miss(chat_id, hint_phone)
+            finally:
+                self._reconcile_inflight.discard(chat_id)
+
+        asyncio.create_task(_runner())
+
+    async def _reconcile_chat_after_delete_miss(self, chat_id: int, hint_phone: str = None):
+        """بعد DELETE-MISS: اسحب آخر 15 رسالة من الشات لالتقاط أي رسائل أخرى
+        فاتتنا (فجوة أحداث). الرسالة المحذوفة نفسها لا يمكن استرجاعها
+        (Telegram حذفها نهائيًا) — لكن الرسائل الأخوات الفائتة يمكن التقاطها."""
+        reader = hint_phone
+        client = self.user_clients.get(reader) if reader else None
+        used_registry = False
+        if not (client and client.is_connected()):
+            reader = None
+            client = None
+            if self.source_registry:
+                reader = self.source_registry.get_reader(chat_id)
+                used_registry = reader is not None
+                if reader:
+                    client = self.user_clients.get(reader)
+        if not (client and client.is_connected()):
+            if used_registry and reader and self.source_registry:
+                self.source_registry.release_load(reader)
+            logging.debug(f"[RECONCILE] no available reader for chat={chat_id}")
+            return
+        try:
+            messages = await client.get_messages(chat_id, limit=15)
+            recovered = 0
+            for msg in messages:
+                if not msg or not msg.raw_text or msg.out:
+                    continue
+                async with self._msg_cache_lock:
+                    if (chat_id, msg.id) in self._msg_cache:
+                        continue
+                claim_token = None
+                if self.message_claim:
+                    claim_token = await self.message_claim.claim(chat_id, msg.id, 'reconcile', reader)
+                    if claim_token is None:
+                        continue
+                links = LinkNormalizer.extract_links(msg.raw_text)
+                if not links:
+                    if self.message_claim:
+                        await self.message_claim.mark_processed(chat_id, msg.id, claim_token)
+                    continue
+                chat_title = ''
+                try:
+                    chat_obj = getattr(msg, 'chat', None)
+                    if chat_obj is not None and getattr(chat_obj, 'title', None):
+                        chat_title = chat_obj.title
+                except Exception:
+                    pass
+                chat_title = chat_title or f"chat_{chat_id}"
+                logging.info(
+                    f"[RECONCILE] 📨🔗 Recovered missed message msg_id={msg.id} "
+                    f"from '{chat_title[:30]}' ({len(links)} links)"
+                )
+                sender_name = self._get_sender_name(msg.sender) if getattr(msg, 'sender', None) else 'Unknown'
+                await self._journal_write(chat_id, msg.id, msg.raw_text, reader,
+                                          chat_title=chat_title, sender_name=sender_name,
+                                          state='pending')
+                await self._rescue_enqueue_links(
+                    links, msg.raw_text, chat_title, sender_name,
+                    '', 'group', chat_id, reader, msg.id,
+                    pipeline_tag='RECONCILE')
+                if self.message_claim:
+                    await self.message_claim.mark_processed(chat_id, msg.id, claim_token)
+                await self._journal_set_state_safe(chat_id, msg.id, 'processed')
+                recovered += 1
+            # حدّث آخر msg_id مشاهد (يمنع polling من إعادة المعالجة)
+            if messages:
+                new_max = max(m.id for m in messages if m)
+                async with self._polling_lock:
+                    if new_max > self._polling_state.get(chat_id, 0):
+                        self._polling_state[chat_id] = new_max
+            if recovered:
+                logging.info(f"[RECONCILE] chat={chat_id}: recovered {recovered} missed message(s)")
+        except Exception as e:
+            logging.debug(f"[RECONCILE] chat={chat_id} error: {e}")
+        finally:
+            if used_registry and reader and self.source_registry:
+                self.source_registry.release_load(reader)
+
+    async def _journal_recovery(self):
+        """استرجاع الانهيار: صفوف journal بحالة pending عمرها > 120 ثانية تعني
+        أن النظام انهار/أُعيد تشغيله بعد كتابة الرسالة وقبل اكتمال معالجتها.
+        نعيد معالجتها — MessageClaim يمنع أي تكرار."""
+        try:
+            await asyncio.sleep(45)  # انتظر اكتمال الإقلاع
+            rows = await self.prod_db.journal_pending_older_than(120)
+            if not rows:
+                logging.info("[JOURNAL-RECOVERY] no stale pending rows — clean")
+                return
+            logging.warning(f"[JOURNAL-RECOVERY] {len(rows)} stale pending row(s) — reprocessing")
+            recovered = 0
+            for row in rows:
+                try:
+                    raw_text = row.get('raw_text') or ''
+                    if not raw_text:
+                        continue
+                    orig_chat_id = row.get('chat_id')
+                    msg_id = row.get('msg_id')
+                    links = LinkNormalizer.extract_links(raw_text)
+                    if not links:
+                        await self._journal_set_state_safe(orig_chat_id, msg_id, 'no_links')
+                        continue
+                    claim_token = None
+                    if self.message_claim:
+                        claim_token = await self.message_claim.claim(
+                            orig_chat_id, msg_id, 'journal_recovery',
+                            row.get('source_phone') or '')
+                        if claim_token is None:
+                            await self._journal_set_state_safe(orig_chat_id, msg_id, 'dup_claim')
+                            continue
+                    group_name = row.get('chat_title') or f"chat_{orig_chat_id}"
+                    await self._rescue_enqueue_links(
+                        links, raw_text, group_name,
+                        row.get('sender_name') or 'Unknown',
+                        row.get('chat_username') or '',
+                        row.get('chat_link_type') or 'telegram',
+                        orig_chat_id, row.get('source_phone') or '', msg_id,
+                        pipeline_tag='JOURNAL-RECOVERY')
+                    if self.message_claim and claim_token:
+                        await self.message_claim.mark_processed(orig_chat_id, msg_id, claim_token)
+                    await self._journal_set_state_safe(orig_chat_id, msg_id, 'processed')
+                    recovered += 1
+                except Exception as e:
+                    logging.error(f"[JOURNAL-RECOVERY] row error: {e}")
+            logging.info(f"[JOURNAL-RECOVERY] done — {recovered} row(s) reprocessed")
+        except Exception as e:
+            logging.error(f"[JOURNAL-RECOVERY] fatal: {e}", exc_info=True)
+
     async def _on_user_message(self, event, source_phone: str):
         """معالج رسائل فوري — يسحب الروابط قبل ما تحذفها بوتات أخرى.
         
@@ -3326,13 +3612,18 @@ class Monitor:
         """
         try:
             raw_text = event.raw_text
-            if not raw_text: return
-
             chat_id = event.chat_id
             if chat_id == self.config.channel_id: return
 
             sender_id = event.sender_id or 0
             msg_id = event.id
+
+            if not raw_text:
+                # رسالة بلا نص (ملصق/صوت...) — سجّلها في journal كدليل جنائي
+                # على وصول الحدث نفسه، ثم اخرج (لا روابط ممكنة فيها)
+                self._no_text_count = getattr(self, '_no_text_count', 0) + 1
+                await self._journal_write(chat_id, msg_id, None, source_phone, state='no_text')
+                return
 
             # === الخطوة 0: PRE-CACHE (أول شي قبل أي شي ثاني) ===
             # نخزن الرسالة كاملة في الذاكرة فوراً — لو حُذفت لاحقاً، نقدر نعالجها
@@ -3384,7 +3675,15 @@ class Monitor:
                     }
             except Exception as cache_err:
                 logging.debug(f"[CACHE] store error: {cache_err}")
-                # حتى لو فشل cache، نكمل المعالجة
+                # حتى لو فشل cache، نكمل المعالجة — journal fallback بدون metadata
+                await self._journal_write(chat_id, msg_id, raw_text, source_phone, state='pending')
+            else:
+                # === DURABLE JOURNAL (write-ahead log) — يبقى بعد انتهاء TTL
+                # الذاكرة وبعد إعادة تشغيل النظام ===
+                await self._journal_write(chat_id, msg_id, raw_text, source_phone,
+                                          chat_title=chat_title, chat_username=chat_username,
+                                          chat_link_type=chat_link_type, sender_id=sender_id,
+                                          sender_name=sender_name, state='pending')
 
             # === الخطوة 1: استخرج الروابط فوراً (regex سريع، بدون API) ===
             links = LinkNormalizer.extract_links(raw_text)
@@ -3395,7 +3694,8 @@ class Monitor:
                     if claim_token:
                         # سجل كـ processed (لا روابط → لا enqueue)
                         await self.message_claim.mark_processed(chat_id, msg_id, claim_token)
-                return  # ما فيها روابط — لا نعالج (cache ينظف تلقائياً)
+                await self._journal_set_state_safe(chat_id, msg_id, 'no_links')
+                return  # ما فيها روابط — لا نعالج (journal/cache ينظفان تلقائياً)
 
             # === ATOMIC CLAIM (يمنع التكرار من Polling + Scanner + حسابات أخرى) ===
             claim_token = None
@@ -3404,6 +3704,7 @@ class Monitor:
                 if claim_token is None:
                     # سبق معالجتها بواسطة Polling أو Scanner أو حساب آخر
                     logging.debug(f"[PIPELINE-1] ⏭️ msg ({chat_id}, {msg_id}) already claimed — skip")
+                    await self._journal_set_state_safe(chat_id, msg_id, 'dup_claim')
                     return
 
             # === الخطوة 2: معالجة فورية (sync, سريعة جداً) ===
@@ -3519,11 +3820,13 @@ class Monitor:
                 # === Mark message as PROCESSED (claim_token verified) ===
                 if claim_token:
                     await self.message_claim.mark_processed(chat_id, msg_id, claim_token)
+                await self._journal_set_state_safe(chat_id, msg_id, 'processed')
 
             except Exception as inner_e:
-                # === Mark as FAILED (allows retry by Polling/Scanner) ===
+                # === Mark as FAILED (allows retry by Polling/Scanner/Journal-Recovery) ===
                 if claim_token:
                     await self.message_claim.mark_failed(chat_id, msg_id, claim_token, str(inner_e))
+                await self._journal_set_state_safe(chat_id, msg_id, 'pending', error=str(inner_e))
                 raise  # re-raise to outer handler
 
             # علّم الرسالة كـ "معالجة" في cache
@@ -3539,23 +3842,37 @@ class Monitor:
 
     async def _on_message_deleted(self, event, source_phone: str):
         """يلتقط الرسائل المحذوفة — يعالجها لو ما عولجت قبل.
-        
-        سيناريو: بوت حماية (جبل/صقير) يحذف الرسالة قبل ما _on_user_message يخلص.
-        الـ MessageDeleted event يجي بعد الحذف بثواني.
-        نحن مخزنين الرسالة في _msg_cache فنقدر نسحبها ونعالجها.
+
+        مصادر الإنقاذ (بالأولوية):
+        1. _msg_cache (ذاكرة — أسرع مسار، TTL 120 ثانية)
+        2. message_journal (SQLite — يصمد بعد إعادة التشغيل وبعد انتهاء TTL)
+
+        لو لم تُوجد الرسالة في أي مصدر → DELETE-MISS:
+        دليل جنائي أن NewMessage لم يصل أبدًا (فجوة تسليم أحداث).
+        نسجّل تحذيرًا مقيّدًا + صف delete_miss في journal + نطلق reconcile
+        للشات (يلتقط أي رسائل أخرى فاتتنا).
         """
         try:
-            # MessageDeleted event فيه: deleted_ids (list) + chat_id (اختياري)
             deleted_ids = getattr(event, 'deleted_ids', []) or []
             if not deleted_ids:
                 return
 
-            # نحاول نسحب chat_id من event (مو دايماً متوفر في MessageDeleted)
             chat_id = getattr(event, 'chat_id', None)
-            
+
+            # حماية من المسح الجماعي (admin clear) — لا نغرق السجلات
+            if len(deleted_ids) > 50:
+                logging.warning(
+                    f"[DELETE-HANDLER] mass delete: {len(deleted_ids)} ids in chat={chat_id} "
+                    f"— processing first 50 for forensics"
+                )
+                deleted_ids = deleted_ids[:50]
+
+            reconcile_chats: Set[int] = set()
+
             for deleted_msg_id in deleted_ids:
-                # ابحث عن الرسالة في cache
+                # === المصدر 1: _msg_cache (ذاكرة) ===
                 cached_msg = None
+                rescue_source = None
                 async with self._msg_cache_lock:
                     if chat_id:
                         cached_msg = self._msg_cache.pop((chat_id, deleted_msg_id), None)
@@ -3565,17 +3882,43 @@ class Monitor:
                             if key[1] == deleted_msg_id:
                                 cached_msg = self._msg_cache.pop(key, None)
                                 break
-                
+
+                # === المصدر 2: message_journal (durable — يصمد بعد restart/TTL) ===
+                if not cached_msg and self._journal_enabled():
+                    try:
+                        row = None
+                        if chat_id:
+                            row = await self.prod_db.journal_get(chat_id, deleted_msg_id)
+                        else:
+                            rows = await self.prod_db.journal_lookup_any(deleted_msg_id)
+                            row = rows[0] if rows else None
+                        if row and row.get('raw_text'):
+                            cached_msg = dict(row)
+                            rescue_source = 'journal'
+                    except Exception as e:
+                        logging.debug(f"[JOURNAL] lookup error: {e}")
+
+                # === DELETE-MISS: NewMessage لم يصل أبدًا ===
                 if not cached_msg:
-                    continue  # ما عندنا الرسالة في cache — تجاهل
-                
-                if cached_msg.get('processed'):
-                    # الرسالة عُولجت بالفعل في _on_user_message — ما نحتاج شي
-                    logging.debug(f"[DELETE-HANDLER] msg_id={deleted_msg_id} already processed — skip")
+                    await self._record_delete_miss(chat_id, deleted_msg_id, source_phone)
+                    if chat_id:
+                        reconcile_chats.add(chat_id)
                     continue
-                
-                # الرسالة محذوفة قبل المعالجة! سحبها من cache وعالجها فوراً
-                raw_text = cached_msg.get('raw_text', '')
+
+                # عولجت مسبقًا؟ (لا حاجة لإنقاذ — فقط علّم الحذف للتحقيق)
+                already_done = bool(cached_msg.get('processed')) or cached_msg.get('state') in (
+                    'processed', 'no_links', 'no_text', 'dup_claim', 'rescued'
+                )
+                if already_done:
+                    await self._journal_mark_deleted_safe(
+                        chat_id if chat_id else cached_msg.get('chat_id'), deleted_msg_id)
+                    logging.debug(
+                        f"[DELETE-HANDLER] msg_id={deleted_msg_id} already processed — skip"
+                    )
+                    continue
+
+                # الرسالة محذوفة قبل المعالجة! عالجها الآن (من cache أو journal)
+                raw_text = cached_msg.get('raw_text') or ''
                 group_name = cached_msg.get('chat_title') or f"chat_{cached_msg.get('chat_id')}"
                 sender_name = cached_msg.get('sender_name', 'Unknown')
                 chat_username = cached_msg.get('chat_username', '')
@@ -3586,13 +3929,11 @@ class Monitor:
                 # استخرج الروابط
                 links = LinkNormalizer.extract_links(raw_text)
                 if not links:
+                    await self._journal_set_state_safe(
+                        orig_chat_id, deleted_msg_id, 'no_links', mark_deleted=True)
                     continue
 
                 # === ATOMIC CLAIM (يمنع duplicate rescue عبر monitors متعددة) ===
-                # قبل أي معالجة، نطالب بـ claim على (chat_id, msg_id). لو فشل،
-                # يعني أن worker آخر (NewMessage/Polling/Scanner أو delete-handler آخر)
-                # سبقنا → نتخطى لتجنب المعالجة المكررة.
-                # هذا يحل مشكلة duplicate rescue التي ظهرت في production.
                 claim_token = None
                 if self.message_claim:
                     claim_token = await self.message_claim.claim(
@@ -3603,73 +3944,23 @@ class Monitor:
                             f"[DELETE-HANDLER] ⏭️ Duplicate message claim: "
                             f"chat_id={orig_chat_id} msg_id={deleted_msg_id} — skip"
                         )
+                        await self._journal_set_state_safe(
+                            orig_chat_id, deleted_msg_id, 'dup_claim', mark_deleted=True)
                         continue
 
                 logging.warning(
                     f"[DELETE-HANDLER] 🚨⏰ RESCUED deleted msg_id={deleted_msg_id} "
-                    f"from '{group_name[:30]}' (had {len(links)} links) — processing NOW"
+                    f"from '{group_name[:30]}' (had {len(links)} links, "
+                    f"source={rescue_source or 'cache'}) — processing NOW"
                 )
 
-                # سجل المجموعة (لو ما سُجلت بعد)
                 try:
-                    is_new = await self.prod_db.add_monitored_chat(
-                        chat_id=orig_chat_id,
-                        chat_title=group_name,
-                        username=chat_username,
-                        link_type=chat_link_type,
-                        monitored_by=orig_source_phone,
-                    )
-                    if is_new:
-                        logging.info(
-                            f"[MONITORED] ✅ New chat (via delete-handler): '{group_name[:40]}' "
-                            f"(id={orig_chat_id}, by={orig_source_phone})"
-                        )
-                except Exception as e:
-                    logging.debug(f"[MONITORED] add error (delete): {e}")
-
-                # enqueue كل رابط
-                try:
-                    for link_info in links:
-                        link_data = {
-                            **link_info,
-                            'group_name': group_name,
-                            'sender_name': sender_name,
-                            'sender_contact': extract_sender_contact(raw_text),
-                            'source_phone': orig_source_phone,
-                            'message_text': raw_text,
-                            'message_link': f"https://t.me/c/{str(orig_chat_id).replace('-100', '')}/{deleted_msg_id}" if orig_chat_id else None,
-                        }
-
-                        # Blacklist
-                        link_raw = link_info['raw'].lower()
-                        username_raw = (link_info.get('username') or '').lower()
-                        full_text_check = f"{raw_text} {link_raw} {username_raw}".lower()
-                        is_bad, bad_reason = GulfFilter.is_blacklisted(
-                            full_text_check, username_raw, link_info['raw'], group_name
-                        )
-                        if is_bad:
-                            logging.info(
-                                f"[DELETE-HANDLER] 🚫 BLACKLISTED: {link_info['raw'][:50]} ({bad_reason})"
-                            )
-                            await self.metrics.record_skip(f'blacklist_{bad_reason}')
-                            continue
-
-                        is_new = await self.prod_db.enqueue_link(link_data)
-                        if is_new:
-                            await self.prod_db.set_group_state(
-                                link_info['normalized'], GroupState.DISCOVERED,
-                                link_info['raw'], group_name)
-                            logging.info(
-                                f"[DELETE-HANDLER] ✅ RESCUED & enqueued: {link_info['raw'][:60]} "
-                                f"(would have been LOST without cache)"
-                            )
-                        else:
-                            await self.metrics.record_duplicate()
-                            logging.info(f"[DELETE-HANDLER] ⏭️ Duplicate: {link_info['normalized'][:60]}")
+                    rescued = await self._rescue_enqueue_links(
+                        links, raw_text, group_name, sender_name, chat_username,
+                        chat_link_type, orig_chat_id, orig_source_phone, deleted_msg_id,
+                        pipeline_tag='DELETE-HANDLER')
 
                     # === Mark as PROCESSED (claim_token verified) ===
-                    # يتحقق من claim_token لمنع stale worker من إكمال processing
-                    # بعد أن انتهى lease وحصل worker آخر على claim جديد.
                     if self.message_claim and claim_token:
                         ok = await self.message_claim.mark_processed(
                             orig_chat_id, deleted_msg_id, claim_token
@@ -3679,17 +3970,28 @@ class Monitor:
                                 f"[DELETE-HANDLER] mark_processed rejected (stale token) "
                                 f"for msg ({orig_chat_id}, {deleted_msg_id})"
                             )
-
+                    await self._journal_set_state_safe(
+                        orig_chat_id, deleted_msg_id,
+                        'rescued' if rescued else 'processed', mark_deleted=True)
                 except Exception as inner_e:
                     # === Mark as FAILED (allows retry by Polling/Scanner/another delete) ===
                     if self.message_claim and claim_token:
                         await self.message_claim.mark_failed(
-                            orig_chat_id, deleted_msg_id, claim_token, str(inner_e)
-                        )
+                            orig_chat_id, deleted_msg_id, claim_token, str(inner_e))
+                    await self._journal_set_state_safe(
+                        orig_chat_id, deleted_msg_id, 'pending',
+                        error=str(inner_e), mark_deleted=True)
                     logging.error(
-                        f"[DELETE-HANDLER] processing error for msg ({orig_chat_id}, {deleted_msg_id}): {inner_e}"
+                        f"[DELETE-HANDLER] processing error for msg "
+                        f"({orig_chat_id}, {deleted_msg_id}): {inner_e}"
                     )
-                
+
+            # === RECONCILE: التقط أي رسائل أخرى فاتتنا في الشات ===
+            if reconcile_chats and getattr(
+                    getattr(self, 'config', None), 'delete_miss_reconcile', True):
+                for rc_chat_id in reconcile_chats:
+                    self._spawn_reconcile(rc_chat_id, source_phone)
+
         except Exception as e:
             logging.error(f"Delete handler error: {e}", exc_info=True)
 
@@ -3708,6 +4010,13 @@ class Monitor:
                         self._msg_cache.pop(key, None)
                 if expired_keys:
                     logging.debug(f"[CACHE] cleaned {len(expired_keys)} expired messages (size={len(self._msg_cache)})")
+                # ملخص INFO دوري للرسائل بلا نص (رؤية جنائية بدون spam)
+                if getattr(self, '_no_text_count', 0) > 0:
+                    logging.info(
+                        f"[PIPELINE-1] (summary) {self._no_text_count} message(s) "
+                        f"had no text in last 30s"
+                    )
+                    self._no_text_count = 0
             except asyncio.CancelledError:
                 break
             except Exception as e:
@@ -3726,6 +4035,15 @@ class Monitor:
                 await self.prod_db.cleanup_processed_messages()
                 count = await self.prod_db.count_processed_messages()
                 logging.info(f"[CLEANUP] processed_messages count after cleanup: {count}")
+                # === Journal cleanup (كل ساعة) ===
+                try:
+                    jr = await self.prod_db.journal_cleanup(
+                        retention_s=self.config.journal_retention_s,
+                        short_retention_s=self.config.journal_no_text_retention_s)
+                    if jr.get('removed_old', 0) or jr.get('removed_light', 0):
+                        logging.info(f"[CLEANUP] journal cleanup: {jr}")
+                except Exception as je:
+                    logging.debug(f"[CLEANUP] journal error: {je}")
             except asyncio.CancelledError:
                 break
             except Exception as e:
@@ -3885,6 +4203,8 @@ class Monitor:
             if not messages:
                 return  # ما فيه جديد
             
+            # نجاح — صفّر عدّاد الإخفاقات المتتالية
+            self._chat_poll_failures[chat_id] = 0
             # حدّث آخر msg_id شفناه
             new_max_id = max(m.id for m in messages)
             async with self._polling_lock:
@@ -3935,6 +4255,11 @@ class Monitor:
                             'processed': True,
                             'via_polling': True,
                         }
+                    await self._journal_write(
+                        chat_id, msg.id, msg.raw_text, phone,
+                        chat_title=chat_title, chat_username=chat.get('username', ''),
+                        sender_name=self._get_sender_name(msg.sender) if msg.sender else 'Unknown',
+                        state='no_links')
                     continue
                 
                 # الرسالة فيها روابط — عالجها كأنها NewMessage
@@ -3959,6 +4284,11 @@ class Monitor:
                         'processed': False,
                         'via_polling': True,
                     }
+                await self._journal_write(
+                    chat_id, msg.id, msg.raw_text, phone,
+                    chat_title=chat_title, chat_username=chat.get('username', ''),
+                    sender_name=self._get_sender_name(msg.sender) if msg.sender else 'Unknown',
+                    state='pending')
                 
                 try:
                     # سجل المجموعة
@@ -4017,11 +4347,13 @@ class Monitor:
                     # === Mark as PROCESSED ===
                     if self.message_claim:
                         await self.message_claim.mark_processed(chat_id, msg.id, claim_token)
+                    await self._journal_set_state_safe(chat_id, msg.id, 'processed')
 
                 except Exception as inner_e:
                     # === Mark as FAILED (allows retry) ===
                     if self.message_claim:
                         await self.message_claim.mark_failed(chat_id, msg.id, claim_token, str(inner_e))
+                    await self._journal_set_state_safe(chat_id, msg.id, 'pending', error=str(inner_e))
                     logging.error(f"[POLLING] processing error for msg ({chat_id}, {msg.id}): {inner_e}")
 
                 # علّم الرسالة كـ معالَجة في cache
@@ -4036,7 +4368,33 @@ class Monitor:
             # تجاهل أخطاء "chat not found" / "private" — ما تكررها
             err_str = str(e).lower()
             if any(s in err_str for s in ['chat not found', 'channel private', 'forbidden', 'banned']):
-                # شيل المجموعة من قائمة الـ polling (مو مفيدة)
+                # الحساب فقد وصوله لهذا الشات — أزله من reader_phones (لهذا الشات فقط)
+                # حتى لا يُختار مجددًا ويهدر محاولات polling
+                if any(s in err_str for s in ['channel private', 'forbidden', 'banned']) and self.source_registry:
+                    try:
+                        removed = await self.source_registry.remove_reader(chat_id, phone)
+                        if removed:
+                            logging.info(
+                                f"[POLLING] Removed reader {phone} from chat {chat_id} "
+                                f"(account lost access)"
+                            )
+                    except Exception as re_err:
+                        logging.debug(f"[POLLING] remove_reader error: {re_err}")
+                # عدّ الإخفاقات المتتالية — بعد 5، أجّل الشات ساعتين (يوفر دورة polling)
+                self._chat_poll_failures[chat_id] = self._chat_poll_failures.get(chat_id, 0) + 1
+                if self._chat_poll_failures[chat_id] >= 5:
+                    try:
+                        await self.prod_db.update_monitored_chat(
+                            chat_id,
+                            next_poll_at=(datetime.now() + timedelta(hours=2)).isoformat())
+                        logging.info(
+                            f"[POLLING] Deferred chat '{chat_title[:30]}' by 2h "
+                            f"after 5 consecutive failures"
+                        )
+                    except Exception:
+                        pass
+                    self._chat_poll_failures[chat_id] = 0
+                # شيل المجموعة من قائمة الـ polling القديمة (legacy)
                 if chat in self._active_polling_chats:
                     self._active_polling_chats.remove(chat)
                     logging.info(f"[POLLING] Removed chat '{chat_title[:30]}' from polling list (error: {err_str[:50]})")
@@ -7748,6 +8106,12 @@ class Monitor:
         else:
             logging.info("🧹 Message Cache Cleanup already running — skip duplicate")
 
+        # === JOURNAL RECOVERY — استرجاع رسائل انهار النظام قبل معالجتها ===
+        if self.config.journal_recovery_enabled:
+            if not hasattr(self, '_journal_recovery_task') or self._journal_recovery_task is None or self._journal_recovery_task.done():
+                self._journal_recovery_task = asyncio.create_task(self._journal_recovery())
+                logging.info("📓 Journal Recovery started (crash-safe message rescue)")
+
         # === LEGACY POLLING WORKER — DISABLED ===
         # The legacy _active_polling_worker is superseded by PollingScheduler
         # (which covers ALL sources, not just Top-200, and uses fair scheduling).
@@ -7800,9 +8164,11 @@ class Monitor:
         registry_task = getattr(self, '_registry_task', None)
         polling_scheduler_task = getattr(self, '_polling_scheduler_task', None)
         claim_cleanup_task = getattr(self, '_claim_cleanup_task', None)
+        journal_recovery_task = getattr(self, '_journal_recovery_task', None)
         tasks = [self._bot_task, self._keep_alive_task, self._joiner_task,
                  scorer_task, cache_cleanup_task, polling_task,
-                 registry_task, polling_scheduler_task, claim_cleanup_task
+                 registry_task, polling_scheduler_task, claim_cleanup_task,
+                 journal_recovery_task
                  ] + list(self._user_tasks.values()) + self._current_scan_tasks
         for t in tasks:
             if t and not t.done():
