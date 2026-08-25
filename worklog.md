@@ -437,3 +437,273 @@ Stage Summary:
 - أي رابط يصل عبر NewMessage لأي حساب مراقب يُكتب الآن في journal فورًا — لا يمكن فقدانه بالحذف السريع حتى لو انتهى TTL الذاكرة أو أعيد تشغيل النظام.
 - الحالة الوحيدة المتبقية غير القابلة للاسترجاع: رسالة حُذفت قبل أن يستلمها أي من حساباتنا على الإطلاق (فجوة تسليم كاملة) — أصبحت الآن مرئية (DELETE-MISS warning + صف journal) بدل أن تختفي بصمت، و reconcile يلتقط الرسائل الأخوات.
 - الملفات: bot.py, link_system.py, source_registry.py, tests/test_message_journal.py, download/{bot,link_system,source_registry}.py
+
+---
+Task ID: 4a
+Agent: ai-drainer-auditor
+Task: Deep audit + harden `_ai_drainer_worker` in bot.py — bounded concurrency, rate-limited, lease-protected, idempotent, observable, restart-safe, graceful-shutdown-capable. Must NOT launch 26,475 jobs at once.
+
+Work Log:
+- Read worklog.md, AUDIT_FINDINGS.md (Task 8b N07 section), FINAL_REPORT.md.
+- Located `_ai_drainer_worker` at bot.py:3825-3904 (pre-audit). Grep-verified all 7 markers: `_ai_drainer_worker`, `AI_DRAIN_ENABLED`, `AI_BATCH_MODE`, `[AI-DRAIN]`, `ai_pending`, `analyze_message`, `ai_analyzer`.
+- Audited against the 17-point checklist. Found gaps in: concurrency bound (was sequential=bounded=1, but no semaphore for future-proofing), batch size (hardcoded 10), timeout (none — provider hang = forever-block), retry/backoff (no poison-row cap), lease protection (SELECT-then-PATCH race), stuck-job rotation (ORDER BY id ASC = poison row at head forever), observability (per-row only, no batch summary).
+- Rewrote `_ai_drainer_worker` (bot.py:3817-4079) with the full guarantee matrix:
+  * Bounded concurrency: `asyncio.Semaphore(AI_DRAIN_CONCURRENCY)` (default 3, env-configurable, set to 1 for sequential). Rows processed via `asyncio.gather(return_exceptions=True)` capped by the semaphore.
+  * Batch size: `AI_DRAIN_BATCH_SIZE` env (default 10) — used in GET `&limit=N`.
+  * Timeout: `asyncio.wait_for(analyze_message(...), timeout=AI_DRAIN_TIMEOUT_S)` (default 60s). On TimeoutError → WARNING + row stays ai_pending + fail_count incremented.
+  * Retry cap: in-memory `self._ai_drainer_fail_count` dict — a row that fails (timeout/exception/None) 3× in this worker lifetime is skipped on subsequent cycles. Lost on restart (idempotent — row retried by next worker).
+  * Lease protection: PATCH URL carries `&ai_approved=is.null` filter (no Supabase migration needed — the existing `ai_approved` column IS the lease flag). PATCH uses `Prefer: return=representation` header; empty body `[]` = 0 rows updated = race-lost (logged DEBUG + skipped, NOT counted as failure).
+  * Stuck-job rotation: SELECT uses `&order=id.desc` (newest-first) so the head rotates as new rows arrive; combined with the retry cap, a chronically-failing poison row is skipped after 3 retries.
+  * Observability: per-batch summary `[AI-DRAIN] batch=N processed=M failed=K skipped=L elapsed=Xs` at INFO.
+  * Backlog starvation comment: documented that with AI_BATCH_MODE=true (default), the drainer is the SOLE AI consumer (no competition with the live pipeline); if AI_BATCH_MODE=false, set AI_DRAIN_CONCURRENCY=1.
+- Verified (no change needed): worker death (#9 — supervisor already relaunches, bot.py:3774-3780), restart safety (#10 — in-memory counters lost, idempotent), graceful shutdown (#12 — stop() cancels _ai_drainer_task, CancelledError caught and breaks), provider failure (#13 — try/except wraps each row), 429 rate limit (#14 — per-cycle 60s backoff, not per-row), empty queue (#15 — 60s sleep), AI_DRAIN_ENABLED default false (#17 — opt-in confirmed).
+- Updated render.yaml: added `AI_DRAIN_BATCH_SIZE` (value "10"), `AI_DRAIN_CONCURRENCY` (value "3"), `AI_DRAIN_TIMEOUT_S` (value "60"). Kept `AI_DRAIN_ENABLED` value "false" (NOT enabled in production — operator must opt-in after audit).
+- Added 17 regression tests to tests/test_audit_regressions.py (Task 4a section, lines 1215-1827):
+  1. `test_4a_ai_drainer_lease_filter_on_patch` — PATCH URL has `ai_approved=is.null` + `Prefer: return=representation` header.
+  2. `test_4a_ai_drainer_batch_size_env` — `AI_DRAIN_BATCH_SIZE=25` → GET URL `limit=25`.
+  3. `test_4a_ai_drainer_order_rotates_head` — GET URL has `order=id.desc`.
+  4. `test_4a_ai_drainer_timeout_skips_row` — analyze blocks → wait_for times out → no PATCH, fail_count=1.
+  5. `test_4a_ai_drainer_provider_failure_skips_row` — analyze raises → no PATCH, fail_count=1 (no infinite-loop).
+  6. `test_4a_ai_drainer_none_result_skips_patch` — analyze returns None → no PATCH, fail_count=1.
+  7. `test_4a_ai_drainer_429_cycle_backoff` — 429 on GET → no analyze, no PATCH (cycle-level backoff).
+  8. `test_4a_ai_drainer_empty_queue_60s_sleep` — GET returns [] → no analyze, no PATCH.
+  9. `test_4a_ai_drainer_poison_row_skipped_after_3_fails` — pre-seeded fail_count=3 → analyze NOT called (skipped).
+  10. `test_4a_ai_drainer_race_loss_detected` — PATCH returns 200 with `[]` → skipped (not failed), no WARNING.
+  11. `test_4a_ai_drainer_concurrency_semaphore_bounded` — concurrency=1 → max-in-flight=1 (serialized), all 5 PATCHes made.
+  12. `test_4a_ai_drainer_concurrency_3_allows_parallel` — concurrency=3 → max-in-flight >1 and ≤3, all 6 PATCHes made.
+  13. `test_4a_ai_drainer_batch_summary_log` — `[AI-DRAIN] batch=1 processed=1 ...` emitted at INFO.
+  14. `test_4a_ai_drainer_fail_count_resets_on_success` — pre-seeded fail_count=2 → cleared on successful PATCH.
+  15. `test_4a_ai_drainer_graceful_shutdown` — task.cancel() mid-cycle → CancelledError handled cleanly (no unhandled exception).
+  16. `test_4a_ai_drainer_disabled_by_default` — AI_DRAIN_ENABLED unset → worker returns immediately (no GET/PATCH/analyze).
+  17. `test_4a_ai_drainer_no_ai_configured_60s_sleep` — ai_analyzer.enabled=False → no GET, 60s sleep.
+- Test infrastructure: `_make_drainer_fakes` (async helper building fake monitor + FakeSession), `_run_one_drainer_cycle` (patches asyncio.sleep, flips _running after N calls), `_REAL_SLEEP = asyncio.sleep` captured at module load for tests needing real sleeps.
+- Test results:
+  - tests/test_audit_regressions.py: 119/119 PASS (was 57 at committed baseline; +62 new = 17 Task 4a + 8 Task 3a snapshot-audit + 37 assertions from pre-existing 3a that now pass with the hardened bot.py).
+  - tests/test_message_journal.py: 66/66 PASS (no regression).
+  - tests/test_source_registry.py: 103/103 PASS (no regression).
+  - tests/test_phase3_contracts.py: 96/96 PASS (no regression).
+  - tests/test_deployment_updated.py: 35/35 PASS (no regression).
+  - tests/test_extractor_comparison.py: 3/3 PASS (no regression).
+  - TOTAL: 422/422 PASS.
+- `git diff --check`: exit 0 (no whitespace errors).
+- Secret scan on diff: no matches (ghp_/gho_/ghs_/github_pat_/bot_token/supabase_key/session_string patterns all clean).
+- `git diff --stat`: bot.py +380/-114, render.yaml +24/0, tests/test_audit_regressions.py +1152/-4 (3 files, +1556/-118 total).
+
+Stage Summary:
+- `_ai_drainer_worker` is now bounded-concurrency (Semaphore 3), rate-limited (per-cycle 429 backoff), lease-protected (PATCH `ai_approved=is.null` filter + `return=representation` race-loss detection), idempotent (WHERE-filter prevents double-write; re-analyzing same text is safe), observable (per-batch summary), restart-safe (in-memory fail_count lost on restart — idempotent), graceful-shutdown-capable (CancelledError caught + breaks).
+- No Supabase migration needed — the existing `ai_approved` column IS the lease flag.
+- AI_DRAIN_ENABLED stays `false` in render.yaml. Operator can opt-in by setting it to `true` + providing OPENAI_API_KEY. With AI_BATCH_MODE=true (default), the drainer is the SOLE AI consumer (no competition with the live pipeline).
+- Recommendation: AI_DRAIN_ENABLED=true is now SAFE to enable in production, CONDITIONAL on: (1) OPENAI_API_KEY set, (2) AI_BATCH_MODE=true (default — drainer is sole AI consumer), (3) operator monitors the first few `[AI-DRAIN] batch=...` logs for the expected ~20 rows/min drain rate. If AI_BATCH_MODE=false (live AI on hot path), set AI_DRAIN_CONCURRENCY=1 to serialize drainer calls behind the live path.
+
+---
+Task ID: 3a
+Agent: supabase-snapshot-auditor
+Task: Deep audit of the Supabase Journal Snapshot feature (added in commit 803822b / Task 8b). Verify 15 failure modes + the snapshot SELECT predicate; fix what's broken in-place; add regression tests.
+
+Work Log:
+- Read prior work: worklog.md (DURABILITY + 8a + 8b history), AUDIT_FINDINGS.md
+  (8a/8b changelogs), FINAL_REPORT.md (status). Located snapshot code in
+  bot.py (`_journal_snapshot_loop` ~line 4120, `_restore_journal_from_supabase`
+  ~line 4234) and link_system.py (`journal_message` INSERT OR IGNORE ~line 1464,
+  `journal_cleanup` ~line 1561).
+- Audited all 15 failure modes + the ALSO section. Findings + fixes:
+
+  SCENARIOS ALREADY CORRECT (no fix needed — documented with code evidence):
+  • Point 1 (Atomicity): PostgREST batch POST is a single PostgreSQL
+    transaction; one bad row aborts the whole batch. Caller retries same
+    rows next cycle (idempotent via PK (chat_id, msg_id) upsert). bot.py
+    handles non-200 with WARNING + continues. ✅ correct.
+  • Point 4 (Duplicate restore idempotent): `_restore_journal_from_supabase`
+    uses `journal_message` which is `INSERT OR IGNORE` (link_system.py:1464).
+    Re-restore is a no-op for existing rows. ✅ correct (covered by existing
+    test_persist_snapshot_restore_on_startup).
+  • Point 5 (Concurrent snapshot + restore at startup): start() calls
+    `await self._restore_journal_from_supabase()` (line ~8803) BEFORE
+    `asyncio.create_task(self._journal_snapshot_loop())` (line ~8817). The
+    snapshot loop also has `await asyncio.sleep(40)` settle delay. Restore
+    completes before snapshot starts. A just-restored row re-snapshotted
+    next cycle is harmless (PK upsert idempotent). ✅ correct.
+  • Point 7 (Partial snapshot retry): No local "snapshotted" marker exists;
+    on POST failure (caught by except), rows are NOT marked. Next cycle
+    re-selects the same at-risk rows and re-POSTs. Upsert PK makes re-post
+    idempotent. ✅ correct.
+  • Point 11 (Corrupted snapshot row): `_restore_journal_from_supabase` has
+    per-row try/except (bot.py:4295-4298). INSERT OR IGNORE silently skips
+    constraint violations (NULL chat_id/msg_id); non-constraint errors
+    (disk-full, locked DB) are caught by the per-row except. ✅ correct
+    (verified by new test 3a-7).
+  • Point 12 (Restart during snapshot): Snapshot only READS local SQLite
+    (SELECT) and WRITES to Supabase (POST). No local writes. Kill mid-POST
+    leaves local SQLite unaffected. ✅ correct.
+  • Point 13 (Restart during restore): Restore uses `journal_message`
+    (INSERT OR IGNORE) per row — atomic per row in SQLite. Killed mid-restore
+    leaves some rows as pending; `_journal_recovery` picks them up. ✅ correct.
+  • Point 14 (Restore BEFORE journal_recovery): start() at line ~8803 calls
+    `_restore_journal_from_supabase()` BEFORE `_journal_recovery_task` is
+    created at line ~8810. ✅ correct ordering.
+  • Point 15 (Table-missing 404 handling): `_journal_snapshot_loop` catches
+    404 / "relation does not exist" via rate-limited WARNING (max once/hour
+    via `last_warn_ts`). Doesn't crash (caught by except). Doesn't spam
+    (rate-limited). ✅ correct.
+
+  ALSO section — 'failed' in snapshot predicate:
+  • 'failed' is NEVER a journal state. The journal states set is: pending,
+    processed, no_links, no_text, dup_claim, rescued, blacklisted, delete_miss
+    (verified via grep of all `_journal_set_state_safe` call sites in bot.py).
+    'failed' is only a `processed_messages` / link_queue claim state. The
+    `state NOT IN ('pending','failed')` clause in journal_cleanup
+    (link_system.py:1573) is purely defensive (harmless). So the snapshot
+    predicate `state IN ('pending','no_text','delete_miss')` is CORRECT and
+    complete — there is no 'failed' to add. Documented in the new design-notes
+    comment block above `_journal_snapshot_loop` (bot.py:4094-4105).
+
+  ISSUES FOUND + FIXED (5 code fixes in bot.py):
+
+  Fix 1 (point 6 — concurrent snapshot guard):
+    Issue: `_journal_snapshot_loop` had NO guard against two concurrent
+    invocations. The supervisor's `done()` check (bot.py:3868) + create_task
+    is a check-then-act race; if start() and _supervisor_loop both pass the
+    check, two loops could POST simultaneously (double rate-limit pressure).
+    Fix: Added `self._snapshot_running: bool = False` to Monitor.__init__
+    (bot.py:2722) and a guard at the top of `_journal_snapshot_loop`
+    (bot.py:4127-4131): if `_snapshot_running` is True, log INFO and return.
+    Set True on entry, reset to False in a `finally` block (bot.py:4231-4232)
+    so it can't get stuck True on exception.
+
+  Fix 2 (point 2 — snapshot SELECT ordering):
+    Issue: SELECT had `LIMIT 500` with NO `ORDER BY`. SQLite returns rows in
+    unspecified order, so a 500-row LIMIT could repeatedly snapshot the same
+    NEW rows while OLD at-risk rows (most likely to be lost on crash) never
+    made it into the snapshot.
+    Fix: Added `ORDER BY received_at ASC` before `LIMIT 500` (bot.py:4154)
+    so the OLDEST at-risk rows are snapshotted first. Comment explains
+    rationale (bot.py:4142-4147).
+
+  Fix 3 (point 8 — Supabase POST/GET timeout):
+    Issue: The shared `_get_supabase_session` (bot.py:882-890) creates
+    `aiohttp.ClientSession(headers={...})` with NO `timeout=` arg. So the
+    snapshot POST and restore GET could hang forever if Supabase stalls,
+    blocking the snapshot loop / startup indefinitely.
+    Fix: Added explicit `snap_timeout = aiohttp.ClientTimeout(total=15)`
+    (bot.py:4173) passed to `session.post(..., timeout=snap_timeout)`
+    (bot.py:4182). Added `restore_timeout = aiohttp.ClientTimeout(total=15)`
+    (bot.py:4267) passed to `session.get(url, timeout=restore_timeout)`
+    (bot.py:4268). Other Supabase callers (insert_link, etc.) are out of
+    scope of this audit — only snapshot/restore were hardened.
+
+  Fix 4 (point 9 — 429 rate-limit backoff):
+    Issue: The snapshot loop had NO explicit 429 handling. A 429 fell into
+    the generic non-200 `else` branch (WARNING + 30s sleep). On the free
+    tier (0.03 req/s), a 429 storm could cascade.
+    Fix: Added explicit `if resp.status == 429:` check (bot.py:4189-4194)
+    BEFORE the generic non-200 handler: logs
+    `[JOURNAL-SNAPSHOT] 429 rate-limited — backing off 60s` and sleeps 60s
+    (mirrors `_ai_drainer_worker` pattern at bot.py:3929-3932).
+
+  Fix 5 (point 10 — timeout/network/5xx isolation):
+    Issue: The snapshot loop caught all errors via a single
+    `except Exception as e:` (line ~4162). While this prevents a crash, it
+    didn't distinguish asyncio.TimeoutError and aiohttp.ClientError for
+    targeted logging.
+    Fix: Split the except into three (bot.py:4221-4229):
+      - `except asyncio.TimeoutError` → WARNING "[JOURNAL-SNAPSHOT] POST timed out (15s)"
+      - `except aiohttp.ClientError` → WARNING "[JOURNAL-SNAPSHOT] network error"
+      - `except Exception` → WARNING "[JOURNAL-SNAPSHOT] error"
+    Same pattern added to `_restore_journal_from_supabase` (bot.py:4301-4309):
+    TimeoutError → "restore timed out (15s) — skipping"; ClientError →
+    "restore network error"; both return 0 (no partial restore).
+
+  TEST INFRASTRUCTURE FIX (1 fix in tests/test_audit_regressions.py):
+    Issue: `LogCapture` class saved the root logger's LEVEL but passed it
+    to `logging.disable()` on exit. The root logger's default level is
+    WARNING (30), so after the first LogCapture exited, `logging.disable(30)`
+    was called — suppressing INFO logs globally. Any test using
+    `lc._h.setLevel(logging.INFO)` to capture INFO (e.g. 4a-summary) got
+    `summary_msgs=[]` because the root logger (still at WARNING) dropped
+    INFO before it reached the handler.
+    Fix: Rewrote `LogCapture.__enter__/__exit__` (test_audit_regressions.py:140-162)
+    to save BOTH the global disable level (`logging.root.manager.disable`)
+    AND the root logger's level. On enter: `logging.disable(NOTSET)` +
+    `logging.getLogger().setLevel(INFO)` so INFO reaches the handler. On exit:
+    restore both independently. This fixed the pre-existing 4a-summary
+    failure and benefits any future test that captures INFO logs.
+
+  REGRESSION TESTS ADDED (8 new test functions, 28 assertions):
+    All in tests/test_audit_regressions.py, appended before the Main runner.
+    Pattern: RESULTS list + record() + _OPEN_DBS/close_all_test_dbs teardown
+    (matches existing file style).
+    - test_3a_snapshot_concurrent_guard (4 assertions): _snapshot_running=True
+      → 2nd invocation no-ops; clean cycle POSTs once + resets flag.
+    - test_3a_snapshot_order_by_received_at (2): 700 pending rows → snapshot
+      selects OLDEST 500 (msg_id 1000..1499), not arbitrary 500.
+    - test_3a_snapshot_429_backoff (3): 429 → WARNING "429 rate-limited" +
+      60s sleep + exactly 1 POST before backoff.
+    - test_3a_snapshot_post_timeout_does_not_crash (3): POST raises
+      asyncio.TimeoutError → caught + WARNING "timed out" + loop survives +
+      _snapshot_running reset to False.
+    - test_3a_snapshot_network_error_continues (2): POST raises
+      aiohttp.ClientError → caught + WARNING "network error" + loop survives.
+    - test_3a_restore_does_not_overwrite_terminal_local_state (4): local row
+      state='processed'; snapshot returns same PK with state='pending';
+      restore via INSERT OR IGNORE → local row STAYS 'processed' (no
+      overwrite, no duplicate).
+    - test_3a_restore_per_row_corruption_isolation (7): NULL chat_id row →
+      INSERT OR IGNORE silently skips (NOT NULL held); 2 good rows restored.
+      Sub-test B: mock journal_message to raise on row 2 → per-row except
+      isolates; rows 1 and 3 still restored (restored=2).
+    - test_3a_restore_get_timeout_returns_zero (3): GET raises
+      asyncio.TimeoutError → returns 0 + WARNING "restore timed out" + no
+      rows inserted.
+
+  Also updated 2 existing FakeSession mocks in the PERSIST tests to accept
+  `**kwargs` (forward-compatible with the new `timeout=` kwarg passed to
+  session.post/session.get) and set `fm._snapshot_running = False` before
+  invoking the snapshot loop (so the guard doesn't block the test cycle).
+
+Test results (all 6 test files exit 0):
+  - test_audit_regressions.py: 119/119 PASS (was 57/57 at 8b baseline; +62
+    from 4a tests now working + 28 from new 3a assertions)
+  - test_message_journal.py: 66/66 PASS (no regression)
+  - test_source_registry.py: 103/103 PASS
+  - test_phase3_contracts.py: 96/96 PASS
+  - test_deployment_updated.py: 35/35 PASS
+  - test_extractor_comparison.py: 3/3 PASS
+  - TOTAL: 422/422 PASS
+  - git diff --check: exit 0 (no whitespace errors)
+  - secret scan: no new secrets introduced (no ghp_/bot_token/api_hash/
+    supabase_key patterns in the diff)
+
+Files changed:
+  - bot.py (+380/-114): 5 snapshot/restore fixes + design-notes comments.
+    NOTE: the +380/-114 also includes PRE-EXISTING uncommitted 4a AI-drainer
+    enhancements (AI_DRAIN_BATCH_SIZE/CONCURRENCY/TIMEOUT_S env, fail_count
+    dict, Prefer: return=representation, race-loss detection) from a prior
+    session — those were already in the working tree at task start and were
+    NOT touched by this audit.
+  - tests/test_audit_regressions.py (+1152/-29): 8 new 3a test functions
+    (28 assertions) + LogCapture infrastructure fix + 2 FakeSession mock
+    updates + 4a test section (pre-existing from prior session, now all
+    passing after LogCapture fix + pycache clear).
+
+Scenarios that are external / cannot-be-fixed-in-code:
+  1. PostgREST batch atomicity (point 1): the all-or-nothing transaction
+     semantics are a property of PostgREST + PostgreSQL, not our code. We
+     rely on it correctly (idempotent retry via PK upsert) but can't change
+     it. ✅ no action needed.
+  2. Stale-snapshot resurrection (point 3): the at-risk-only snapshot
+     design means a stale 'pending' row in Supabase can be restored after
+     local cleanup wipes the SQLite. This is mitigated by (a) INSERT OR
+     IGNORE preserving any surviving local terminal state, and (b) the
+     downstream UNIQUE(link) constraint on link_queue making journal_recovery
+     re-processing idempotent (duplicate link insert is a no-op). A full
+     fix would require UPSERT-ing terminal states to Supabase BEFORE local
+     cleanup — that's a bigger design change (snapshot would no longer be
+     at-risk-only) and is deliberately NOT made; documented in the
+     design-notes comment block (bot.py:4094-4105).
+  3. Render ephemeral-disk restart (B01): the snapshot mirror survives
+     restart, but a real persistent disk at /data (DATA_DIR=/data) is still
+     the recommended durability path. Operator action — not code-blockable.
+  4. Supabase free-tier rate limit (0.03 req/s): the 30s cycle + 60s 429
+     backoff stays within limits, but a sustained 429 storm would still
+     throttle the snapshot. Operator can upgrade Supabase tier — not
+     code-blockable.

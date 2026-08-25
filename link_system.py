@@ -809,6 +809,25 @@ async def init_production_tables(db):
         except Exception:
             pass  # Column already exists
 
+    # [Task 6a] One-time backfill: seed next_poll_at + last_activity for any
+    # pre-fix row still carrying NULL (the 845 existing monitored chats at
+    # audit time all had NULL next_poll_at → invisible to /api/polling_status).
+    # COALESCE keeps existing non-NULL values untouched; only NULLs become
+    # now(). Cheap (single UPDATE, idempotent, no-op after first run).
+    try:
+        now_iso = datetime.now().isoformat()
+        await conn.execute(
+            "UPDATE monitored_chats SET next_poll_at = COALESCE(next_poll_at, ?) "
+            "WHERE next_poll_at IS NULL",
+            (now_iso,))
+        await conn.execute(
+            "UPDATE monitored_chats SET last_activity = COALESCE(last_activity, ?) "
+            "WHERE last_activity IS NULL",
+            (now_iso,))
+        await conn.commit()
+    except Exception as _bfill_e:
+        logging.warning(f"[DB] next_poll_at backfill skipped: {_bfill_e}")
+
     # === جدول جديد: processed_messages (atomic dedup + retry-safe) ===
     # State machine: 'claimed' → 'processed' (success) | 'failed' (retryable)
     # claim_token + lease_until prevent stale workers from corrupting fresh claims
@@ -1047,15 +1066,25 @@ class ProductionDB:
     async def add_monitored_chat(self, chat_id: int, chat_title: str, username: str = '',
                                   link_type: str = '', monitored_by: str = '',
                                   member_count: int = 0) -> bool:
-        """يضيف مجموعة للمراقبة — يرجع True لو جديدة، False لو مكررة."""
+        """يضيف مجموعة للمراقبة — يرجع True لو جديدة، False لو مكررة.
+
+        [Task 6a] Seeds next_poll_at = now() + last_activity = now() so the chat
+        is IMMEDIATELY due for polling and visible to /api/polling_status's
+        `next_poll_at <= now` predicate. Previously next_poll_at was left NULL
+        on insert, which the SourceRegistry scheduler tolerated
+        (`next_poll_at IS NULL OR next_poll_at <= ?`) but the status endpoint
+        did NOT — so freshly-discovered chats polled fine yet reported
+        active_chats_count=0. Seeding non-NULL aligns both code paths."""
         conn = await self._conn()
         try:
+            now_iso = datetime.now().isoformat()
             await conn.execute(
                 """INSERT OR IGNORE INTO monitored_chats
-                (chat_id, chat_title, username, link_type, monitored_by, member_count, first_seen, last_seen)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
                 (chat_id, chat_title, username, link_type, monitored_by, member_count,
-                 datetime.now().isoformat(), datetime.now().isoformat()))
+                 first_seen, last_seen, last_activity, next_poll_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (chat_id, chat_title, username, link_type, monitored_by, member_count,
+                 now_iso, now_iso, now_iso, now_iso))
             await conn.commit()
             return conn.total_changes > 0
         except Exception as e:

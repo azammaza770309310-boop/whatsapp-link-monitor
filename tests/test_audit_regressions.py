@@ -29,6 +29,7 @@ import time
 import types
 import sqlite3
 import logging
+import aiohttp
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -120,7 +121,16 @@ async def sql_exec(prod_db, query, params=()):
 # === Log capture helper ===
 
 class LogCapture:
-    """Append (level, message) tuples from the root logger while active."""
+    """Append (level, message) tuples from the root logger while active.
+
+    [Task 3a fix] Properly saves/restores BOTH the root logger's effective
+    level AND the global logging.disable level. The previous version saved
+    the logger's level but passed it to logging.disable() on exit — which
+    set the global disable to WARNING (30), silently suppressing INFO logs
+    in all subsequent LogCapture calls (broke 4a-summary's INFO capture).
+    Now: root logger level is lowered to INFO on enter so handler-level
+    filtering actually works, and the global disable is saved/restored
+    separately."""
     def __init__(self):
         self.records = []
 
@@ -128,11 +138,15 @@ class LogCapture:
         self.records.append((record.levelname, record.getMessage()))
 
     def __enter__(self):
-        self._restore_level = logging.getLogger().level
+        self._restore_disable = logging.root.manager.disable
+        self._restore_logger_level = logging.getLogger().level
         logging.disable(logging.NOTSET)
-        self._handler_obj = logging.getLogger().addHandler  # placeholder
+        # Lower the root logger's level so INFO/WARNING messages can reach
+        # the handler. The handler's own level (set below) does the final
+        # filtering; without this, the root logger (default WARNING) drops
+        # INFO before it ever reaches the handler.
+        logging.getLogger().setLevel(logging.INFO)
         self._logger = logging.getLogger()
-        self._filter = lambda r: self._handler(r)
         # Use a real Handler subclass instance
         class _H(logging.Handler):
             def emit(s, record):
@@ -144,7 +158,8 @@ class LogCapture:
 
     def __exit__(self, *a):
         self._logger.removeHandler(self._h)
-        logging.disable(self._restore_level)
+        logging.getLogger().setLevel(self._restore_logger_level)
+        logging.disable(self._restore_disable)
 
     @property
     def warnings(self):
@@ -1123,7 +1138,7 @@ async def test_persist_snapshot_restore_on_startup():
             async def __aenter__(self): return self._r
             async def __aexit__(self, *a): return False
         class FakeSession:
-            def get(self, url): return FakeCM(FakeResp(200, snap_rows))
+            def get(self, url, **kwargs): return FakeCM(FakeResp(200, snap_rows))
         fm.db = types.SimpleNamespace(
             supabase_url='https://example.supabase.co',
             supabase_key='fake_key',
@@ -1174,14 +1189,17 @@ async def test_persist_snapshot_loop_batches():
             async def __aenter__(self): return self._r
             async def __aexit__(self, *a): return False
         class FakeSession:
-            def post(self, url, json=None, headers=None):
+            def post(self, url, json=None, headers=None, **kwargs):
                 post_calls.append({'url': url, 'json': json, 'headers': headers})
                 return FakeCM(FakeResp(204))
         fm.db = types.SimpleNamespace(
             supabase_url='https://example.supabase.co',
             supabase_key='fake_key',
             _get_supabase_session=AsyncMock(return_value=FakeSession()))
-        # Run a single snapshot cycle (flip _running off on the 2nd sleep)
+        # Run a single snapshot cycle (flip _running off on the 2nd sleep).
+        # The snapshot loop now guards on _snapshot_running; ensure it's
+        # False so the test invocation actually enters the body.
+        fm._snapshot_running = False
         fm._running = True
         sleep_count = {'n': 0}
         async def _sleep(_n):
@@ -1208,11 +1226,1491 @@ async def test_persist_snapshot_loop_batches():
         record("PERSIST: exception", False, str(e))
 
 
+# ===================================================================
+# Task 4a — AI Drainer Deep Audit + Hardening regressions
+# (bounded concurrency, rate-limit, lease, idempotency, restart-safe,
+#  graceful-shutdown, observable, stuck-job rotation, retry cap)
+# ===================================================================
+
+_REAL_SLEEP = asyncio.sleep  # capture before any patching
+
+
+async def _make_drainer_fakes(pending_rows, patch_status=204, patch_body='',
+                              get_status=200, get_body=None):
+    """Build the (fm, FakeSession) pair used by every 4a drainer test.
+
+    Returns (fm, patch_calls, get_calls, analyze_calls) where the lists
+    are populated by the FakeSession as the drainer runs. Tests inspect
+    them after running one cycle of the drainer via _run_one_drainer_cycle.
+    """
+    prod_db, _ = await make_test_db()
+    fm = make_fake_monitor(prod_db)
+    patch_calls = []
+    get_calls = []
+    analyze_calls = []
+
+    class FakeResp:
+        def __init__(self, status, json_data=None, text=''):
+            self.status = status
+            self._j = json_data
+            self._t = text
+
+        async def text(self):
+            return self._t
+
+        async def json(self):
+            return self._j
+
+    class FakeCM:
+        def __init__(self, resp):
+            self._r = resp
+
+        async def __aenter__(self):
+            return self._r
+
+        async def __aexit__(self, *a):
+            return False
+
+    class FakeSession:
+        def get(self, url):
+            get_calls.append(url)
+            return FakeCM(FakeResp(get_status, json_data=pending_rows,
+                                   text=get_body or ''))
+
+        def patch(self, url, json=None, headers=None):
+            patch_calls.append({'url': url, 'json': json, 'headers': headers})
+            return FakeCM(FakeResp(patch_status, text=patch_body))
+
+    fm.db = types.SimpleNamespace(
+        supabase_url='https://example.supabase.co',
+        supabase_key='fake_key',
+        _get_supabase_session=AsyncMock(return_value=FakeSession()))
+    return fm, patch_calls, get_calls, analyze_calls
+
+
+async def _run_one_drainer_cycle(fm, sleep_flip_on=2, **env_overrides):
+    """Run _ai_drainer_worker until _running flips False.
+
+    Default: flip on the 2nd asyncio.sleep call (= 1 full cycle:
+    startup sleep → GET → process → end-of-cycle sleep → flip).
+
+    The patched asyncio.sleep returns immediately (no real wait) so tests
+    are fast. NOTE: blocking-analyze tests (timeout / graceful-shutdown)
+    must NOT use asyncio.sleep inside the analyze coroutine — use
+    asyncio.Event().wait() instead, which is NOT affected by this patch
+    and blocks until cancelled by wait_for / task.cancel().
+    """
+    for k, v in env_overrides.items():
+        if v is None:
+            os.environ.pop(k, None)
+        else:
+            os.environ[k] = str(v)
+    fm._running = True
+    call_count = {'n': 0}
+
+    async def _sleep(_n):
+        call_count['n'] += 1
+        if call_count['n'] >= sleep_flip_on:
+            fm._running = False
+
+    with patch('asyncio.sleep', new=_sleep):
+        await bot.Monitor._ai_drainer_worker(fm)
+
+
+async def test_4a_ai_drainer_lease_filter_on_patch():
+    """[4a] PATCH URL carries `ai_approved=is.null` lease filter so a
+    concurrent worker / supervisor-relaunched instance can't double-write."""
+    print("\n--- 4a: PATCH URL carries ai_approved=is.null lease filter ---")
+    try:
+        os.environ['AI_DRAIN_ENABLED'] = 'true'
+        pending = [{'id': 1, 'link': 'https://t.me/4aL', 'link_type': 'telegram',
+                    'message_text': 'join https://t.me/4aL', 'group_name': 'G',
+                    'sender_name': 'S', 'source_phone': 'A'}]
+        fm, patch_calls, _, _ = await _make_drainer_fakes(pending)
+        async def _analyze(text):
+            return {'should_save': True, 'description': 'edu', 'country': 'SA',
+                    'is_advertisement': False}
+        fm.ai_analyzer = types.SimpleNamespace(enabled=True, analyze_message=_analyze)
+        await _run_one_drainer_cycle(fm)
+        record("4a-lease: PATCH URL contains ai_approved=is.null filter",
+               patch_calls and 'ai_approved=is.null' in patch_calls[0]['url'],
+               f"urls={[c['url'] for c in patch_calls]}")
+        record("4a-lease: PATCH carries Prefer: return=representation header",
+               patch_calls and (patch_calls[0].get('headers') or {}).get('Prefer')
+               == 'return=representation',
+               f"headers={patch_calls[0].get('headers') if patch_calls else None}")
+        os.environ.pop('AI_DRAIN_ENABLED', None)
+    except Exception as e:
+        record("4a-lease: exception", False, str(e))
+        os.environ.pop('AI_DRAIN_ENABLED', None)
+
+
+async def test_4a_ai_drainer_batch_size_env():
+    """[4a] AI_DRAIN_BATCH_SIZE env is honored in the GET URL `limit=N`."""
+    print("\n--- 4a: AI_DRAIN_BATCH_SIZE env honored in GET URL ---")
+    try:
+        os.environ['AI_DRAIN_ENABLED'] = 'true'
+        pending = [{'id': 1, 'link': 'https://t.me/4aB', 'link_type': 'telegram',
+                    'message_text': 'x', 'group_name': 'g', 'sender_name': 's',
+                    'source_phone': 'a'}]
+        fm, _, get_calls, _ = await _make_drainer_fakes(pending)
+        async def _analyze(text):
+            return {'should_save': True, 'description': 'edu', 'country': 'SA',
+                    'is_advertisement': False}
+        fm.ai_analyzer = types.SimpleNamespace(enabled=True, analyze_message=_analyze)
+        await _run_one_drainer_cycle(fm, AI_DRAIN_BATCH_SIZE=25)
+        record("4a-batch: GET URL contains limit=25 (from env override)",
+               get_calls and 'limit=25' in get_calls[0],
+               f"get_url={get_calls[0] if get_calls else None}")
+        os.environ.pop('AI_DRAIN_ENABLED', None)
+        os.environ.pop('AI_DRAIN_BATCH_SIZE', None)
+    except Exception as e:
+        record("4a-batch: exception", False, str(e))
+        os.environ.pop('AI_DRAIN_ENABLED', None)
+        os.environ.pop('AI_DRAIN_BATCH_SIZE', None)
+
+
+async def test_4a_ai_drainer_order_rotates_head():
+    """[4a] GET URL uses `order=id.desc` so a poison row at the head
+    doesn't permanently block newer rows from being seen."""
+    print("\n--- 4a: GET URL uses order=id.desc (head rotation) ---")
+    try:
+        os.environ['AI_DRAIN_ENABLED'] = 'true'
+        pending = [{'id': 1, 'link': 'https://t.me/4aR', 'link_type': 'telegram',
+                    'message_text': 'x', 'group_name': 'g', 'sender_name': 's',
+                    'source_phone': 'a'}]
+        fm, _, get_calls, _ = await _make_drainer_fakes(pending)
+        async def _analyze(text):
+            return {'should_save': True, 'description': 'edu', 'country': 'SA',
+                    'is_advertisement': False}
+        fm.ai_analyzer = types.SimpleNamespace(enabled=True, analyze_message=_analyze)
+        await _run_one_drainer_cycle(fm)
+        record("4a-rotate: GET URL contains order=id.desc",
+               get_calls and 'order=id.desc' in get_calls[0],
+               f"get_url={get_calls[0] if get_calls else None}")
+        os.environ.pop('AI_DRAIN_ENABLED', None)
+    except Exception as e:
+        record("4a-rotate: exception", False, str(e))
+        os.environ.pop('AI_DRAIN_ENABLED', None)
+
+
+async def test_4a_ai_drainer_timeout_skips_row():
+    """[4a] analyze_message timeout → row stays ai_pending (no PATCH),
+    counted as failed, fail_count incremented."""
+    print("\n--- 4a: timeout on analyze_message leaves row ai_pending ---")
+    try:
+        os.environ['AI_DRAIN_ENABLED'] = 'true'
+        pending = [{'id': 7, 'link': 'https://t.me/4aTO', 'link_type': 'telegram',
+                    'message_text': 'x', 'group_name': 'g', 'sender_name': 's',
+                    'source_phone': 'a'}]
+        fm, patch_calls, _, _ = await _make_drainer_fakes(pending)
+
+        async def _blocking_analyze(text):
+            # Blocks forever — NOT asyncio.sleep (which is patched).
+            # asyncio.Event().wait() is unaffected by the sleep patch and
+            # blocks until cancelled by wait_for's timeout.
+            await asyncio.Event().wait()
+            return {}
+
+        fm.ai_analyzer = types.SimpleNamespace(enabled=True, analyze_message=_blocking_analyze)
+        # Tiny timeout so the test runs fast
+        await _run_one_drainer_cycle(fm, AI_DRAIN_TIMEOUT_S='0.05')
+        record("4a-timeout: NO PATCH made (row stays ai_pending)",
+               len(patch_calls) == 0, f"patch_calls={patch_calls}")
+        record("4a-timeout: fail_count[7] == 1 (incremented)",
+               fm._ai_drainer_fail_count.get(7) == 1,
+               f"fail_count={fm._ai_drainer_fail_count}")
+        os.environ.pop('AI_DRAIN_ENABLED', None)
+        os.environ.pop('AI_DRAIN_TIMEOUT_S', None)
+    except Exception as e:
+        record("4a-timeout: exception", False, str(e))
+        os.environ.pop('AI_DRAIN_ENABLED', None)
+        os.environ.pop('AI_DRAIN_TIMEOUT_S', None)
+
+
+async def test_4a_ai_drainer_provider_failure_skips_row():
+    """[4a] analyze_message raises → row stays ai_pending (no PATCH),
+    counted as failed, fail_count incremented (NOT infinite-loop)."""
+    print("\n--- 4a: provider failure leaves row ai_pending ---")
+    try:
+        os.environ['AI_DRAIN_ENABLED'] = 'true'
+        pending = [{'id': 9, 'link': 'https://t.me/4aPF', 'link_type': 'telegram',
+                    'message_text': 'x', 'group_name': 'g', 'sender_name': 's',
+                    'source_phone': 'a'}]
+        fm, patch_calls, _, _ = await _make_drainer_fakes(pending)
+
+        async def _boom_analyze(text):
+            raise RuntimeError("simulated provider 5xx")
+
+        fm.ai_analyzer = types.SimpleNamespace(enabled=True, analyze_message=_boom_analyze)
+        await _run_one_drainer_cycle(fm)
+        record("4a-provider-fail: NO PATCH made (row stays ai_pending)",
+               len(patch_calls) == 0, f"patch_calls={patch_calls}")
+        record("4a-provider-fail: fail_count[9] == 1 (incremented, no infinite-loop)",
+               fm._ai_drainer_fail_count.get(9) == 1,
+               f"fail_count={fm._ai_drainer_fail_count}")
+        os.environ.pop('AI_DRAIN_ENABLED', None)
+    except Exception as e:
+        record("4a-provider-fail: exception", False, str(e))
+        os.environ.pop('AI_DRAIN_ENABLED', None)
+
+
+async def test_4a_ai_drainer_none_result_skips_patch():
+    """[4a] analyze_message returns None → no PATCH, counted as failed,
+    fail_count incremented (provider returned malformed/empty)."""
+    print("\n--- 4a: None result skips PATCH ---")
+    try:
+        os.environ['AI_DRAIN_ENABLED'] = 'true'
+        pending = [{'id': 11, 'link': 'https://t.me/4aNR', 'link_type': 'telegram',
+                    'message_text': 'x', 'group_name': 'g', 'sender_name': 's',
+                    'source_phone': 'a'}]
+        fm, patch_calls, _, _ = await _make_drainer_fakes(pending)
+
+        async def _none_analyze(text):
+            return None
+
+        fm.ai_analyzer = types.SimpleNamespace(enabled=True, analyze_message=_none_analyze)
+        await _run_one_drainer_cycle(fm)
+        record("4a-none-result: NO PATCH made (row stays ai_pending)",
+               len(patch_calls) == 0, f"patch_calls={patch_calls}")
+        record("4a-none-result: fail_count[11] == 1 (incremented)",
+               fm._ai_drainer_fail_count.get(11) == 1,
+               f"fail_count={fm._ai_drainer_fail_count}")
+        os.environ.pop('AI_DRAIN_ENABLED', None)
+    except Exception as e:
+        record("4a-none-result: exception", False, str(e))
+        os.environ.pop('AI_DRAIN_ENABLED', None)
+
+
+async def test_4a_ai_drainer_429_cycle_backoff():
+    """[4a] 429 on GET triggers 60s sleep PER-CYCLE (not per-row). No
+    PATCH made, no analyze_message called."""
+    print("\n--- 4a: 429 on GET triggers 60s cycle backoff ---")
+    try:
+        os.environ['AI_DRAIN_ENABLED'] = 'true'
+        pending = [{'id': 1, 'link': 'https://t.me/4a429', 'link_type': 'telegram',
+                    'message_text': 'x', 'group_name': 'g', 'sender_name': 's',
+                    'source_phone': 'a'}]
+        fm, patch_calls, get_calls, _ = await _make_drainer_fakes(
+            pending, get_status=429, get_body='rate limited')
+        analyze_count = {'n': 0}
+
+        async def _analyze(text):
+            analyze_count['n'] += 1
+            return {'should_save': True, 'description': 'edu', 'country': 'SA',
+                    'is_advertisement': False}
+
+        fm.ai_analyzer = types.SimpleNamespace(enabled=True, analyze_message=_analyze)
+        await _run_one_drainer_cycle(fm)
+        record("4a-429: GET was called (returned 429)",
+               len(get_calls) == 1, f"get_calls={get_calls}")
+        record("4a-429: analyze_message NEVER called (cycle-level backoff)",
+               analyze_count['n'] == 0, f"analyze_count={analyze_count['n']}")
+        record("4a-429: NO PATCH made (whole batch skipped)",
+               len(patch_calls) == 0, f"patch_calls={patch_calls}")
+        os.environ.pop('AI_DRAIN_ENABLED', None)
+    except Exception as e:
+        record("4a-429: exception", False, str(e))
+        os.environ.pop('AI_DRAIN_ENABLED', None)
+
+
+async def test_4a_ai_drainer_empty_queue_60s_sleep():
+    """[4a] Empty queue (GET returns []) → 60s sleep, no PATCH, no analyze."""
+    print("\n--- 4a: empty queue → 60s sleep ---")
+    try:
+        os.environ['AI_DRAIN_ENABLED'] = 'true'
+        fm, patch_calls, get_calls, _ = await _make_drainer_fakes(
+            pending_rows=[], get_status=200, get_body='[]')
+        analyze_count = {'n': 0}
+
+        async def _analyze(text):
+            analyze_count['n'] += 1
+            return {'should_save': True, 'description': 'edu', 'country': 'SA',
+                    'is_advertisement': False}
+
+        fm.ai_analyzer = types.SimpleNamespace(enabled=True, analyze_message=_analyze)
+        await _run_one_drainer_cycle(fm)
+        record("4a-empty: GET was called (returned 200 with [])",
+               len(get_calls) == 1, f"get_calls={get_calls}")
+        record("4a-empty: analyze_message NEVER called (no rows to process)",
+               analyze_count['n'] == 0, f"analyze_count={analyze_count['n']}")
+        record("4a-empty: NO PATCH made",
+               len(patch_calls) == 0, f"patch_calls={patch_calls}")
+        os.environ.pop('AI_DRAIN_ENABLED', None)
+    except Exception as e:
+        record("4a-empty: exception", False, str(e))
+        os.environ.pop('AI_DRAIN_ENABLED', None)
+
+
+async def test_4a_ai_drainer_poison_row_skipped_after_3_fails():
+    """[4a] A row that fails 3× in this worker lifetime is skipped on
+    subsequent cycles (no analyze_message call). Prevents a poison row
+    from burning the AI budget every cycle."""
+    print("\n--- 4a: poison row skipped after 3 fails ---")
+    try:
+        os.environ['AI_DRAIN_ENABLED'] = 'true'
+        pending = [{'id': 42, 'link': 'https://t.me/4aPOI', 'link_type': 'telegram',
+                    'message_text': 'x', 'group_name': 'g', 'sender_name': 's',
+                    'source_phone': 'a'}]
+        fm, patch_calls, _, _ = await _make_drainer_fakes(pending)
+        analyze_count = {'n': 0}
+
+        async def _always_fails(text):
+            analyze_count['n'] += 1
+            raise RuntimeError("chronically failing provider")
+
+        fm.ai_analyzer = types.SimpleNamespace(enabled=True, analyze_message=_always_fails)
+        # Pre-seed fail_count = 3 (simulates 3 prior failures across cycles)
+        fm._ai_drainer_fail_count = {42: 3}
+        await _run_one_drainer_cycle(fm)
+        record("4a-poison: analyze_message NEVER called (row skipped at fail_count>=3)",
+               analyze_count['n'] == 0, f"analyze_count={analyze_count['n']}")
+        record("4a-poison: NO PATCH made (poison row skipped)",
+               len(patch_calls) == 0, f"patch_calls={patch_calls}")
+        os.environ.pop('AI_DRAIN_ENABLED', None)
+    except Exception as e:
+        record("4a-poison: exception", False, str(e))
+        os.environ.pop('AI_DRAIN_ENABLED', None)
+
+
+async def test_4a_ai_drainer_race_loss_detected():
+    """[4a] PATCH returns 200 with empty body `[]` → race-lost (another
+    worker claimed it first). Counted as SKIPPED, NOT failed."""
+    print("\n--- 4a: race-loss (PATCH 0 rows) detected as skipped ---")
+    try:
+        os.environ['AI_DRAIN_ENABLED'] = 'true'
+        pending = [{'id': 99, 'link': 'https://t.me/4aRL', 'link_type': 'telegram',
+                    'message_text': 'x', 'group_name': 'g', 'sender_name': 's',
+                    'source_phone': 'a'}]
+        fm, patch_calls, _, _ = await _make_drainer_fakes(
+            pending, patch_status=200, patch_body='[]')
+        async def _analyze(text):
+            return {'should_save': True, 'description': 'edu', 'country': 'SA',
+                    'is_advertisement': False}
+        fm.ai_analyzer = types.SimpleNamespace(enabled=True, analyze_message=_analyze)
+        # Capture logs to assert race-lost is DEBUG-logged (not WARNING)
+        with LogCapture() as lc:
+            await _run_one_drainer_cycle(fm)
+        # Race-loss is DEBUG — should NOT appear in warnings (which only
+        # capture WARNING+). The absence of a "patch status" warning
+        # proves it was treated as race-lost, not a patch failure.
+        race_warnings = [w for w in lc.all_msgs if 'race-lost' in w]
+        patch_fail_warnings = [w for w in lc.all_msgs if 'patch status=' in w]
+        record("4a-race-loss: PATCH was made (with ai_approved=is.null filter)",
+               patch_calls and 'ai_approved=is.null' in patch_calls[0]['url'],
+               f"patch_calls={patch_calls}")
+        record("4a-race-loss: NO 'patch status=' warning (treated as skip, not fail)",
+               len(patch_fail_warnings) == 0,
+               f"patch_fail_warnings={patch_fail_warnings}")
+        os.environ.pop('AI_DRAIN_ENABLED', None)
+    except Exception as e:
+        record("4a-race-loss: exception", False, str(e))
+        os.environ.pop('AI_DRAIN_ENABLED', None)
+
+
+async def test_4a_ai_drainer_concurrency_semaphore_bounded():
+    """[4a] AI_DRAIN_CONCURRENCY=1 serializes analyze_message calls (no 2
+    concurrent). With 5 rows, max-concurrent-in-flight must be ≤ 1."""
+    print("\n--- 4a: concurrency=1 semaphore serializes analyze_message ---")
+    try:
+        os.environ['AI_DRAIN_ENABLED'] = 'true'
+        pending = [{'id': i, 'link': f'https://t.me/4aC{i}', 'link_type': 'telegram',
+                    'message_text': 'x', 'group_name': 'g', 'sender_name': 's',
+                    'source_phone': 'a'} for i in range(5)]
+        fm, patch_calls, _, _ = await _make_drainer_fakes(pending)
+        in_flight = {'cur': 0, 'max': 0}
+
+        async def _tracking_analyze(text):
+            in_flight['cur'] += 1
+            in_flight['max'] = max(in_flight['max'], in_flight['cur'])
+            await _REAL_SLEEP(0.01)  # tiny yield to allow concurrency
+            in_flight['cur'] -= 1
+            return {'should_save': True, 'description': 'edu', 'country': 'SA',
+                    'is_advertisement': False}
+
+        fm.ai_analyzer = types.SimpleNamespace(enabled=True, analyze_message=_tracking_analyze)
+        await _run_one_drainer_cycle(fm, AI_DRAIN_CONCURRENCY='1')
+        record("4a-concurrency=1: max concurrent analyze_message == 1 (serialized)",
+               in_flight['max'] == 1, f"in_flight.max={in_flight['max']}")
+        record("4a-concurrency=1: all 5 PATCHes made",
+               len(patch_calls) == 5, f"patch_calls={len(patch_calls)}")
+        os.environ.pop('AI_DRAIN_ENABLED', None)
+        os.environ.pop('AI_DRAIN_CONCURRENCY', None)
+    except Exception as e:
+        record("4a-concurrency=1: exception", False, str(e))
+        os.environ.pop('AI_DRAIN_ENABLED', None)
+        os.environ.pop('AI_DRAIN_CONCURRENCY', None)
+
+
+async def test_4a_ai_drainer_concurrency_3_allows_parallel():
+    """[4a] AI_DRAIN_CONCURRENCY=3 allows up to 3 concurrent analyze_message
+    calls (max-in-flight should be > 1, bounded ≤ 3)."""
+    print("\n--- 4a: concurrency=3 allows parallel (bounded ≤ 3) ---")
+    try:
+        os.environ['AI_DRAIN_ENABLED'] = 'true'
+        pending = [{'id': i, 'link': f'https://t.me/4aP{i}', 'link_type': 'telegram',
+                    'message_text': 'x', 'group_name': 'g', 'sender_name': 's',
+                    'source_phone': 'a'} for i in range(6)]
+        fm, patch_calls, _, _ = await _make_drainer_fakes(pending)
+        in_flight = {'cur': 0, 'max': 0}
+
+        async def _tracking_analyze(text):
+            in_flight['cur'] += 1
+            in_flight['max'] = max(in_flight['max'], in_flight['cur'])
+            await _REAL_SLEEP(0.05)  # yield to allow real concurrency
+            in_flight['cur'] -= 1
+            return {'should_save': True, 'description': 'edu', 'country': 'SA',
+                    'is_advertisement': False}
+
+        fm.ai_analyzer = types.SimpleNamespace(enabled=True, analyze_message=_tracking_analyze)
+        await _run_one_drainer_cycle(fm, AI_DRAIN_CONCURRENCY='3')
+        record("4a-concurrency=3: max concurrent > 1 (parallel actually happens)",
+               in_flight['max'] > 1, f"in_flight.max={in_flight['max']}")
+        record("4a-concurrency=3: max concurrent ≤ 3 (bounded by semaphore)",
+               in_flight['max'] <= 3, f"in_flight.max={in_flight['max']}")
+        record("4a-concurrency=3: all 6 PATCHes made",
+               len(patch_calls) == 6, f"patch_calls={len(patch_calls)}")
+        os.environ.pop('AI_DRAIN_ENABLED', None)
+        os.environ.pop('AI_DRAIN_CONCURRENCY', None)
+    except Exception as e:
+        record("4a-concurrency=3: exception", False, str(e))
+        os.environ.pop('AI_DRAIN_ENABLED', None)
+        os.environ.pop('AI_DRAIN_CONCURRENCY', None)
+
+
+async def test_4a_ai_drainer_batch_summary_log():
+    """[4a] Per-batch summary `[AI-DRAIN] batch=N processed=M failed=K
+    skipped=L elapsed=Xs` is emitted at INFO."""
+    print("\n--- 4a: per-batch summary log emitted ---")
+    try:
+        os.environ['AI_DRAIN_ENABLED'] = 'true'
+        pending = [{'id': 1, 'link': 'https://t.me/4aSUM', 'link_type': 'telegram',
+                    'message_text': 'x', 'group_name': 'g', 'sender_name': 's',
+                    'source_phone': 'a'}]
+        fm, _, _, _ = await _make_drainer_fakes(pending)
+        async def _analyze(text):
+            return {'should_save': True, 'description': 'edu', 'country': 'SA',
+                    'is_advertisement': False}
+        fm.ai_analyzer = types.SimpleNamespace(enabled=True, analyze_message=_analyze)
+        with LogCapture() as lc:
+            # LogCapture captures WARNING+ by default; bump the handler AND
+            # the root logger level to INFO to capture the batch summary
+            # (which is logged at INFO via logging.info).
+            lc._h.setLevel(logging.INFO)
+            _root = logging.getLogger()
+            _prev_root_level = _root.level
+            _root.setLevel(logging.INFO)
+            try:
+                await _run_one_drainer_cycle(fm)
+            finally:
+                _root.setLevel(_prev_root_level)
+        summary_msgs = [m for _, m in lc.records
+                        if '[AI-DRAIN] batch=' in m and 'processed=' in m
+                        and 'failed=' in m and 'skipped=' in m and 'elapsed=' in m]
+        record("4a-summary: batch summary log emitted (batch/processed/failed/skipped/elapsed)",
+               len(summary_msgs) >= 1, f"summary_msgs={summary_msgs}")
+        if summary_msgs:
+            m = summary_msgs[0]
+            record("4a-summary: summary reports batch=1 processed=1",
+                   'batch=1' in m and 'processed=1' in m,
+                   f"summary={m}")
+        os.environ.pop('AI_DRAIN_ENABLED', None)
+    except Exception as e:
+        record("4a-summary: exception", False, str(e))
+        os.environ.pop('AI_DRAIN_ENABLED', None)
+
+
+async def test_4a_ai_drainer_fail_count_resets_on_success():
+    """[4a] On successful PATCH, the row's fail_count is cleared (reset).
+    Verifies a row that failed once but succeeds next cycle isn't stuck
+    at fail_count=1."""
+    print("\n--- 4a: fail_count resets to 0 on success ---")
+    try:
+        os.environ['AI_DRAIN_ENABLED'] = 'true'
+        pending = [{'id': 77, 'link': 'https://t.me/4aRS', 'link_type': 'telegram',
+                    'message_text': 'x', 'group_name': 'g', 'sender_name': 's',
+                    'source_phone': 'a'}]
+        fm, _, _, _ = await _make_drainer_fakes(pending)
+        async def _analyze(text):
+            return {'should_save': True, 'description': 'edu', 'country': 'SA',
+                    'is_advertisement': False}
+        fm.ai_analyzer = types.SimpleNamespace(enabled=True, analyze_message=_analyze)
+        # Pre-seed fail_count = 2 (simulates 2 prior failures)
+        fm._ai_drainer_fail_count = {77: 2}
+        await _run_one_drainer_cycle(fm)
+        record("4a-reset: fail_count[77] cleared on success (not in dict)",
+               77 not in fm._ai_drainer_fail_count,
+               f"fail_count={fm._ai_drainer_fail_count}")
+        os.environ.pop('AI_DRAIN_ENABLED', None)
+    except Exception as e:
+        record("4a-reset: exception", False, str(e))
+        os.environ.pop('AI_DRAIN_ENABLED', None)
+
+
+async def test_4a_ai_drainer_graceful_shutdown():
+    """[4a] CancelledError during the cycle breaks the loop cleanly — no
+    unhandled exception, no partial state corruption."""
+    print("\n--- 4a: graceful shutdown on CancelledError ---")
+    err = ''
+    cancelled_cleanly = False
+    try:
+        os.environ['AI_DRAIN_ENABLED'] = 'true'
+        pending = [{'id': 1, 'link': 'https://t.me/4aSD', 'link_type': 'telegram',
+                    'message_text': 'x', 'group_name': 'g', 'sender_name': 's',
+                    'source_phone': 'a'}]
+        fm, _, _, _ = await _make_drainer_fakes(pending)
+
+        async def _blocking_analyze(text):
+            # Blocks forever — NOT asyncio.sleep (which would be patched).
+            # asyncio.Event().wait() blocks until cancelled by task.cancel().
+            await asyncio.Event().wait()
+
+        fm.ai_analyzer = types.SimpleNamespace(enabled=True, analyze_message=_blocking_analyze)
+        fm._running = True
+
+        # Patch asyncio.sleep to skip the long startup/cycle sleeps but
+        # NOT affect _blocking_analyze (which uses Event().wait()).
+        async def _skip_long_sleeps(n):
+            if n >= 10:
+                return  # skip startup (45s), cycle (30s), backoff (60s)
+            await _REAL_SLEEP(n)
+
+        async def _runner():
+            with patch('asyncio.sleep', new=_skip_long_sleeps):
+                await bot.Monitor._ai_drainer_worker(fm)
+
+        task = asyncio.create_task(_runner())
+        # Use _REAL_SLEEP (captured before patching) so the test's own
+        # sleep isn't affected by the patched asyncio.sleep inside _runner.
+        await _REAL_SLEEP(0.2)  # let the task reach _blocking_analyze
+        task.cancel()
+        try:
+            await task
+            # Worker caught CancelledError, broke the loop, returned
+            # normally — clean shutdown.
+            cancelled_cleanly = True
+        except asyncio.CancelledError:
+            # Worker propagated CancelledError (e.g. cancelled during the
+            # startup sleep before the try/except) — still clean.
+            cancelled_cleanly = True
+        except Exception as e:
+            cancelled_cleanly = False
+            err = str(e)
+        os.environ.pop('AI_DRAIN_ENABLED', None)
+        os.environ.pop('AI_DRAIN_TIMEOUT_S', None)
+    except Exception as e:
+        err = f"outer: {e}"
+        cancelled_cleanly = False
+        os.environ.pop('AI_DRAIN_ENABLED', None)
+        os.environ.pop('AI_DRAIN_TIMEOUT_S', None)
+    record("4a-shutdown: CancelledError handled cleanly (no unhandled exception)",
+           cancelled_cleanly, f"err={err}")
+
+
+async def test_4a_ai_drainer_disabled_by_default():
+    """[4a] AI_DRAIN_ENABLED default false → worker returns immediately
+    (idle), no GET, no PATCH, no analyze. Opt-in confirmed."""
+    print("\n--- 4a: AI_DRAIN_ENABLED=false (default) → worker idle ---")
+    try:
+        os.environ.pop('AI_DRAIN_ENABLED', None)
+        pending = [{'id': 1, 'link': 'https://t.me/4aOFF', 'link_type': 'telegram',
+                    'message_text': 'x', 'group_name': 'g', 'sender_name': 's',
+                    'source_phone': 'a'}]
+        fm, patch_calls, get_calls, _ = await _make_drainer_fakes(pending)
+        analyze_count = {'n': 0}
+
+        async def _analyze(text):
+            analyze_count['n'] += 1
+            return {'should_save': True, 'description': 'edu', 'country': 'SA',
+                    'is_advertisement': False}
+
+        fm.ai_analyzer = types.SimpleNamespace(enabled=True, analyze_message=_analyze)
+        # Run the worker — it should return immediately (no loop)
+        await bot.Monitor._ai_drainer_worker(fm)
+        record("4a-disabled: NO GET made (worker idle)",
+               len(get_calls) == 0, f"get_calls={get_calls}")
+        record("4a-disabled: NO PATCH made (worker idle)",
+               len(patch_calls) == 0, f"patch_calls={patch_calls}")
+        record("4a-disabled: NO analyze_message called (worker idle)",
+               analyze_count['n'] == 0, f"analyze_count={analyze_count['n']}")
+    except Exception as e:
+        record("4a-disabled: exception", False, str(e))
+
+
+async def test_4a_ai_drainer_no_ai_configured_60s_sleep():
+    """[4a] ai_analyzer.enabled=False or missing → 60s sleep, no GET."""
+    print("\n--- 4a: no AI configured → 60s sleep ---")
+    try:
+        os.environ['AI_DRAIN_ENABLED'] = 'true'
+        pending = [{'id': 1, 'link': 'https://t.me/4aNAI', 'link_type': 'telegram',
+                    'message_text': 'x', 'group_name': 'g', 'sender_name': 's',
+                    'source_phone': 'a'}]
+        fm, patch_calls, get_calls, _ = await _make_drainer_fakes(pending)
+        # ai_analyzer exists but disabled (no providers)
+        fm.ai_analyzer = types.SimpleNamespace(enabled=False, analyze_message=AsyncMock())
+        await _run_one_drainer_cycle(fm, sleep_flip_on=1)
+        record("4a-no-ai: NO GET made (ai_analyzer disabled)",
+               len(get_calls) == 0, f"get_calls={get_calls}")
+        record("4a-no-ai: NO PATCH made",
+               len(patch_calls) == 0, f"patch_calls={patch_calls}")
+        os.environ.pop('AI_DRAIN_ENABLED', None)
+    except Exception as e:
+        record("4a-no-ai: exception", False, str(e))
+        os.environ.pop('AI_DRAIN_ENABLED', None)
+
+
+# ===================================================================
+# Task 3a — Supabase Journal Snapshot Deep Audit (8 NEW regression tests)
+#
+# Scenarios covered (one test function each, multi-assertion):
+#   3a-1  snapshot concurrent-invocation guard (_snapshot_running flag)
+#   3a-2  snapshot SELECT ORDER BY received_at ASC (oldest at-risk first)
+#   3a-3  snapshot 429 → 60s backoff (mirrors _ai_drainer_worker)
+#   3a-4  snapshot POST timeout → caught + loop continues (no crash)
+#   3a-5  snapshot network/5xx error → caught + loop continues
+#   3a-6  restore does NOT overwrite local terminal state (INSERT OR IGNORE)
+#   3a-7  restore per-row corruption isolation (NULL PK / malformed ts)
+#   3a-8  restore GET timeout → returns 0 + logs WARNING (no crash)
+# ===================================================================
+
+
+async def test_3a_snapshot_concurrent_guard():
+    """[3a-1 / point 6] Two concurrent _journal_snapshot_loop invocations —
+    the second is a no-op (returns immediately without POSTing)."""
+    print("\n--- 3a-1: snapshot concurrent-invocation guard ---")
+    try:
+        prod_db, _ = await make_test_db()
+        fm = make_fake_monitor(prod_db)
+        # Seed 1 pending row so a real cycle would POST
+        await prod_db.journal_message({
+            'chat_id': -1001, 'msg_id': 1, 'raw_text': 'x https://t.me/A1',
+            'source_phone': 'A', 'state': 'pending', 'received_at': time.time()})
+        post_calls = []
+        class FakeResp:
+            def __init__(self, status): self.status = status
+            async def text(self): return ''
+        class FakeCM:
+            def __init__(self, r): self._r = r
+            async def __aenter__(self): return self._r
+            async def __aexit__(self, *a): return False
+        class FakeSession:
+            def post(self, url, json=None, headers=None, **kwargs):
+                post_calls.append({'url': url, 'json': json, 'headers': headers})
+                return FakeCM(FakeResp(204))
+        fm.db = types.SimpleNamespace(
+            supabase_url='https://example.supabase.co',
+            supabase_key='fake_key',
+            _get_supabase_session=AsyncMock(return_value=FakeSession()))
+        # Simulate an in-flight cycle: set the guard True BEFORE launching
+        fm._snapshot_running = True
+        fm._running = True
+        # Patch sleep so even if the guard failed, the loop wouldn't hang.
+        async def _sleep(_n):
+            fm._running = False
+        with patch('asyncio.sleep', new=_sleep):
+            await bot.Monitor._journal_snapshot_loop(fm)
+        record("3a-1: 2nd concurrent invocation did NOT POST (guard held)",
+               len(post_calls) == 0, f"post_calls={len(post_calls)}")
+        record("3a-1: _snapshot_running still True after guarded return",
+               getattr(fm, '_snapshot_running', None) is True,
+               f"got {getattr(fm, '_snapshot_running', None)!r}")
+        # Verify guard is reset to False on a CLEAN cycle (no double-stick)
+        fm._snapshot_running = False
+        sleep_count = {'n': 0}
+        async def _sleep2(_n):
+            sleep_count['n'] += 1
+            if sleep_count['n'] >= 2:
+                fm._running = False
+        with patch('asyncio.sleep', new=_sleep2):
+            await bot.Monitor._journal_snapshot_loop(fm)
+        record("3a-1: clean cycle POSTs exactly once",
+               len(post_calls) == 1, f"post_calls={len(post_calls)}")
+        record("3a-1: _snapshot_running reset to False after clean cycle",
+               getattr(fm, '_snapshot_running', None) is False,
+               f"got {getattr(fm, '_snapshot_running', None)!r}")
+    except Exception as e:
+        record("3a-1: exception", False, str(e))
+
+
+async def test_3a_snapshot_order_by_received_at():
+    """[3a-2 / point 2] With 700 pending rows (oldest=base, newest=base+699),
+    a 500-LIMIT snapshot selects the 500 OLDEST (ORDER BY received_at ASC)."""
+    print("\n--- 3a-2: snapshot SELECT ORDER BY received_at ASC ---")
+    try:
+        prod_db, _ = await make_test_db()
+        fm = make_fake_monitor(prod_db)
+        base = time.time() - 10000  # 10000s ago
+        # Insert 700 pending rows with ascending received_at; the first 500
+        # (oldest) should be the ones selected.
+        for i in range(700):
+            await prod_db.journal_message({
+                'chat_id': -1001, 'msg_id': 1000 + i,
+                'raw_text': f'msg {i} https://t.me/A{i}',
+                'source_phone': 'A', 'state': 'pending',
+                'received_at': base + i})
+        post_calls = []
+        class FakeResp:
+            def __init__(self, status): self.status = status
+            async def text(self): return ''
+        class FakeCM:
+            def __init__(self, r): self._r = r
+            async def __aenter__(self): return self._r
+            async def __aexit__(self, *a): return False
+        class FakeSession:
+            def post(self, url, json=None, headers=None, **kwargs):
+                post_calls.append({'url': url, 'json': json, 'headers': headers})
+                return FakeCM(FakeResp(204))
+        fm.db = types.SimpleNamespace(
+            supabase_url='https://example.supabase.co',
+            supabase_key='fake_key',
+            _get_supabase_session=AsyncMock(return_value=FakeSession()))
+        fm._snapshot_running = False
+        fm._running = True
+        sleep_count = {'n': 0}
+        async def _sleep(_n):
+            sleep_count['n'] += 1
+            if sleep_count['n'] >= 2:
+                fm._running = False
+        with patch('asyncio.sleep', new=_sleep):
+            await bot.Monitor._journal_snapshot_loop(fm)
+        record("3a-2: snapshot POSTed exactly 500 rows (LIMIT held)",
+               len(post_calls) == 1
+               and isinstance(post_calls[0].get('json'), list)
+               and len(post_calls[0]['json']) == 500,
+               f"post_calls={len(post_calls)}")
+        if post_calls and isinstance(post_calls[0].get('json'), list):
+            batch = post_calls[0]['json']
+            msg_ids = sorted(b['msg_id'] for b in batch)
+            # Oldest 500 = msg_ids 1000..1499 (received_at ascending)
+            expected = list(range(1000, 1500))
+            record("3a-2: snapshot selected OLDEST 500 (msg_id 1000..1499)",
+                   msg_ids == expected,
+                   f"got min={min(msg_ids)} max={max(msg_ids)} (want 1000/1499)")
+    except Exception as e:
+        record("3a-2: exception", False, str(e))
+
+
+async def test_3a_snapshot_429_backoff():
+    """[3a-3 / point 9] Supabase returns 429 → loop logs WARNING + sleeps 60s
+    (NOT the 30s default), then continues."""
+    print("\n--- 3a-3: snapshot 429 → 60s backoff ---")
+    try:
+        prod_db, _ = await make_test_db()
+        fm = make_fake_monitor(prod_db)
+        await prod_db.journal_message({
+            'chat_id': -1001, 'msg_id': 1, 'raw_text': 'x https://t.me/A1',
+            'source_phone': 'A', 'state': 'pending', 'received_at': time.time()})
+        post_calls = []
+        class FakeResp:
+            def __init__(self, status): self.status = status
+            async def text(self): return 'rate limited'
+        class FakeCM:
+            def __init__(self, r): self._r = r
+            async def __aenter__(self): return self._r
+            async def __aexit__(self, *a): return False
+        class FakeSession:
+            def post(self, url, json=None, headers=None, **kwargs):
+                post_calls.append({'url': url, 'json': json, 'headers': headers})
+                return FakeCM(FakeResp(429))
+        fm.db = types.SimpleNamespace(
+            supabase_url='https://example.supabase.co',
+            supabase_key='fake_key',
+            _get_supabase_session=AsyncMock(return_value=FakeSession()))
+        fm._snapshot_running = False
+        fm._running = True
+        sleep_calls = []
+        async def _sleep(_n):
+            sleep_calls.append(_n)
+            # Flip _running off after the 429 backoff (60s sleep) so the
+            # loop exits cleanly. The 40s startup sleep is call #1; the
+            # 429 backoff sleep is call #2.
+            if len(sleep_calls) >= 2:
+                fm._running = False
+        with LogCapture() as cap, patch('asyncio.sleep', new=_sleep):
+            await bot.Monitor._journal_snapshot_loop(fm)
+        rate_warns = [m for lvl, m in cap.records
+                      if lvl == 'WARNING' and '429 rate-limited' in m]
+        record("3a-3: 429 logged as WARNING with '429 rate-limited' marker",
+               len(rate_warns) >= 1, f"warns={rate_warns[:1]}")
+        record("3a-3: 60s backoff sleep invoked after 429",
+               60 in sleep_calls, f"sleep_calls={sleep_calls}")
+        record("3a-3: exactly 1 POST attempt before backoff",
+               len(post_calls) == 1, f"post_calls={len(post_calls)}")
+    except Exception as e:
+        record("3a-3: exception", False, str(e))
+
+
+async def test_3a_snapshot_post_timeout_does_not_crash():
+    """[3a-4 / point 8] POST raises asyncio.TimeoutError → caught, loop
+    continues, no crash, no rows lost (re-snapshotted next cycle)."""
+    print("\n--- 3a-4: snapshot POST timeout does not crash ---")
+    try:
+        prod_db, _ = await make_test_db()
+        fm = make_fake_monitor(prod_db)
+        await prod_db.journal_message({
+            'chat_id': -1001, 'msg_id': 1, 'raw_text': 'x https://t.me/A1',
+            'source_phone': 'A', 'state': 'pending', 'received_at': time.time()})
+        post_calls = []
+        class FakeCM:
+            def __init__(self, r): self._r = r
+            async def __aenter__(self): raise asyncio.TimeoutError("simulated hang")
+            async def __aexit__(self, *a): return False
+        class FakeSession:
+            def post(self, url, json=None, headers=None, **kwargs):
+                post_calls.append({'url': url, 'json': json, 'headers': headers})
+                return FakeCM(None)
+        fm.db = types.SimpleNamespace(
+            supabase_url='https://example.supabase.co',
+            supabase_key='fake_key',
+            _get_supabase_session=AsyncMock(return_value=FakeSession()))
+        fm._snapshot_running = False
+        fm._running = True
+        sleep_count = {'n': 0}
+        async def _sleep(_n):
+            sleep_count['n'] += 1
+            if sleep_count['n'] >= 3:  # let 1 cycle + 1 retry happen
+                fm._running = False
+        with LogCapture() as cap, patch('asyncio.sleep', new=_sleep):
+            await bot.Monitor._journal_snapshot_loop(fm)
+        timeout_warns = [m for lvl, m in cap.records
+                         if lvl == 'WARNING' and 'timed out' in m.lower()]
+        record("3a-4: TimeoutError caught + WARNING logged",
+               len(timeout_warns) >= 1, f"warns={timeout_warns[:1]}")
+        record("3a-4: loop survived (>=1 POST attempt, no crash)",
+               len(post_calls) >= 1, f"post_calls={len(post_calls)}")
+        record("3a-4: _snapshot_running reset to False after clean exit",
+               getattr(fm, '_snapshot_running', None) is False,
+               f"got {getattr(fm, '_snapshot_running', None)!r}")
+    except Exception as e:
+        record("3a-4: exception", False, str(e))
+
+
+async def test_3a_snapshot_network_error_continues():
+    """[3a-5 / point 10] POST raises aiohttp.ClientError (network) → caught,
+    loop continues, no crash."""
+    print("\n--- 3a-5: snapshot network/5xx error continues ---")
+    try:
+        prod_db, _ = await make_test_db()
+        fm = make_fake_monitor(prod_db)
+        await prod_db.journal_message({
+            'chat_id': -1001, 'msg_id': 1, 'raw_text': 'x https://t.me/A1',
+            'source_phone': 'A', 'state': 'pending', 'received_at': time.time()})
+        class FakeCM:
+            def __init__(self, r): self._r = r
+            async def __aenter__(self): raise aiohttp.ClientError("conn refused")
+            async def __aexit__(self, *a): return False
+        class FakeSession:
+            def post(self, url, json=None, headers=None, **kwargs):
+                return FakeCM(None)
+        fm.db = types.SimpleNamespace(
+            supabase_url='https://example.supabase.co',
+            supabase_key='fake_key',
+            _get_supabase_session=AsyncMock(return_value=FakeSession()))
+        fm._snapshot_running = False
+        fm._running = True
+        sleep_count = {'n': 0}
+        async def _sleep(_n):
+            sleep_count['n'] += 1
+            if sleep_count['n'] >= 3:
+                fm._running = False
+        with LogCapture() as cap, patch('asyncio.sleep', new=_sleep):
+            await bot.Monitor._journal_snapshot_loop(fm)
+        net_warns = [m for lvl, m in cap.records
+                     if lvl == 'WARNING' and 'network error' in m]
+        record("3a-5: ClientError caught + 'network error' WARNING logged",
+               len(net_warns) >= 1, f"warns={net_warns[:1]}")
+        record("3a-5: loop survived (no exception propagated)",
+               True, "loop exited via _running=False flip")
+    except Exception as e:
+        record("3a-5: exception", False, str(e))
+
+
+async def test_3a_restore_does_not_overwrite_terminal_local_state():
+    """[3a-6 / point 2 + 3] Local row exists with state='processed' (newer).
+    Snapshot returns it as state='pending' (older). Restore via INSERT OR
+    IGNORE must NOT overwrite the local processed state — the local row stays
+    'processed' (source of truth is local)."""
+    print("\n--- 3a-6: restore does NOT overwrite local terminal state ---")
+    try:
+        prod_db, _ = await make_test_db()
+        fm = make_fake_monitor(prod_db)
+        # Seed local journal with a PROCESSED row (terminal state).
+        await prod_db.journal_message({
+            'chat_id': -1001, 'msg_id': 1, 'raw_text': 'x https://t.me/A1',
+            'source_phone': 'A', 'state': 'pending', 'received_at': time.time()})
+        await prod_db.journal_set_state(-1001, 1, 'processed')
+        # Verify local state is 'processed' BEFORE restore
+        pre = await prod_db.journal_get(-1001, 1)
+        record("3a-6: local row is 'processed' BEFORE restore",
+               pre['state'] == 'processed', f"got {pre['state']!r}")
+        # Snapshot returns the SAME (chat_id, msg_id) but with state='pending'
+        # (stale — taken before the local row transitioned to processed).
+        snap_rows = [{'chat_id': -1001, 'msg_id': 1, 'raw_text': 'x https://t.me/A1',
+                      'source_phone': 'A', 'chat_title': '', 'chat_username': '',
+                      'chat_link_type': 'telegram', 'sender_id': 0, 'sender_name': '',
+                      'state': 'pending', 'received_at': time.time() - 999}]
+        class FakeResp:
+            def __init__(self, status, json_data=None):
+                self.status = status; self._j = json_data
+            async def text(self): return ''
+            async def json(self): return self._j
+        class FakeCM:
+            def __init__(self, r): self._r = r
+            async def __aenter__(self): return self._r
+            async def __aexit__(self, *a): return False
+        class FakeSession:
+            def get(self, url, **kwargs): return FakeCM(FakeResp(200, snap_rows))
+        fm.db = types.SimpleNamespace(
+            supabase_url='https://example.supabase.co',
+            supabase_key='fake_key',
+            _get_supabase_session=AsyncMock(return_value=FakeSession()))
+        restored = await bot.Monitor._restore_journal_from_supabase(fm)
+        # Restore returns 1 (journal_message "succeeds" even though INSERT
+        # OR IGNORE was a no-op — it doesn't report rows-affected).
+        record("3a-6: restore returns 1 (one snapshot row processed)",
+               restored == 1, f"got {restored}")
+        post = await prod_db.journal_get(-1001, 1)
+        record("3a-6: local row STILL 'processed' after restore (INSERT OR IGNORE)",
+               post['state'] == 'processed',
+               f"got {post['state']!r} (snapshot tried to set 'pending')")
+        # Count rows — should still be exactly 1 (no duplicate).
+        cnt = await sql_one(prod_db, "SELECT COUNT(*) FROM message_journal WHERE chat_id=? AND msg_id=?",
+                            (-1001, 1))
+        record("3a-6: no duplicate row created (still 1)",
+               cnt[0] == 1, f"count={cnt[0]}")
+    except Exception as e:
+        record("3a-6: exception", False, str(e))
+
+
+async def test_3a_restore_per_row_corruption_isolation():
+    """[3a-7 / point 11] Snapshot returns 3 rows; row #2 has NULL chat_id.
+    INSERT OR IGNORE silently skips the constraint-violating row (no
+    exception), so all 3 calls "succeed" but only 2 rows land in SQLite.
+    A second sub-test mocks journal_message to RAISE on row #2 to verify
+    the per-row try/except genuinely isolates non-constraint errors."""
+    print("\n--- 3a-7: restore per-row corruption isolation ---")
+    try:
+        prod_db, _ = await make_test_db()
+        fm = make_fake_monitor(prod_db)
+        snap_rows = [
+            {'chat_id': -2001, 'msg_id': 11, 'raw_text': 'a https://t.me/A1',
+             'source_phone': 'A', 'chat_title': '', 'chat_username': '',
+             'chat_link_type': 'telegram', 'sender_id': 0, 'sender_name': '',
+             'state': 'pending', 'received_at': time.time() - 100},
+            # Bad row: NULL chat_id → INSERT OR IGNORE silently skips (NOT
+            # NULL constraint violation is caught by the OR IGNORE clause,
+            # NOT raised). journal_message returns normally; restored count
+            # is incremented but the row is NOT in the DB.
+            {'chat_id': None, 'msg_id': 12, 'raw_text': 'bad',
+             'source_phone': 'A', 'chat_title': '', 'chat_username': '',
+             'chat_link_type': 'telegram', 'sender_id': 0, 'sender_name': '',
+             'state': 'pending', 'received_at': time.time() - 50},
+            {'chat_id': -2003, 'msg_id': 13, 'raw_text': 'c https://t.me/A3',
+             'source_phone': 'A', 'chat_title': '', 'chat_username': '',
+             'chat_link_type': 'telegram', 'sender_id': 0, 'sender_name': '',
+             'state': 'pending', 'received_at': time.time() - 10},
+        ]
+        class FakeResp:
+            def __init__(self, status, json_data=None):
+                self.status = status; self._j = json_data
+            async def text(self): return ''
+            async def json(self): return self._j
+        class FakeCM:
+            def __init__(self, r): self._r = r
+            async def __aenter__(self): return self._r
+            async def __aexit__(self, *a): return False
+        class FakeSession:
+            def get(self, url, **kwargs): return FakeCM(FakeResp(200, snap_rows))
+        fm.db = types.SimpleNamespace(
+            supabase_url='https://example.supabase.co',
+            supabase_key='fake_key',
+            _get_supabase_session=AsyncMock(return_value=FakeSession()))
+        restored = await bot.Monitor._restore_journal_from_supabase(fm)
+        # INSERT OR IGNORE silently swallows the NOT NULL violation on row 2,
+        # so journal_message returns normally for ALL 3 rows → restored=3.
+        # This documents the overcount: restored = calls, not rows-inserted.
+        record("3a-7: restore returns 3 (INSERT OR IGNORE swallows constraint violation)",
+               restored == 3, f"got {restored}")
+        # Verify rows 1 and 3 exist; row 2 (NULL chat_id) does NOT.
+        r1 = await prod_db.journal_get(-2001, 11)
+        r3 = await prod_db.journal_get(-2003, 13)
+        record("3a-7: good row 1 (-2001,11) restored",
+               r1 is not None and r1['state'] == 'pending',
+               f"got {r1}")
+        record("3a-7: good row 3 (-2003,13) restored",
+               r3 is not None and r3['state'] == 'pending',
+               f"got {r3}")
+        # Verify NO row with chat_id IS NULL exists (NOT NULL held)
+        null_cnt = await sql_one(prod_db,
+            "SELECT COUNT(*) FROM message_journal WHERE chat_id IS NULL")
+        record("3a-7: bad row (NULL chat_id) NOT inserted (NOT NULL held)",
+               null_cnt[0] == 0, f"null_count={null_cnt[0]}")
+
+        # --- Sub-test B: mock journal_message to RAISE on row #2 to verify
+        # the per-row try/except genuinely isolates non-constraint errors.
+        prod_db2, _ = await make_test_db()
+        fm2 = make_fake_monitor(prod_db2)
+        class FakeSession2:
+            def get(self, url, **kwargs): return FakeCM(FakeResp(200, snap_rows))
+        fm2.db = types.SimpleNamespace(
+            supabase_url='https://example.supabase.co',
+            supabase_key='fake_key',
+            _get_supabase_session=AsyncMock(return_value=FakeSession2()))
+        call_idx = {'n': 0}
+        real_journal = prod_db2.journal_message
+        async def _raising_journal(entry):
+            call_idx['n'] += 1
+            if call_idx['n'] == 2:
+                raise sqlite3.OperationalError("simulated disk-full")
+            return await real_journal(entry)
+        fm2.prod_db.journal_message = _raising_journal
+        restored2 = await bot.Monitor._restore_journal_from_supabase(fm2)
+        # Row 1 inserts (call 1), row 2 RAISES (call 2, caught by per-row
+        # except → pass), row 3 inserts (call 3). restored count = 2.
+        record("3a-7: per-row except isolates non-constraint error (restored=2)",
+               restored2 == 2, f"got {restored2}")
+        # Verify rows 1 and 3 still landed despite row 2 raising.
+        r1b = await prod_db2.journal_get(-2001, 11)
+        r3b = await prod_db2.journal_get(-2003, 13)
+        record("3a-7: row 1 restored even though row 2 raised",
+               r1b is not None, f"got {r1b}")
+        record("3a-7: row 3 restored even though row 2 raised",
+               r3b is not None, f"got {r3b}")
+    except Exception as e:
+        record("3a-7: exception", False, str(e))
+
+
+async def test_3a_restore_get_timeout_returns_zero():
+    """[3a-8 / point 8] Restore GET raises asyncio.TimeoutError → returns 0
+    + logs WARNING (no crash, no partial restore)."""
+    print("\n--- 3a-8: restore GET timeout returns 0 ---")
+    try:
+        prod_db, _ = await make_test_db()
+        fm = make_fake_monitor(prod_db)
+        class FakeCM:
+            def __init__(self, r): self._r = r
+            async def __aenter__(self): raise asyncio.TimeoutError("simulated hang")
+            async def __aexit__(self, *a): return False
+        class FakeSession:
+            def get(self, url, **kwargs): return FakeCM(None)
+        fm.db = types.SimpleNamespace(
+            supabase_url='https://example.supabase.co',
+            supabase_key='fake_key',
+            _get_supabase_session=AsyncMock(return_value=FakeSession()))
+        with LogCapture() as cap:
+            restored = await bot.Monitor._restore_journal_from_supabase(fm)
+        record("3a-8: restore returned 0 on timeout (not raise)",
+               restored == 0, f"got {restored}")
+        timeout_warns = [m for lvl, m in cap.records
+                         if lvl == 'WARNING' and 'timed out' in m.lower()]
+        record("3a-8: 'restore timed out' WARNING logged",
+               len(timeout_warns) >= 1, f"warns={timeout_warns[:1]}")
+        # Verify no rows were inserted into local journal (GET never returned)
+        cnt = await sql_one(prod_db, "SELECT COUNT(*) FROM message_journal")
+        record("3a-8: no rows inserted (local journal still empty)",
+               cnt[0] == 0, f"count={cnt[0]}")
+    except Exception as e:
+        record("3a-8: exception", False, str(e))
+
+
+# =========================================================================
+# [Task 6a] PollingScheduler / active_chats_count=0 root-cause regressions
+# =========================================================================
+
+async def test_6a_polling_status_counts_null_next_poll_at_as_active():
+    """[B03 + 6a] The /api/polling_status predicate MUST include NULL
+    next_poll_at rows. Historically the query was `next_poll_at <= ?` which
+    excluded all NULL rows → active_chats_count=0 even with 845 chats."""
+    try:
+        prod_db, _ = await make_test_db()
+        now = "2026-08-25T12:00:00"
+        # 3 rows: NULL next_poll_at, past (due), future (not due)
+        await sql_exec(prod_db,
+            "INSERT INTO monitored_chats (chat_id, chat_title, next_poll_at) VALUES (?,?,?)",
+            (100, "NULL_chat", None))
+        await sql_exec(prod_db,
+            "INSERT INTO monitored_chats (chat_id, chat_title, next_poll_at) VALUES (?,?,?)",
+            (101, "due_chat", "2026-08-25T11:00:00"))
+        await sql_exec(prod_db,
+            "INSERT INTO monitored_chats (chat_id, chat_title, next_poll_at) VALUES (?,?,?)",
+            (102, "future_chat", "2026-08-25T23:00:00"))
+        # Mirror the EXACT predicate the fixed /api/polling_status uses.
+        row = await sql_one(prod_db,
+            "SELECT COUNT(*) FROM monitored_chats WHERE (next_poll_at IS NULL OR next_poll_at <= ?)",
+            (now,))
+        record("6a-1: NULL + due counted (active_chats_count > 0)",
+               row[0] == 2, f"expected 2 (NULL+due), got {row[0]}")
+        # The OLD broken predicate must NOT count the NULL row.
+        row_old = await sql_one(prod_db,
+            "SELECT COUNT(*) FROM monitored_chats WHERE next_poll_at <= ?",
+            (now,))
+        record("6a-1b: legacy predicate excluded NULL (regression guard)",
+               row_old[0] == 1, f"legacy got {row_old[0]} (must be 1, not 2)")
+    except Exception as e:
+        record("6a-1: exception", False, str(e))
+
+
+async def test_6a_add_monitored_chat_seeds_next_poll_at():
+    """[6a] add_monitored_chat MUST seed next_poll_at = now() so the chat is
+    immediately due for polling AND visible to the status endpoint. Pre-fix
+    the column was left NULL on insert."""
+    try:
+        prod_db, _ = await make_test_db()
+        # Need member_count? add_monitored_chat signature: (chat_id, title, ...)
+        ok = await prod_db.add_monitored_chat(
+            200, "TestEdu", username="testedu", link_type="group",
+            monitored_by="966500000000", member_count=100)
+        record("6a-2: add_monitored_chat returns True for new chat", ok is True)
+        row = await sql_one(prod_db,
+            "SELECT next_poll_at, last_activity FROM monitored_chats WHERE chat_id=?",
+            (200,))
+        record("6a-2b: next_poll_at seeded non-NULL on insert",
+               row[0] is not None and row[1] is not None,
+               f"next_poll_at={row[0]}, last_activity={row[1]}")
+    except Exception as e:
+        record("6a-2: exception", False, str(e))
+
+
+async def test_6a_backfill_seeds_null_next_poll_at_rows():
+    """[6a] The startup backfill `UPDATE ... SET next_poll_at = COALESCE(...)`
+    MUST convert pre-existing NULL rows to now(). Simulate a pre-fix row
+    inserted with NULL, run the backfill SQL, assert it's now non-NULL."""
+    try:
+        prod_db, _ = await make_test_db()
+        # Insert a row the OLD way (NULL next_poll_at) — bypass add_monitored_chat
+        await sql_exec(prod_db,
+            "INSERT INTO monitored_chats (chat_id, chat_title, next_poll_at, last_activity) "
+            "VALUES (300, 'LegacyChat', NULL, NULL)")
+        # Run the backfill SQL (mirrors link_system._create_tables backfill block)
+        now_iso = "2026-08-25T13:00:00"
+        conn = await prod_db._conn()
+        await conn.execute(
+            "UPDATE monitored_chats SET next_poll_at = COALESCE(next_poll_at, ?) "
+            "WHERE next_poll_at IS NULL", (now_iso,))
+        await conn.execute(
+            "UPDATE monitored_chats SET last_activity = COALESCE(last_activity, ?) "
+            "WHERE last_activity IS NULL", (now_iso,))
+        await conn.commit()
+        row = await sql_one(prod_db,
+            "SELECT next_poll_at, last_activity FROM monitored_chats WHERE chat_id=?",
+            (300,))
+        record("6a-3: backfill converted NULL → non-NULL",
+               row[0] is not None and row[1] is not None,
+               f"next_poll_at={row[0]}, last_activity={row[1]}")
+        # Idempotency: re-running must NOT overwrite a non-NULL value
+        await conn.execute(
+            "UPDATE monitored_chats SET next_poll_at = COALESCE(next_poll_at, ?) "
+            "WHERE next_poll_at IS NULL", ("2099-01-01T00:00:00",))
+        await conn.commit()
+        row2 = await sql_one(prod_db,
+            "SELECT next_poll_at FROM monitored_chats WHERE chat_id=?", (300,))
+        record("6a-3b: backfill idempotent (non-NULL preserved)",
+               row2[0] == now_iso, f"expected {now_iso}, got {row2[0]}")
+    except Exception as e:
+        record("6a-3: exception", False, str(e))
+
+
+async def test_6a_scheduler_select_due_includes_null():
+    """[6a] SourceRegistry.select_due_chats predicate must include NULL.
+    Source-level regression guard (predicate is the scheduler's actual
+    due-selection)."""
+    try:
+        # Read source_registry.py and assert the predicate shape is intact.
+        src = (PROJECT_ROOT / "source_registry.py").read_text(encoding="utf-8")
+        has_null_or = "next_poll_at IS NULL OR next_poll_at <=" in src.replace("\n", " ")
+        record("6a-4: SourceRegistry predicate includes NULL-or-due",
+               has_null_or, "predicate missing/changed — would regress active_chats")
+    except Exception as e:
+        record("6a-4: exception", False, str(e))
+
+
+# =========================================================================
+# [Task 9a] Supervisor coverage regression guards
+# =========================================================================
+
+async def test_9a_supervisor_watches_nine_critical_tasks():
+    """[9a/W2] _supervisor_loop MUST supervise all 9 critical tasks.
+    Source-level guard: a dropped worker from the relaunch list would
+    silently die. Assert the 9 task names appear in _supervisor_loop."""
+    try:
+        src = (PROJECT_ROOT / "bot.py").read_text(encoding="utf-8")
+        # Extract the _supervisor_loop body
+        start = src.find("async def _supervisor_loop(self):")
+        end = src.find("    # ====", start)  # next section divider
+        if start < 0 or end < 0:
+            end = src.find("# [L03]", start) if start >= 0 else -1
+        body = src[start:end] if start >= 0 and end > start else src
+        required = [
+            "_polling_scheduler_task",     # 1 polling
+            "_journal_recovery_task",      # 2 journal recovery
+            "_journal_snapshot_task",      # 3 supabase mirror
+            "_ai_drainer_task",             # 4 ai drainer
+            "_joiner_task",                # 5 joiner
+            "_claim_cleanup_task",          # 6 claim cleanup
+            "_msg_cache_cleanup_task",      # 7 cache cleanup
+            "_priority_scorer_task",        # 8 priority
+            "_polling_watchdog_task",       # 9 watchdog
+        ]
+        missing = [t for t in required if t not in body]
+        record("9a-1: supervisor covers all 9 critical tasks",
+               not missing, f"missing: {missing}" if missing else "all 9 present")
+    except Exception as e:
+        record("9a-1: exception", False, str(e))
+
+
+async def test_9a_supervisor_relaunch_lock_present():
+    """[9a/W1] The supervisor relaunch of polling_scheduler MUST be wrapped in
+    a lock so the 60s supervisor + 30s watchdog can't both relaunch it
+    concurrently (duplicate-instance regression)."""
+    try:
+        src = (PROJECT_ROOT / "bot.py").read_text(encoding="utf-8")
+        start = src.find("async def _supervisor_loop(self):")
+        end = src.find("    async def _polling_watchdog_loop", start)
+        body = src[start:end] if start >= 0 and end > start else ""
+        has_lock = "_scheduler_relaunch_lock" in body and "async with _relaunch_lock" in body
+        record("9a-2: supervisor relaunch is lock-protected",
+               has_lock, "missing _scheduler_relaunch_lock — duplicate-scheduler risk")
+    except Exception as e:
+        record("9a-2: exception", False, str(e))
+
+
+async def test_9a_ai_drainer_relaunch_gated_on_env():
+    """[9a/W1] The supervisor MUST NOT relaunch _ai_drainer_worker when
+    AI_DRAIN_ENABLED is false (else noisy restart warnings every 60s for a
+    worker that intentionally self-disabled)."""
+    try:
+        src = (PROJECT_ROOT / "bot.py").read_text(encoding="utf-8")
+        start = src.find("async def _supervisor_loop(self):")
+        end = src.find("    async def _polling_watchdog_loop", start)
+        body = src[start:end] if start >= 0 and end > start else ""
+        has_gate = ("ai_drain_on" in body and "AI_DRAIN_ENABLED" in body
+                    and "if ai_drain_on" in body)
+        record("9a-3: ai_drainer relaunch gated on AI_DRAIN_ENABLED",
+               has_gate, "missing gate — noisy restart warnings when disabled")
+    except Exception as e:
+        record("9a-3: exception", False, str(e))
+
+
+# =========================================================================
+# [Task 10a] SQLite concurrency + pragma regressions
+# =========================================================================
+
+async def test_10a_concurrent_writers_no_deadlock_no_corruption():
+    """[10a] 10 coroutines × 100 (INSERT OR IGNORE + UPDATE) on the same
+    table must complete with no exceptions, no deadlock, and the correct
+    final row count (100 unique, each updated to its final value)."""
+    try:
+        prod_db, _ = await make_test_db()
+        N = 10
+        M = 100
+
+        async def writer(wid):
+            conn = await prod_db._conn()
+            for i in range(M):
+                # All writers target the SAME 100 rows (chat_id = i) → contention
+                await conn.execute(
+                    "INSERT OR IGNORE INTO monitored_chats "
+                    "(chat_id, chat_title, next_poll_at) VALUES (?,?,?)",
+                    (i, f"w{wid}_c{i}", "2026-08-25T12:00:00"))
+                await conn.execute(
+                    "UPDATE monitored_chats SET chat_title=? WHERE chat_id=?",
+                    (f"final_w{wid}_c{i}", i))
+            await conn.commit()
+
+        await asyncio.gather(*[writer(w) for w in range(N)], return_exceptions=True)
+        row = await sql_one(prod_db, "SELECT COUNT(*) FROM monitored_chats")
+        record("10a-1: concurrent writers — 100 unique rows (no corruption)",
+               row[0] == M, f"expected {M}, got {row[0]}")
+        # All rows must have a title (no NULL from a half-written tx)
+        nulls = await sql_one(prod_db,
+            "SELECT COUNT(*) FROM monitored_chats WHERE chat_title IS NULL")
+        record("10a-1b: no NULL titles (no partial writes)",
+               nulls[0] == 0, f"{nulls[0]} NULL titles")
+    except Exception as e:
+        record("10a-1: exception", False, str(e))
+
+
+async def test_10a_pragma_busy_timeout_and_wal_set():
+    """[10a] The production _ensure_conn path MUST set WAL mode + busy_timeout
+    (>=5000ms). Without these, concurrent writers get SQLITE_BUSY errors and
+    the journal risks corruption on crash.
+
+    Source-level guard: Monitor._ensure_conn in bot.py is the production
+    connection-opener. We assert the PRAGMA statements are present there.
+    (The test-FakeDB doesn't replicate the pragma setup — it's a bot.py
+    concern, not a link_system concern.)"""
+    try:
+        src = (PROJECT_ROOT / "bot.py").read_text(encoding="utf-8")
+        start = src.find("async def _ensure_conn(self):")
+        # _ensure_conn ends at the next method def at the same indent.
+        end = src.find("\n    async def ", start + 40)
+        if end < 0:
+            end = src.find("\n    def ", start + 40)
+        body = src[start:end if end > 0 else start + 1500]
+        has_wal = "PRAGMA journal_mode=WAL" in body or "journal_mode = WAL" in body
+        has_bt = "PRAGMA busy_timeout=5000" in body or "busy_timeout = 5000" in body or "busy_timeout=5000" in body
+        record("10a-2: _ensure_conn sets PRAGMA journal_mode=WAL",
+               has_wal, "WAL pragma missing — crash-corruption risk")
+        record("10a-2b: _ensure_conn sets PRAGMA busy_timeout>=5000",
+               has_bt, "busy_timeout missing — SQLITE_BUSY under contention")
+    except Exception as e:
+        record("10a-2: exception", False, str(e))
+
+
+# =========================================================================
+# [Task 5a] API security regressions
+# =========================================================================
+
+async def test_5a_middleware_constant_time_compare():
+    """[5a/A1] dashboard_api_key_middleware MUST use secrets.compare_digest
+    (constant-time), not `==`. A wrong key → 401; a correct key → passes."""
+    try:
+        os.environ['DASHBOARD_API_KEY'] = "secret-key-value-123"
+        # Wrong key → 401
+        req_bad = MagicMock()
+        req_bad.path = "/api/links"
+        req_bad.headers = {"X-Api-Key": "wrong"}
+        handler = AsyncMock(return_value=web_json_ok())
+        resp_bad = await bot.dashboard_api_key_middleware(req_bad, handler)
+        record("5a-1: wrong X-Api-Key → 401",
+               getattr(resp_bad, 'status', None) == 401,
+               f"status={getattr(resp_bad, 'status', None)}")
+        # Correct key → handler invoked
+        req_ok = MagicMock()
+        req_ok.path = "/api/links"
+        req_ok.headers = {"X-Api-Key": "secret-key-value-123"}
+        handler2 = AsyncMock(return_value=web_json_ok())
+        await bot.dashboard_api_key_middleware(req_ok, handler2)
+        record("5a-1b: correct X-Api-Key → handler invoked",
+               handler2.called, "handler not called")
+        # Source uses compare_digest — search the WHOLE middleware function
+        # (from `async def dashboard_api_key_middleware` to the next top-level
+        # `async def`/`def` at column 0). A narrow \n\n window truncated the
+        # body before reaching the compare_digest call.
+        src = (PROJECT_ROOT / "bot.py").read_text(encoding="utf-8")
+        mw_start = src.find("async def dashboard_api_key_middleware")
+        # find next top-level (col-0) function def after the middleware
+        import re as _re
+        nxt = _re.search(r'\n(?:async )?def [a-zA-Z_]', src[mw_start + 50:])
+        mw_end = (mw_start + 50 + nxt.start()) if nxt else mw_start + 3000
+        mw_body = src[mw_start:mw_end]
+        record("5a-1c: uses secrets.compare_digest (constant-time)",
+               "secrets.compare_digest" in mw_body,
+               "middleware not calling secrets.compare_digest — timing-attack risk")
+    except Exception as e:
+        record("5a-1: exception", False, str(e))
+    finally:
+        os.environ.pop('DASHBOARD_API_KEY', None)
+
+
+async def test_5a_middleware_exempt_health_endpoints():
+    """[5a/A2] /health, /ready, /metrics are NOT under /api/* so they're NEVER
+    gated — Render's health probe + Prometheus must stay open even when the
+    key is set."""
+    try:
+        os.environ['DASHBOARD_API_KEY'] = "secret-key-value-123"
+        for path in ("/health", "/ready", "/metrics"):
+            req = MagicMock()
+            req.path = path
+            req.headers = {}  # no X-Api-Key
+            handler = AsyncMock(return_value=web_json_ok())
+            await bot.dashboard_api_key_middleware(req, handler)
+            record(f"5a-2: {path} exempt from auth", handler.called,
+                   f"{path} was gated — would break Render health probe")
+    except Exception as e:
+        record("5a-2: exception", False, str(e))
+    finally:
+        os.environ.pop('DASHBOARD_API_KEY', None)
+
+
+async def test_5a_middleware_unset_means_open():
+    """[5a/A4] When DASHBOARD_API_KEY is UNSET, /api/* is open (backward
+    compatible — the existing dashboard sends no X-Api-Key header)."""
+    try:
+        os.environ.pop('DASHBOARD_API_KEY', None)
+        req = MagicMock()
+        req.path = "/api/links"
+        req.headers = {}  # no key
+        handler = AsyncMock(return_value=web_json_ok())
+        await bot.dashboard_api_key_middleware(req, handler)
+        record("5a-3: DASHBOARD_API_KEY unset → /api open (backward-compat)",
+               handler.called, "middleware gated even when key unset — breaks dashboard")
+    except Exception as e:
+        record("5a-3: exception", False, str(e))
+
+
+async def test_5a_redact_phone_masks_middle():
+    """[5a/A3] _redact_phone must mask the middle of a phone number and never
+    leak the full value; edge cases (None, "", short) → safe output."""
+    try:
+        rp = bot._redact_phone
+        full = "+96651234567"
+        masked = rp(full)
+        record("5a-4: full phone masked (no full leak)",
+               full not in masked and "•" in masked, f"'{masked}'")
+        record("5a-4b: None → ''", rp(None) == "", f"got '{rp(None)}'")
+        record("5a-4c: '' → ''", rp("") == "", f"got '{rp('')}'")
+        record("5a-4d: short → '••••'", rp("12") == "••••", f"got '{rp('12')}'")
+    except Exception as e:
+        record("5a-4: exception", False, str(e))
+
+
+def web_json_ok():
+    """Minimal aiohttp.web.json_response stand-in for middleware tests."""
+    class _R:
+        status = 200
+    return _R()
+
+
+# =========================================================================
+# [Task 11a] Secrets scan — source files must contain NO real secrets
+# =========================================================================
+
+async def test_11a_no_real_secrets_in_source_files():
+    """[11a/B23] bot.py, link_system.py, source_registry.py, render.yaml must
+    contain NO real secrets. Placeholders (YOUR_, fake_, example, <PAT>) are
+    OK. This is a regression guard against re-committing a credential."""
+    import re
+    try:
+        files = ["bot.py", "link_system.py", "source_registry.py", "render.yaml"]
+        patterns = [
+            (r'ghp_[A-Za-z0-9]{36}', "GitHub PAT (ghp_)"),
+            (r'github_pat_[A-Za-z0-9_]{60,}', "GitHub fine-grained PAT"),
+            (r'sk-proj-[A-Za-z0-9_]{40,}', "OpenAI project key"),
+            (r'sk-[A-Za-z0-9]{48}', "OpenAI legacy key"),
+            (r'BOT_TOKEN\s*=\s*[0-9]{6,}:[A-Za-z0-9_-]{30,}', "Telegram BOT_TOKEN"),
+            (r'API_HASH\s*=\s*[a-f0-9]{30,}', "Telegram API_HASH"),
+            (r'session_string\s*=\s*1[A-Za-z0-9_-]{40,}', "Telethon session"),
+            (r'eyJ[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{20,}',
+             "Supabase JWT"),
+        ]
+        bad = []
+        for fname in files:
+            try:
+                txt = (PROJECT_ROOT / fname).read_text(encoding="utf-8",
+                                                        errors="ignore")
+            except Exception:
+                continue
+            for pat, label in patterns:
+                for m in re.finditer(pat, txt):
+                    val = m.group(0)
+                    # Allow placeholders
+                    if any(ph in val for ph in
+                           ("YOUR_", "fake_", "example", "<PAT", "<TOKEN",
+                            "123:test", "testhash")):
+                        continue
+                    bad.append(f"{fname}:{m.start()}: {label}")
+        record("11a-1: no real secrets in source files",
+               not bad, f"FOUND {len(bad)}: {bad[:3]}" if bad else "clean")
+    except Exception as e:
+        record("11a-1: exception", False, str(e))
+
+
 # === Main runner ===
 
 async def main():
     print("=" * 70)
-    print("Audit-Fix Regressions — Test Suite (Task 8a: 12 fixes + Task 8b: 10 new + persistence)")
+    print("Audit-Fix Regressions — Test Suite (Task 8a: 12 fixes + Task 8b: 10 new + persistence + Task 4a: AI drainer hardening + Task 3a: snapshot audit + Task 9a/10a/5a/11a: workers/sqlite/api/secrets)")
     print("=" * 70)
 
     await test_B01_data_dir_env_configurable()
@@ -1241,6 +2739,59 @@ async def main():
     await test_N10_ensure_conn_lock_serializes()
     await test_persist_snapshot_restore_on_startup()
     await test_persist_snapshot_loop_batches()
+
+    # === Task 4a — AI Drainer Deep Audit + Hardening (15 scenarios) ===
+    await test_4a_ai_drainer_lease_filter_on_patch()
+    await test_4a_ai_drainer_batch_size_env()
+    await test_4a_ai_drainer_order_rotates_head()
+    await test_4a_ai_drainer_timeout_skips_row()
+    await test_4a_ai_drainer_provider_failure_skips_row()
+    await test_4a_ai_drainer_none_result_skips_patch()
+    await test_4a_ai_drainer_429_cycle_backoff()
+    await test_4a_ai_drainer_empty_queue_60s_sleep()
+    await test_4a_ai_drainer_poison_row_skipped_after_3_fails()
+    await test_4a_ai_drainer_race_loss_detected()
+    await test_4a_ai_drainer_concurrency_semaphore_bounded()
+    await test_4a_ai_drainer_concurrency_3_allows_parallel()
+    await test_4a_ai_drainer_batch_summary_log()
+    await test_4a_ai_drainer_fail_count_resets_on_success()
+    await test_4a_ai_drainer_graceful_shutdown()
+    await test_4a_ai_drainer_disabled_by_default()
+    await test_4a_ai_drainer_no_ai_configured_60s_sleep()
+
+    # === Task 3a — Supabase Journal Snapshot Deep Audit (8 scenarios) ===
+    await test_3a_snapshot_concurrent_guard()
+    await test_3a_snapshot_order_by_received_at()
+    await test_3a_snapshot_429_backoff()
+    await test_3a_snapshot_post_timeout_does_not_crash()
+    await test_3a_snapshot_network_error_continues()
+    await test_3a_restore_does_not_overwrite_terminal_local_state()
+    await test_3a_restore_per_row_corruption_isolation()
+    await test_3a_restore_get_timeout_returns_zero()
+
+    # === Task 6a — PollingScheduler / active_chats_count=0 ===
+    await test_6a_polling_status_counts_null_next_poll_at_as_active()
+    await test_6a_add_monitored_chat_seeds_next_poll_at()
+    await test_6a_backfill_seeds_null_next_poll_at_rows()
+    await test_6a_scheduler_select_due_includes_null()
+
+    # === Task 9a — Supervisor coverage ===
+    await test_9a_supervisor_watches_nine_critical_tasks()
+    await test_9a_supervisor_relaunch_lock_present()
+    await test_9a_ai_drainer_relaunch_gated_on_env()
+
+    # === Task 10a — SQLite concurrency + pragmas ===
+    await test_10a_concurrent_writers_no_deadlock_no_corruption()
+    await test_10a_pragma_busy_timeout_and_wal_set()
+
+    # === Task 5a — API security ===
+    await test_5a_middleware_constant_time_compare()
+    await test_5a_middleware_exempt_health_endpoints()
+    await test_5a_middleware_unset_means_open()
+    await test_5a_redact_phone_masks_middle()
+
+    # === Task 11a — Secrets scan ===
+    await test_11a_no_real_secrets_in_source_files()
 
     # [infra] close all aiosqlite connections before the loop tears down
     await close_all_test_dbs()

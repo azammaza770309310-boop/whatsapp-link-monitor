@@ -43,8 +43,32 @@ services:
       # this to true starts a 30s drainer that runs AI on up to 10 NULL-
       # ai_approved rows per cycle and PATCHes the verdict back. Leave
       # false unless AI_BATCH_MODE=true is also set. ===
+      # [Task 4a hardened] The drainer is now bounded-concurrency,
+      # rate-limited, lease-protected, idempotent, observable, restart-
+      # safe, and graceful-shutdown-capable. See _ai_drainer_worker
+      # docstring for the full guarantee matrix. Defaults below preserve
+      # backward-compatible behavior (AI_DRAIN_ENABLED=false → idle). ===
       - key: AI_DRAIN_ENABLED
         value: "false"
+      # [Task 4a] AI_DRAIN_BATCH_SIZE — rows per 30s cycle (default 10).
+      # At 10 rows/cycle × 2 cycles/min = 20 rows/min ≈ 22h to clear the
+      # 26,475 backlog. Bump to 20 only if the AI provider headroom allows.
+      - key: AI_DRAIN_BATCH_SIZE
+        value: "10"
+      # [Task 4a] AI_DRAIN_CONCURRENCY — max concurrent analyze_message
+      # calls per batch via asyncio.Semaphore (default 3). With batch
+      # mode ON, the drainer is the SOLE AI consumer — 3 concurrent calls
+      # is well within Groq's 30 RPM / OpenAI's 60 RPM. If AI_BATCH_MODE
+      # is set to false (live AI on hot path), set this to 1 to serialize
+      # drainer calls behind the live path.
+      - key: AI_DRAIN_CONCURRENCY
+        value: "3"
+      # [Task 4a] AI_DRAIN_TIMEOUT_S — per-row analyze_message timeout via
+      # asyncio.wait_for (default 60s). On timeout the row stays ai_pending
+      # (no permanent claim); the in-memory retry cap (3 fails) then skips
+      # it on subsequent cycles so a poison row can't burn the AI budget.
+      - key: AI_DRAIN_TIMEOUT_S
+        value: "60"
       # === اختياري ===
       - key: OWNER_ID
         sync: false

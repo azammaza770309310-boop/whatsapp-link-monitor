@@ -25,6 +25,7 @@ import hashlib
 import logging
 import os
 import re
+import secrets
 import signal
 import sys
 import time
@@ -2716,9 +2717,22 @@ class Monitor:
         self._reconcile_inflight: Set[int] = set()         # شاتات قيد reconcile
         self._chat_poll_failures: Dict[int, int] = {}      # chat_id → إخفاقات polling متتالية
         self._journal_recovery_task: Optional[asyncio.Task] = None
+        # [Task 3a / point 6] snapshot concurrent-invocation guard — set True
+        # while a snapshot cycle is mid-POST so the supervisor relaunch path
+        # is a no-op rather than a double POST.
+        self._snapshot_running: bool = False
         # [B07] supervisor + [L03] polling-watchdog task handles
         self._supervisor_task: Optional[asyncio.Task] = None
         self._polling_watchdog_task: Optional[asyncio.Task] = None
+        # [Task 9a / W3] Shared lock that serializes the relaunch of
+        # `_polling_scheduler_task` between `_supervisor_loop` (60s) and
+        # `_polling_watchdog_loop` (30s). Without it, both loops can
+        # simultaneously observe the scheduler task as `.done()` and each
+        # call `asyncio.create_task(self.polling_scheduler.run())` — the
+        # second assignment overwrites the first reference, leaving the
+        # first instance running fire-and-forget → two concurrent polling
+        # schedulers double the BATCH_SIZE and halve the cycle sleep.
+        self._scheduler_relaunch_lock = asyncio.Lock()
 
     @staticmethod
     def _get_chat_name(chat):
@@ -3735,29 +3749,60 @@ class Monitor:
     # [B07] Supervisor loop — recreates dead critical background tasks
     # ===================================================================
     async def _supervisor_loop(self):
-        """60s supervisor: checks 5 critical background tasks and recreates any
+        """60s supervisor: checks critical background tasks and recreates any
         that are done/cancelled. A bug, an unhandled exception, or an OOM kill
         can silently terminate a worker task; without a supervisor it stays dead
         until a full process restart (which on Render free can be hours/days).
 
-        Critical tasks: polling, journal_recovery, journal_snapshot, ai_drainer,
-        joiner. Logs WARNING [SUPERVISOR] restarted <name> on each restart.
+        Critical tasks watched (Task 9a hardened the original 5 → 9):
+          1. polling_scheduler        (heartbeat — also has its own 30s watchdog)
+          2. journal_recovery         (crash-safe message rescue)
+          3. journal_snapshot_loop     (Supabase durability mirror)
+          4. ai_drainer_worker         (only when AI_DRAIN_ENABLED=true)
+          5. joiner_worker             (link processor)
+          6. claim_cleanup_task        (hourly processed_messages purge —
+               was NOT supervised before Task 9a; a dead task let the table
+               grow unbounded)
+          7. msg_cache_cleanup_task    (30s TTL purge — was NOT supervised)
+          8. priority_scorer_task      (member_count fetch — was NOT supervised)
+          9. polling_watchdog_task     (the 30s scheduler watchdog itself —
+               if THIS dies, only the 60s supervisor watches polling, so
+               we self-heal the watchdog too)
 
-        Note (task 8a): journal_snapshot + ai_drainer methods may not exist yet
-        (task 8b adds them). Each is guarded with hasattr so the supervisor
-        degrades to watching polling + journal_recovery + joiner until 8b lands.
+        Logs WARNING [SUPERVISOR] restarted <name> on each restart.
+
+        Note (Task 9a): the polling_scheduler relaunch is wrapped in
+        self._scheduler_relaunch_lock so the supervisor + the 30s
+        polling_watchdog can't BOTH relaunch it concurrently (was a
+        duplicate-instance risk on the 30s/60s boundary).
+        Note (Task 9a): ai_drainer restart is gated on AI_DRAIN_ENABLED —
+        otherwise the worker self-returns at line ~3882 and the supervisor
+        would emit a noisy "restarted" warning every 60s for a worker
+        that intentionally exited (default deployment = AI_DRAIN disabled).
         """
         await asyncio.sleep(60)  # let startup settle before first check
-        logging.info("[SUPERVISOR] started — 60s cycle, watching critical tasks")
+        logging.info("[SUPERVISOR] started — 60s cycle, watching 9 critical tasks")
+        # [Task 9a / W1] cache the AI_DRAIN_ENABLED decision at supervisor
+        # startup so a runtime env flip doesn't trigger a storm of restarts.
+        # If the operator wants to enable the drainer, they restart the
+        # process — same pattern as every other env-gated worker.
+        ai_drain_on = os.getenv('AI_DRAIN_ENABLED', 'false').lower() in ('true', '1', 'yes')
         while self._running:
             try:
-                # 1. PollingScheduler
-                if (getattr(self, '_polling_scheduler_task', None) is None
-                        or self._polling_scheduler_task.done()):
-                    if getattr(self, 'polling_scheduler', None) and self._running:
-                        self._polling_scheduler_task = asyncio.create_task(
-                            self.polling_scheduler.run())
-                        logging.warning("[SUPERVISOR] restarted polling_scheduler")
+                # 1. PollingScheduler — lock-protected to prevent the 30s
+                # polling_watchdog from racing us to relaunch the same task.
+                # [Task 9a] getattr-or-fallback so tests with a stub self
+                # (no _scheduler_relaunch_lock attr) don't AttributeError;
+                # the fallback lock doesn't serialize cross-task in tests
+                # but real Monitor instances set the attr in __init__.
+                _relaunch_lock = getattr(self, '_scheduler_relaunch_lock', None) or asyncio.Lock()
+                async with _relaunch_lock:
+                    if (getattr(self, '_polling_scheduler_task', None) is None
+                            or self._polling_scheduler_task.done()):
+                        if getattr(self, 'polling_scheduler', None) and self._running:
+                            self._polling_scheduler_task = asyncio.create_task(
+                                self.polling_scheduler.run())
+                            logging.warning("[SUPERVISOR] restarted polling_scheduler")
                 # 2. Journal recovery
                 if (getattr(self, '_journal_recovery_task', None) is None
                         or self._journal_recovery_task.done()) and self._running:
@@ -3771,8 +3816,13 @@ class Monitor:
                         self._journal_snapshot_task = asyncio.create_task(
                             self._journal_snapshot_loop())
                         logging.warning("[SUPERVISOR] restarted journal_snapshot")
-                # 4. AI drainer — guarded: 8b adds the method
-                if hasattr(self, '_ai_drainer_worker') and self._running:
+                # 4. AI drainer — guarded: 8b adds the method.
+                # [Task 9a / W1] ONLY relaunch when AI_DRAIN_ENABLED is true;
+                # otherwise the worker exits immediately at startup and the
+                # supervisor would emit a noisy "restarted" WARNING every
+                # 60s for a worker that intentionally self-disabled. Default
+                # deployment (AI_DRAIN_ENABLED unset) stays quiet.
+                if ai_drain_on and hasattr(self, '_ai_drainer_worker') and self._running:
                     if (getattr(self, '_ai_drainer_task', None) is None
                             or self._ai_drainer_task.done()):
                         self._ai_drainer_task = asyncio.create_task(
@@ -3783,6 +3833,40 @@ class Monitor:
                         or self._joiner_task.done()) and self._running:
                     self._joiner_task = asyncio.create_task(self._joiner_worker())
                     logging.warning("[SUPERVISOR] restarted joiner")
+                # 6. [Task 9a / W2] Claim cleanup loop (hourly) — was NOT
+                # supervised; a single unhandled exception in the loop body
+                # (rare but possible) left the processed_messages table
+                # growing unbounded. Now self-heals.
+                if (getattr(self, '_claim_cleanup_task', None) is None
+                        or self._claim_cleanup_task.done()) and self._running:
+                    self._claim_cleanup_task = asyncio.create_task(
+                        self._cleanup_processed_messages_loop())
+                    logging.warning("[SUPERVISOR] restarted claim_cleanup")
+                # 7. [Task 9a / W2] Message cache cleanup (30s TTL purge)
+                # — was NOT supervised; a dead task let _msg_cache grow
+                # unbounded (memory leak). Now self-heals.
+                if (getattr(self, '_msg_cache_cleanup_task', None) is None
+                        or self._msg_cache_cleanup_task.done()) and self._running:
+                    self._msg_cache_cleanup_task = asyncio.create_task(
+                        self._msg_cache_cleanup())
+                    logging.warning("[SUPERVISOR] restarted msg_cache_cleanup")
+                # 8. [Task 9a / W2] Priority scorer (member_count fetch) —
+                # was NOT supervised; a dead task meant no priority updates
+                # (links still process, but with priority=3). Now self-heals.
+                if (getattr(self, '_priority_scorer_task', None) is None
+                        or self._priority_scorer_task.done()) and self._running:
+                    self._priority_scorer_task = asyncio.create_task(
+                        self._priority_scorer())
+                    logging.warning("[SUPERVISOR] restarted priority_scorer")
+                # 9. [Task 9a / W2] Polling watchdog (the 30s scheduler
+                # watchdog itself) — was NOT supervised; if THIS died, only
+                # the 60s supervisor watched polling (twice the dead-time).
+                # Self-heal so the dedicated 30s watchdog stays alive.
+                if (getattr(self, '_polling_watchdog_task', None) is None
+                        or self._polling_watchdog_task.done()) and self._running:
+                    self._polling_watchdog_task = asyncio.create_task(
+                        self._polling_watchdog_loop())
+                    logging.warning("[SUPERVISOR] restarted polling_watchdog")
             except asyncio.CancelledError:
                 break
             except Exception as e:
@@ -3798,16 +3882,27 @@ class Monitor:
         others). Polling is the system's heartbeat — a dead scheduler means NO
         new links are discovered — so it gets its own faster watchdog. Logs
         WARNING [POLLING-WATCHDOG] scheduler was dead — restarted.
+
+        [Task 9a / W3] Relaunch is wrapped in self._scheduler_relaunch_lock so
+        the supervisor (60s) and this watchdog (30s) can't BOTH detect the
+        scheduler as dead and BOTH call asyncio.create_task — that race
+        leaked the first task reference (fire-and-forget) and produced two
+        concurrent PollingScheduler instances doubling BATCH_SIZE.
         """
         await asyncio.sleep(30)
         logging.info("[POLLING-WATCHDOG] started — 30s cycle, scheduler-only")
         while self._running:
             try:
-                t = getattr(self, '_polling_scheduler_task', None)
-                if (t is None or t.done()) and getattr(self, 'polling_scheduler', None) and self._running:
-                    self._polling_scheduler_task = asyncio.create_task(
-                        self.polling_scheduler.run())
-                    logging.warning("[POLLING-WATCHDOG] scheduler was dead — restarted")
+                # [Task 9a / W3] Lock-protected relaunch — same lock as the
+                # supervisor uses, so the two paths serialize. getattr-or-
+                # fallback so test stubs without the attr don't crash.
+                _relaunch_lock = getattr(self, '_scheduler_relaunch_lock', None) or asyncio.Lock()
+                async with _relaunch_lock:
+                    t = getattr(self, '_polling_scheduler_task', None)
+                    if (t is None or t.done()) and getattr(self, 'polling_scheduler', None) and self._running:
+                        self._polling_scheduler_task = asyncio.create_task(
+                            self.polling_scheduler.run())
+                        logging.warning("[POLLING-WATCHDOG] scheduler was dead — restarted")
             except asyncio.CancelledError:
                 break
             except Exception as e:
@@ -3815,23 +3910,96 @@ class Monitor:
             await asyncio.sleep(30)
 
     # ===================================================================
-    # [N07] AI drainer — processes the ai_pending backlog (26,475 structural).
-    # Respects AI_BATCH_MODE: the drainer runs ONLY when explicitly enabled
-    # via AI_DRAIN_ENABLED (default false), since batch mode intentionally
-    # skips AI on the hot path for speed. Toggling AI_DRAIN_ENABLED=true +
-    # AI_BATCH_MODE=true lets the drainer catch up the backlog in the
-    # background without slowing the live enqueue/join pipeline.
+    # [N07 / Task 4a hardened] AI drainer — processes the ai_pending backlog
+    # (26,475 structural). Bounded-concurrency, rate-limited, lease-
+    # protected, idempotent, observable, restart-safe, graceful-shutdown-
+    # capable. Respects AI_BATCH_MODE: the drainer runs ONLY when explicitly
+    # enabled via AI_DRAIN_ENABLED (default false), since batch mode
+    # intentionally skips AI on the hot path for speed. Toggling
+    # AI_DRAIN_ENABLED=true + AI_BATCH_MODE=true lets the drainer catch up
+    # the backlog in the background without slowing the live enqueue/join
+    # pipeline.
+    #
+    # Bounded concurrency: AI_DRAIN_CONCURRENCY (default 3) caps the number
+    #   of concurrent analyze_message calls via asyncio.Semaphore. The 10
+    #   rows/batch are gathered concurrently up to this cap (was sequential
+    #   in 8b — now configurable; default 3 keeps us well within Groq's
+    #   30 RPM / OpenAI's 60 RPM, set to 1 to restore sequential behavior).
+    # Batch size: AI_DRAIN_BATCH_SIZE (default 10) — cap rows per 30s cycle.
+    # Timeout: AI_DRAIN_TIMEOUT_S (default 60) — each analyze_message is
+    #   wrapped in asyncio.wait_for; on timeout the row stays ai_pending
+    #   (no permanent claim, re-tried next cycle up to the retry cap).
+    # Retry cap: in-memory _ai_drainer_fail_count dict — a row that fails
+    #   (timeout / exception / None result) 3× in this worker lifetime is
+    #   skipped on subsequent cycles (prevents a poison row from burning
+    #   the AI budget every cycle). Lost on restart — idempotent (row is
+    #   retried by the next worker instance).
+    # Lease protection: PATCH URL carries `ai_approved=is.null` filter so
+    #   two concurrent workers (or a supervisor-relaunched instance) can't
+    #   double-write. PATCH uses `Prefer: return=representation` and parses
+    #   the body — empty list = 0 rows updated = race-lost (logged DEBUG +
+    #   skipped, NOT counted as failure). No Supabase migration needed —
+    #   the existing `ai_approved` column IS the lease flag.
+    # Stuck-job rotation: SELECT uses `&order=id.desc` so the head rotates
+    #   as new rows arrive (newest-first); combined with the retry cap,
+    #   a chronically-failing poison row at the head is skipped after 3
+    #   retries instead of blocking every cycle.
+    # Graceful shutdown: stop() cancels _ai_drainer_task; the worker catches
+    #   asyncio.CancelledError and breaks. A partial PATCH is idempotent
+    #   (the WHERE-filter prevents double-write).
+    # Observability: per-batch summary
+    #   `[AI-DRAIN] batch=N processed=M failed=K skipped=L elapsed=Xs`.
+    #
+    # NOTE (backlog starvation): With AI_BATCH_MODE=true (default), the
+    # live NewMessage pipeline does NOT call the AI provider (batch mode
+    # skips AI on the hot path), so the drainer is the SOLE consumer of
+    # the AI rate limit — no competition. If the operator flips
+    # AI_BATCH_MODE=false (live AI on hot path), the drainer may compete
+    # with the live pipeline for the provider rate limit; in that case
+    # set AI_DRAIN_CONCURRENCY=1 to serialize drainer calls behind the
+    # live path. The drainer is a backlog reducer, NOT the primary path —
+    # 10 rows/30s = 20 rows/min = ~22h to clear 26,475, which is fine.
     # ===================================================================
     async def _ai_drainer_worker(self):
-        """Every 30s: fetch up to 10 links where ai_approved IS NULL from
-        Supabase, run AI on each, PATCH the verdict back. 429 → 60s backoff.
-        Empty queue → 60s sleep. Disabled unless AI_DRAIN_ENABLED=true."""
+        """Every 30s: fetch up to AI_DRAIN_BATCH_SIZE links where
+        ai_approved IS NULL from Supabase, run AI on each (bounded by
+        AI_DRAIN_CONCURRENCY semaphore), PATCH the verdict back with a
+        `ai_approved=is.null` lease filter. Each analyze_message call is
+        wrapped in asyncio.wait_for(AI_DRAIN_TIMEOUT_S). 429 → 60s cycle
+        backoff. Empty queue → 60s sleep. Disabled unless
+        AI_DRAIN_ENABLED=true (default false — opt-in)."""
         if not os.getenv('AI_DRAIN_ENABLED', 'false').lower() in ('true', '1', 'yes'):
             logging.info("[AI-DRAIN] disabled (AI_DRAIN_ENABLED != true) — worker idle")
             return
         await asyncio.sleep(45)  # let startup settle
-        logging.info("[AI-DRAIN] started — 30s cycle, 10 links/batch")
+        try:
+            batch_size = int(os.getenv('AI_DRAIN_BATCH_SIZE', '10'))
+        except (ValueError, TypeError):
+            batch_size = 10
+        try:
+            concurrency = max(1, int(os.getenv('AI_DRAIN_CONCURRENCY', '3')))
+        except (ValueError, TypeError):
+            concurrency = 3
+        try:
+            timeout_s = float(os.getenv('AI_DRAIN_TIMEOUT_S', '60'))
+        except (ValueError, TypeError):
+            timeout_s = 60.0
+        sem = asyncio.Semaphore(concurrency)
+        # In-memory per-row failure counter (capped at 3) — skips chronically-
+        # failing rows THIS worker lifetime. Lost on restart (idempotent —
+        # the row is retried by the next worker instance). Prevents a poison
+        # row from being retried every cycle and burning the AI budget.
+        if not hasattr(self, '_ai_drainer_fail_count') or \
+                not isinstance(getattr(self, '_ai_drainer_fail_count'), dict):
+            self._ai_drainer_fail_count = {}
+        fail_count = self._ai_drainer_fail_count
+        logging.info(
+            f"[AI-DRAIN] started — 30s cycle, batch={batch_size}, "
+            f"concurrency={concurrency}, timeout={timeout_s}s"
+        )
         while self._running:
+            batch_start = time.time()
+            processed = failed = skipped = 0
             try:
                 if not (getattr(self, 'ai_analyzer', None) and self.ai_analyzer.enabled):
                     # No AI configured — nothing to do
@@ -3841,11 +4009,16 @@ class Monitor:
                     await asyncio.sleep(60)
                     continue
                 session = await self.db._get_supabase_session()
-                # Fetch up to 10 links where ai_approved IS NULL
+                # Fetch up to batch_size links where ai_approved IS NULL.
+                # ORDER BY id DESC rotates the head so a poison row at the
+                # head doesn't permanently block newer rows from being seen
+                # (the in-memory fail counter then skips the poison row
+                # itself after 3 retries).
                 fetch_url = (
                     f"{self.db.supabase_url}/rest/v1/links?"
                     f"ai_approved=is.null&select=id,link,link_type,message_text,"
-                    f"group_name,sender_name,source_phone&limit=10"
+                    f"group_name,sender_name,source_phone"
+                    f"&order=id.desc&limit={batch_size}"
                 )
                 async with session.get(fetch_url) as resp:
                     if resp.status == 429:
@@ -3861,42 +4034,139 @@ class Monitor:
                 if not rows:
                     await asyncio.sleep(60)  # empty queue
                     continue
-                for row in rows:
+
+                async def _process_one(row):
+                    nonlocal processed, failed, skipped
+                    link_id = row.get('id')
+                    link = row.get('link')
+                    if not link:
+                        skipped += 1
+                        return
+                    # Skip chronically-failing rows this worker lifetime
+                    if fail_count.get(link_id, 0) >= 3:
+                        skipped += 1
+                        logging.debug(
+                            f"[AI-DRAIN] skip poison row id={link_id} "
+                            f"(3 prior failures this worker lifetime)"
+                        )
+                        return
+                    ai_text = (row.get('message_text') or '') + ' ' + (row.get('group_name') or '')
+                    ai_result = None
                     try:
-                        link_id = row.get('id')
-                        link = row.get('link')
-                        if not link:
-                            continue
-                        ai_text = (row.get('message_text') or '') + ' ' + (row.get('group_name') or '')
-                        ai_result = await self.ai_analyzer.analyze_message((ai_text or '')[:1500])
-                        if not ai_result:
-                            continue
-                        patch_data = {
-                            'ai_approved': bool(ai_result.get('should_save', True)),
-                            'ai_description': (ai_result.get('description') or '')[:200] or None,
-                            'ai_country': ai_result.get('country') or None,
-                            'ai_is_ad': bool(ai_result.get('is_advertisement', False)),
-                        }
-                        safe_link = url_quote(link, safe='')
+                        async with sem:
+                            ai_result = await asyncio.wait_for(
+                                self.ai_analyzer.analyze_message((ai_text or '')[:1500]),
+                                timeout=timeout_s,
+                            )
+                    except asyncio.TimeoutError:
+                        fail_count[link_id] = fail_count.get(link_id, 0) + 1
+                        logging.warning(
+                            f"[AI-DRAIN] timeout id={link_id} after {timeout_s}s "
+                            f"(fail #{fail_count[link_id]}) — row stays ai_pending"
+                        )
+                        failed += 1
+                        return
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception as ae:
+                        fail_count[link_id] = fail_count.get(link_id, 0) + 1
+                        logging.warning(
+                            f"[AI-DRAIN] analyze failed id={link_id}: {ae} "
+                            f"(fail #{fail_count[link_id]}) — row stays ai_pending"
+                        )
+                        failed += 1
+                        return
+                    if not ai_result:
+                        fail_count[link_id] = fail_count.get(link_id, 0) + 1
+                        logging.warning(
+                            f"[AI-DRAIN] analyze returned None id={link_id} "
+                            f"(fail #{fail_count[link_id]}) — row stays ai_pending"
+                        )
+                        failed += 1
+                        return
+                    patch_data = {
+                        'ai_approved': bool(ai_result.get('should_save', True)),
+                        'ai_description': (ai_result.get('description') or '')[:200] or None,
+                        'ai_country': ai_result.get('country') or None,
+                        'ai_is_ad': bool(ai_result.get('is_advertisement', False)),
+                    }
+                    safe_link = url_quote(link, safe='')
+                    # Lease protection: only PATCH if ai_approved is still NULL.
+                    # If another worker / supervisor-relaunched instance claimed
+                    # it first, this PATCH updates 0 rows — we detect via the
+                    # empty response body and log+skip (NOT a failure).
+                    patch_url = (
+                        f"{self.db.supabase_url}/rest/v1/links?"
+                        f"link=eq.{safe_link}&ai_approved=is.null"
+                    )
+                    try:
                         async with session.patch(
-                            f"{self.db.supabase_url}/rest/v1/links?link=eq.{safe_link}",
-                            json=patch_data
+                            patch_url, json=patch_data,
+                            headers={'Prefer': 'return=representation'},
                         ) as patch_resp:
-                            if patch_resp.status in (200, 204):
-                                logging.info(
-                                    f"[AI-DRAIN] patched link id={link_id} "
-                                    f"approved={patch_data['ai_approved']} "
-                                    f"country={patch_data['ai_country']}"
-                                )
+                            patch_status = patch_resp.status
+                            patch_body_text = ''
+                            try:
+                                patch_body_text = await patch_resp.text()
+                            except Exception:
+                                pass
+                            if patch_status in (200, 204):
+                                # Try to detect race-loss (0 rows updated).
+                                # With return=representation + 200, body is a
+                                # JSON list of updated rows. Empty list = 0
+                                # rows = another worker claimed it first.
+                                # 204 (no body) = legacy/mock — assume success.
+                                race_lost = False
+                                if patch_status == 200 and patch_body_text:
+                                    try:
+                                        updated = json_module.loads(patch_body_text)
+                                        if isinstance(updated, list) and len(updated) == 0:
+                                            race_lost = True
+                                    except (ValueError, json_module.JSONDecodeError):
+                                        pass  # not JSON — assume success
+                                if race_lost:
+                                    skipped += 1
+                                    logging.debug(
+                                        f"[AI-DRAIN] race-lost id={link_id} "
+                                        f"(another worker claimed it first — 0 rows updated)"
+                                    )
+                                else:
+                                    processed += 1
+                                    fail_count.pop(link_id, None)  # reset on success
+                                    logging.info(
+                                        f"[AI-DRAIN] patched link id={link_id} "
+                                        f"approved={patch_data['ai_approved']} "
+                                        f"country={patch_data['ai_country']}"
+                                    )
                             else:
-                                pbody = await patch_resp.text()
+                                failed += 1
                                 logging.warning(
-                                    f"[AI-DRAIN] patch status={patch_resp.status} "
-                                    f"link_id={link_id}: {pbody[:120]}"
+                                    f"[AI-DRAIN] patch status={patch_status} "
+                                    f"link_id={link_id}: {patch_body_text[:120]}"
                                 )
-                    except Exception as row_e:
-                        logging.error(f"[AI-DRAIN] row error (id={row.get('id')}): {row_e}")
-                        continue
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception as patch_e:
+                        failed += 1
+                        logging.error(
+                            f"[AI-DRAIN] patch exception id={link_id}: {patch_e}"
+                        )
+
+                results = await asyncio.gather(
+                    *[_process_one(r) for r in rows],
+                    return_exceptions=True,
+                )
+                # Surface any unexpected exceptions from _process_one that
+                # weren't caught by its internal try/except.
+                for r in results:
+                    if isinstance(r, Exception) and not isinstance(r, asyncio.CancelledError):
+                        logging.error(f"[AI-DRAIN] unexpected row exception: {r}")
+                        failed += 1
+                elapsed = time.time() - batch_start
+                logging.info(
+                    f"[AI-DRAIN] batch={len(rows)} processed={processed} "
+                    f"failed={failed} skipped={skipped} elapsed={elapsed:.1f}s"
+                )
             except asyncio.CancelledError:
                 break
             except Exception as e:
@@ -3911,88 +4181,166 @@ class Monitor:
     # On startup, _restore_journal_from_supabase restores them into the
     # local SQLite before _journal_recovery runs. Additive + idempotent —
     # doesn't replace the SQLite journal, just mirrors at-risk rows.
+    #
+    # [Task 3a audit — design notes]
+    # • Snapshot SELECT predicate: state IN ('pending','no_text','delete_miss')
+    #   ONLY. Terminal states (processed/rescued/no_links/dup_claim/blacklisted)
+    #   are deliberately EXCLUDED so the snapshot table stays small. Tradeoff:
+    #   a stale 'pending' row in Supabase can resurrect on restart-with-wiped-
+    #   local; mitigated by (a) INSERT OR IGNORE preserving any local terminal
+    #   state and (b) downstream UNIQUE(link) constraint on link_queue making
+    #   re-processing idempotent.
+    # • 'failed' is NEVER a journal state (only a processed_messages /
+    #   link_queue claim state). The `state NOT IN ('pending','failed')` clause
+    #   in journal_cleanup is purely defensive. So there is no `failed` to add
+    #   to the snapshot predicate.
+    # • POST is atomic per PostgREST batch (single PostgreSQL transaction);
+    #   one bad row aborts the whole batch — caller retries the same rows
+    #   next cycle (idempotent via PK (chat_id, msg_id) upsert).
+    # • Explicit `aiohttp.ClientTimeout(total=15)` per call so a hung Supabase
+    #   can't block the snapshot loop forever (the shared session in
+    #   _get_supabase_session has NO default timeout — other Supabase callers
+    #   are out of scope of this audit).
+    # • `_snapshot_running` bool guard prevents two concurrent invocations
+    #   (e.g. supervisor relaunches the loop while the previous cycle still
+    #   POSTing) — last-writer-wins via PK upsert would be safe regardless,
+    #   but the guard avoids double-rate-limit pressure on the free tier.
+    # • 429 → 60s backoff (mirrors _ai_drainer_worker). 5xx/network → WARNING
+    #   + 30s retry. Table-missing (404) → rate-limited WARNING (max 1/hour).
     # ===================================================================
     async def _journal_snapshot_loop(self):
         """30s background loop: mirror at-risk journal rows to Supabase.
         On failure (table missing / 404), logs a rate-limited WARNING with
-        the exact SQL to run, then keeps retrying every 30s."""
-        await asyncio.sleep(40)  # let startup settle (before _journal_recovery)
-        logging.info("[JOURNAL-SNAPSHOT] started — 30s cycle, 500 rows/batch")
-        last_warn_ts = 0.0
-        while self._running:
-            try:
-                if not self.db.supabase_url or not self.db.supabase_key:
-                    await asyncio.sleep(60)
-                    continue
-                conn = await self.prod_db._conn()
-                cursor = await conn.execute(
-                    """SELECT chat_id, msg_id, raw_text, source_phone, chat_title,
-                              chat_username, chat_link_type, sender_id, sender_name,
-                              state, received_at
-                       FROM message_journal
-                       WHERE state IN ('pending','no_text','delete_miss')
-                       LIMIT 500""")
-                rows = await cursor.fetchall()
-                if not rows:
-                    await asyncio.sleep(30)
-                    continue
-                batch = [
-                    {
-                        'chat_id': r[0], 'msg_id': r[1], 'raw_text': r[2],
-                        'source_phone': r[3], 'chat_title': r[4] or '',
-                        'chat_username': r[5] or '', 'chat_link_type': r[6] or 'telegram',
-                        'sender_id': r[7] or 0, 'sender_name': r[8] or '',
-                        'state': r[9], 'received_at': r[10],
-                    }
-                    for r in rows
-                ]
-                session = await self.db._get_supabase_session()
-                async with session.post(
-                    f"{self.db.supabase_url}/rest/v1/message_journal_snapshot",
-                    headers={
-                        "Prefer": "resolution=merge-duplicates",
-                        # apikey + Authorization are already on the shared session
-                        # (set in _get_supabase_session); we add Prefer here.
-                    },
-                    json=batch,
-                ) as resp:
-                    if resp.status not in (200, 201, 204):
-                        body = await resp.text()
-                        # 404 / table-missing — rate-limit the warning to once/hour
-                        now = time.time()
-                        if 'relation' in body.lower() or 'does not exist' in body.lower() \
-                                or resp.status == 404:
-                            if now - last_warn_ts > 3600:
+        the exact SQL to run, then keeps retrying every 30s.
+
+        [Task 3a] Guarded by self._snapshot_running — if already mid-cycle,
+        logs INFO and returns silently (supervisor relaunch is a no-op)."""
+        # [Task 3a / point 6] Concurrent-invocation guard.
+        if getattr(self, '_snapshot_running', False):
+            logging.info("[JOURNAL-SNAPSHOT] previous cycle still running — skip")
+            return
+        self._snapshot_running = True
+        try:
+            await asyncio.sleep(40)  # let startup settle (before _journal_recovery)
+            logging.info("[JOURNAL-SNAPSHOT] started — 30s cycle, 500 rows/batch")
+            last_warn_ts = 0.0
+            while self._running:
+                try:
+                    if not self.db.supabase_url or not self.db.supabase_key:
+                        await asyncio.sleep(60)
+                        continue
+                    conn = await self.prod_db._conn()
+                    # [Task 3a / point 2] ORDER BY received_at ASC → snapshot
+                    # OLDEST at-risk rows first (they are the most likely to
+                    # be lost on a crash). Without ORDER BY, SQLite returns
+                    # rows in unspecified order and a 500-row LIMIT could
+                    # repeatedly snapshot the same NEW rows while OLD ones
+                    # never make it.
+                    cursor = await conn.execute(
+                        """SELECT chat_id, msg_id, raw_text, source_phone, chat_title,
+                                  chat_username, chat_link_type, sender_id, sender_name,
+                                  state, received_at
+                           FROM message_journal
+                           WHERE state IN ('pending','no_text','delete_miss')
+                           ORDER BY received_at ASC
+                           LIMIT 500""")
+                    rows = await cursor.fetchall()
+                    if not rows:
+                        await asyncio.sleep(30)
+                        continue
+                    batch = [
+                        {
+                            'chat_id': r[0], 'msg_id': r[1], 'raw_text': r[2],
+                            'source_phone': r[3], 'chat_title': r[4] or '',
+                            'chat_username': r[5] or '', 'chat_link_type': r[6] or 'telegram',
+                            'sender_id': r[7] or 0, 'sender_name': r[8] or '',
+                            'state': r[9], 'received_at': r[10],
+                        }
+                        for r in rows
+                    ]
+                    session = await self.db._get_supabase_session()
+                    # [Task 3a / point 8] explicit per-call timeout so a hung
+                    # Supabase cannot block the snapshot loop forever.
+                    snap_timeout = aiohttp.ClientTimeout(total=15)
+                    async with session.post(
+                        f"{self.db.supabase_url}/rest/v1/message_journal_snapshot",
+                        headers={
+                            "Prefer": "resolution=merge-duplicates",
+                            # apikey + Authorization are already on the shared session
+                            # (set in _get_supabase_session); we add Prefer here.
+                        },
+                        json=batch,
+                        timeout=snap_timeout,
+                    ) as resp:
+                        if resp.status not in (200, 201, 204):
+                            body = await resp.text()
+                            # [Task 3a / point 9] explicit 429 backoff (mirrors
+                            # _ai_drainer_worker) so the free-tier 0.03 req/s
+                            # limit doesn't cascade into a storm of retries.
+                            if resp.status == 429:
                                 logging.warning(
-                                    "[JOURNAL-SNAPSHOT] table message_journal_snapshot "
-                                    "missing — run this SQL in Supabase SQL Editor:\n"
-                                    "CREATE TABLE IF NOT EXISTS message_journal_snapshot "
-                                    "(chat_id BIGINT NOT NULL, msg_id BIGINT NOT NULL, "
-                                    "raw_text TEXT, source_phone TEXT, chat_title TEXT, "
-                                    "chat_username TEXT, chat_link_type TEXT, "
-                                    "sender_id BIGINT, sender_name TEXT, state TEXT NOT NULL, "
-                                    "received_at DOUBLE PRECISION, "
-                                    "PRIMARY KEY (chat_id, msg_id));\n"
-                                    "CREATE UNIQUE INDEX IF NOT EXISTS "
-                                    "idx_journal_snapshot_pk ON message_journal_snapshot "
-                                    "(chat_id, msg_id);"
+                                    "[JOURNAL-SNAPSHOT] 429 rate-limited — backing off 60s"
                                 )
-                                last_warn_ts = now
-                        else:
-                            logging.warning(
-                                f"[JOURNAL-SNAPSHOT] POST status={resp.status}: {body[:200]}"
-                            )
-            except asyncio.CancelledError:
-                break
-            except Exception as e:
-                logging.warning(f"[JOURNAL-SNAPSHOT] error: {e}")
-            await asyncio.sleep(30)
+                                await asyncio.sleep(60)
+                                continue
+                            # 404 / table-missing — rate-limit the warning to once/hour
+                            now = time.time()
+                            if 'relation' in body.lower() or 'does not exist' in body.lower() \
+                                    or resp.status == 404:
+                                if now - last_warn_ts > 3600:
+                                    logging.warning(
+                                        "[JOURNAL-SNAPSHOT] table message_journal_snapshot "
+                                        "missing — run this SQL in Supabase SQL Editor:\n"
+                                        "CREATE TABLE IF NOT EXISTS message_journal_snapshot "
+                                        "(chat_id BIGINT NOT NULL, msg_id BIGINT NOT NULL, "
+                                        "raw_text TEXT, source_phone TEXT, chat_title TEXT, "
+                                        "chat_username TEXT, chat_link_type TEXT, "
+                                        "sender_id BIGINT, sender_name TEXT, state TEXT NOT NULL, "
+                                        "received_at DOUBLE PRECISION, "
+                                        "PRIMARY KEY (chat_id, msg_id));\n"
+                                        "CREATE UNIQUE INDEX IF NOT EXISTS "
+                                        "idx_journal_snapshot_pk ON message_journal_snapshot "
+                                        "(chat_id, msg_id);"
+                                    )
+                                    last_warn_ts = now
+                            else:
+                                logging.warning(
+                                    f"[JOURNAL-SNAPSHOT] POST status={resp.status}: {body[:200]}"
+                                )
+                except asyncio.CancelledError:
+                    break
+                # [Task 3a / point 10] catch TimeoutError, ClientError, and
+                # generic Exception so a hung/500-ing Supabase never crashes
+                # the worker. The loop continues at the 30s cadence.
+                except asyncio.TimeoutError as te:
+                    logging.warning(f"[JOURNAL-SNAPSHOT] POST timed out (15s): {te}")
+                except aiohttp.ClientError as ce:
+                    logging.warning(f"[JOURNAL-SNAPSHOT] network error: {ce}")
+                except Exception as e:
+                    logging.warning(f"[JOURNAL-SNAPSHOT] error: {e}")
+                await asyncio.sleep(30)
+        finally:
+            self._snapshot_running = False
 
     async def _restore_journal_from_supabase(self):
         """Startup: SELECT at-risk rows from Supabase snapshot, INSERT OR
         IGNORE into local message_journal. Called BEFORE _journal_recovery
         so the recovery sweep can pick them up. Idempotent — INSERT OR
-        IGNORE dedups against any rows that survived the local SQLite."""
+        IGNORE dedups against any rows that survived the local SQLite.
+
+        [Task 3a] Design notes:
+        • INSERT OR IGNORE preserves any local terminal state (processed/
+          rescued/no_links/dup_claim/blacklisted) — a stale 'pending' row
+          in the snapshot will NOT overwrite a newer local state. If local
+          SQLite was wiped, the stale 'pending' is restored and journal_recovery
+          re-processes it (idempotent via UNIQUE(link) on link_queue).
+        • Per-row try/except isolates corrupted rows (NULL chat_id/msg_id,
+          malformed received_at) — one bad row doesn't abort the restore.
+        • Explicit `aiohttp.ClientTimeout(total=15)` on the GET so a hung
+          Supabase can't block startup. Restore returns 0 on timeout.
+        • The restore query has NO `order=` param — order doesn't matter
+          because each row is an independent INSERT OR IGNORE (no cross-row
+          dependency)."""
         try:
             if not self.db.supabase_url or not self.db.supabase_key:
                 return 0
@@ -4005,7 +4353,10 @@ class Monitor:
                 f"select=chat_id,msg_id,raw_text,source_phone,chat_title,"
                 f"chat_username,chat_link_type,sender_id,sender_name,state,received_at"
             )
-            async with session.get(url) as resp:
+            # [Task 3a / point 8] explicit timeout so a hung Supabase at
+            # startup can't block _journal_recovery from running.
+            restore_timeout = aiohttp.ClientTimeout(total=15)
+            async with session.get(url, timeout=restore_timeout) as resp:
                 if resp.status != 200:
                     body = await resp.text()
                     logging.info(
@@ -4038,6 +4389,12 @@ class Monitor:
                     pass
             logging.info(f"[JOURNAL-SNAPSHOT] restored {restored} row(s) from Supabase")
             return restored
+        except asyncio.TimeoutError:
+            logging.warning("[JOURNAL-SNAPSHOT] restore timed out (15s) — skipping")
+            return 0
+        except aiohttp.ClientError as ce:
+            logging.warning(f"[JOURNAL-SNAPSHOT] restore network error: {ce}")
+            return 0
         except Exception as e:
             logging.warning(f"[JOURNAL-SNAPSHOT] restore error: {e}")
             return 0
@@ -9065,17 +9422,25 @@ async def api_polling_status_handler(request):
             try:
                 conn = await db._ensure_conn()
                 now_iso = datetime.utcnow().isoformat()
-                # Count chats whose next_poll_at is due (<= now) — these are
-                # the sources the scheduler is actively polling right now.
+                # [Task 6a] Count chats whose next_poll_at is due (<= now) OR NULL.
+                # MUST mirror SourceRegistry.select_due_chats's predicate
+                # `next_poll_at IS NULL OR next_poll_at <= ?` — otherwise chats
+                # freshly added by add_monitored_chat (which now seeds
+                # next_poll_at=now()) AND pre-existing rows still carrying a
+                # NULL next_poll_at (pre-fix inserts) are invisible to the
+                # status endpoint even while the scheduler IS polling them.
+                # This is the root cause of the historical active_chats_count=0.
                 cur = await conn.execute(
-                    "SELECT COUNT(*) FROM monitored_chats WHERE next_poll_at <= ?",
+                    "SELECT COUNT(*) FROM monitored_chats "
+                    "WHERE (next_poll_at IS NULL OR next_poll_at <= ?)",
                     (now_iso,))
                 row = await cur.fetchone()
                 active_chats_count = int(row[0]) if row else 0
                 # Surface up to 250 due chats for the dashboard list.
                 cur = await conn.execute(
                     "SELECT chat_id, chat_title, last_msg_id FROM monitored_chats "
-                    "WHERE next_poll_at <= ? ORDER BY last_activity DESC LIMIT 250",
+                    "WHERE (next_poll_at IS NULL OR next_poll_at <= ?) "
+                    "ORDER BY last_activity DESC LIMIT 250",
                     (now_iso,))
                 for r in await cur.fetchall():
                     active_chats.append({
@@ -9380,9 +9745,18 @@ async def api_deploy_check_handler(request):
       - Supabase connectivity (live ping)
       - SQLite tables
       - Telegram bot connection
-      - User clients (monitor vs joiner)
+      - User clients (monitor vs joiner) — phones REDACTED (Task 5a / A3)
       - Recent link count + queue size
     Useful for debugging "why is dashboard empty / 401 errors".
+
+    [Task 5a / A3] Phone numbers in user_clients are masked (keep country
+    prefix + last 2 digits) — a diagnostic endpoint should not leak account
+    PII even with the dashboard open. Other operator-facing endpoints
+    (/api/joiners_status, /api/joined_groups, /api/monitored_chats,
+    /api/links) still return raw phones because the operator needs to
+    identify which account is which in the dashboard; if those endpoints
+    are public (DASHBOARD_API_KEY unset), the operator should set the key
+    + frontend X-Api-Key to gate them. Documented in FINAL_REPORT.md.
     """
     monitor = request.app.get("monitor")
     db = request.app.get("db")
@@ -9478,7 +9852,10 @@ async def api_deploy_check_handler(request):
     )
     report["telegram"]["user_clients"] = {}
     for phone, client in monitor.user_clients.items():
-        report["telegram"]["user_clients"][phone] = {
+        # [Task 5a / A3] redact phone in the diagnostic endpoint to avoid
+        # leaking account PII when the dashboard is open. Keys stay unique
+        # (operator can still distinguish accounts by the masked suffix).
+        report["telegram"]["user_clients"][_redact_phone(phone)] = {
             "connected": bool(client and client.is_connected()),
         }
     if not report["telegram"]["bot_connected"]:
@@ -9558,15 +9935,66 @@ def _warn_dashboard_api_key_open_once() -> None:
             "down the dashboard (backward-compatible: unset = open).")
 
 
+def _redact_phone(phone) -> str:
+    """[Task 5a / A3] Mask the middle digits of a phone number for safe
+    inclusion in diagnostic API responses.
+
+    - "+96651234567"  → "+9665•••••67"
+    - "96651234567"   → "9665•••••67"
+    - "" / None / non-str → "" (no PII leak on edge cases)
+    - Short strings (<=4 chars) → "••••" (don't leak the whole value)
+
+    Rationale: the operator can still distinguish accounts by the country
+    prefix + last 2 digits, but a publicly-readable dashboard (when
+    DASHBOARD_API_KEY is unset) does not leak the full phone number to
+    the internet. Used in /api/deploy_check (the most leak-prone endpoint
+    because it lists every connected account). Other operator-facing
+    endpoints (/api/joiners_status, etc.) still return raw phones because
+    the operator needs full identification in the dashboard — those
+    endpoints should be gated via DASHBOARD_API_KEY + frontend X-Api-Key
+    if the deployment is public.
+    """
+    if phone is None:
+        return ""
+    s = str(phone)
+    if not s:
+        return ""
+    if len(s) <= 4:
+        return "••••"
+    # Keep the first 4 chars (usually the country prefix like "+966")
+    # and the last 2 chars; mask the middle.
+    return f"{s[:4]}{'•' * (len(s) - 6)}{s[-2:]}"
+
+
 @web.middleware
 async def dashboard_api_key_middleware(request, handler):
-    """Gates /api/* routes behind an optional X-Api-Key shared secret."""
+    """Gates /api/* routes behind an optional X-Api-Key shared secret.
+
+    [Task 5a / A1] Comparison uses secrets.compare_digest (constant-time) —
+    was `provided != key` (string inequality, timing-attack vulnerable). The
+    shared secret is short (<=128 chars typical), so the timing side-channel
+    let an attacker recover the key byte-by-byte via response-time
+    measurement. compare_digest short-circuits on length mismatch but is
+    constant-time for equal-length inputs — the practical leak closed.
+
+    Health endpoints (/health, /ready, /metrics) are NOT under /api/* and
+    are NEVER gated (Render's health probe + Prometheus must stay open).
+    /api/deploy_check IS gated (it's a diagnostic, not a deploy probe).
+    """
     path = request.path
     if path.startswith("/api/"):
         key = _get_dashboard_api_key()
         if key is not None:
             provided = request.headers.get("X-Api-Key") or request.headers.get("X-API-Key")
-            if not provided or provided != key:
+            # [Task 5a / A1] constant-time compare — was `provided != key`
+            # (timing attack). secrets.compare_digest returns False for
+            # non-ASCII or non-str inputs without raising.
+            try:
+                ok = bool(provided) and secrets.compare_digest(
+                    str(provided), str(key))
+            except (TypeError, ValueError):
+                ok = False
+            if not ok:
                 return web.json_response(
                     {"error": "unauthorized: missing or invalid X-Api-Key"},
                     status=401, headers={"Access-Control-Allow-Origin": "*"})
