@@ -811,11 +811,13 @@ async def test_startup_contract():
                "FAILED status exists")
 
         record("STARTUP-4: STATUS=FAILED on invalid session",
-               "reason=invalid_session_string" in source,
+               "reason=invalid_session_string" in source or
+               "_alert_terminal_failure(phone, 'invalid_session_string')" in source,
                "invalid session detected")
 
         record("STARTUP-5: STATUS=FAILED on not_authorized",
-               "reason=not_authorized" in source,
+               "reason=not_authorized" in source or
+               "_alert_terminal_failure(phone, 'not_authorized'" in source,
                "not_authorized detected")
 
         record("STARTUP-6: connect() before is_user_authorized()",

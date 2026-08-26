@@ -31,7 +31,7 @@ import sys
 import time
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import List, Tuple, Dict, Set, Optional
+from typing import List, Tuple, Dict, Set, Optional, Any
 from urllib.parse import quote as url_quote
 
 import aiohttp
@@ -2750,6 +2750,31 @@ class Monitor:
         self._login_cooldowns: Dict[int, datetime] = {}  # sender_id → next allowed time
         self._login_cooldown = timedelta(seconds=60)  # 60s between code requests
         self._user_tasks: Dict[str, asyncio.Task] = {}
+        # ===== [REQAUDIT-3] Joiner Fleet Resilience State =====
+        # Phones that hit a terminal session failure (not_authorized /
+        # invalid_session / client_creation_error). We alert the owner ONCE
+        # per phone, then keep the loop alive sleeping 1h between rechecks
+        # so the operator can fix the DB session_string and have it picked
+        # up without a process restart.
+        self._alerted_terminal_phones: Set[str] = set()
+        # Live fleet health snapshot — updated by _joiner_fleet_health_loop
+        # (60s cycle) and read by /ready, /api/joined_groups, and the
+        # _joiner_worker fleet backoff gate. Keys:
+        #   connected_joiners: int
+        #   floodwait_joiners: List[{phone, wait_s}]
+        #   disconnected_joiners: List[str]
+        #   safety_guard_blocked_joiners: int
+        #   all_unavailable_since: Optional[datetime]
+        #   fleet_down_alerted: bool
+        self._fleet_health: Dict[str, Any] = {
+            'connected_joiners': 0,
+            'floodwait_joiners': [],
+            'disconnected_joiners': [],
+            'safety_guard_blocked_joiners': 0,
+            'all_unavailable_since': None,
+            'fleet_down_alerted': False,
+        }
+        self._joiner_fleet_health_task: Optional[asyncio.Task] = None
         # محلل الذكاء الاصطناعي
         self.ai_analyzer = AIAnalyzer()
         self._startup_scan_done: Set[str] = set()
@@ -3844,7 +3869,8 @@ class Monitor:
         can silently terminate a worker task; without a supervisor it stays dead
         until a full process restart (which on Render free can be hours/days).
 
-        Critical tasks watched (Task 9a hardened the original 5 → 9):
+        Critical tasks watched (Task 9a hardened the original 5 → 9, REQAUDIT-2
+        added 10, REQAUDIT-3 added 11 + 12):
           1. polling_scheduler        (heartbeat — also has its own 30s watchdog)
           2. journal_recovery         (crash-safe message rescue)
           3. journal_snapshot_loop     (Supabase durability mirror)
@@ -3858,6 +3884,15 @@ class Monitor:
           9. polling_watchdog_task     (the 30s scheduler watchdog itself —
                if THIS dies, only the 60s supervisor watches polling, so
                we self-heal the watchdog too)
+         10. pending_approval_recheck  (REQAUDIT-2 — flips PENDING→JOINED on
+               admin approval; without this, PENDING_APPROVAL is terminal)
+         11. joiner_fleet_health       (REQAUDIT-3 — 60s fleet health snapshot
+               + owner alert when ALL joiners unavailable >5min; without
+               this, /ready stops surfacing fleet state and the operator
+               gets no push notification when the fleet goes down)
+         12. per-account user_client loops (REQAUDIT-3 — restarts dead
+               _run_user_client tasks; without this, a phone that hit an
+               unhandled exception stays `not_connected` until restart)
 
         Logs WARNING [SUPERVISOR] restarted <name> on each restart.
 
@@ -3871,7 +3906,7 @@ class Monitor:
         that intentionally exited (default deployment = AI_DRAIN disabled).
         """
         await asyncio.sleep(60)  # let startup settle before first check
-        logging.info("[SUPERVISOR] started — 60s cycle, watching 9 critical tasks")
+        logging.info("[SUPERVISOR] started — 60s cycle, watching 12 critical task groups (10 loops + per-account user_client loops + joiner_fleet_health)")
         # [Task 9a / W1] cache the AI_DRAIN_ENABLED decision at supervisor
         # startup so a runtime env flip doesn't trigger a storm of restarts.
         # If the operator wants to enable the drainer, they restart the
@@ -3966,11 +4001,197 @@ class Monitor:
                     self._pending_approval_recheck_task = asyncio.create_task(
                         self._pending_approval_recheck_loop())
                     logging.warning("[SUPERVISOR] restarted pending_approval_recheck")
+                # 11. [REQAUDIT-3] Joiner Fleet Health monitor (60s cycle).
+                # If this dies, the operator gets no alert when the whole
+                # joiner fleet goes down (FloodWait/disconnect/safety-limit),
+                # /ready + /api/joined_groups stop surfacing fleet state,
+                # and the scheduler backoff gate stops reading fresh data.
+                if (getattr(self, '_joiner_fleet_health_task', None) is None
+                        or self._joiner_fleet_health_task.done()) and self._running:
+                    self._joiner_fleet_health_task = asyncio.create_task(
+                        self._joiner_fleet_health_loop())
+                    logging.warning("[SUPERVISOR] restarted joiner_fleet_health")
+                # 12. [REQAUDIT-3] Per-account user_client loops. Previously
+                # these were fire-and-forget in self._user_tasks and NOT
+                # supervised — a terminal `return` on not_authorized (now
+                # fixed to be non-terminal) OR any unhandled exception that
+                # escaped the inner try/except left the phone permanently
+                # `not_connected` until a full process restart. Now we
+                # self-heal: for each dead task whose phone is still in the
+                # watchers DB, re-fetch the watcher and restart the loop.
+                # (The non-terminal refactor in _run_user_client means the
+                # loop should rarely die — but if it does, we recover.)
+                try:
+                    watchers_now = await self.db.get_active_watchers()
+                    live_phones = {w['phone'] for w in watchers_now}
+                    for ph, t in list(self._user_tasks.items()):
+                        if ph not in live_phones:
+                            continue  # phone removed from DB — don't restart
+                        if t is None or t.done():
+                            w = next((x for x in watchers_now if x['phone'] == ph), None)
+                            if w:
+                                self._user_tasks[ph] = asyncio.create_task(
+                                    self._run_user_client(w))
+                                logging.warning(
+                                    f"[SUPERVISOR] restarted user_client for {ph}")
+                except Exception as e:
+                    logging.error(f"[SUPERVISOR] user_tasks check error: {e}")
             except asyncio.CancelledError:
                 break
             except Exception as e:
                 logging.error(f"[SUPERVISOR] error: {e}", exc_info=True)
             await asyncio.sleep(60)
+
+    # ===================================================================
+    # [REQAUDIT-3] Joiner Fleet Health monitor — 60s cycle
+    # ===================================================================
+    async def _joiner_fleet_health_loop(self):
+        """60s cycle: computes a live snapshot of joiner-fleet health and
+        writes it to self._fleet_health for /ready + /api/joined_groups +
+        the _joiner_worker backoff gate to read.
+
+        On detecting that ALL joiners are unavailable (connected_joiners
+        == 0) for >5 minutes (300s), sends a ONE-TIME Telegram alert to
+        OWNER_ID — previously the bot silently logged `METRIC Skipped
+        link: no_joiner_*` forever and the operator only found out by
+        manually checking logs.
+
+        Availability is the union of:
+          - client exists in self.user_clients
+          - client.is_connected() returns True
+          - phone is NOT in floodwait_mgr's blocked set
+        A phone that hits safety_guard's hourly_limit is technically
+        still "connected" but unavailable for joins — counted separately
+        as safety_guard_blocked_joiners and NOT counted as connected.
+        """
+        await asyncio.sleep(60)  # let startup settle
+        logging.info("[FLEET-HEALTH] started — 60s cycle")
+        while self._running:
+            try:
+                watchers = []
+                try:
+                    watchers = await self.db.get_active_watchers()
+                except Exception as e:
+                    logging.warning(f"[FLEET-HEALTH] get_active_watchers failed: {e}")
+                joiner_phones = [w['phone'] for w in watchers
+                                 if w.get('role', 'monitor') == 'joiner']
+
+                connected = []
+                floodwait_list = []
+                disconnected = []
+                safety_guard_blocked = 0
+
+                for ph in joiner_phones:
+                    client = self.user_clients.get(ph)
+                    if not client or not client.is_connected():
+                        disconnected.append(ph)
+                        continue
+                    # FloodWait check (DB-backed)
+                    try:
+                        is_blocked, wait = await self.floodwait_mgr.is_blocked(ph)
+                    except Exception:
+                        is_blocked, wait = False, 0
+                    if is_blocked:
+                        floodwait_list.append({'phone': ph, 'wait_s': int(wait)})
+                        continue
+                    # Safety guard hourly-limit check (mirrors _safety_guard's
+                    # gate so the snapshot reflects real availability).
+                    try:
+                        hourly_joins = await self.prod_db.count_operations(ph, 'join', 3600)
+                    except Exception:
+                        hourly_joins = 0
+                    if hourly_joins >= 5:
+                        safety_guard_blocked += 1
+                        continue
+                    connected.append(ph)
+
+                connected_count = len(connected)
+                prev_snapshot = self._fleet_health
+                prev_connected = prev_snapshot.get('connected_joiners', 0)
+                prev_all_down_since = prev_snapshot.get('all_unavailable_since')
+
+                # Update the snapshot atomically.
+                self._fleet_health = {
+                    'connected_joiners': connected_count,
+                    'connected_joiner_phones': connected,
+                    'floodwait_joiners': floodwait_list,
+                    'disconnected_joiners': disconnected,
+                    'safety_guard_blocked_joiners': safety_guard_blocked,
+                    'all_unavailable_since': prev_all_down_since,
+                    'fleet_down_alerted': prev_snapshot.get('fleet_down_alerted', False),
+                }
+
+                now = datetime.now()
+                if connected_count == 0:
+                    # Fleet is fully down.
+                    if prev_all_down_since is None:
+                        # Transition: just went down.
+                        self._fleet_health['all_unavailable_since'] = now
+                        logging.warning(
+                            f"[FLEET-HEALTH] ALL joiners unavailable "
+                            f"(floodwait={len(floodwait_list)}, "
+                            f"disconnected={len(disconnected)}, "
+                            f"safety_guard={safety_guard_blocked}) — "
+                            f"alert timer started"
+                        )
+                    else:
+                        down_seconds = (now - prev_all_down_since).total_seconds()
+                        # Alert after 5 min (300s) of total fleet outage.
+                        if (down_seconds >= 300
+                                and not self._fleet_health.get('fleet_down_alerted', False)):
+                            self._fleet_health['fleet_down_alerted'] = True
+                            await self._send_fleet_down_alert(
+                                floodwait_list, disconnected, safety_guard_blocked,
+                                int(down_seconds))
+                else:
+                    # Fleet has at least one available joiner — reset.
+                    if prev_all_down_since is not None or \
+                            self._fleet_health.get('fleet_down_alerted', False):
+                        logging.info(
+                            f"[FLEET-HEALTH] fleet recovered — "
+                            f"{connected_count} joiner(s) available"
+                        )
+                    self._fleet_health['all_unavailable_since'] = None
+                    self._fleet_health['fleet_down_alerted'] = False
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logging.error(f"[FLEET-HEALTH] error: {e}", exc_info=True)
+            await asyncio.sleep(60)
+
+    async def _send_fleet_down_alert(self, floodwait_list, disconnected,
+                                     safety_guard_blocked, down_seconds):
+        """[REQAUDIT-3] Push a Telegram alert to OWNER_ID when the whole
+        joiner fleet has been unavailable for >5 min. Best-effort — if
+        bot_client is None / not connected / OWNER_ID unset, just log."""
+        oid = self.config.owner_id
+        floodwait_str = ', '.join(
+            f"{f['phone']} ({f['wait_s']//60}min)" for f in floodwait_list
+        ) or 'none'
+        disc_str = ', '.join(disconnected) or 'none'
+        msg = (
+            f"🚨 *JOINER FLEET DOWN*\n"
+            f"Down for: {down_seconds//60} min\n"
+            f"Connected: 0\n"
+            f"FloodWait: {floodwait_str}\n"
+            f"Disconnected: {disc_str}\n"
+            f"Safety-guard blocked: {safety_guard_blocked}\n"
+            f"Action: check sessions + clear FloodWait via /clear_floodwait"
+        )
+        logging.error(f"[FLEET-HEALTH] {msg.replace(chr(10), ' | ')}")
+        if oid is None:
+            return
+        try:
+            if self.bot_client and self.bot_client.is_connected():
+                try:
+                    await self.bot_client.send_message(oid, msg, parse_mode='Markdown')
+                except Exception:
+                    try:
+                        await self.bot_client.send_message(oid, msg)
+                    except Exception:
+                        pass
+        except Exception as e:
+            logging.warning(f"[FLEET-HEALTH] alert send failed: {e}")
 
     # ===================================================================
     # [L03] Polling-watchdog — dedicated, more frequent scheduler restart
@@ -7257,45 +7478,110 @@ class Monitor:
             except (ValueError, RuntimeError):
                 pass
 
+    async def _alert_terminal_failure(self, phone: str, reason: str, detail: str = ""):
+        """[REQAUDIT-3] Send a ONE-TIME Telegram alert to the owner when a
+        joiner/monitor phone hits a terminal session failure
+        (not_authorized / invalid_session_string / invalid_session /
+        client_creation_error). Subsequent hits for the same phone are
+        suppressed by self._alerted_terminal_phones so we don't spam the
+        owner every 1h while they're fixing the session in the DB.
+
+        The alert goes to OWNER_ID via the bot_client. If bot_client is
+        None / not connected / OWNER_ID unset, we still log (always) and
+        just skip the Telegram send.
+        """
+        logging.error(
+            f"[ACCOUNT] {phone} STATUS=FAILED\n"
+            f"[ACCOUNT] reason={reason}\n"
+            f"[ACCOUNT] action=re-login or session_string update required"
+            + (f"\n[ACCOUNT] detail={detail}" if detail else "")
+        )
+        if phone in self._alerted_terminal_phones:
+            return  # already alerted — avoid 1h-cadence spam
+        self._alerted_terminal_phones.add(phone)
+        oid = self.config.owner_id
+        if oid is None:
+            return  # OWNER_ID unset — log is the only channel
+        try:
+            if self.bot_client and self.bot_client.is_connected():
+                msg = (
+                    f"⚠️ *Joiner Fleet Alert*\n"
+                    f"Phone: `{phone}`\n"
+                    f"Reason: `{reason}`\n"
+                    f"Action: re-login or update session_string in watchers DB\n"
+                    f"The account is now OFFLINE until fixed."
+                )
+                try:
+                    await self.bot_client.send_message(oid, msg, parse_mode='Markdown')
+                except Exception:
+                    # Markdown parse failure → retry as plain text
+                    try:
+                        await self.bot_client.send_message(oid, msg)
+                    except Exception:
+                        pass
+        except Exception as e:
+            logging.warning(f"[ACCOUNT] {phone} alert send failed: {e}")
+
     async def _run_user_client(self, watcher):
         """تشغيل user_client — المراقبون فقط يستمعون للرسائل، الفدائيون لا
 
         Startup Contract:
             - لا تعتبر الحساب READY حتى: connect → authorize → register handlers
             - لو فشل أي خطوة، سجل STATUS=FAILED مع السبب
+
+        [REQAUDIT-3] NON-TERMINAL refactor: previously, terminal session
+        failures (invalid_session_string / invalid_session /
+        client_creation_error / not_authorized) did `return` — the loop
+        died, the phone stayed `not_connected` forever, and the supervisor
+        didn't restart it (user_tasks weren't supervised). Now the loop:
+          1. Re-fetches the watcher from the DB on every iteration so an
+             operator-updated session_string is picked up without a
+             process restart.
+          2. On terminal failures: alerts the owner ONCE, then sleeps 1h
+             and `continue`s — never `return`s. This gives the operator
+             time to fix the DB and lets the supervisor / next iteration
+             recover the account automatically.
         """
         phone = watcher['phone']
-        session_string = watcher['session_string']
-        role = watcher.get('role', 'monitor')  # افتراضي: مراقب
         backoff = 5
         while self._running:
             try:
+                # [REQAUDIT-3] Re-fetch watcher from DB so updated
+                # session_string / role is picked up without a restart.
+                fresh = None
+                try:
+                    fresh = await self.db._supabase_get_watcher(phone)
+                except Exception:
+                    fresh = None
+                if fresh and fresh.get('session_string'):
+                    session_string = fresh['session_string']
+                    role = fresh.get('role', watcher.get('role', 'monitor'))
+                else:
+                    session_string = watcher.get('session_string')
+                    role = watcher.get('role', 'monitor')
+
                 client = self.user_clients.get(phone)
                 if client is None:
                     # حماية من الجلسات التالفة
                     if not session_string or not isinstance(session_string, str) or len(session_string) < 50:
-                        logging.error(
-                            f"[ACCOUNT] {phone} STATUS=FAILED\n"
-                            f"[ACCOUNT] reason=invalid_session_string"
-                        )
+                        await self._alert_terminal_failure(phone, 'invalid_session_string')
                         self._cleanup_user_client(phone)
-                        return
+                        await asyncio.sleep(3600)  # 1h cooldown — operator fix window
+                        continue
                     try:
                         client = self._create_user_client(session_string, phone)
                     except ValueError as ve:
-                        logging.error(
-                            f"[ACCOUNT] {phone} STATUS=FAILED\n"
-                            f"[ACCOUNT] reason=invalid_session: {ve}"
-                        )
+                        await self._alert_terminal_failure(phone, 'invalid_session', str(ve))
                         self._cleanup_user_client(phone)
-                        return
+                        await asyncio.sleep(3600)
+                        continue
                     except Exception as ce:
-                        logging.error(
-                            f"[ACCOUNT] {phone} STATUS=FAILED\n"
-                            f"[ACCOUNT] reason=client_creation_error: {ce}"
-                        )
-                        return
+                        await self._alert_terminal_failure(phone, 'client_creation_error', str(ce))
+                        await asyncio.sleep(3600)
+                        continue
                     self.user_clients[phone] = client
+                    # [REQAUDIT-3] session recovered → clear the alert flag
+                    self._alerted_terminal_phones.discard(phone)
 
                 if not client.is_connected():
                     logging.info(f"[ACCOUNT] {phone} connecting...")
@@ -7303,13 +7589,10 @@ class Monitor:
 
                     # === VERIFY AUTHORIZATION ===
                     if not await client.is_user_authorized():
-                        logging.error(
-                            f"[ACCOUNT] {phone} STATUS=FAILED\n"
-                            f"[ACCOUNT] reason=not_authorized\n"
-                            f"[ACCOUNT] action=re-login required"
-                        )
+                        await self._alert_terminal_failure(phone, 'not_authorized', 're-login required')
                         self._cleanup_user_client(phone)
-                        return
+                        await asyncio.sleep(3600)
+                        continue
 
                     # === REGISTER HANDLERS (monitors only) ===
                     if role == 'monitor':
@@ -7441,6 +7724,28 @@ class Monitor:
                 # Emergency Control: لو الانضمام متوقف → انتظر بس
                 if self._join_paused:
                     logging.info(f"[SCHED] cycle={cycle} ⏸️ Join PAUSED — sleeping 60s (send /resume_join or /clear_floodwait)")
+                    await asyncio.sleep(60)
+                    continue
+
+                # [REQAUDIT-3] Fleet-health backoff gate — if ALL joiners
+                # are unavailable (FloodWait / disconnected / safety-guard
+                # blocked), DON'T pick a link. Previously the scheduler
+                # picked a link every cycle, ran PIPELINE-6 joiner
+                # iteration, found no eligible joiner, marked the link
+                # QUEUED+5min, and re-enqueued it 5 min later — burning
+                # cycles on every stuck link in the queue (96+ links ×
+                # every 5 min = wasted storm). Now we skip the cycle
+                # entirely; when a joiner comes back (detected by
+                # _joiner_fleet_health_loop), the next cycle resumes.
+                fleet = getattr(self, '_fleet_health', None) or {}
+                if fleet.get('connected_joiners', 0) == 0:
+                    logging.info(
+                        f"[SCHED] cycle={cycle} 🛑 [FLEET] all joiners "
+                        f"unavailable (floodwait={len(fleet.get('floodwait_joiners', []))}, "
+                        f"disconnected={len(fleet.get('disconnected_joiners', []))}, "
+                        f"safety_guard={fleet.get('safety_guard_blocked_joiners', 0)}) "
+                        f"— skipping cycle, sleeping 60s"
+                    )
                     await asyncio.sleep(60)
                     continue
 
@@ -9529,6 +9834,16 @@ class Monitor:
             self._pending_approval_recheck_task = asyncio.create_task(self._pending_approval_recheck_loop())
             logging.info("✉️ Pending-Approval Recheck started (30-min cycle — self-heal PENDING_APPROVAL → JOINED)")
 
+        # [REQAUDIT-3] Joiner Fleet Health monitor — 60s cycle. Computes
+        # the live fleet-health snapshot (connected/floodwait/disconnected/
+        # safety-guard counts) for /ready + /api/joined_groups + the
+        # _joiner_worker backoff gate, and pushes a Telegram alert to
+        # OWNER_ID when ALL joiners are unavailable for >5 min. Supervisor
+        # resurrects on death.
+        if not hasattr(self, '_joiner_fleet_health_task') or self._joiner_fleet_health_task is None or self._joiner_fleet_health_task.done():
+            self._joiner_fleet_health_task = asyncio.create_task(self._joiner_fleet_health_loop())
+            logging.info("🛡️ Joiner Fleet Health monitor started (60s cycle — alerts on full-fleet outage)")
+
         # === LEGACY POLLING WORKER — DISABLED ===
         # The legacy _active_polling_worker is superseded by PollingScheduler
         # (which covers ALL sources, not just Top-200, and uses fair scheduling).
@@ -9590,11 +9905,14 @@ class Monitor:
         ai_drainer_task = getattr(self, '_ai_drainer_task', None)
         # [REQAUDIT-2] pending-approval recheck task
         pending_recheck_task = getattr(self, '_pending_approval_recheck_task', None)
+        # [REQAUDIT-3] joiner fleet health task
+        fleet_health_task = getattr(self, '_joiner_fleet_health_task', None)
         tasks = [self._bot_task, self._keep_alive_task, self._joiner_task,
                  scorer_task, cache_cleanup_task, polling_task,
                  registry_task, polling_scheduler_task, claim_cleanup_task,
                  journal_recovery_task, supervisor_task, polling_watchdog_task,
-                 journal_snapshot_task, ai_drainer_task, pending_recheck_task
+                 journal_snapshot_task, ai_drainer_task, pending_recheck_task,
+                 fleet_health_task,
                  ] + list(self._user_tasks.values()) + self._current_scan_tasks
         for t in tasks:
             if t and not t.done():
@@ -9670,6 +9988,21 @@ async def api_joined_groups_handler(request):
         except Exception:
             active_joiners = 0
 
+        # [REQAUDIT-3] Live fleet health from the monitor's snapshot —
+        # surfaces connected vs. floodwait vs. disconnected vs.
+        # safety-guard-blocked joiner counts so the dashboard can show
+        # "joins are flowing" vs. "fleet is down" at a glance.
+        fleet = {}
+        if monitor:
+            fh = getattr(monitor, '_fleet_health', None) or {}
+            fleet = {
+                "connected_joiners": fh.get('connected_joiners', 0),
+                "floodwait_joiners_count": len(fh.get('floodwait_joiners', [])),
+                "disconnected_joiners_count": len(fh.get('disconnected_joiners', [])),
+                "safety_guard_blocked_joiners": fh.get('safety_guard_blocked_joiners', 0),
+                "all_joiners_unavailable": (fh.get('connected_joiners', 0) == 0),
+            }
+
         return web.json_response({
             "joined_groups": groups,
             "stats": {
@@ -9677,6 +10010,7 @@ async def api_joined_groups_handler(request):
                 "pending_groups": pending,
                 "active_joiners": active_joiners,
                 "pending_approval": total_pending_approval,
+                "fleet_health": fleet,
             }
         }, status=200, headers={"Access-Control-Allow-Origin": "*"})
 
@@ -10260,6 +10594,21 @@ async def ready_handler(request):
     )
     active_watchers = len(monitor.user_clients) if monitor else 0
 
+    # [REQAUDIT-3] Surface live joiner-fleet health so the operator (and
+    # the dashboard) can see at a glance whether joins are actually being
+    # processed. Without this, /ready returned "ready" even when ALL
+    # joiners were in FloodWait / disconnected — masking the real state.
+    fleet = {}
+    if monitor:
+        fh = getattr(monitor, '_fleet_health', None) or {}
+        fleet = {
+            "connected_joiners": fh.get('connected_joiners', 0),
+            "floodwait_joiners_count": len(fh.get('floodwait_joiners', [])),
+            "disconnected_joiners_count": len(fh.get('disconnected_joiners', [])),
+            "safety_guard_blocked_joiners": fh.get('safety_guard_blocked_joiners', 0),
+            "all_joiners_unavailable": (fh.get('connected_joiners', 0) == 0),
+        }
+
     if db_ok and bot_ok:
         return web.json_response({
             "status": "ready",
@@ -10267,6 +10616,7 @@ async def ready_handler(request):
             "db_connected": db_ok,
             "active_watchers": active_watchers,
             "scan_running": monitor.is_scan_running() if monitor else False,
+            "fleet_health": fleet,
         }, status=200)
     else:
         return web.json_response({
@@ -10275,6 +10625,7 @@ async def ready_handler(request):
             "db_connected": db_ok,
             "db_error": db_error,
             "active_watchers": active_watchers,
+            "fleet_health": fleet,
         }, status=503)
 
 

@@ -3410,6 +3410,260 @@ async def test_reqaudit2_recheck_invite_expired_handling():
         record("ReqAudit2-17: exception", False, str(e))
 
 
+# ==========================================================================
+# === [REQAUDIT-3] Joiner Fleet Resilience — 8 regressions ================
+# ==========================================================================
+# Production evidence (2026-08-26 16:55–17:00 UTC, post-REQAUDIT-2 deploy):
+#   Every PIPELINE-6 cycle failed with the same 3-account pattern:
+#     Account 1 → FloodWait active (28593s left)   ≈ 8h ban
+#     Account 2 → safety_guard (hourly_limit_5/5)
+#     Account 3 → not_connected (session dropped, no auto-reconnect)
+#   → no eligible joiner → QUEUED+5min → METRIC Skipped (total: 96).
+# The bot stayed in this frozen state silently — no operator alert, no
+# /ready signal, no auto-recovery. These 8 tests pin the REQAUDIT-3 fix
+# so the same fleet-down state can never happen silently again.
+
+
+async def test_reqaudit3_fleet_health_state_in_init():
+    """ReqAudit3-1: Monitor.__init__ must declare _alerted_terminal_phones
+    (set) and _fleet_health (dict with the 6 keys) + _joiner_fleet_health_task
+    slot. Without these, the fleet-health loop and owner-alert dedup have
+    no state to write to."""
+    try:
+        src = (PROJECT_ROOT / "bot.py").read_text(encoding="utf-8")
+        has_alerted_set = "_alerted_terminal_phones: Set[str] = set()" in src
+        has_fleet_dict = "_fleet_health: Dict[str, Any] = {" in src
+        required_keys = [
+            "'connected_joiners'",
+            "'floodwait_joiners'",
+            "'disconnected_joiners'",
+            "'safety_guard_blocked_joiners'",
+            "'all_unavailable_since'",
+            "'fleet_down_alerted'",
+        ]
+        missing = [k for k in required_keys if k not in src]
+        has_task_slot = "_joiner_fleet_health_task: Optional[asyncio.Task] = None" in src
+        record("ReqAudit3-1: fleet health state attrs in __init__",
+               has_alerted_set and has_fleet_dict and not missing and has_task_slot,
+               f"alerted_set={has_alerted_set} fleet_dict={has_fleet_dict} "
+               f"task_slot={has_task_slot} missing_keys={missing}")
+    except Exception as e:
+        record("ReqAudit3-1: exception", False, str(e))
+
+
+async def test_reqaudit3_run_user_client_non_terminal():
+    """ReqAudit3-2: _run_user_client must NOT `return` on terminal session
+    failures. Previously the 4 terminal branches (invalid_session_string /
+    invalid_session / client_creation_error / not_authorized) did `return`,
+    leaving the phone permanently not_connected. Now they must call
+    _alert_terminal_failure + asyncio.sleep(3600) + continue.
+    Also must re-fetch watcher from DB each iteration so operator-updated
+    session_string is picked up without restart."""
+    try:
+        src = (PROJECT_ROOT / "bot.py").read_text(encoding="utf-8")
+        # Find the _run_user_client body window.
+        start = src.find("async def _run_user_client(self, watcher):")
+        # End at next method def at column 4 (i.e., "    def " or "    async def ").
+        end_match = src.find("\n    def _cleanup_user_client", start)
+        body = src[start:end_match] if (start >= 0 and end_match > 0) else ""
+        # Must NOT have a bare `return` in the terminal branches.
+        # (a bare `return` outside `except asyncio.CancelledError: raise` and
+        # not as part of `return` in a different method)
+        # Count `return` occurrences in the body — should be 0 for the
+        # terminal branches now that they use `continue`.
+        returns_in_body = body.count("\n                        return") + \
+                          body.count("\n                    return") + \
+                          body.count("\n                return")
+        # Actually let's count any standalone "        return" with 8 spaces
+        # at start of line OR within nested blocks.
+        bare_returns = sum(1 for line in body.split("\n")
+                           if line.strip() == "return")
+        has_alert_call = "_alert_terminal_failure(phone," in body
+        has_sleep_3600 = "asyncio.sleep(3600)" in body
+        has_continue = body.count("continue") >= 4  # 4 terminal branches
+        has_db_refetch = "_supabase_get_watcher(phone)" in body
+        # The docstring must mention NON-TERMINAL.
+        has_non_terminal_doc = "NON-TERMINAL" in body
+        record("ReqAudit3-2: _run_user_client is non-terminal (alert+sleep+continue)",
+               has_alert_call and has_sleep_3600 and has_continue >= 1
+               and has_db_refetch and has_non_terminal_doc and bare_returns == 0,
+               f"alert={has_alert_call} sleep3600={has_sleep_3600} "
+               f"continue_count={body.count('continue')} db_refetch={has_db_refetch} "
+               f"non_terminal_doc={has_non_terminal_doc} bare_returns={bare_returns}")
+    except Exception as e:
+        record("ReqAudit3-2: exception", False, str(e))
+
+
+async def test_reqaudit3_supervisor_watches_user_tasks():
+    """ReqAudit3-3: _supervisor_loop must include a section that iterates
+    self._user_tasks and restarts any dead task whose phone is still in
+    the watchers DB. Without this, a dead _run_user_client stays dead
+    forever (the loop's own non-terminal refactor handles most cases,
+    but a CancelledError leaking or an OOM killing the task entirely
+    needs supervisor-level resurrection)."""
+    try:
+        src = (PROJECT_ROOT / "bot.py").read_text(encoding="utf-8")
+        start = src.find("async def _supervisor_loop(self):")
+        end = src.find("    # ===================================================================\n    # [REQAUDIT-3] Joiner Fleet Health", start)
+        body = src[start:end] if (start >= 0 and end > 0) else src[start:start+15000]
+        has_user_tasks_iter = "for ph, t in list(self._user_tasks.items())" in body
+        has_live_phones_check = "ph not in live_phones" in body
+        has_restart = "self._user_tasks[ph] = asyncio.create_task" in body
+        has_warning = "[SUPERVISOR] restarted user_client for" in body
+        record("ReqAudit3-3: supervisor restarts dead _user_tasks",
+               has_user_tasks_iter and has_live_phones_check and has_restart and has_warning,
+               f"iter={has_user_tasks_iter} live_check={has_live_phones_check} "
+               f"restart={has_restart} warning={has_warning}")
+    except Exception as e:
+        record("ReqAudit3-3: exception", False, str(e))
+
+
+async def test_reqaudit3_fleet_health_loop_method_present():
+    """ReqAudit3-4: _joiner_fleet_health_loop method must exist with the
+    60s cycle, must compute connected/floodwait/disconnected/
+    safety_guard_blocked counts, must update self._fleet_health, and
+    must call _send_fleet_down_alert after 300s of full outage."""
+    try:
+        src = (PROJECT_ROOT / "bot.py").read_text(encoding="utf-8")
+        start = src.find("async def _joiner_fleet_health_loop(self):")
+        # End at the next method def
+        end = src.find("async def _send_fleet_down_alert", start)
+        body = src[start:end] if (start >= 0 and end > 0) else src[start:start+12000]
+        has_method = start >= 0
+        has_60s_cycle = "await asyncio.sleep(60)" in body
+        has_connected_count = "connected_count = len(connected)" in body
+        has_floodwait_list = "floodwait_list.append({'phone': ph, 'wait_s'" in body
+        has_disconnected_list = "disconnected.append(ph)" in body
+        has_safety_count = "safety_guard_blocked += 1" in body
+        has_snapshot_update = "self._fleet_health = {" in body
+        has_300s_threshold = "down_seconds >= 300" in body
+        has_alert_call = "await self._send_fleet_down_alert(" in body
+        record("ReqAudit3-4: _joiner_fleet_health_loop computes + alerts",
+               has_method and has_60s_cycle and has_connected_count
+               and has_floodwait_list and has_disconnected_list
+               and has_safety_count and has_snapshot_update
+               and has_300s_threshold and has_alert_call,
+               f"method={has_method} 60s={has_60s_cycle} connected={has_connected_count} "
+               f"floodwait={has_floodwait_list} disc={has_disconnected_list} "
+               f"safety={has_safety_count} snapshot={has_snapshot_update} "
+               f"300s={has_300s_threshold} alert_call={has_alert_call}")
+    except Exception as e:
+        record("ReqAudit3-4: exception", False, str(e))
+
+
+async def test_reqaudit3_fleet_health_task_supervised():
+    """ReqAudit3-5: _joiner_fleet_health_task must be in the supervisor's
+    watched set (auto-restarted on death) AND started in start()."""
+    try:
+        src = (PROJECT_ROOT / "bot.py").read_text(encoding="utf-8")
+        # Supervisor section
+        sup_start = src.find("async def _supervisor_loop(self):")
+        sup_end = src.find("    # ===================================================================\n    # [REQAUDIT-3] Joiner Fleet Health", sup_start)
+        sup_body = src[sup_start:sup_end] if (sup_start >= 0 and sup_end > 0) else src[sup_start:sup_start+15000]
+        has_sup_watch = "_joiner_fleet_health_task" in sup_body and \
+                        "self._joiner_fleet_health_task = asyncio.create_task" in sup_body
+        has_sup_warning = "[SUPERVISOR] restarted joiner_fleet_health" in sup_body
+        # start() wiring
+        start_section = src.find("self._pending_approval_recheck_task = asyncio.create_task(self._pending_approval_recheck_loop())")
+        start_window = src[start_section:start_section+2000] if start_section > 0 else ""
+        has_start_wiring = "_joiner_fleet_health_task = asyncio.create_task(self._joiner_fleet_health_loop())" in start_window
+        has_start_log = "🛡️ Joiner Fleet Health monitor started" in start_window
+        # shutdown cancellation
+        has_shutdown_cancel = "fleet_health_task = getattr(self, '_joiner_fleet_health_task', None)" in src
+        record("ReqAudit3-5: fleet-health task is supervised + started + cancelled",
+               has_sup_watch and has_sup_warning and has_start_wiring
+               and has_start_log and has_shutdown_cancel,
+               f"sup_watch={has_sup_watch} sup_warn={has_sup_warning} "
+               f"start_wired={has_start_wiring} start_log={has_start_log} "
+               f"shutdown_cancel={has_shutdown_cancel}")
+    except Exception as e:
+        record("ReqAudit3-5: exception", False, str(e))
+
+
+async def test_reqaudit3_joiner_worker_fleet_backoff():
+    """ReqAudit3-6: _joiner_worker must check self._fleet_health's
+    connected_joiners count BEFORE picking a link, and skip the cycle
+    (sleep 60s + continue) when ALL joiners are unavailable. Without
+    this, the scheduler burns cycles re-enqueueing every stuck link
+    every 5 min (96+ links × every 5 min = wasted storm)."""
+    try:
+        src = (PROJECT_ROOT / "bot.py").read_text(encoding="utf-8")
+        start = src.find("async def _joiner_worker(self):")
+        end = src.find("async def _alert_terminal_failure", start)
+        body = src[start:end] if (start >= 0 and end > 0) else src[start:start+15000]
+        has_fleet_get = "fleet = getattr(self, '_fleet_health', None) or {}" in body
+        has_zero_check = "fleet.get('connected_joiners', 0) == 0" in body
+        # The log message is an f-string split across lines, so check the
+        # two distinguishing components separately.
+        has_skip_log = "[FLEET]" in body and "all joiners" in body and "unavailable" in body
+        has_sleep_continue = "await asyncio.sleep(60)\n                    continue" in body
+        record("ReqAudit3-6: _joiner_worker fleet backoff gate",
+               has_fleet_get and has_zero_check and has_skip_log and has_sleep_continue,
+               f"fleet_get={has_fleet_get} zero_check={has_zero_check} "
+               f"skip_log={has_skip_log} sleep_continue={has_sleep_continue}")
+    except Exception as e:
+        record("ReqAudit3-6: exception", False, str(e))
+
+
+async def test_reqaudit3_ready_endpoint_surfaces_fleet():
+    """ReqAudit3-7: /ready response must include a fleet_health object
+    with connected_joiners, floodwait_joiners_count,
+    disconnected_joiners_count, safety_guard_blocked_joiners, and
+    all_joiners_unavailable. Without this, /ready returned "ready" even
+    when ALL joiners were in FloodWait/disconnected — masking the real
+    fleet-down state from the operator."""
+    try:
+        src = (PROJECT_ROOT / "bot.py").read_text(encoding="utf-8")
+        start = src.find("async def ready_handler(request):")
+        end = src.find("async def metrics_handler", start)
+        body = src[start:end] if (start >= 0 and end > 0) else src[start:start+5000]
+        has_fleet_var = "fleet = {}" in body and "fh = getattr(monitor, '_fleet_health'" in body
+        required_keys = [
+            '"connected_joiners"',
+            '"floodwait_joiners_count"',
+            '"disconnected_joiners_count"',
+            '"safety_guard_blocked_joiners"',
+            '"all_joiners_unavailable"',
+        ]
+        missing = [k for k in required_keys if k not in body]
+        has_fleet_in_response = '"fleet_health": fleet' in body
+        record("ReqAudit3-7: /ready surfaces fleet_health",
+               has_fleet_var and not missing and has_fleet_in_response,
+               f"fleet_var={has_fleet_var} missing_keys={missing} "
+               f"in_response={has_fleet_in_response}")
+    except Exception as e:
+        record("ReqAudit3-7: exception", False, str(e))
+
+
+async def test_reqaudit3_api_joined_groups_surfaces_fleet():
+    """ReqAudit3-8: /api/joined_groups stats must include a fleet_health
+    object (same shape as /ready). This is the dashboard's primary data
+    source — without it, the dashboard shows "active_joiners: 3" even
+    when all 3 are in FloodWait/disconnected."""
+    try:
+        src = (PROJECT_ROOT / "bot.py").read_text(encoding="utf-8")
+        start = src.find("async def api_joined_groups_handler(request):")
+        end = src.find("async def api_pending_approvals_handler", start)
+        body = src[start:end] if (start >= 0 and end > 0) else src[start:start+10000]
+        has_fleet_block = "fleet = {}" in body and \
+                          "fh = getattr(monitor, '_fleet_health'" in body
+        required_keys = [
+            '"connected_joiners"',
+            '"floodwait_joiners_count"',
+            '"disconnected_joiners_count"',
+            '"safety_guard_blocked_joiners"',
+            '"all_joiners_unavailable"',
+        ]
+        missing = [k for k in required_keys if k not in body]
+        has_in_stats = '"fleet_health": fleet' in body
+        record("ReqAudit3-8: /api/joined_groups surfaces fleet_health",
+               has_fleet_block and not missing and has_in_stats,
+               f"fleet_block={has_fleet_block} missing_keys={missing} "
+               f"in_stats={has_in_stats}")
+    except Exception as e:
+        record("ReqAudit3-8: exception", False, str(e))
+
+
 # === Main runner ===
 
 async def main():
@@ -3538,6 +3792,16 @@ async def main():
     await test_reqaudit2_recheck_uses_original_joiner_account()
     await test_reqaudit2_recheck_bounded_and_rated()
     await test_reqaudit2_recheck_invite_expired_handling()
+
+    # === [REQAUDIT-3] Joiner Fleet Resilience — 8 regressions ===
+    await test_reqaudit3_fleet_health_state_in_init()
+    await test_reqaudit3_run_user_client_non_terminal()
+    await test_reqaudit3_supervisor_watches_user_tasks()
+    await test_reqaudit3_fleet_health_loop_method_present()
+    await test_reqaudit3_fleet_health_task_supervised()
+    await test_reqaudit3_joiner_worker_fleet_backoff()
+    await test_reqaudit3_ready_endpoint_surfaces_fleet()
+    await test_reqaudit3_api_joined_groups_surfaces_fleet()
 
     # [infra] close all aiosqlite connections before the loop tears down
     await close_all_test_dbs()
