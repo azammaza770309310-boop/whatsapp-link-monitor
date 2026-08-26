@@ -3104,6 +3104,312 @@ async def test_req3_scorer_marks_channels_banned():
         record("Req3-2: exception", False, str(e))
 
 
+# ===================================================================
+# [REQAUDIT-2] InviteRequestSentError → PENDING_APPROVAL full lifecycle
+# Production evidence (2026-08-26 03:49:47 / 03:51:01 UTC):
+#   telethon.errors.rpcerrorlist.InviteRequestSentError:
+#     "You have successfully requested to join this chat or channel"
+#   → logged as "❌ FAILED" + retried every 30 min — WRONG. Fix: catch the
+#   error, return PENDING_APPROVAL, mark DONE (not retried), add to ALL
+#   dedup skip-sets, AND self-heal via _pending_approval_recheck_loop.
+# ===================================================================
+
+async def test_reqaudit2_groupstate_pending_approval_enum():
+    """[REQAUDIT-2] GroupState enum must include PENDING_APPROVAL."""
+    try:
+        from link_system import GroupState
+        ok = hasattr(GroupState, "PENDING_APPROVAL") and GroupState.PENDING_APPROVAL == "PENDING_APPROVAL"
+        record("ReqAudit2-1: GroupState.PENDING_APPROVAL enum present",
+               ok, f"value={getattr(GroupState, 'PENDING_APPROVAL', '<missing>')}")
+    except Exception as e:
+        record("ReqAudit2-1: exception", False, str(e))
+
+
+async def test_reqaudit2_invite_request_sent_error_imported():
+    """[REQAUDIT-2] _join_group_safe must import InviteRequestSentError."""
+    try:
+        src = (PROJECT_ROOT / "bot.py").read_text(encoding="utf-8")
+        idx = src.find("def _join_group_safe")
+        if idx < 0:
+            record("ReqAudit2-2: InviteRequestSentError imported", False,
+                   "_join_group_safe not found")
+            return
+        import_block_idx = src.find("from telethon.errors import", idx)
+        ok = import_block_idx > 0 and "InviteRequestSentError" in src[import_block_idx:import_block_idx + 800]
+        record("ReqAudit2-2: InviteRequestSentError imported in _join_group_safe",
+               ok, f"import_block_found={import_block_idx > 0}")
+    except Exception as e:
+        record("ReqAudit2-2: exception", False, str(e))
+
+
+async def test_reqaudit2_invite_request_sent_handler_private_branch():
+    """[REQAUDIT-2] telegram_private branch catches InviteRequestSentError → (True, PENDING_APPROVAL, None)."""
+    try:
+        src = (PROJECT_ROOT / "bot.py").read_text(encoding="utf-8")
+        idx = src.find("if link_type == 'telegram_private':")
+        if idx < 0:
+            record("ReqAudit2-3: private-branch handler", False,
+                   "telegram_private branch not found")
+            return
+        BOUND = 4000
+        handler_idx = src.find("except InviteRequestSentError:", idx)
+        flood_idx = src.find("except FloodWaitError as e:", idx)
+        return_idx = src.find('return True, "PENDING_APPROVAL", None', idx)
+        ok = (0 < handler_idx < idx + BOUND
+              and 0 < flood_idx < idx + BOUND
+              and handler_idx < flood_idx
+              and 0 < return_idx < handler_idx + 1200)
+        record("ReqAudit2-3: private-branch catches InviteRequestSentError → PENDING_APPROVAL",
+               ok,
+               f"handler={handler_idx} flood={flood_idx} return={return_idx} branch={idx}")
+    except Exception as e:
+        record("ReqAudit2-3: exception", False, str(e))
+
+
+async def test_reqaudit2_invite_request_sent_handler_username_branch():
+    """[REQAUDIT-2] telegram (username) branch ALSO catches InviteRequestSentError."""
+    try:
+        src = (PROJECT_ROOT / "bot.py").read_text(encoding="utf-8")
+        idx = src.find("elif link_type == 'telegram':")
+        if idx < 0:
+            record("ReqAudit2-4: username-branch handler", False,
+                   "telegram (username) branch not found")
+            return
+        handler_count = src.count("except InviteRequestSentError:")
+        second_handler_idx = src.find("except InviteRequestSentError:", idx)
+        return_idx = src.find('return True, "PENDING_APPROVAL", None', second_handler_idx)
+        ok = (handler_count >= 2
+              and second_handler_idx > idx
+              and 0 < return_idx < second_handler_idx + 800)
+        record("ReqAudit2-4: username-branch catches InviteRequestSentError → PENDING_APPROVAL",
+               ok,
+               f"handler_count={handler_count} second_handler={second_handler_idx} return={return_idx}")
+    except Exception as e:
+        record("ReqAudit2-4: exception", False, str(e))
+
+
+async def test_reqaudit2_pipeline6_pending_approval_branch():
+    """[REQAUDIT-2] PIPELINE-6 caller maps PENDING_APPROVAL → DONE (NOT QUEUED)."""
+    try:
+        src = (PROJECT_ROOT / "bot.py").read_text(encoding="utf-8")
+        marker = 'elif status == "PENDING_APPROVAL":'
+        idx = src.find(marker)
+        if idx < 0:
+            record("ReqAudit2-5: PIPELINE-6 PENDING_APPROVAL branch", False,
+                   "PENDING_APPROVAL elif-branch not found")
+            return
+        next_elif = src.find('                elif status ==', idx + len(marker))
+        end = next_elif if 0 < next_elif else idx + 1500
+        window = src[idx:end]
+        has_state = "GroupState.PENDING_APPROVAL" in window
+        has_done = "final_status = 'DONE'" in window
+        no_retry = "QUEUED" not in window and "minutes=30" not in window
+        record("ReqAudit2-5: PIPELINE-6 marks PENDING_APPROVAL as DONE (not retried)",
+               has_state and has_done and no_retry,
+               f"state={has_state} done={has_done} no_retry={no_retry}")
+    except Exception as e:
+        record("ReqAudit2-5: exception", False, str(e))
+
+
+async def test_reqaudit2_dedup_skipsets_include_pending_approval():
+    """[REQAUDIT-2] PENDING_APPROVAL in ALL JOINED+ALREADY_MEMBER skip-sets (4+)."""
+    try:
+        import re
+        src = (PROJECT_ROOT / "bot.py").read_text(encoding="utf-8")
+        pattern = re.compile(r"GroupState\.JOINED,\s*GroupState\.ALREADY_MEMBER(?:,\s*GroupState\.PENDING_APPROVAL)?")
+        matches = list(pattern.finditer(src))
+        total = len(matches)
+        with_pa = sum(1 for m in matches if "GroupState.PENDING_APPROVAL" in m.group(0))
+        ok = total >= 4 and with_pa == total
+        record("ReqAudit2-6: all JOINED+ALREADY_MEMBER skip-sets include PENDING_APPROVAL",
+               ok, f"skipsets_found={total} with_PENDING_APPROVAL={with_pa}")
+    except Exception as e:
+        record("ReqAudit2-6: exception", False, str(e))
+
+
+async def test_reqaudit2_joined_groups_command_shows_pending():
+    """[REQAUDIT-2] /joined_groups surfaces a PENDING_APPROVAL section."""
+    try:
+        src = (PROJECT_ROOT / "bot.py").read_text(encoding="utf-8")
+        has_marker = "بانتظار موافقة المشرف (PENDING_APPROVAL)" in src
+        has_query = "GroupState.PENDING_APPROVAL" in src
+        has_display = "بانتظار موافقة المشرف" in src
+        record("ReqAudit2-7: /joined_groups shows PENDING_APPROVAL section",
+               has_marker and has_query and has_display,
+               f"marker={has_marker} query={has_query} display={has_display}")
+    except Exception as e:
+        record("ReqAudit2-7: exception", False, str(e))
+
+
+async def test_reqaudit2_api_joined_groups_pending_count():
+    """[REQAUDIT-2] /api/joined_groups exposes pending_approval stat."""
+    try:
+        src = (PROJECT_ROOT / "bot.py").read_text(encoding="utf-8")
+        has_query = "state = 'PENDING_APPROVAL'" in src
+        has_stat = '"pending_approval"' in src
+        record("ReqAudit2-8: /api/joined_groups exposes pending_approval stat",
+               has_query and has_stat,
+               f"query={has_query} stat={has_stat}")
+    except Exception as e:
+        record("ReqAudit2-8: exception", False, str(e))
+
+
+async def test_reqaudit2_recheck_loop_method_present():
+    """[REQAUDIT-2 STRONGEST] _pending_approval_recheck_loop method must
+    exist — this is the self-healing loop that detects when the admin
+    approves and transitions PENDING_APPROVAL → JOINED. Without it, groups
+    stay pending forever (operator would have to manually re-scan)."""
+    try:
+        src = (PROJECT_ROOT / "bot.py").read_text(encoding="utf-8")
+        has_method = "async def _pending_approval_recheck_loop" in src
+        has_checkinvite = "CheckChatInviteRequest" in src
+        has_chatalready = "ChatInviteAlready" in src
+        has_transition = "GroupState.JOINED, raw,\n                                        joined_by=phone, error='approved_via_recheck'" in src or \
+                        "error='approved_via_recheck'" in src
+        record("ReqAudit2-9: _pending_approval_recheck_loop self-healing method present",
+               has_method and has_checkinvite and has_chatalready and has_transition,
+               f"method={has_method} checkChatInvite={has_checkinvite} ChatInviteAlready={has_chatalready} transition={has_transition}")
+    except Exception as e:
+        record("ReqAudit2-9: exception", False, str(e))
+
+
+async def test_reqaudit2_recheck_loop_started_in_start():
+    """[REQAUDIT-2 STRONGEST] The recheck loop must be started in start()
+    (not just defined). Otherwise it's dead code like _run_startup_scan was
+    before REQAUDIT-1."""
+    try:
+        src = (PROJECT_ROOT / "bot.py").read_text(encoding="utf-8")
+        has_start = "asyncio.create_task(self._pending_approval_recheck_loop())" in src
+        has_log = "Pending-Approval Recheck started" in src
+        record("ReqAudit2-10: recheck loop wired into start()",
+               has_start and has_log,
+               f"start={has_start} log={has_log}")
+    except Exception as e:
+        record("ReqAudit2-10: exception", False, str(e))
+
+
+async def test_reqaudit2_recheck_loop_supervised():
+    """[REQAUDIT-2 STRONGEST] The recheck loop must be in the supervisor's
+    watched-task list — if it dies (OOM, exception), the supervisor
+    resurrects it. Otherwise PENDING_APPROVAL groups never get re-checked."""
+    try:
+        src = (PROJECT_ROOT / "bot.py").read_text(encoding="utf-8")
+        # The supervisor block must reference the task handle AND create_task it
+        has_handle_check = "_pending_approval_recheck_task" in src
+        # Find the supervisor block
+        sup_idx = src.find("async def _supervisor_loop")
+        if sup_idx < 0:
+            record("ReqAudit2-11: recheck loop supervised", False, "supervisor not found")
+            return
+        # Find the relaunch block within 12000 chars of the supervisor
+        # (the supervisor has a long docstring + 10 task checks, so the
+        # recheck relaunch is ~8400 chars in)
+        relaunch_block = src.find("_pending_approval_recheck_task", sup_idx)
+        has_relaunch = relaunch_block > 0 and relaunch_block < sup_idx + 12000
+        has_create_task = "asyncio.create_task(\n                        self._pending_approval_recheck_loop())" in src or \
+                          "asyncio.create_task(self._pending_approval_recheck_loop())" in src
+        has_warning = "restarted pending_approval_recheck" in src
+        record("ReqAudit2-11: recheck loop supervised (resurrected on death)",
+               has_handle_check and has_relaunch and has_create_task and has_warning,
+               f"handle={has_handle_check} relaunch={has_relaunch} create_task={has_create_task} warn={has_warning}")
+    except Exception as e:
+        record("ReqAudit2-11: exception", False, str(e))
+
+
+async def test_reqaudit2_recheck_loop_shutdown_cancellation():
+    """[REQAUDIT-2 STRONGEST] The recheck task must be cancelled on shutdown
+    (added to the cleanup task list in stop()) so the process exits cleanly."""
+    try:
+        src = (PROJECT_ROOT / "bot.py").read_text(encoding="utf-8")
+        has_attr = "pending_recheck_task = getattr(self, '_pending_approval_recheck_task'" in src
+        in_list = "pending_recheck_task\n                 ]" in src or "pending_recheck_task" in src
+        record("ReqAudit2-12: recheck task cancelled on shutdown",
+               has_attr,
+               f"attr={has_attr} in_list={in_list}")
+    except Exception as e:
+        record("ReqAudit2-12: exception", False, str(e))
+
+
+async def test_reqaudit2_pending_approvals_command():
+    """[REQAUDIT-2 STRONGEST] /pending_approvals bot command must exist for
+    operator visibility (Req #7 — clear JOIN result recording)."""
+    try:
+        src = (PROJECT_ROOT / "bot.py").read_text(encoding="utf-8")
+        has_cmd = 'elif cmd == "/pending_approvals":' in src
+        in_admin = '"/pending_approvals"' in src
+        has_query = "FROM group_states WHERE state = ?" in src and "GroupState.PENDING_APPROVAL" in src
+        record("ReqAudit2-13: /pending_approvals command registered + handler",
+               has_cmd and in_admin and has_query,
+               f"cmd={has_cmd} in_admin_list={in_admin} query={has_query}")
+    except Exception as e:
+        record("ReqAudit2-13: exception", False, str(e))
+
+
+async def test_reqaudit2_api_pending_approvals_endpoint():
+    """[REQAUDIT-2 STRONGEST] /api/pending_approvals HTTP endpoint must exist
+    so the dashboard can surface pending-approval groups."""
+    try:
+        src = (PROJECT_ROOT / "bot.py").read_text(encoding="utf-8")
+        has_handler = "async def api_pending_approvals_handler" in src
+        has_route = 'app.router.add_get("/api/pending_approvals"' in src
+        has_self_heal = '"self_healing": True' in src
+        record("ReqAudit2-14: /api/pending_approvals endpoint + route",
+               has_handler and has_route and has_self_heal,
+               f"handler={has_handler} route={has_route} self_heal_stat={has_self_heal}")
+    except Exception as e:
+        record("ReqAudit2-14: exception", False, str(e))
+
+
+async def test_reqaudit2_recheck_uses_original_joiner_account():
+    """[REQAUDIT-2 STRONGEST] The recheck must use the SAME joiner account
+    that sent the original request (group_states.joined_by) — otherwise the
+    membership check would query a different account that was never invited,
+    and ChatInviteAlready would never fire."""
+    try:
+        src = (PROJECT_ROOT / "bot.py").read_text(encoding="utf-8")
+        has_select = "SELECT normalized_link, raw_link, joined_by, last_seen" in src
+        has_use = "client = getattr(self, 'user_clients', {}).get(phone)" in src
+        has_phone_from_row = "phone = joined_by or \"\"" in src
+        record("ReqAudit2-15: recheck uses original joiner account (joined_by)",
+               has_select and has_use and has_phone_from_row,
+               f"select={has_select} use_clients={has_use} phone_from_row={has_phone_from_row}")
+    except Exception as e:
+        record("ReqAudit2-15: exception", False, str(e))
+
+
+async def test_reqaudit2_recheck_bounded_and_rated():
+    """[REQAUDIT-2 STRONGEST] The recheck loop must be bounded (max 50/cycle)
+    and rate-limited (sleep 5s between checks) so it can't monopolize the
+    API or trigger FloodWait."""
+    try:
+        src = (PROJECT_ROOT / "bot.py").read_text(encoding="utf-8")
+        has_limit = "LIMIT 50" in src
+        has_sleep = "await asyncio.sleep(5)" in src
+        has_interval = "PENDING_RECHECK_INTERVAL_S" in src
+        record("ReqAudit2-16: recheck bounded (50/cycle) + rated (5s) + env interval",
+               has_limit and has_sleep and has_interval,
+               f"limit={has_limit} sleep5={has_sleep} env_interval={has_interval}")
+    except Exception as e:
+        record("ReqAudit2-16: exception", False, str(e))
+
+
+async def test_reqaudit2_recheck_invite_expired_handling():
+    """[REQAUDIT-2 STRONGEST] If the invite expired (admin revoked), the
+    recheck must transition the group to PRIVATE (terminal) so we stop
+    checking a dead link forever — otherwise the loop re-checks an
+    unreachable group every 30 min indefinitely."""
+    try:
+        src = (PROJECT_ROOT / "bot.py").read_text(encoding="utf-8")
+        has_expired_check = "'Expired' in _ename or 'expired' in str(e).lower()" in src
+        has_private_transition = "GroupState.PRIVATE, raw,\n                                        error='invite_expired_recheck'" in src or \
+                                "error='invite_expired_recheck'" in src
+        record("ReqAudit2-17: recheck handles invite-expired → PRIVATE (terminal)",
+               has_expired_check and has_private_transition,
+               f"expired_check={has_expired_check} private_transition={has_private_transition}")
+    except Exception as e:
+        record("ReqAudit2-17: exception", False, str(e))
+
+
 # === Main runner ===
 
 async def main():
@@ -3212,6 +3518,26 @@ async def main():
     await test_req2_startup_scan_wired_into_start()
     await test_req3_pre_publish_channel_exclusion_present()
     await test_req3_scorer_marks_channels_banned()
+
+    # === [REQAUDIT-2] InviteRequestSentError → PENDING_APPROVAL full lifecycle ===
+    await test_reqaudit2_groupstate_pending_approval_enum()
+    await test_reqaudit2_invite_request_sent_error_imported()
+    await test_reqaudit2_invite_request_sent_handler_private_branch()
+    await test_reqaudit2_invite_request_sent_handler_username_branch()
+    await test_reqaudit2_pipeline6_pending_approval_branch()
+    await test_reqaudit2_dedup_skipsets_include_pending_approval()
+    await test_reqaudit2_joined_groups_command_shows_pending()
+    await test_reqaudit2_api_joined_groups_pending_count()
+    # [REQAUDIT-2 STRONGEST] self-healing recheck loop + operator visibility
+    await test_reqaudit2_recheck_loop_method_present()
+    await test_reqaudit2_recheck_loop_started_in_start()
+    await test_reqaudit2_recheck_loop_supervised()
+    await test_reqaudit2_recheck_loop_shutdown_cancellation()
+    await test_reqaudit2_pending_approvals_command()
+    await test_reqaudit2_api_pending_approvals_endpoint()
+    await test_reqaudit2_recheck_uses_original_joiner_account()
+    await test_reqaudit2_recheck_bounded_and_rated()
+    await test_reqaudit2_recheck_invite_expired_handling()
 
     # [infra] close all aiosqlite connections before the loop tears down
     await close_all_test_dbs()

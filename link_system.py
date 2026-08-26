@@ -159,6 +159,11 @@ class GroupState:
     FLOODWAIT = 'FLOODWAIT'
     BANNED = 'BANNED'
     ALREADY_MEMBER = 'ALREADY_MEMBER'
+    # [REQAUDIT-2] join request sent successfully (InviteRequestSentError),
+    # awaiting admin approval. NOT a failure — must not be retried as FAILED.
+    # A background recheck loop transitions these to JOINED once the admin
+    # approves (self-healing — see _pending_approval_recheck_loop in bot.py).
+    PENDING_APPROVAL = 'PENDING_APPROVAL'
 
 
 # -------------------------------------------------------------------

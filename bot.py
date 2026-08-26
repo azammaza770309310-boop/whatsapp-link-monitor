@@ -2383,7 +2383,10 @@ class MessageFormatter:
             "📌 أوامر تنظيف القناة:\n"
             "• /cleanup_preview — معاينة ما سيُحذف (بدون حذف فعلي)\n"
             "• /cleanup_links — حذف الروابط غير التعليمية والمكررة\n"
-            "• /cleanup_status — تقدم التنظيف"
+            "• /cleanup_status — تقدم التنظيف\n\n"
+            "📌 [REQAUDIT-2] بانتظار موافقة المشرف:\n"
+            "• /pending_approvals — عرض المجموعات التي أُرسل لها طلب انضمام وينتظر قبول المشرف\n"
+            "• فحص تلقائي كل 30 دقيقة — عند قبول المشرف تتحول المجموعة إلى JOINED أوتوماتيكياً"
         )
 
     @staticmethod
@@ -2809,6 +2812,8 @@ class Monitor:
         # [B07] supervisor + [L03] polling-watchdog task handles
         self._supervisor_task: Optional[asyncio.Task] = None
         self._polling_watchdog_task: Optional[asyncio.Task] = None
+        # [REQAUDIT-2] pending-approval self-healing recheck task handle
+        self._pending_approval_recheck_task: Optional[asyncio.Task] = None
         # [Task 9a / W3] Shared lock that serializes the relaunch of
         # `_polling_scheduler_task` between `_supervisor_loop` (60s) and
         # `_polling_watchdog_loop` (30s). Without it, both loops can
@@ -3952,6 +3957,15 @@ class Monitor:
                     self._polling_watchdog_task = asyncio.create_task(
                         self._polling_watchdog_loop())
                     logging.warning("[SUPERVISOR] restarted polling_watchdog")
+                # 10. [REQAUDIT-2] Pending-approval self-healing recheck loop.
+                # If this dies, PENDING_APPROVAL groups never get re-checked
+                # for admin approval → they'd stay PENDING forever. The
+                # supervisor self-heals it so the lifecycle completes.
+                if (getattr(self, '_pending_approval_recheck_task', None) is None
+                        or self._pending_approval_recheck_task.done()) and self._running:
+                    self._pending_approval_recheck_task = asyncio.create_task(
+                        self._pending_approval_recheck_loop())
+                    logging.warning("[SUPERVISOR] restarted pending_approval_recheck")
             except asyncio.CancelledError:
                 break
             except Exception as e:
@@ -3993,6 +4007,163 @@ class Monitor:
             except Exception as e:
                 logging.error(f"[POLLING-WATCHDOG] error: {e}", exc_info=True)
             await asyncio.sleep(30)
+
+    # ===================================================================
+    # [REQAUDIT-2] Pending-approval self-healing recheck loop
+    # ===================================================================
+    async def _pending_approval_recheck_loop(self):
+        """[REQAUDIT-2] Self-healing: every N seconds (default 30 min, env
+        PENDING_RECHECK_INTERVAL_S), for each group in state PENDING_APPROVAL,
+        check whether the group admin has approved the join request. If yes,
+        transition state to JOINED. This prevents groups from being stuck in
+        PENDING_APPROVAL forever (the admin may approve minutes/hours/days
+        later — without this loop the operator would have to manually re-run
+        /scan or /requeue to discover the approval).
+
+        Detection method:
+          - Private invite hash (t.me/+hash, t.me/joinchat/hash):
+              messages.checkChatInvite(hash) returns:
+                * ChatInviteAlready  → the joiner is now a member → JOINED
+                * ChatInvite          → request still pending → stay
+          - Username link (t.me/username):
+              get_entity(username) → GetParticipantRequest(channel, "me"):
+                * success            → JOINED
+                * UserNotParticipant → still pending
+
+        Uses the SAME joiner account that sent the original request
+        (group_states.joined_by) so the membership check is authoritative.
+
+        Rate-limited: 5s between each check (well under get_entity 30/min
+        and import_invite 5/hour caps). Bounded: max 50 groups per cycle
+        (oldest first) so the loop can't monopolize the API. Errors per-row
+        are isolated (one bad link can't crash the loop). Invite-expired
+        transitions to PRIVATE (terminal — the request can never succeed).
+        """
+        await asyncio.sleep(60)  # let clients connect at startup
+        try:
+            interval = int(os.getenv("PENDING_RECHECK_INTERVAL_S", "1800"))
+        except (ValueError, TypeError):
+            interval = 1800
+        logging.info(f"[PENDING-RECHECK] started — {interval}s cycle, max 50 groups/cycle")
+        while self._running:
+            try:
+                conn = await self.prod_db._ensure_conn()
+                cursor = await conn.execute(
+                    "SELECT normalized_link, raw_link, joined_by, last_seen "
+                    "FROM group_states WHERE state = ? "
+                    "ORDER BY last_seen ASC LIMIT 50",
+                    (GroupState.PENDING_APPROVAL,)
+                )
+                rows = await cursor.fetchall()
+                if not rows:
+                    await asyncio.sleep(interval)
+                    continue
+                logging.info(f"[PENDING-RECHECK] cycle: checking {len(rows)} pending-approval group(s)")
+                approved = 0
+                still_pending = 0
+                errors = 0
+                expired = 0
+                for norm, raw, joined_by, last_seen in rows:
+                    if not self._running:
+                        break
+                    try:
+                        phone = joined_by or ""
+                        client = getattr(self, 'user_clients', {}).get(phone)
+                        if not client or not client.is_connected():
+                            still_pending += 1
+                            continue
+                        # === private invite hash path ===
+                        raw_lower = (raw or '').lower()
+                        hash_val = None
+                        if '/+' in (raw or ''):
+                            hash_val = raw.split('/+', 1)[1].split('?')[0].split('#')[0]
+                        elif 'joinchat/' in raw_lower:
+                            hash_val = raw.split('joinchat/', 1)[1].split('?')[0].split('#')[0]
+                        if hash_val:
+                            try:
+                                from telethon.tl.functions.messages import CheckChatInviteRequest
+                                from telethon.tl.types import ChatInviteAlready
+                            except ImportError:
+                                errors += 1
+                                continue
+                            try:
+                                result = await asyncio.wait_for(
+                                    client(CheckChatInviteRequest(hash_val)), timeout=15)
+                                if isinstance(result, ChatInviteAlready):
+                                    await self.prod_db.set_group_state(
+                                        norm, GroupState.JOINED, raw,
+                                        joined_by=phone, error='approved_via_recheck')
+                                    approved += 1
+                                    logging.info(
+                                        f"[PENDING-RECHECK] ✅ APPROVED: {raw[:50]} by={phone} → JOINED"
+                                    )
+                                else:
+                                    still_pending += 1
+                            except asyncio.TimeoutError:
+                                errors += 1
+                            except Exception as e:
+                                _ename = type(e).__name__
+                                if 'Expired' in _ename or 'expired' in str(e).lower():
+                                    await self.prod_db.set_group_state(
+                                        norm, GroupState.PRIVATE, raw,
+                                        error='invite_expired_recheck')
+                                    expired += 1
+                                    logging.warning(
+                                        f"[PENDING-RECHECK] 🔴 invite expired: {raw[:50]}"
+                                    )
+                                else:
+                                    errors += 1
+                                    logging.debug(
+                                        f"[PENDING-RECHECK] check error on {raw[:40]}: {_ename}: {e}"
+                                    )
+                        else:
+                            # === username link path ===
+                            username = None
+                            if 't.me/' in (raw or ''):
+                                _u = raw.split('t.me/', 1)[1]
+                                username = _u.split('?')[0].split('#')[0].split('/')[0]
+                            if not username:
+                                errors += 1
+                                continue
+                            try:
+                                entity = await asyncio.wait_for(
+                                    client.get_entity(username), timeout=15)
+                                verified, mc = await self._verify_membership(
+                                    client, entity, phone, raw)
+                                if verified:
+                                    await self.prod_db.set_group_state(
+                                        norm, GroupState.JOINED, raw,
+                                        joined_by=phone,
+                                        member_count=mc,
+                                        error='approved_via_recheck')
+                                    approved += 1
+                                    logging.info(
+                                        f"[PENDING-RECHECK] ✅ APPROVED: {raw[:50]} by={phone} → JOINED (members={mc})"
+                                    )
+                                else:
+                                    still_pending += 1
+                            except asyncio.TimeoutError:
+                                errors += 1
+                            except Exception:
+                                errors += 1
+                        # rate-limit between checks (avoid FloodWait)
+                        await asyncio.sleep(5)
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception as e:
+                        errors += 1
+                        logging.debug(
+                            f"[PENDING-RECHECK] row error on {(raw or '')[:40]}: {e}"
+                        )
+                logging.info(
+                    f"[PENDING-RECHECK] cycle done: approved={approved} "
+                    f"still_pending={still_pending} errors={errors} expired={expired}"
+                )
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logging.error(f"[PENDING-RECHECK] loop error: {e}", exc_info=True)
+            await asyncio.sleep(interval)
 
     # ===================================================================
     # [N07 / Task 4a hardened] AI drainer — processes the ai_pending backlog
@@ -5522,6 +5693,7 @@ class Monitor:
                     '/cleanup_preview', '/cleanup_links', '/cleanup_status',
                     '/live_audit', '/status', '/watchers', '/help',
                     '/joined_groups', '/queue', '/debug_pipeline',
+                    '/pending_approvals',
                 ]
 
                 if cmd in admin_commands:
@@ -6864,6 +7036,13 @@ class Monitor:
                         (GroupState.ALREADY_MEMBER,))
                     already_rows = await cursor.fetchall()
 
+                    # [REQAUDIT-2] المجموعات بانتظار موافقة المشرف (PENDING_APPROVAL)
+                    cursor = await conn.execute(
+                        "SELECT normalized_link, raw_link, joined_by, last_seen "
+                        "FROM group_states WHERE state = ? ORDER BY last_seen DESC LIMIT 50",
+                        (GroupState.PENDING_APPROVAL,))
+                    pending_rows = await cursor.fetchall()
+
                     # إحصائيات
                     cursor = await conn.execute(
                         "SELECT state, COUNT(*) FROM group_states GROUP BY state")
@@ -6905,12 +7084,65 @@ class Monitor:
                         if len(already_rows) > 10:
                             lines.append(f"  ... و {len(already_rows) - 10} أخرى")
 
+                    # [REQAUDIT-2] المجموعات بانتظار موافقة المشرف
+                    if pending_rows:
+                        lines.append("")
+                        lines.append(f"✉️ بانتظار موافقة المشرف ({len(pending_rows)}):")
+                        for i, r in enumerate(pending_rows[:10], 1):
+                            raw = r[1] or r[0] or '?'
+                            joined_by = r[2] or '?'
+                            masked = joined_by[:4] + '***' + joined_by[-4:] if len(joined_by) > 8 else joined_by
+                            when = r[3][:19] if r[3] else '?'
+                            lines.append(f"  {i}. {raw[:60]}")
+                            lines.append(f"     by={masked} at={when} (طلب مُرسل، ينتظر القبول — فحص تلقائي كل 30د)")
+                        if len(pending_rows) > 10:
+                            lines.append(f"  ... و {len(pending_rows) - 10} أخرى")
+
                     lines.append("")
                     lines.append("═══════════════════════════")
 
                     await reply("\n".join(lines))
                 except Exception as e:
                     logging.error(f"[JOINED_GROUPS] Error: {e}", exc_info=True)
+                    await reply(f"❌ خطأ: {e}")
+
+            elif cmd == "/pending_approvals":
+                # === [REQAUDIT-2] عرض المجموعات بانتظار موافقة المشرف ===
+                logging.info("[PENDING_APPROVALS] /pending_approvals command invoked")
+                try:
+                    conn = await self.db._ensure_conn()
+                    cursor = await conn.execute(
+                        "SELECT normalized_link, raw_link, joined_by, last_seen, last_error "
+                        "FROM group_states WHERE state = ? ORDER BY last_seen DESC LIMIT 100",
+                        (GroupState.PENDING_APPROVAL,))
+                    rows = await cursor.fetchall()
+                    cursor = await conn.execute(
+                        "SELECT COUNT(*) FROM group_states WHERE state = ?",
+                        (GroupState.PENDING_APPROVAL,))
+                    total = (await cursor.fetchone())[0]
+                    lines = [
+                        f"✉️ مجموعات بانتظار موافقة المشرف (المجموع: {total})",
+                        f"═══════════════════════════",
+                        f"فحص تلقائي كل 30 دقيقة — عند القبول تتحول تلقائياً إلى JOINED",
+                        f"",
+                    ]
+                    if not rows:
+                        lines.append("✅ لا توجد طلبات بانتظار الموافقة حالياً")
+                    else:
+                        for i, r in enumerate(rows[:50], 1):
+                            raw = r[1] or r[0] or '?'
+                            joined_by = r[2] or '?'
+                            masked = joined_by[:4] + '***' + joined_by[-4:] if len(joined_by) > 8 else joined_by
+                            when = r[3][:19] if r[3] else '?'
+                            lines.append(f"{i}. {raw[:60]}")
+                            lines.append(f"   by={masked} at={when}")
+                        if total > 50:
+                            lines.append(f"... و {total - 50} أخرى (استخدم /cleanup_preview لإدارة القائمة)")
+                    lines.append("")
+                    lines.append("═══════════════════════════")
+                    await reply("\n".join(lines))
+                except Exception as e:
+                    logging.error(f"[PENDING_APPROVALS] Error: {e}", exc_info=True)
                     await reply(f"❌ خطأ: {e}")
 
             elif cmd == "/queue":
@@ -7236,7 +7468,9 @@ class Monitor:
 
                 # 2. تحقق من حالة المجموعة في State Machine
                 state = await self.prod_db.get_group_state(normalized)
-                if state in (GroupState.JOINED, GroupState.ALREADY_MEMBER):
+                # [REQAUDIT-2] PENDING_APPROVAL = request already sent — do NOT
+                # re-issue ImportChatInviteRequest (pointless + PeerFlood risk).
+                if state in (GroupState.JOINED, GroupState.ALREADY_MEMBER, GroupState.PENDING_APPROVAL):
                     logging.info(f"[LINK id={link_id}] [PIPELINE-3] ⏭️ already {state} — skipping")
                     await self.prod_db.update_queue_status(link_data['id'], 'DONE')
                     await self.metrics.record_skip('already_joined')
@@ -7612,6 +7846,25 @@ class Monitor:
                     final_status = 'DONE'
                     await self.metrics.record_membership_skip()
                     logging.info(f"[LINK id={link_id}] [PIPELINE-6] ℹ️ {phone} already member: {raw_link[:60]}")
+
+                elif status == "PENDING_APPROVAL":
+                    # [REQAUDIT-2] Join request sent, awaiting admin approval.
+                    # NOT joined yet — but the request succeeded, so mark DONE
+                    # (do NOT retry as FAILED: re-issuing ImportChatInviteRequest
+                    # or JoinChannelRequest is pointless once a request is
+                    # pending, and risks PeerFlood). The background
+                    # _pending_approval_recheck_loop will detect when the admin
+                    # approves and transition state to JOINED automatically
+                    # (self-healing — no operator action needed).
+                    state_to_set = GroupState.PENDING_APPROVAL
+                    state_error = 'pending_admin_approval'
+                    final_status = 'DONE'
+                    await self.metrics.record_join_success(phone)
+                    await self.db.increment_joiner_stats(phone, success=True)
+                    logging.info(
+                        f"[LINK id={link_id}] [PIPELINE-6] ✉️ {phone} PENDING_APPROVAL: {raw_link[:60]} "
+                        f"(request sent, awaiting admin approval — not retried; recheck loop will detect approval)"
+                    )
 
                 elif status == "FLOODWAIT":
                     state_to_set = GroupState.FLOODWAIT
@@ -8143,7 +8396,8 @@ class Monitor:
 
                             # تحقق من group_states — هل المجموعة منضم لها بالفعل؟
                             state = await self.prod_db.get_group_state(normalized)
-                            if state in (GroupState.JOINED, GroupState.ALREADY_MEMBER):
+                            # [REQAUDIT-2] PENDING_APPROVAL = request sent; skip
+                            if state in (GroupState.JOINED, GroupState.ALREADY_MEMBER, GroupState.PENDING_APPROVAL):
                                 total_skipped_already_joined += 1
                                 continue
                             if state == GroupState.BANNED:
@@ -8336,7 +8590,8 @@ class Monitor:
 
                         # b. تجاوز لو الحالة معروفة في group_states
                         state = await self.prod_db.get_group_state(normalized)
-                        if state in (GroupState.JOINED, GroupState.ALREADY_MEMBER, GroupState.BANNED, GroupState.PRIVATE):
+                        # [REQAUDIT-2] PENDING_APPROVAL = request already sent
+                        if state in (GroupState.JOINED, GroupState.ALREADY_MEMBER, GroupState.PENDING_APPROVAL, GroupState.BANNED, GroupState.PRIVATE):
                             self._bulk_join_stats['skipped'] += 1
                             await self.prod_db.update_queue_status(link_id, 'DONE')
                             continue
@@ -8373,6 +8628,12 @@ class Monitor:
                             await self.prod_db.set_group_state(normalized, GroupState.ALREADY_MEMBER, raw_link,
                                                                joined_by=joiner_phone)
                             logging.info(f"[BULK_JOIN] ℹ️ Already member: {raw_link[:50]}")
+                        elif status == "PENDING_APPROVAL":
+                            # [REQAUDIT-2] request sent, awaiting admin approval
+                            self._bulk_join_stats['joined'] += 1
+                            await self.prod_db.set_group_state(normalized, GroupState.PENDING_APPROVAL, raw_link,
+                                                               joined_by=joiner_phone, error='pending_admin_approval')
+                            logging.info(f"[BULK_JOIN] ✉️ Pending approval: {raw_link[:50]}")
                         elif status == "IS_CHANNEL":
                             self._bulk_join_stats['skipped'] += 1
                             await self.prod_db.set_group_state(normalized, GroupState.FAILED, raw_link,
@@ -8696,8 +8957,10 @@ class Monitor:
         # 5. Attempt history — تم تخفيف (فقط لو انضم بالفعل)
         state = await self.prod_db.get_group_state(normalized_link)
         # JOINING = محاولة حالية (هذا الـ Scheduler نفسه)، لا ترفض
-        # فقط JOINED و ALREADY_MEMBER تعني أننا انضممنا سابقاً
-        if state in (GroupState.JOINED, GroupState.ALREADY_MEMBER):
+        # [REQAUDIT-2] JOINED/ALREADY_MEMBER/PENDING_APPROVAL = we already
+        # sent a join for this group (succeeded or pending approval) — block
+        # a second attempt to avoid duplicate requests / PeerFlood.
+        if state in (GroupState.JOINED, GroupState.ALREADY_MEMBER, GroupState.PENDING_APPROVAL):
             return False, f'already_attempted_{state}'
         # تم إزالة فحص attempt_count >= 3 (تخفيف)
 
@@ -8902,6 +9165,12 @@ class Monitor:
                 ChannelPrivateError, InviteHashExpiredError,
                 PeerFloodError, UserBannedInChannelError,
                 ChatWriteForbiddenError,
+                # [REQAUDIT-2] raised when a group requires admin approval to
+                # join. Telegram's message is literally "You have successfully
+                # requested to join this chat or channel" — the request SUCCEEDED
+                # and is pending approval. Without this import the outer
+                # `except Exception` swallowed it as FAILED → infinite retry.
+                InviteRequestSentError,
             )
 
             link_type = link_data['link_type']
@@ -8926,6 +9195,22 @@ class Monitor:
                     return False, "TIMEOUT", None
                 except UserAlreadyParticipantError:
                     return False, "ALREADY_MEMBER", None
+                except InviteRequestSentError:
+                    # [REQAUDIT-2] Telegram raised "You have successfully
+                    # requested to join this chat or channel" — the join
+                    # request was SENT and is pending admin approval. This
+                    # is NOT a failure: the API call succeeded. Mark as
+                    # PENDING_APPROVAL so the link is NOT retried as FAILED
+                    # (which would waste API calls re-issuing
+                    # ImportChatInviteRequest and risk PeerFlood/ban). The
+                    # background _pending_approval_recheck_loop will detect
+                    # when the admin approves and transition to JOINED.
+                    await self.rate_limiter.record_success(phone, 'import_invite')
+                    logging.info(
+                        f"[JOIN] ✉️ {phone} PENDING_APPROVAL: join request sent, "
+                        f"awaiting admin approval link={raw_link[:50]}"
+                    )
+                    return True, "PENDING_APPROVAL", None
                 except FloodWaitError as e:
                     logging.warning(f"[JOIN] ❌ FloodWait phone={phone} seconds={e.seconds} link={raw_link[:50]}")
                     await self.rate_limiter.record_floodwait(phone, e.seconds)
@@ -9014,6 +9299,18 @@ class Monitor:
                     return False, "TIMEOUT", None
                 except UserAlreadyParticipantError:
                     return False, "ALREADY_MEMBER", None
+                except InviteRequestSentError:
+                    # [REQAUDIT-2] Public group/channel with join-approval
+                    # enabled — Telegram accepted the request and it's
+                    # pending admin approval. NOT a failure (same semantics
+                    # as the ImportChatInviteRequest path above). The
+                    # background recheck loop will detect approval → JOINED.
+                    await self.rate_limiter.record_success(phone, 'join_channel')
+                    logging.info(
+                        f"[JOIN] ✉️ {phone} PENDING_APPROVAL: join request sent, "
+                        f"awaiting admin approval link={raw_link[:50]}"
+                    )
+                    return True, "PENDING_APPROVAL", None
                 except FloodWaitError as e:
                     logging.warning(f"[JOIN] ❌ FloodWait phone={phone} seconds={e.seconds} link={raw_link[:50]}")
                     await self.rate_limiter.record_floodwait(phone, e.seconds)
@@ -9223,6 +9520,15 @@ class Monitor:
             self._polling_watchdog_task = asyncio.create_task(self._polling_watchdog_loop())
             logging.info("🐕 Polling Watchdog started (30s cycle — scheduler-only)")
 
+        # === [REQAUDIT-2] PENDING-APPROVAL RECHECK — self-healing 30-min cycle ===
+        # Transitions PENDING_APPROVAL → JOINED when the group admin approves
+        # the join request. Without this, groups whose join-request was sent
+        # (InviteRequestSentError) would stay PENDING forever. Supervisor
+        # resurrects on death.
+        if not hasattr(self, '_pending_approval_recheck_task') or self._pending_approval_recheck_task is None or self._pending_approval_recheck_task.done():
+            self._pending_approval_recheck_task = asyncio.create_task(self._pending_approval_recheck_loop())
+            logging.info("✉️ Pending-Approval Recheck started (30-min cycle — self-heal PENDING_APPROVAL → JOINED)")
+
         # === LEGACY POLLING WORKER — DISABLED ===
         # The legacy _active_polling_worker is superseded by PollingScheduler
         # (which covers ALL sources, not just Top-200, and uses fair scheduling).
@@ -9282,11 +9588,13 @@ class Monitor:
         # [PERSISTENCE Option C] journal snapshot + [N07] ai drainer tasks
         journal_snapshot_task = getattr(self, '_journal_snapshot_task', None)
         ai_drainer_task = getattr(self, '_ai_drainer_task', None)
+        # [REQAUDIT-2] pending-approval recheck task
+        pending_recheck_task = getattr(self, '_pending_approval_recheck_task', None)
         tasks = [self._bot_task, self._keep_alive_task, self._joiner_task,
                  scorer_task, cache_cleanup_task, polling_task,
                  registry_task, polling_scheduler_task, claim_cleanup_task,
                  journal_recovery_task, supervisor_task, polling_watchdog_task,
-                 journal_snapshot_task, ai_drainer_task
+                 journal_snapshot_task, ai_drainer_task, pending_recheck_task
                  ] + list(self._user_tasks.values()) + self._current_scan_tasks
         for t in tasks:
             if t and not t.done():
@@ -9350,6 +9658,11 @@ async def api_joined_groups_handler(request):
             "SELECT COUNT(*) FROM link_queue WHERE status = 'QUEUED'")
         pending = (await cursor.fetchone())[0]
 
+        # [REQAUDIT-2] Pending-approval count (requests sent, awaiting admin)
+        cursor = await conn.execute(
+            "SELECT COUNT(*) FROM group_states WHERE state = 'PENDING_APPROVAL'")
+        total_pending_approval = (await cursor.fetchone())[0]
+
         # Active joiners from Supabase
         try:
             joiners = await db.get_watchers_by_role("joiner")
@@ -9363,11 +9676,56 @@ async def api_joined_groups_handler(request):
                 "total_joined": total_joined,
                 "pending_groups": pending,
                 "active_joiners": active_joiners,
+                "pending_approval": total_pending_approval,
             }
         }, status=200, headers={"Access-Control-Allow-Origin": "*"})
 
     except Exception as e:
         logging.error(f"[API] joined_groups error: {e}")
+        return web.json_response({"error": str(e)}, status=500,
+                                 headers={"Access-Control-Allow-Origin": "*"})
+
+
+async def api_pending_approvals_handler(request):
+    """[REQAUDIT-2] API endpoint: returns all groups in state PENDING_APPROVAL
+    (join request sent, awaiting admin approval). Includes the joiner phone
+    (masked when dashboard is open) and timestamp. The dashboard surfaces
+    this so the operator can see which groups are pending — and trust the
+    self-healing recheck loop to flip them to JOINED on approval.
+    """
+    monitor = request.app.get("monitor")
+    db = request.app.get("db")
+    if not monitor or not db:
+        return web.json_response({"error": "not ready"}, status=503)
+    try:
+        conn = await db._ensure_conn()
+        cursor = await conn.execute(
+            "SELECT normalized_link, raw_link, joined_by, last_seen, last_error "
+            "FROM group_states WHERE state = ? ORDER BY last_seen DESC LIMIT 200",
+            ('PENDING_APPROVAL',))
+        rows = await cursor.fetchall()
+        _show_full = _api_should_show_full_pii()
+        groups = []
+        for r in rows:
+            groups.append({
+                "id": len(groups) + 1,
+                "normalized_link": r[0] or '',
+                "group_link": r[1] or '',
+                "status": "PENDING_APPROVAL",
+                "joined_by_phone": (r[2] or '') if _show_full else _redact_phone(r[2]),
+                "since": r[3] or '',
+                "last_error": r[4] or '',
+            })
+        return web.json_response({
+            "pending_approvals": groups,
+            "stats": {
+                "total_pending_approval": len(groups),
+                "recheck_interval_seconds": int(os.getenv("PENDING_RECHECK_INTERVAL_S", "1800")),
+                "self_healing": True,
+            }
+        }, status=200, headers={"Access-Control-Allow-Origin": "*"})
+    except Exception as e:
+        logging.error(f"[API] pending_approvals error: {e}")
         return web.json_response({"error": str(e)}, status=500,
                                  headers={"Access-Control-Allow-Origin": "*"})
 
@@ -10263,6 +10621,7 @@ async def start_http_server(monitor=None, db=None):
     app.router.add_get("/ready", ready_handler)        # readiness
     app.router.add_get("/metrics", metrics_handler)    # Prometheus metrics
     app.router.add_get("/api/joined_groups", api_joined_groups_handler)
+    app.router.add_get("/api/pending_approvals", api_pending_approvals_handler)  # [REQAUDIT-2]
     app.router.add_get("/api/links", api_links_handler)
     app.router.add_get("/api/stats", api_stats_handler)
     app.router.add_get("/api/deploy_check", api_deploy_check_handler)  # diagnostic
@@ -10274,7 +10633,7 @@ async def start_http_server(monitor=None, db=None):
     await runner.setup()
     site = web.TCPSite(runner, "0.0.0.0", port)
     await site.start()
-    logging.info(f"HTTP server listening on port {port} (endpoints: /health /ready /metrics /api/joined_groups /api/links /api/stats /api/deploy_check /api/monitored_chats /api/link_source_check)")
+    logging.info(f"HTTP server listening on port {port} (endpoints: /health /ready /metrics /api/joined_groups /api/pending_approvals /api/links /api/stats /api/deploy_check /api/monitored_chats /api/link_source_check)")
     return runner
 
 
