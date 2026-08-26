@@ -10981,6 +10981,30 @@ async def metrics_handler(request):
     pending_scan_tasks = len(monitor._current_scan_tasks)
     login_sessions = len(monitor._login_sessions)
 
+    # [PR-1/PR-2/observability] link-capture metrics (from Metrics singleton)
+    m = getattr(monitor, 'metrics', None)
+    msum = {}
+    if m is not None:
+        try:
+            msum = await m.get_summary()
+        except Exception:
+            msum = {}
+    link_capture_total = msum.get('link_capture_total', 0)
+    link_ring_hits = msum.get('link_ring_hits', 0)
+    delete_miss_total = msum.get('delete_miss_total', 0)
+    delete_rescued_total = msum.get('delete_rescued_total', 0)
+    reconcile_rescued_total = msum.get('reconcile_rescued_total', 0)
+    duplicate_links_skipped = msum.get('total_duplicates', 0)
+    link_forwarded_total = msum.get('link_forwarded_total', 0)
+    floodwait_total = msum.get('total_floodwait', 0)
+    # Fleet health (connected vs disconnected joiners)
+    fh = getattr(monitor, '_fleet_health', {}) or {}
+    connected_joiners = fh.get('connected_joiners', 0)
+    disconnected_accounts = len(fh.get('disconnected_joiners', []))
+    high_risk_chats = len(getattr(monitor, '_tight_poll_chats', set()) or set())
+    tight_poll_active = 1 if getattr(monitor, '_tight_poll_task', None) and \
+        not getattr(monitor._tight_poll_task, 'done', lambda: True)() else 0
+
     metrics = f"""# HELP monitor_total_links Total links stored in database
 # TYPE monitor_total_links gauge
 monitor_total_links {total_links}
@@ -10999,6 +11023,42 @@ monitor_pending_scan_tasks {pending_scan_tasks}
 # HELP monitor_login_sessions Number of active login sessions
 # TYPE monitor_login_sessions gauge
 monitor_login_sessions {login_sessions}
+# HELP link_capture_total Total links captured (NewMessage + Raw + Polling)
+# TYPE link_capture_total counter
+link_capture_total {link_capture_total}
+# HELP link_ring_hits Links rescued from Link Ring Buffer after delete
+# TYPE link_ring_hits counter
+link_ring_hits {link_ring_hits}
+# HELP delete_miss_total Messages deleted before any delivery (no rescue possible)
+# TYPE delete_miss_total counter
+delete_miss_total {delete_miss_total}
+# HELP delete_rescued_total Messages rescued after delete (cache/journal/LRB/get_messages)
+# TYPE delete_rescued_total counter
+delete_rescued_total {delete_rescued_total}
+# HELP reconcile_rescued_total Messages rescued via reconcile
+# TYPE reconcile_rescued_total counter
+reconcile_rescued_total {reconcile_rescued_total}
+# HELP duplicate_links_skipped Duplicate links skipped by central dedup
+# TYPE duplicate_links_skipped counter
+duplicate_links_skipped {duplicate_links_skipped}
+# HELP link_forwarded_total Links successfully published to channel
+# TYPE link_forwarded_total counter
+link_forwarded_total {link_forwarded_total}
+# HELP floodwait_total Total FloodWait events
+# TYPE floodwait_total counter
+floodwait_total {floodwait_total}
+# HELP connected_joiners Joiner accounts currently connected
+# TYPE connected_joiners gauge
+connected_joiners {connected_joiners}
+# HELP disconnected_accounts Accounts currently disconnected/skipped
+# TYPE disconnected_accounts gauge
+disconnected_accounts {disconnected_accounts}
+# HELP high_risk_chats Chats flagged for tight polling
+# TYPE high_risk_chats gauge
+high_risk_chats {high_risk_chats}
+# HELP tight_poll_active 1 if tight-poll loop is active
+# TYPE tight_poll_active gauge
+tight_poll_active {tight_poll_active}
 """
     return web.Response(text=metrics, content_type="text/plain")
 
