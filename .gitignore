@@ -69,6 +69,16 @@ accounts.env
 *_session_string*
 *.session
 upload/
+# [PR-7] runtime data stores — defence-in-depth even if DATA_DIR is overridden
+sessions/
+logs/
+secrets/
+credentials/
+*.session-journal
+*.session-shm
+# never commit StrippedSession / JSON session exports
+*.session.json
+session_*.json
 
 # === Test/CI infrastructure (Task 8a) ===
 .venv-test/
@@ -77,7 +87,8 @@ __pycache__/
 *.pyc
 # Local SQLite DBs created at runtime (DATA_DIR defaults to ./data)
 /data/
-/data/
 *.db-journal
 *.db-wal
 *.db
+# Render/blueprint local snapshots
+render.yaml.local
