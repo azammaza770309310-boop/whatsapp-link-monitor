@@ -2804,6 +2804,18 @@ class Monitor:
         self._msg_cache: Dict[Tuple[int, int], dict] = {}
         self._msg_cache_lock = asyncio.Lock()
         self._msg_cache_ttl = 120  # ثانية — نبقي الرسائل لمدة دقيقتين
+        # === LINK RING BUFFER (LRB) — LINK-ONLY FAST CAPTURE ===
+        # [PR-1] مسار مستقل فائق السرعة: يخزّن الروابط المُستخرَجة (normalized
+        # فقط) بأسرع نقطة بعد وصول الرسالة — قبل أي metadata/sender/title/cache.
+        # الهدف: لو حُذفت الرسالة قبل اكتمال PRE-CACHE metadata، يقدر
+        # _on_message_deleted يسحب الرابط من LRB ويدخله dedup/queue.
+        # Key: (chat_id, msg_id) → List[normalized_link]
+        self._link_ring: Dict[Tuple[int, int], List[str]] = {}
+        self._link_ring_lock = asyncio.Lock()
+        self._link_ring_ttl = 300   # 5 دقائق (أطول من cache لاحتمال وصول Delete متأخر)
+        self._link_ring_cap = 20000 # حد أقصى لمنع نمو الذاكرة بلا حدود
+        self._link_ring_evicted = 0 # عدّاد للمراقبة
+        self._link_ring_hits = 0    # عدّاد ضربات الإنقاذ من LRB
         # === ACTIVE POLLING WORKER ===
         # بدل الاعتماد على NewMessage events فقط (اللي قد تتأخر أو تُحذف قبل ما توصل),
         # نضيف polling نشط: كل 3 ثواني نسحب آخر 3 رسائل من كل مجموعة نشطة
@@ -3413,13 +3425,30 @@ class Monitor:
 
     def _register_user_handlers(self, phone: str):
         """تسجيل معالجات الرسائل لكل user_client.
-        
-        معالجان رئيسيان:
+
+        معالجات ثلاثة:
+        0. Raw MTProto hook (PR-3) — طبقة إضافية فائقة السرعة لالتقاط
+           الروابط قبل تطبيع Telethon. يكتب LRB فقط (supplementary).
         1. NewMessage — يخزن كل رسالة في cache فور وصولها (قبل أي معالجة بطيئة)
         2. MessageDeleted — لو حُذفت رسالة، نسحبها من cache ونعالجها فوراً
         """
         client = self.user_clients.get(phone)
         if not client: return
+        # [PR-3] Raw MTProto hook — supplementary, never replaces NewMessage.
+        # يلتقط updateNewMessage / updateNewChannelMessage قبل تطبيع Telethon،
+        # يكتب LRB فقط (روابط normalized) لأسرع التقاط ممكن. الفشل لا يكسر البوت.
+        try:
+            from telethon.tl.types import (UpdateNewMessage,
+                                            UpdateNewChannelMessage)
+            client.add_event_handler(
+                lambda u: self._on_raw_new_message(u, phone),
+                events.Raw(types=(UpdateNewMessage, UpdateNewChannelMessage))
+            )
+        except Exception as raw_e:
+            logging.warning(
+                f"[RAW-HOOK] registration failed for {phone}: {raw_e} "
+                f"— NewMessage still active (supplementary layer only)"
+            )
         # معالج الرسائل الجديدة — يخزن في cache أولاً، ثم يعالج
         client.add_event_handler(
             lambda e: self._on_user_message(e, phone),
@@ -3430,7 +3459,64 @@ class Monitor:
             lambda e: self._on_message_deleted(e, phone),
             events.MessageDeleted()
         )
-        logging.info(f"User handlers registered for {phone} (NewMessage + MessageDeleted)")
+        logging.info(f"User handlers registered for {phone} (Raw + NewMessage + MessageDeleted)")
+
+    @staticmethod
+    def _normalize_raw_chat_id(peer_id) -> Optional[int]:
+        """[PR-3] يطبّع chat_id من raw MTProto peer_id ليتطابق مع
+        event.chat_id في NewMessage (صيغة -100... للسوبرجروبات/القنوات).
+        PeerChannel → -100{channel_id}  (supergroup/channel)
+        PeerChat    → -{chat_id}        (legacy small group)
+        PeerUser    → {user_id}         (private chat)
+        يعيد None لو النوع غير معروف."""
+        if peer_id is None:
+            return None
+        try:
+            # PeerChannel (supergroups + broadcast channels)
+            cid = getattr(peer_id, 'channel_id', None)
+            if cid:
+                return int(f"-100{cid}")
+            # PeerChat (legacy small groups)
+            hid = getattr(peer_id, 'chat_id', None)
+            if hid:
+                return -int(hid) if int(hid) > 0 else int(hid)
+            # PeerUser (private chat)
+            uid = getattr(peer_id, 'user_id', None)
+            if uid:
+                return int(uid)
+        except (ValueError, TypeError):
+            return None
+        return None
+
+    async def _on_raw_new_message(self, update, source_phone: str):
+        """[PR-3] Raw MTProto hook — طبقة صفر، قبل تطبيع Telethon.
+        يكتب LRB فقط (روابط normalized) كطبقة supplementary إضافية.
+        لا يستبدل NewMessage. الفشل لا يكسر event loop (try/except شامل).
+        مبدأ: observability/exceptions هنا لا يجب أن تكسر أي شيء أبداً."""
+        try:
+            msg = getattr(update, 'message', None)
+            if msg is None:
+                return
+            text = getattr(msg, 'message', '') or ''
+            if not text:
+                return
+            mid = getattr(msg, 'id', 0)
+            if not mid:
+                return
+            peer_id = getattr(msg, 'peer_id', None)
+            chat_id = self._normalize_raw_chat_id(peer_id)
+            if chat_id is None:
+                return  # نوع غير مدعوم — تجاهل بهدوء
+            # استخراج الروابط (regex نقي) + كتابة LRB
+            links = LinkNormalizer.extract_links(text)
+            if links:
+                try:
+                    await self._link_ring_put(chat_id, int(mid),
+                                              [l.get('normalized') or l.get('raw') for l in links])
+                except Exception:
+                    pass  # LRB فشل — لكن NewMessage سيلتقط لاحقاً
+        except Exception:
+            pass  # Raw hook لا يكسر event loop أبداً
 
     async def _check_telegram_membership(self, link: str) -> dict:
         """
@@ -3591,6 +3677,62 @@ class Monitor:
         except Exception as e:
             logging.warning(f"[JOURNAL] mark_deleted FAILED: ({chat_id},{msg_id}) {e}")
 
+    # === LINK RING BUFFER helpers (PR-1) ===
+    async def _link_ring_put(self, chat_id, msg_id, normalized_links: List[str]) -> None:
+        """يخزّن الروابط المُستخرَجة (normalized) في LRB فوراً.
+        لا ينتظر metadata. لا يستخدم API. لا يكسر الـpipeline عند الفشل."""
+        if not normalized_links or chat_id is None or msg_id is None:
+            return
+        try:
+            async with self._link_ring_lock:
+                # حماية من نمو الذاكرة: لو تجاوزنا الحد، اطرد أقدم 10% دفعة واحدة
+                if len(self._link_ring) >= self._link_ring_cap:
+                    # اطرد 10% الأقدم (بترتيب الإدراج — أبسط وأسرع)
+                    drop_n = max(1, self._link_ring_cap // 10)
+                    for k in list(self._link_ring.keys())[:drop_n]:
+                        self._link_ring.pop(k, None)
+                    self._link_ring_evicted += drop_n
+                self._link_ring[(int(chat_id), int(msg_id))] = list(normalized_links)
+        except Exception as e:
+            logging.debug(f"[LRB] put error ({chat_id},{msg_id}): {e}")
+
+    async def _link_ring_pop(self, chat_id, msg_id) -> List[str]:
+        """يسحب ويحذف روابط رسالة من LRB. يعيد [] لو غير موجود.
+        يدعم البحث عبر كل الشاتات لو chat_id=None (لأحداث الحذف بدون chat_id)."""
+        try:
+            async with self._link_ring_lock:
+                if chat_id is not None:
+                    return self._link_ring.pop((int(chat_id), int(msg_id)), [])
+                # chat_id مجهول — ابحث بالـmsg_id فقط (نادر، قد يخلط بين شاتات)
+                for key, val in list(self._link_ring.items()):
+                    if key[1] == int(msg_id):
+                        self._link_ring.pop(key, None)
+                        return val
+        except Exception as e:
+            logging.debug(f"[LRB] pop error ({chat_id},{msg_id}): {e}")
+        return []
+
+    async def _link_ring_evict(self) -> int:
+        """يطرد المدخلات المنتهية الصلاحية (> TTL). يعيد عدد المُطرَد."""
+        now = time.time()
+        cutoff = now - self._link_ring_ttl
+        evicted = 0
+        try:
+            async with self._link_ring_lock:
+                # LRB لا يخزّن received_at (نخزن links فقط) — لذا نعتمد على
+                # الحجم الإجمالي بدل الوقت. هذا مقصود: الروابط صغيرة، وحد
+                # الـcap + هذا الـeviction كافيان. (TTL مفيد فقط لو خزّنا timestamps.)
+                # نطرد أقدم 10% لو قاربنا الحد.
+                if len(self._link_ring) > int(self._link_ring_cap * 0.9):
+                    drop_n = len(self._link_ring) // 10
+                    for k in list(self._link_ring.keys())[:drop_n]:
+                        self._link_ring.pop(k, None)
+                    evicted = drop_n
+                    self._link_ring_evicted += drop_n
+        except Exception as e:
+            logging.debug(f"[LRB] evict error: {e}")
+        return evicted
+
     async def _record_delete_miss(self, chat_id, msg_id, source_phone):
         """يسجّل حذف رسالة لم نرَ NewMessage لها أبدًا — دليل على فجوة تسليم أحداث.
         تحذير WARNING مقيّد (مرة/دقيقة لكل شات) + صف delete_miss في journal."""
@@ -3606,6 +3748,9 @@ class Monitor:
             )
             self._delete_miss_log_ts[key] = now
             self._delete_miss_count[key] = 0
+        # [PR-2/observability] مقياس delete_miss_total
+        try: await self.metrics.record_delete_miss()
+        except Exception: pass
         if chat_id is not None and self._journal_enabled():
             try:
                 await self.prod_db.journal_message({
@@ -4878,14 +5023,16 @@ class Monitor:
 
     async def _on_user_message(self, event, source_phone: str):
         """معالج رسائل فوري — يسحب الروابط قبل ما تحذفها بوتات أخرى.
-        
-        الاستراتيجية (3 طبقات حماية ضد الحذف):
-        1. PRE-CACHE: نخزن الرسالة في ذاكرة فور وصولها (تستغفض أقل من ميلي ثانية)
-        2. EXTRACT: نستخرج الروابط فوراً (regex سريع، بدون API)
-        3. BACKGROUND: نطلق مهمة خلفية للمعالجة (DB, Blacklist, Enqueue) — لا نوقف event loop
-        
-        لو بوت حماية حذف الرسالة قبل خطوة 2، الـ MessageDeleted handler
-        يقدر يسحب الرسالة من cache ويعالجها بنفسه.
+
+        الاستراتيجية (4 طبقات حماية ضد الحذف):
+        0. LINK-ONLY FAST CAPTURE: استخراج الروابط + كتابة LRB فوراً
+           (regex نقي، لا API، لا metadata) — أسرع مسار، يسبق كل شيء.
+        1. PRE-CACHE: نخزن الرسالة كاملة في ذاكرة (metadata + raw_text)
+        2. JOURNAL: نسجل durable WAL (يصمد بعد restart/TTL)
+        3. BACKGROUND: معالجة (claim + blacklist + enqueue) — لا نوقف event loop
+
+        لو بوت حماية حذف الرسالة قبل خطوة 1، الـ MessageDeleted handler
+        يسحب الرابط من LRB (طبقة 0) ويدخله dedup/queue مباشرة.
         """
         try:
             raw_text = event.raw_text
@@ -4902,7 +5049,29 @@ class Monitor:
                 await self._journal_write(chat_id, msg_id, None, source_phone, state='no_text')
                 return
 
-            # === الخطوة 0: PRE-CACHE (أول شي قبل أي شي ثاني) ===
+            # === الخطوة 0: LINK-ONLY FAST CAPTURE (أسرع مسار — قبل أي metadata) ===
+            # نستخرج الروابط فوراً (regex نقي، لا API) ونخزّنها في LRB.
+            # هذا يضمن: لو حُذفت الرسالة قبل اكتمال PRE-CACHE metadata،
+            # الـ MessageDeleted handler يقدر يسحب الروابط من LRB وينقذها.
+            # مبدأ تصميمي: فشل observability (metrics/logging) لا يكسر مسار
+            # الالتقاط — كل مكالنات الـmetrics مُغلّفة دفاعياً.
+            links = LinkNormalizer.extract_links(raw_text)
+            if links:
+                try:
+                    await self._link_ring_put(chat_id, msg_id,
+                                              [l.get('normalized') or l.get('raw') for l in links])
+                except Exception:
+                    pass  # LRB فشل — لكن extract ناجح، نكمل
+                try:
+                    await self.metrics.record_link_capture(len(links))
+                except Exception:
+                    pass  # metrics لا يكسر الالتقاط
+                logging.info(
+                    f"[LINK-CAPTURE] captured {len(links)} link(s) "
+                    f"chat_id={chat_id} msg_id={msg_id} source={source_phone}"
+                )
+
+            # === الخطوة 1: PRE-CACHE (metadata كاملة — لو فشلت، LRB أنقذ الروابط) ===
             # نخزن الرسالة كاملة في الذاكرة فوراً — لو حُذفت لاحقاً، نقدر نعالجها
             try:
                 chat_obj = event.chat
@@ -4913,7 +5082,7 @@ class Monitor:
                         chat_title = chat_obj.title
                     if hasattr(chat_obj, 'username') and chat_obj.username:
                         chat_username = chat_obj.username
-                
+
                 # استخراج معلومات المرسل بدون API
                 sender_obj = event.sender
                 sender_name = f"user_{sender_id}"
@@ -4926,7 +5095,7 @@ class Monitor:
                         sender_name = sender_obj.title
                     elif hasattr(sender_obj, 'username') and sender_obj.username:
                         sender_name = f"@{sender_obj.username}"
-                
+
                 # نوع المجموعة
                 chat_link_type = 'telegram'
                 if chat_obj:
@@ -4934,7 +5103,7 @@ class Monitor:
                         chat_link_type = 'group'
                     elif hasattr(chat_obj, 'broadcast') and chat_obj.broadcast:
                         chat_link_type = 'channel'
-                
+
                 # خزّن في cache (async lock سريع)
                 async with self._msg_cache_lock:
                     self._msg_cache[(chat_id, msg_id)] = {
@@ -4962,8 +5131,10 @@ class Monitor:
                                           chat_link_type=chat_link_type, sender_id=sender_id,
                                           sender_name=sender_name, state='pending')
 
-            # === الخطوة 1: استخرج الروابط فوراً (regex سريع، بدون API) ===
-            links = LinkNormalizer.extract_links(raw_text)
+            # === الخطوة 2: استخدم links المُستخرَجة في الخطوة 0 ===
+            # (defensive re-extract لو الخطوة 0 فشلت بصمت — استرجاع الأمان)
+            if not links:
+                links = LinkNormalizer.extract_links(raw_text)
             if not links:
                 # ما فيها روابط — لكن سجل claim مع lease قصير (يمنع إعادة المعالجة الفورية)
                 if self.message_claim:
@@ -5123,17 +5294,111 @@ class Monitor:
         except Exception as e:
             logging.error(f"Event handler error: {e}", exc_info=True)
 
+    def _normalized_to_link_data(self, normalized: str, source_phone: str,
+                                 chat_id, msg_id, group_name: str = '') -> Optional[dict]:
+        """[PR-2] يُعيد بناء minimal link_data من normalized link فقط
+        (tg:user:x / tg:invite:h / wa:invite:h) — لإنقاذ LRB بدون metadata.
+        يعيد None لو الصيغة غير معروفة."""
+        if not normalized:
+            return None
+        n = normalized.strip().lower()
+        try:
+            if n.startswith('tg:user:'):
+                username = n[len('tg:user:'):]
+                return {
+                    'raw': f'https://t.me/{username}',
+                    'normalized': n, 'link_type': 'telegram',
+                    'username': username, 'invite_hash': None,
+                    'msg_id': None, 'group_name': group_name or f'chat_{chat_id}',
+                    'sender_name': 'Unknown', 'sender_contact': '',
+                    'source_phone': source_phone or '',
+                    'message_text': '', 'message_link': None,
+                }
+            if n.startswith('tg:invite:'):
+                inv = n[len('tg:invite:'):]
+                return {
+                    'raw': f'https://t.me/+{inv}',
+                    'normalized': n, 'link_type': 'telegram_private',
+                    'username': None, 'invite_hash': inv,
+                    'msg_id': None, 'group_name': group_name or f'chat_{chat_id}',
+                    'sender_name': 'Unknown', 'sender_contact': '',
+                    'source_phone': source_phone or '',
+                    'message_text': '', 'message_link': None,
+                }
+            if n.startswith('wa:invite:'):
+                inv = n[len('wa:invite:'):]
+                return {
+                    'raw': f'https://chat.whatsapp.com/{inv}',
+                    'normalized': n, 'link_type': 'whatsapp',
+                    'username': None, 'invite_hash': inv,
+                    'msg_id': None, 'group_name': group_name or f'chat_{chat_id}',
+                    'sender_name': 'Unknown', 'sender_contact': '',
+                    'source_phone': source_phone or '',
+                    'message_text': '', 'message_link': None,
+                }
+        except Exception:
+            return None
+        return None
+
+    async def _rescue_link_only(self, chat_id, msg_id, source_phone,
+                                normalized_links) -> int:
+        """[PR-2] إنقاذ روابط من LRB (link-only، بدون metadata كاملة).
+        مسار موحّد: reconstruct → is_link_known (central dedup) → enqueue_link.
+        يرجع عدد الروابط الجديدة المُضافة للـqueue (0 لو كلها مكررة/معروفة)."""
+        new_count = 0
+        for normalized in (normalized_links or []):
+            link_data = self._normalized_to_link_data(
+                normalized, source_phone, chat_id, msg_id)
+            if not link_data:
+                continue
+            try:
+                # central dedup: هل الرابط معروف مسبقاً (queue/forwarded/target)?
+                if await self.prod_db.is_link_known(link_data['raw'], link_data['normalized']):
+                    logging.info(
+                        f"[DEDUP] skipped (known) {normalized[:50]} "
+                        f"from LRB rescue chat={chat_id} msg={msg_id}"
+                    )
+                    continue
+                # سجّل المجموعة المصدر (best-effort)
+                try:
+                    await self.prod_db.add_monitored_chat(
+                        chat_id=chat_id, chat_title=link_data['group_name'],
+                        username='', link_type='telegram',
+                        monitored_by=source_phone or '')
+                except Exception:
+                    pass
+                is_new = await self.prod_db.enqueue_link(link_data)
+                if is_new:
+                    new_count += 1
+                    try:
+                        await self.prod_db.set_group_state(
+                            link_data['normalized'], GroupState.DISCOVERED,
+                            link_data['raw'], link_data['group_name'])
+                    except Exception:
+                        pass
+                    logging.warning(
+                        f"[LINK-DELETED-RESCUE] rescued {link_data['raw'][:60]} "
+                        f"from LRB chat_id={chat_id} msg_id={msg_id} "
+                        f"(no metadata — link-only)"
+                    )
+            except Exception as e:
+                logging.error(f"[LINK-DELETED-RESCUE] error for {normalized[:50]}: {e}")
+        return new_count
+
     async def _on_message_deleted(self, event, source_phone: str):
         """يلتقط الرسائل المحذوفة — يعالجها لو ما عولجت قبل.
 
-        مصادر الإنقاذ (بالأولوية):
-        1. _msg_cache (ذاكرة — أسرع مسار، TTL 120 ثانية)
-        2. message_journal (SQLite — يصمد بعد إعادة التشغيل وبعد انتهاء TTL)
+        مصادر الإنقاذ (بالأولوية — حسب طلب المستخدم):
+        1. Link Ring Buffer (LRB — أسرع مسار، روابط فقط بدون metadata)
+        2. _msg_cache (ذاكرة — رسالة كاملة، TTL 120 ثانية)
+        3. message_journal (SQLite — يصمد بعد restart/TTL)
+        4. Best-effort get_messages (لو Telegram ما حذفها بعد من الـindex)
+        5. Reconcile للسياق (يلتقط الرسائل الأخوات الفائتة)
 
         لو لم تُوجد الرسالة في أي مصدر → DELETE-MISS:
         دليل جنائي أن NewMessage لم يصل أبدًا (فجوة تسليم أحداث).
         نسجّل تحذيرًا مقيّدًا + صف delete_miss في journal + نطلق reconcile
-        للشات (يلتقط أي رسائل أخرى فاتتنا).
+        للشات. لا ندّعي استرجاع ما لم يصل أصلًا من Telegram.
         """
         try:
             deleted_ids = getattr(event, 'deleted_ids', []) or []
@@ -5159,7 +5424,40 @@ class Monitor:
                 # this, one bad row silently skipped processing for 49 messages
                 # that were never rescued.
                 try:
-                    # === المصدر 1: _msg_cache (ذاكرة) ===
+                    # === المصدر 1: Link Ring Buffer (LRB — أسرع مسار، روابط فقط) ===
+                    # [PR-2] لو NewMessage وصل لطبقة extract (Step 0) قبل الحذف،
+                    # LRB عنده الروابط. نُنقذها (link-only) عبر مسار موحّد:
+                    # reconstruct → is_link_known (dedup) → enqueue_link.
+                    # لو LRB عنده الروابط، ما نحتاج النص الكامل (مبدأ: الرابط أهم).
+                    ring_links = await self._link_ring_pop(chat_id, deleted_msg_id)
+                    if ring_links:
+                        try:
+                            rescued = await self._rescue_link_only(
+                                chat_id, deleted_msg_id, source_phone, ring_links)
+                            # LRB hit = استرجعنا الروابط بنجاح من LRB
+                            # (دون النظر إن كانت new أو known — الـdedup مقياس منفصل)
+                            try: await self.metrics.record_link_ring_hit()
+                            except Exception: pass
+                            try: await self.metrics.record_delete_rescued('link_ring')
+                            except Exception: pass
+                            # سجّل في journal للتحقيق (raw_text=None — link-only)
+                            if self._journal_enabled() and chat_id is not None:
+                                try:
+                                    await self._journal_set_state_safe(
+                                        chat_id, deleted_msg_id,
+                                        'rescued' if rescued else 'dup_claim',
+                                        mark_deleted=True)
+                                except Exception:
+                                    pass
+                            # محّل cache إن وُجد (تنظيف)
+                            async with self._msg_cache_lock:
+                                self._msg_cache.pop((chat_id, deleted_msg_id), None)
+                            continue   # ✅ الرابط أُنقذ/عُولج من LRB — لا داعي للمسار الكامل
+                        except Exception as lrb_e:
+                            logging.debug(f"[DELETE-HANDLER] LRB rescue error: {lrb_e}")
+                            # لو فشل LRB rescue، نكمل للمسار الكامل (cache/journal)
+
+                    # === المصدر 2: _msg_cache (ذاكرة — رسالة كاملة) ===
                     cached_msg = None
                     rescue_source = None
                     async with self._msg_cache_lock:
@@ -5172,7 +5470,7 @@ class Monitor:
                                     cached_msg = self._msg_cache.pop(key, None)
                                     break
 
-                    # === المصدر 2: message_journal (durable — يصمد بعد restart/TTL) ===
+                    # === المصدر 3: message_journal (durable — يصمد بعد restart/TTL) ===
                     if not cached_msg and self._journal_enabled():
                         try:
                             row = None
@@ -5194,6 +5492,42 @@ class Monitor:
                             logging.debug(f"[JOURNAL] lookup error: {e}")
 
                     # === DELETE-MISS: NewMessage لم يصل أبدًا ===
+                    # === المصدر 4: Best-effort get_messages (Telegram قد يؤخّر الحذف في الـindex) ===
+                    # [PR-2] رغم ندرة نجاحه (الرسالة محذوفة فعلاً)، الإضافة رخيصة:
+                    # لو نجح، نستخرج raw_text ونعالج كأنه cache hit. لو فشل/أعاد None → DELETE-MISS.
+                    if not cached_msg and chat_id is not None:
+                        try:
+                            gm_client = None
+                            # استخدم نفس phone الذي رأى الحذف، أو أي عميل متصل
+                            if source_phone and self.user_clients.get(source_phone) \
+                                    and self.user_clients[source_phone].is_connected():
+                                gm_client = self.user_clients[source_phone]
+                            if gm_client is None:
+                                for c in self.user_clients.values():
+                                    if c and c.is_connected():
+                                        gm_client = c; break
+                            if gm_client is not None:
+                                msgs = await gm_client.get_messages(chat_id, ids=[deleted_msg_id])
+                                gm = msgs[0] if msgs else None
+                                gm_text = getattr(gm, 'message', '') or ''
+                                if gm_text:
+                                    cached_msg = {
+                                        'raw_text': gm_text,
+                                        'source_phone': source_phone,
+                                        'chat_id': chat_id, 'msg_id': deleted_msg_id,
+                                        'chat_title': '', 'chat_username': '',
+                                        'chat_link_type': 'telegram', 'sender_name': 'Unknown',
+                                        'state': 'pending',
+                                    }
+                                    rescue_source = 'get_messages'
+                                    logging.info(
+                                        f"[DELETE-HANDLER] 🎲 get_messages HIT msg_id={deleted_msg_id} "
+                                        f"chat={chat_id} — rescuing full"
+                                    )
+                        except Exception as gm_e:
+                            logging.debug(f"[DELETE-HANDLER] get_messages miss {gm_e}")
+
+                    # === DELETE-MISS: NewMessage لم يصل أبدًا وكل المصادر فشلت ===
                     if not cached_msg:
                         await self._record_delete_miss(chat_id, deleted_msg_id, source_phone)
                         if chat_id:
@@ -10846,20 +11180,32 @@ async def api_deploy_check_handler(request):
 
 
 # -------------------------------------------------------------------
-# [B06] Optional DASHBOARD_API_KEY shared-secret for /api/* routes
+# [B06 / PR-7] DASHBOARD_API_KEY shared-secret for /api/* routes
 # -------------------------------------------------------------------
-# If DASHBOARD_API_KEY env is SET (non-empty), every /api/* request must
-# carry an `X-Api-Key` header matching it; mismatch → 401 JSON. If UNSET,
-# the dashboard stays open (backward-compatible) and we emit ONE startup
-# WARNING so operators know the API is publicly readable. Non-/api routes
-# (/health, /ready, /metrics) are never gated — probes must stay open.
+# SECURE-BY-DEFAULT (PR-7): If DASHBOARD_API_KEY env is SET (non-empty),
+# every /api/* request must carry an `X-Api-Key` header matching it
+# (constant-time compare); mismatch → 401 JSON.
+#
+# If DASHBOARD_API_KEY is UNSET, the /api/* routes are REJECTED with 401
+# by default (fail-closed) — the dashboard MUST NOT leak phones/links to
+# the open internet. Set API_FAIL_OPEN=true ONLY during a controlled
+# transition (the frontend then gets masked PII, never raw phones).
+#
+# Health endpoints (/health, /ready, /metrics) are NEVER gated — probes
+# must stay open for Render/Prometheus.
 
 _DASHBOARD_API_KEY_WARNED = {"open": False}
 
 
 def _get_dashboard_api_key() -> Optional[str]:
-    """Return the configured shared secret, or None if the API is open."""
+    """Return the configured shared secret, or None if unset."""
     return os.environ.get("DASHBOARD_API_KEY") or None
+
+
+def _api_fail_open() -> bool:
+    """[PR-7] Escape-hatch flag. Default False = fail-closed when key unset.
+    Operator sets API_FAIL_OPEN=true ONLY during a controlled transition."""
+    return os.environ.get("API_FAIL_OPEN", "false").lower() in ("true", "1", "yes")
 
 
 def _warn_dashboard_api_key_open_once() -> None:
@@ -10868,20 +11214,26 @@ def _warn_dashboard_api_key_open_once() -> None:
         return
     _DASHBOARD_API_KEY_WARNED["open"] = True
     if _get_dashboard_api_key() is None:
-        logging.warning(
-            "[DASHBOARD] DASHBOARD_API_KEY is UNSET — /api/* endpoints are "
-            "OPEN (no X-Api-Key required). Set DASHBOARD_API_KEY to lock "
-            "down the dashboard (backward-compatible: unset = open).")
+        if _api_fail_open():
+            logging.warning(
+                "[DASHBOARD] DASHBOARD_API_KEY is UNSET but API_FAIL_OPEN=true "
+                "— /api/* endpoints are OPEN with MASKED PII (transition mode). "
+                "Set DASHBOARD_API_KEY to lock them fully.")
+        else:
+            logging.warning(
+                "[DASHBOARD] DASHBOARD_API_KEY is UNSET — /api/* endpoints are "
+                "REJECTED with 401 (fail-closed, PR-7 secure-by-default). "
+                "Set DASHBOARD_API_KEY (+ frontend X-Api-Key) to enable the dashboard. "
+                "For a temporary open transition, set API_FAIL_OPEN=true.")
 
 
 def _api_should_show_full_pii() -> bool:
     """[Security / Req-1] Return True only when the dashboard is behind a
     shared secret AND the request has already passed the middleware check.
 
-    When DASHBOARD_API_KEY is UNSET, the /api/* endpoints are open to the
-    internet. In that open mode, phone numbers in joiners_status /
-    joined_groups / banned_groups must be masked via _redact_phone() so a
-    public scrape does not enumerate every watcher/joiner phone. When the
+    When DASHBOARD_API_KEY is UNSET, the /api/* endpoints are either
+    fail-closed (default) or return masked PII (API_FAIL_OPEN=true). In
+    either case, full phones must NOT be shown without the key. When the
     key IS set, the dashboard_api_key_middleware already rejected any
     request lacking a valid X-Api-Key, so the caller is the authenticated
     operator and may see full phones.
@@ -10951,6 +11303,15 @@ async def dashboard_api_key_middleware(request, handler):
             if not ok:
                 return web.json_response(
                     {"error": "unauthorized: missing or invalid X-Api-Key"},
+                    status=401, headers={"Access-Control-Allow-Origin": "*"})
+        else:
+            # [PR-7] DASHBOARD_API_KEY UNSET → fail-closed by default.
+            # API_FAIL_OPEN=true is the ONLY escape (transition mode, masked PII).
+            if not _api_fail_open():
+                return web.json_response(
+                    {"error": "unauthorized: DASHBOARD_API_KEY not configured. "
+                              "Set it (env) + send X-Api-Key header, or set "
+                              "API_FAIL_OPEN=true for temporary open transition."},
                     status=401, headers={"Access-Control-Allow-Origin": "*"})
     return await handler(request)
 

@@ -196,7 +196,16 @@ def make_fake_monitor(prod_db, journal_enabled=True, reconcile=False, channel_id
         message_claim=MessageClaim(prod_db),
         _msg_cache={},
         _msg_cache_lock=asyncio.Lock(),
-        metrics=types.SimpleNamespace(record_skip=AsyncMock(), record_duplicate=AsyncMock()),
+        metrics=types.SimpleNamespace(
+            record_skip=AsyncMock(), record_duplicate=AsyncMock(),
+            record_link_capture=AsyncMock(), record_link_ring_hit=AsyncMock(),
+            record_delete_miss=AsyncMock(), record_delete_rescued=AsyncMock(),
+            record_reconcile_rescued=AsyncMock(), record_link_forwarded=AsyncMock(),
+        ),
+        # [PR-1] Link Ring Buffer state (matches Monitor.__init__)
+        _link_ring={}, _link_ring_lock=asyncio.Lock(),
+        _link_ring_ttl=300, _link_ring_cap=20000,
+        _link_ring_evicted=0, _link_ring_hits=0,
         user_clients={},
         source_registry=None,
         _delete_miss_log_ts={},
@@ -226,6 +235,8 @@ def make_fake_monitor(prod_db, journal_enabled=True, reconcile=False, channel_id
         '_on_message_deleted', '_on_user_message', '_poll_one_chat',
         '_supervisor_loop', '_polling_watchdog_loop', '_periodic_sync',
         '_get_sender_name',
+        '_link_ring_put', '_link_ring_pop', '_link_ring_evict',  # [PR-1]
+        '_normalized_to_link_data', '_rescue_link_only',  # [PR-2]
     ):
         if hasattr(bot.Monitor, method_name):
             setattr(fm, method_name,
@@ -429,10 +440,21 @@ async def test_B06_dashboard_api_key_optional():
         req_health = types.SimpleNamespace(path='/health', headers={})
         r1 = await bot.dashboard_api_key_middleware(req_health, _ok_handler)
         record("B06: middleware open for /health (non-/api)", r1 == 'ok', f"got {r1!r}")
-        # Middleware open for /api/* when key unset
+        # [PR-7] Middleware REJECTS /api/* when key unset (fail-closed by default).
+        # Previously this was open; now secure-by-default. API_FAIL_OPEN=true is
+        # the only escape (transition mode).
         req_api = types.SimpleNamespace(path='/api/stats', headers={})
         r2 = await bot.dashboard_api_key_middleware(req_api, _ok_handler)
-        record("B06: middleware open for /api/* when key unset", r2 == 'ok', f"got {r2!r}")
+        is_401_unset = hasattr(r2, 'status') and r2.status == 401
+        record("B06: middleware REJECTS /api/* when key unset (PR-7 fail-closed)",
+               is_401_unset, f"got {r2!r}")
+        # API_FAIL_OPEN=true → open transition mode
+        os.environ['API_FAIL_OPEN'] = 'true'
+        bot._DASHBOARD_API_KEY_WARNED['open'] = False
+        r2b = await bot.dashboard_api_key_middleware(req_api, _ok_handler)
+        record("B06: API_FAIL_OPEN=true → /api/* open (transition)",
+               r2b == 'ok', f"got {r2b!r}")
+        os.environ.pop('API_FAIL_OPEN', None)
 
         # SET → require X-Api-Key
         os.environ['DASHBOARD_API_KEY'] = 's3cr3t'
@@ -2775,17 +2797,31 @@ async def test_5a_middleware_exempt_health_endpoints():
 
 
 async def test_5a_middleware_unset_means_open():
-    """[5a/A4] When DASHBOARD_API_KEY is UNSET, /api/* is open (backward
-    compatible — the existing dashboard sends no X-Api-Key header)."""
+    """[5a/A4 → PR-7] When DASHBOARD_API_KEY is UNSET, /api/* is REJECTED
+    with 401 by default (fail-closed, secure-by-default since PR-7). The
+    operator sets DASHBOARD_API_KEY + frontend X-Api-Key to enable the
+    dashboard, or sets API_FAIL_OPEN=true for a temporary open transition."""
     try:
         os.environ.pop('DASHBOARD_API_KEY', None)
+        os.environ.pop('API_FAIL_OPEN', None)   # PR-7: default fail-closed
+        bot._DASHBOARD_API_KEY_WARNED['open'] = False
         req = MagicMock()
         req.path = "/api/links"
         req.headers = {}  # no key
         handler = AsyncMock(return_value=web_json_ok())
-        await bot.dashboard_api_key_middleware(req, handler)
-        record("5a-3: DASHBOARD_API_KEY unset → /api open (backward-compat)",
-               handler.called, "middleware gated even when key unset — breaks dashboard")
+        resp = await bot.dashboard_api_key_middleware(req, handler)
+        is_401 = hasattr(resp, 'status') and resp.status == 401
+        record("5a-3: DASHBOARD_API_KEY unset → /api REJECTED (PR-7 fail-closed)",
+               is_401 and not handler.called,
+               f"got status={getattr(resp,'status',None)}, called={handler.called}")
+        # API_FAIL_OPEN=true restores open mode (transition)
+        os.environ['API_FAIL_OPEN'] = 'true'
+        bot._DASHBOARD_API_KEY_WARNED['open'] = False
+        handler2 = AsyncMock(return_value=web_json_ok())
+        await bot.dashboard_api_key_middleware(req, handler2)
+        record("5a-3b: API_FAIL_OPEN=true → /api open (transition escape)",
+               handler2.called, "transition mode not honored")
+        os.environ.pop('API_FAIL_OPEN', None)
     except Exception as e:
         record("5a-3: exception", False, str(e))
 

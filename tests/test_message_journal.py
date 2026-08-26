@@ -127,7 +127,19 @@ def make_fake_monitor(prod_db, journal_enabled=True, reconcile=False, channel_id
         message_claim=MessageClaim(prod_db),
         _msg_cache={},
         _msg_cache_lock=asyncio.Lock(),
-        metrics=types.SimpleNamespace(record_skip=AsyncMock(), record_duplicate=AsyncMock()),
+        metrics=types.SimpleNamespace(
+            record_skip=AsyncMock(), record_duplicate=AsyncMock(),
+            record_link_capture=AsyncMock(), record_link_ring_hit=AsyncMock(),
+            record_delete_miss=AsyncMock(), record_delete_rescued=AsyncMock(),
+            record_reconcile_rescued=AsyncMock(), record_link_forwarded=AsyncMock(),
+        ),
+        # [PR-1] Link Ring Buffer state (matches Monitor.__init__)
+        _link_ring={},
+        _link_ring_lock=asyncio.Lock(),
+        _link_ring_ttl=300,
+        _link_ring_cap=20000,
+        _link_ring_evicted=0,
+        _link_ring_hits=0,
         user_clients={},
         source_registry=None,
         _delete_miss_log_ts={},
@@ -145,6 +157,7 @@ def make_fake_monitor(prod_db, journal_enabled=True, reconcile=False, channel_id
         '_journal_mark_deleted_safe', '_record_delete_miss',
         '_rescue_enqueue_links', '_spawn_reconcile',
         '_reconcile_chat_after_delete_miss', '_journal_recovery',
+        '_link_ring_put', '_link_ring_pop', '_link_ring_evict',  # [PR-1]
     ):
         setattr(fm, method_name,
                 types.MethodType(getattr(bot.Monitor, method_name), fm))

@@ -565,8 +565,50 @@ class Metrics:
             'total_duplicates': 0,          # روابط مكررة تم تجاهلها (DB)
             'membership_skips': 0,          # روابط تم تجاهلها بسبب العضوية
             'processing_times': [],         # [seconds, ...]
+            # === [PR-1/PR-2] link-capture metrics ===
+            'link_capture_total': 0,        # كل روابط تم التقاطها (NewMessage + Raw + Polling)
+            'link_ring_hits': 0,            # إنقاذات من Link Ring Buffer بعد Delete
+            'delete_miss_total': 0,         # رسائل حُذفت قبل أي وصول (لا إنقاذ ممكن)
+            'delete_rescued_total': 0,      # رسائل أُنقذت بعد Delete (cache/journal/LRB/get_messages)
+            'reconcile_rescued_total': 0,   # رسائل أُنقذت عبر reconcile
+            'link_forwarded_total': 0,      # روابط نُشرت للقناة بنجاح
+            'floodwait_total': 0,           # (alias for total_floodwait) — عدد أحداث FloodWait
+            'high_risk_chats': 0,           # شاتات في وضع tight-poll
+            'tight_poll_active': 0,         # 1 لو tight-poll loop يعمل
         }
         self._lock = asyncio.Lock()
+
+    async def record_link_capture(self, count: int = 1):
+        """[PR-1] سجل التقاط روابط (NewMessage + Raw + Polling)."""
+        async with self._lock:
+            self._data['link_capture_total'] += int(count)
+
+    async def record_link_ring_hit(self):
+        """[PR-2] سجل إنقاذ رابط من Link Ring Buffer بعد Delete."""
+        async with self._lock:
+            self._data['link_ring_hits'] += 1
+            logging.info(f"[METRIC] ✅ Link Ring hit #{self._data['link_ring_hits']}")
+
+    async def record_delete_miss(self):
+        """[PR-2] سجل DELETE-MISS حقيقي (لا إنقاذ ممكن)."""
+        async with self._lock:
+            self._data['delete_miss_total'] += 1
+
+    async def record_delete_rescued(self, source: str = ''):
+        """[PR-2] سجل إنقاذ رسالة بعد Delete (cache/journal/LRB/get_messages)."""
+        async with self._lock:
+            self._data['delete_rescued_total'] += 1
+            logging.info(f"[METRIC] ✅ Delete-rescued via {source} (total: {self._data['delete_rescued_total']})")
+
+    async def record_reconcile_rescued(self):
+        """[PR-2] سجل إنقاذ عبر reconcile."""
+        async with self._lock:
+            self._data['reconcile_rescued_total'] += 1
+
+    async def record_link_forwarded(self):
+        """[PR-4/observability] سجل نشر رابط للقناة بنجاح."""
+        async with self._lock:
+            self._data['link_forwarded_total'] += 1
 
     async def record_api_call(self, phone: str):
         async with self._lock:
@@ -900,6 +942,34 @@ class ProductionDB:
         return await self.db._ensure_conn()
 
     # === Link Queue ===
+
+    async def is_link_known(self, raw_link: str, normalized_link: str = None) -> bool:
+        """[PR-1/central dedup] فحص سريع: هل الرابط معروف مسبقاً؟
+        يفحص:
+          1. link_queue (أي status) عبر normalized_link بصيغة tg:.. / wa:..
+          2. forwarded_requests (نُشر فعلاً) عبر content_hash = MD5(raw URL)
+          3. target_groups (مجموعات الفدائي) عبر db.check_link_exists
+        يستعمله مسار Link-Only Forward لتفادي تكرار النشر قبل أي queue/publish.
+        لا يطرح استثناءات (يُرجع False عند أي خطأ = يسمح بالمحاولة)."""
+        if not raw_link and not normalized_link:
+            return False
+        try:
+            # 1. link_queue via normalized (tg:.. / wa:.. form)
+            if normalized_link:
+                conn = await self._conn()
+                cursor = await conn.execute(
+                    "SELECT 1 FROM link_queue WHERE normalized_link = ? LIMIT 1",
+                    (normalized_link,))
+                if await cursor.fetchone():
+                    return True
+            # 2 + 3. forwarded_requests (MD5) + target_groups — reuse DatabaseManager
+            if raw_link:
+                existing = await self.db.check_link_exists(raw_link)
+                if existing:
+                    return True
+        except Exception as e:
+            logging.debug(f"[DEDUP] is_link_known error (raw={raw_link!r}): {e}")
+        return False
 
     async def enqueue_link(self, link_data: dict, allow_requeue: bool = False) -> bool:
         """يضيف رابط لقائمة الانتظار.

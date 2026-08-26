@@ -80,3 +80,4 @@ __pycache__/
 /data/
 *.db-journal
 *.db-wal
+*.db

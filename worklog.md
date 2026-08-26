@@ -1557,3 +1557,104 @@ Stage Summary:
 - 4 real code fixes (security logging/API masking, PUBLISH phantom-row rollback, startup-scan wiring, pre-publish channel exclusion) + 10 regression tests. Minimal, backward-compatible, no business-logic change to the working pipeline.
 - Documented NOT fixed (operator action required): (a) 3 live secrets still in git history (68dbb53/66779fe/52427b0) — needs Telegram rotation + git-filter-repo purge; (b) DASHBOARD_API_KEY unset in production → phones now masked-by-default (operator sets key to see full); (c) STARTUP_SCAN_DAYS unset in render.yaml → startup scan wired but not yet active (operator sets value to enable); (d) GulfFilter fallback_accept + Oman-not-in-whitelist — deferred (flipping fallback to reject risks breaking production; documented as recommendation).
 - 1 commit ahead of origin/main (after this). Push + Render verify pending.
+
+---
+Task ID: PHASE-0 (Inspection + Baseline)
+Agent: main (Super Z) — link capture hardening (capture-before-delete)
+
+Task: User demanded phased implementation of link-capture/protection improvements on the EXISTING wlm codebase (no rewrite). 17 explicit requirements covering: link-only fast capture (LRB), Raw MTProto hook, DELETE-MISS rescue ordering, central dedup, adaptive polling, fleet/account safety, monitoring coverage, student-group filtering, SECURITY (priority), Supabase journal snapshot, do-not-break-working-features, 14 test scenarios, observability, phased PR strategy, git/deploy rules, production-evidence report.
+
+Work Log:
+- git: clean working tree on `main` at commit bbc66d4 (FLEET resilience). No uncommitted changes.
+- Baseline tests run with .venv-test: test_message_journal 66/66, test_audit_regressions 188/188, test_phase3_contracts 96/96, test_source_registry 103/103, test_deployment_updated 35/35, test_extractor_comparison 3/3 → 491/491 PASS (baseline locked).
+- Read actual code (no assumptions): _on_user_message L4879 (pre-cache _msg_cache shared TTL120s + journal + extract + claim + enqueue), _on_message_deleted L5126 (cache→journal→DELETE-MISS→reconcile), _rescue_enqueue_links L3619, enqueue_link L904 (UNIQUE normalized_link = existing central dedup), insert_request L1518 (forwarded_requests dedup for publish), PUBLISH pipeline L7862 (insert_request→_send→phantom-rollback), joiner selection L8034 (iterates ALL joiners, skips unavailable with continue — good pattern already), dashboard security L10849 (DASHBOARD_API_KEY optional, FAIL-OPEN when unset = the production issue), PollingScheduler/SourceRegistry/MessageClaim in source_registry.py (additive), journal methods L1492-1577 (durable WAL).
+- Key finding: _msg_cache IS shared across all phones in-process (single Bot instance attribute) → DELETE-MISS truly means NO phone received NewMessage (Telegram deleted before delivery).
+- Key finding: .gitignore is Next.js default — does NOT ignore .env / *.session / __pycache__ / *.db. SECURITY GAP for future commits (existing repo already has them gitignored-elsewhere or not committed, but must fix before adding any new local files).
+- Key finding: dedup IS central (enqueue_link UNIQUE + insert_request forwarded_requests). is_link_known helper does NOT exist yet — needed for fast LRB-forward pre-check.
+- Test harness style confirmed: asyncio.run(main()), record(name,passed,detail), env stub before import, FAKE credentials only.
+
+Stage Summary:
+- Baseline locked: 491/491 PASS. Code map complete. No assumptions carried from prior analysis — all verified against live source.
+- Ready for PR-1 (Link Ring Buffer + is_link_known dedup + reorder _on_user_message extract-before-metadata).
+- SECURITY note for later: .gitignore wrong framework; will fix in PR-7. Dashboard fail-open; will harden in PR-7 (fail-closed-by-default + API_FAIL_OPEN escape hatch, flagged as potential frontend-break to user).
+
+---
+Task ID: PR-1 (Link-only fast capture + central dedup)
+Agent: main (Super Z)
+
+Task: Add Link Ring Buffer (LRB) + is_link_known central dedup + reorder _on_user_message to extract links BEFORE metadata. Preserve all working features.
+
+Work Log:
+- Monitor.__init__: added _link_ring (Dict), _link_ring_lock, _link_ring_ttl=300, _link_ring_cap=20000, _link_ring_evicted/_link_ring_hits counters (bot.py L2807-2818).
+- Added _link_ring_put / _link_ring_pop / _link_ring_evict (bot.py L3606-3662): pure-memory, no API, cap-eviction (drops oldest 10% when near cap), defensive try/except so LRB failure never breaks capture.
+- Reordered _on_user_message (L4947): NEW Step 0 = extract_links + _link_ring_put + metrics.record_link_capture + [LINK-CAPTURE] log, BEFORE PRE-CACHE metadata + journal_write. Design principle: observability failures (metrics/logging) wrapped in try/except — never break capture path. Reuses `links` var in later steps (no double regex except defensive re-extract).
+- Metrics class (link_system.py): added record_link_capture, record_link_ring_hit, record_delete_miss, record_delete_rescued, record_reconcile_rescued, record_link_forwarded + new counters (link_capture_total, link_ring_hits, delete_miss_total, delete_rescued_total, reconcile_rescued_total, link_forwarded_total, floodwait_total, high_risk_chats, tight_poll_active).
+- ProductionDB.is_link_known(raw, normalized) (link_system.py L946): central dedup — checks link_queue (any status, via normalized tg:.. form) + forwarded_requests (via MD5 content_hash, reusing db.check_link_exists) + target_groups. Defensive (returns False on error = allows attempt).
+- Regression fix: test_message_journal make_fake_monitor mock lacked record_link_capture/_link_ring_* → AttributeError propagated to outer except, skipping journal_write (test R failed). Fixed by (a) wrapping metrics call in try/except in production code (correct design: observability must not break capture), (b) adding new metrics + LRB attrs to test mock.
+- New tests/test_link_capture.py (21 tests): TG capture, WA capture, LRB idempotency (re-put no dup), chat_id normalization round-trip (supergroup -100... forms), LRB cap eviction, is_link_known across link_queue + forwarded_requests + empty-args defensive, LinkNormalizer coverage (public + private invite + WhatsApp + msg-link strip).
+
+Stage Summary:
+- PR-1 GREEN: 21/21 new tests pass + 491/491 baseline unchanged → 512/512 total.
+- LRB now stores normalized links at the earliest possible point (after raw_text, before any metadata). DELETE-MISS rescue (PR-2) can consult LRB next.
+- is_link_known gives a single pre-publish dedup gate for the upcoming Link-Only Forward path.
+- No business logic touched: JOIN/PUBLISH/Fleet/Scheduler untouched. No secrets in diff.
+
+---
+Task ID: PR-2 (Delete-MISS rescue via Link Ring + unified link-only enqueue)
+Agent: main (Super Z)
+
+Task: Implement ordered DELETE-MISS rescue (LRB→cache→journal→get_messages→reconcile) + unified link-only enqueue path (no separate forward path → central dedup prevents dup publish).
+
+Work Log:
+- Added _normalized_to_link_data(normalized, ...) (bot.py L5220): reconstructs minimal link_data from tg:user:x / tg:invite:h / wa:invite:h — needed because LRB stores only normalized strings, not full metadata.
+- Added _rescue_link_only(chat_id, msg_id, source_phone, normalized_links) (bot.py L5266): unified path — reconstruct → is_link_known (central dedup) → add_monitored_chat → enqueue_link → set_group_state DISCOVERED. Logs [LINK-DELETED-RESCUE]. Returns new-link count.
+- Modified _on_message_deleted (bot.py L5311+): inserted LRB as rescue source #1 (before cache). On LRB hit: run _rescue_link_only, record metrics (link_ring_hit + delete_rescued('link_ring')), mark journal 'rescued'/'dup_claim', pop cache for cleanup, continue (skip full rescue — link saved, no need for metadata per user's "link > message" principle). On LRB miss → cache (source #2) → journal (source #3) → get_messages best-effort (source #4, NEW) → DELETE-MISS (source #5: honest, no fabrication).
+- Added get_messages best-effort block (source #4): tries the phone that saw the delete, else any connected client. Rare hit rate but cheap (Telegram sometimes delays deletion in index 1-2s). Wrapped in try/except.
+- _record_delete_miss: added metrics.record_delete_miss() call (defensive) for delete_miss_total KPI.
+- Regression fix: test_audit_regressions make_fake_monitor lacked new metrics methods + LRB attrs + _link_ring_* binding → AttributeError in _on_message_deleted skipped all rescue (B09/N04 failed). Fixed mock (added metrics methods, LRB attrs, bound _link_ring_put/pop/evict + _normalized_to_link_data + _rescue_link_only).
+- New tests/test_delete_rescue.py (15 tests): #3 cache-rescue-after-delete (no dup, link_ring_hit fires), #4 LRB-only-rescue-on-DELETE-MISS (enqueues, metrics fire, no delete_miss), #5 true-DELETE-MISS (journal delete_miss row + NULL raw_text + no fabrication + metrics), #7 reconcile+NewMessage no-dup (central dedup), #9 restart/recovery no-republish (forwarded_requests dedup).
+
+Stage Summary:
+- PR-2 GREEN: 15/15 new + 491+21 baseline = 527/527 total PASS.
+- Delete rescue now honors user's ordered priority (LRB first) + "link is more important than message" principle (link-only rescue via unified enqueue, no separate forward path).
+- Central dedup (is_link_known + enqueue_link UNIQUE + forwarded_requests content_hash) proven to prevent dup across NewMessage/Delete/reconcile/restart.
+- DELETE-MISS is honest: records miss + NULL raw_text, never fabricates a link. get_messages is a best-effort bonus.
+- No business logic touched: JOIN/PUBLISH/Fleet/Scheduler untouched.
+
+---
+Task ID: PR-3 (Raw MTProto hook + chat_id normalization)
+Agent: main (Super Z)
+
+Task: Add supplementary Raw update hook (UpdateNewMessage/UpdateNewChannelMessage) + chat_id normalization. Never replace NewMessage; never break event loop.
+
+Work Log:
+- Added _normalize_raw_chat_id(peer_id) staticmethod (bot.py L3464): PeerChannel → -100{cid}, PeerChat → -{hid}, PeerUser → uid, None/unknown → None. Verified formula matches Telethon event.chat_id (-100 prefix for supergroups/channels).
+- Added _on_raw_new_message(update, source_phone) (bot.py L3491): extracts text + msg_id + peer_id from raw MTProto update, normalizes chat_id, extracts links (regex), writes LRB ONLY (no enqueue, no metrics — supplementary layer; NewMessage does full processing + metrics). Entire body in try/except that swallows ALL exceptions (Raw hook must never break event loop).
+- Modified _register_user_handlers (bot.py L3426): registers events.Raw(types=(UpdateNewMessage, UpdateNewChannelMessage)) BEFORE NewMessage. Registration wrapped in try/except — if Raw registration fails, NewMessage+MessageDeleted still active (graceful degradation).
+- New tests/test_raw_hook.py (13 tests): #12 chat_id normalization (PeerChannel→-100cid, PeerChat→-hid, PeerUser→uid, None→None, unknown→None), #6 Raw+NewMessage same msg → no dup (LRB idempotent overwrite + link_queue exactly 1 row), Raw resilience (no .message / empty text / unknown peer / None update → no exception).
+- Test-mock fix: staticmethod _normalize_raw_chat_id must be assigned as plain function (not MethodType) on the SimpleNamespace mock — MethodType binding would inject `self` into a static function expecting 1 arg → TypeError. Documented in mock.
+
+Stage Summary:
+- PR-3 GREEN: 13/13 new + 527 baseline = 540/540 total PASS.
+- Raw hook is a true supplementary layer: writes LRB only, fully fault-tolerant, never replaces NewMessage.
+- chat_id normalization proven correct for all Telegram peer types (matches NewMessage's event.chat_id).
+
+---
+Task ID: PR-7 (Security hardening — Dashboard fail-closed + .gitignore + secrets audit)
+Agent: main (Super Z)
+
+Task: User flagged SECURITY as top priority. Log shows "DASHBOARD_API_KEY is UNSET — /api/* endpoints are OPEN". Must fix in production. No secrets in source/logs. Report historical secrets (no auto-purge).
+
+Work Log:
+- Secrets audit (live source scan): NO real secrets in tracked *.py. Only a FAKE token shape in tests ("1234567890:" + "a"*35, explicitly commented as fake). No ghp_/JWT tokens in source.
+- Git history scan: commits 68dbb53 and 66779fe contain REAL secrets in download/create_env_v6.py (API_ID, API_HASH, BOT_TOKEN with real values). Commit 52427b0 is a revert with placeholders. → REPORTED, NOT PURGED (per user instruction #10 "no force-push/purge without approval"). Recommendation: rotate via BotFather + my.telegram.org, THEN git-filter-repo purge + force-push.
+- Tracked files: db/custom.db is a Next.js sample (tables User/Post), NOT bot production DB — non-sensitive but bad practice to track. Added `*.db` to .gitignore for future safety (file stays tracked, removing needs approval).
+- DASHBOARD API hardening (bot.py L11182-11316): changed from FAIL-OPEN to FAIL-CLOSED by default. When DASHBOARD_API_KEY is UNSET: /api/* now returns 401 (was: open). Added API_FAIL_OPEN env (default "false") as the ONLY escape hatch for a controlled transition (then masked PII, never raw phones). Health endpoints (/health, /ready, /metrics) stay open (probes). _warn_dashboard_api_key_open_once updated to log the new fail-closed posture. _api_should_show_full_pii unchanged (still requires key).
+- New tests/test_api_security.py (13 tests): #13 no-key→401 for /api/stats /api/joined_groups /api/deploy_check; correct-key→200; wrong-key→401; /health /ready /metrics always open; API_FAIL_OPEN=true→open transition; #14 secret key value never logged.
+- Regression fix: test_audit_regressions B06 + 5a-3 asserted OLD open behavior → updated to assert NEW fail-closed (+ API_FAIL_OPEN escape). Net +2 assertions (188→190).
+
+Stage Summary:
+- PR-7 GREEN: 13/13 new + 540 baseline = 555/555 total PASS (audit_regressions 188→190).
+- Dashboard now SECURE-BY-DEFAULT: production /api/* can no longer leak phones/links to the open internet. Operator MUST set DASHBOARD_API_KEY (env) + frontend X-Api-Key; API_FAIL_OPEN=true for temporary transition.
+- ⚠️ POTENTIAL BREAKING CHANGE (flagged): if the production frontend dashboard sends no X-Api-Key header, it will now get 401 until the operator sets DASHBOARD_API_KEY. This is the intended security fix per user requirement #10. Mitigation: operator sets DASHBOARD_API_KEY env in Render, OR temporarily API_FAIL_OPEN=true.
+- Historical secrets (68dbb53/66779fe) reported — NOT touched (needs user approval + rotation first).
