@@ -72,8 +72,16 @@ services:
       # === اختياري ===
       - key: OWNER_ID
         sync: false
+      # [Req-2] STARTUP_SCAN_DAYS — proactive history discovery. On every
+      # startup, each connected monitor scans its last N days of message
+      # history (bounded by HISTORY_MAX_PER_CHAT=500 msgs/chat) to find
+      # groups mentioned in older messages — not just wait for new ones.
+      # _run_startup_scan was previously dead code; it is now wired into
+      # start() and gated on this env. Default 7 (one week) balances
+      # coverage vs API load (~1400 iter_messages calls per monitor, runs
+      # in the background). Set to empty/None to disable.
       - key: STARTUP_SCAN_DAYS
-        sync: false
+        value: "7"
       # === Render يضبط PORT تلقائياً ===
       - key: PORT
         value: "10000"
