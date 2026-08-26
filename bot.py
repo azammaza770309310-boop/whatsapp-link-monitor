@@ -811,14 +811,59 @@ class Config:
         return errors
 
 
+class _RedactingFilter(logging.Filter):
+    """[Security / Req-1] Defence-in-depth redaction layer for ALL log records.
+
+    The project was previously compromised. Prior to this filter, 50+
+    logging statements emitted raw phone numbers (e.g. "[JOINER] selected
+    account=+967...") and one statement logged the bot token as
+    first8...last4. A single compromise of the log drain leaked every
+    watcher/joiner phone number. This filter runs at the handler level so
+    that regardless of what a developer writes in a logging.info()/error()
+    call, the redaction is applied before the record reaches the file or
+    stdout.
+
+    Redacted patterns (replaced with placeholders):
+      - International phone numbers: +<7-15 digits>  -> +.......  (7 dots)
+      - Telegram bot tokens:        <digits>:<30+ b64> -> <bot_token>
+      - GitHub PATs:                 ghp_<36 alnum>      -> <github_pat>
+      - Supabase/other JWTs:         eyJ<x>.<x>.<x>      -> <jwt>
+
+    Note: this is additive to per-call-site _redact_phone(); it does NOT
+    remove that helper. The filter is the safety net when a call site is
+    missed.
+    """
+    _PHONE_RE = re.compile(r'\+\d{7,15}')
+    _BOT_TOKEN_RE = re.compile(r'\d{5,12}:[A-Za-z0-9_-]{30,}')
+    _GHP_RE = re.compile(r'ghp_[A-Za-z0-9]{36}')
+    _JWT_RE = re.compile(r'eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}')
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        try:
+            msg = record.getMessage()
+            redacted = self._PHONE_RE.sub('+.......', msg)
+            redacted = self._BOT_TOKEN_RE.sub('<bot_token>', redacted)
+            redacted = self._GHP_RE.sub('<github_pat>', redacted)
+            redacted = self._JWT_RE.sub('<jwt>', redacted)
+            if redacted != msg:
+                record.msg = redacted
+                record.args = None
+        except Exception:
+            pass
+        return True
+
+
 def setup_logging(level_name):
     level = getattr(logging, level_name.upper(), logging.INFO)
     Path(LOGS_DIR).mkdir(parents=True, exist_ok=True)
     formatter = logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s")
+    _redact = _RedactingFilter()
     fh = logging.FileHandler(LOG_FILE, encoding="utf-8")
     fh.setFormatter(formatter)
+    fh.addFilter(_redact)
     ch = logging.StreamHandler(sys.stdout)
     ch.setFormatter(formatter)
+    ch.addFilter(_redact)
     root = logging.getLogger()
     root.setLevel(level)
     if not root.handlers:
@@ -1534,6 +1579,46 @@ class DatabaseManager:
             ai_approved=ai_approved, ai_description=ai_description,
             ai_country=ai_country, ai_is_ad=ai_is_ad)
         return True
+
+    async def delete_forwarded_request(self, link: str) -> bool:
+        """[Req-8 / PUBLISH-VERIFY] Delete the dedup row in forwarded_requests
+        for the given raw link.
+
+        Used to roll back a PHANTOM publish row: insert_request() writes the
+        dedup row to forwarded_requests BEFORE _send() actually delivers the
+        message to the Telegram channel. If _send() fails, that row is a
+        phantom — the DB says "published" but the channel never received
+        the message. Without this rollback, the next scheduler cycle sees
+        group_state=QUEUED (not DISCOVERED) so the publish block is
+        skipped, AND insert_request() returns False (duplicate) — so the
+        link proceeds to JOIN without ever being published to the channel.
+
+        Computes content_hash the SAME way insert_request() does (MD5 of
+        lowercased+stripped link) so the phantom row is matched exactly.
+
+        Returns True if a row was deleted, False if no row matched.
+        """
+        normalized_link = (link or '').lower().strip()
+        for sep in ("#", "?"):
+            idx = normalized_link.find(sep)
+            if idx > 0:
+                normalized_link = normalized_link[:idx]
+        normalized_link = normalized_link.rstrip("/")
+        content_hash = hashlib.md5(normalized_link.encode(), usedforsecurity=False).hexdigest()
+        async with self._lock:
+            conn = await self._ensure_conn()
+            try:
+                cursor = await conn.execute(
+                    "DELETE FROM forwarded_requests WHERE content_hash = ?",
+                    (content_hash,))
+                await conn.commit()
+                deleted = cursor.rowcount > 0
+                if deleted:
+                    logging.info(f"[PUBLISH-ROLLBACK] deleted phantom forwarded_requests row for content_hash={content_hash[:8]}")
+                return deleted
+            except Exception as e:
+                logging.error(f"[PUBLISH-ROLLBACK] delete error: {e}")
+                return False
 
     async def count_requests(self, source_phone: str = None) -> int:
         # محاولة Supabase أولاً
@@ -7201,6 +7286,38 @@ class Monitor:
                     else:
                         logging.info(f"[LINK id={link_id}] [PIPELINE-4] ⏭️ AI SKIPPED (batch mode={ai_batch_mode})")
 
+                    # [Req-3] PRE-PUBLISH channel/user exclusion — the user wants
+                    # student GROUPS only, not channels or user/bot profile links.
+                    # For public telegram username links, resolve the entity; if it's
+                    # a broadcast channel or a User/Bot (not a real group), mark
+                    # BANNED and skip publish+join entirely. Best-effort: on
+                    # resolution failure/timeout, proceed with publish so the
+                    # pipeline isn't blocked (the scorer + join-time check catch
+                    # it later). Private invite links (+hash/joinchat) and WhatsApp
+                    # links are skipped here (can't resolve without joining / N/A).
+                    if link_type == 'telegram':
+                        try:
+                            _pp_client = next((c for c in self.user_clients.values() if c and c.is_connected()), None)
+                            if _pp_client:
+                                from telethon.tl.types import Channel as _PPCh, Chat as _PPCt, User as _PPUs
+                                try:
+                                    _ent = await asyncio.wait_for(_pp_client.get_entity(raw_link), timeout=15)
+                                    _is_broadcast = bool(getattr(_ent, 'broadcast', False))
+                                    _is_user = isinstance(_ent, _PPUs) or (not isinstance(_ent, (_PPCh, _PPCt)) and hasattr(_ent, 'first_name'))
+                                    if _is_broadcast or _is_user:
+                                        _ban_reason = 'is_channel_broadcast' if _is_broadcast else 'not_a_group'
+                                        await self.prod_db.set_group_state(normalized, GroupState.BANNED, raw_link, error=_ban_reason)
+                                        await self.prod_db.update_queue_status(link_data['id'], 'DONE')
+                                        logging.info(f"[LINK id={link_id}] [PIPELINE-5] ⏭️ excluded ({_ban_reason}) before publish — not a student group")
+                                        await self.metrics.record_skip(_ban_reason)
+                                        continue
+                                except asyncio.TimeoutError:
+                                    logging.debug(f"[LINK id={link_id}] [PIPELINE-5] pre-publish entity resolve timed out — proceeding with publish")
+                                except Exception as _pp_e:
+                                    logging.debug(f"[LINK id={link_id}] [PIPELINE-5] pre-publish entity resolve failed ({type(_pp_e).__name__}) — proceeding with publish")
+                        except Exception as _ppc_e:
+                            logging.debug(f"[LINK id={link_id}] [PIPELINE-5] pre-publish channel check skipped: {_ppc_e}")
+
                     await self.prod_db.set_group_state(normalized, GroupState.QUEUED, raw_link)
 
                     # === PIPELINE STAGE 5: Publish to channel ===
@@ -7229,9 +7346,25 @@ class Monitor:
                             logging.info(f"[LINK id={link_id}] [PIPELINE-5] ✅ PUBLISHED_VERIFIED message_id={msg_id}")
                         else:
                             logging.error(f"[LINK id={link_id}] [PUBLISH] failed reason=send_failed link={raw_link[:60]}")
-                            logging.error(f"[LINK id={link_id}] [PIPELINE-5] ❌ PUBLISH_FAILED — retry in 5 min")
+                            logging.error(f"[LINK id={link_id}] [PIPELINE-5] ❌ PUBLISH_FAILED — rolling back phantom publish row + retry in 2 min")
+                            # [Req-8 / PUBLISH-VERIFY] insert_request() wrote a dedup row to
+                            # forwarded_requests BEFORE _send() ran. _send() failed, so that row
+                            # is a PHANTOM (DB says published; channel never got the message).
+                            # Without rollback: next cycle sees state=QUEUED → publish block
+                            # skipped AND insert_request returns False (duplicate) → link never
+                            # published yet proceeds to JOIN. Delete the phantom row + reset
+                            # state to DISCOVERED so the next cycle re-attempts the full publish.
+                            try:
+                                await self.db.delete_forwarded_request(raw_link)
+                            except Exception as _del_e:
+                                logging.warning(f"[LINK id={link_id}] [PUBLISH] phantom-row rollback failed: {_del_e}")
+                            try:
+                                await self.prod_db.set_group_state(normalized, GroupState.DISCOVERED, raw_link)
+                            except Exception as _st_e:
+                                logging.warning(f"[LINK id={link_id}] [PUBLISH] state reset to DISCOVERED failed: {_st_e}")
                             await self.prod_db.update_queue_status(link_data['id'], 'QUEUED',
-                                                                   next_retry=datetime.now() + timedelta(minutes=5))
+                                                                   next_retry=datetime.now() + timedelta(minutes=2))
+                            await self.metrics.record_skip('publish_failed_send')
                             continue
                     else:
                         logging.info(f"[LINK id={link_id}] [PIPELINE-5] ⏭️ Already published (duplicate)")
@@ -7655,6 +7788,37 @@ class Monitor:
 
                         try:
                             entity = await monitor_client.get_entity(username)
+                            # [Req-3] EXCLUDE broadcast channels — the user wants
+                            # student GROUPS only, not channels. A channel has
+                            # entity.broadcast=True. Mark BANNED so the scheduler
+                            # skips it (no publish, no join) on this and future cycles.
+                            from telethon.tl.types import User as _TLUser
+                            _is_broadcast = bool(getattr(entity, 'broadcast', False))
+                            if _is_broadcast:
+                                from link_system import LinkNormalizer as _LN2
+                                _norm2 = _LN2.extract_links(raw_link)
+                                _norm_link2 = _norm2[0].get('normalized', raw_link.lower()) if _norm2 else raw_link.lower()
+                                await self.prod_db.set_group_state(_norm_link2, GroupState.BANNED, raw_link, error='is_channel_broadcast')
+                                await self.prod_db.update_link_priority(link_id, 0)
+                                logging.info(
+                                    f"[SCORER] {link_id} @{username}: 📢 broadcast CHANNEL — "
+                                    f"marking BANNED (is_channel_broadcast) title='{(getattr(entity,'title','') or '')[:40]}'"
+                                )
+                                continue
+                            # [Req-3] EXCLUDE non-group entities (users/bots) —
+                            # t.me/<username> can resolve to a User or Bot, which is
+                            # not a real group. Mark BANNED so it's never published/joined.
+                            if isinstance(entity, _TLUser) or (not isinstance(entity, (Channel, Chat)) and hasattr(entity, 'first_name')):
+                                from link_system import LinkNormalizer as _LN3
+                                _norm3 = _LN3.extract_links(raw_link)
+                                _norm_link3 = _norm3[0].get('normalized', raw_link.lower()) if _norm3 else raw_link.lower()
+                                await self.prod_db.set_group_state(_norm_link3, GroupState.BANNED, raw_link, error='not_a_group')
+                                await self.prod_db.update_link_priority(link_id, 0)
+                                logging.info(
+                                    f"[SCORER] {link_id} @{username}: 👤 not a group (User/Bot) — "
+                                    f"marking BANNED (not_a_group)"
+                                )
+                                continue
                             member_count = 0
                             group_title = ''
                             if hasattr(entity, 'title') and entity.title:
@@ -8917,6 +9081,24 @@ class Monitor:
         # كرر كل ساعة
         asyncio.create_task(self._periodic_sync())
 
+        # === STARTUP HISTORY SCAN [Req-2] ===
+        # Discover groups from RECENT message history of every connected monitor
+        # account — not just wait for new messages containing a link. Without
+        # this, a group mentioned in an older message (before the watcher connected,
+        # or during a bot downtime) is missed forever. _run_startup_scan was
+        # previously dead code (defined, never called); this wires it in.
+        # Gated on STARTUP_SCAN_DAYS env so the operator opts in (default: off).
+        if self.config.startup_scan_days is not None:
+            _monitors_for_scan = [w for w in watchers if w.get('role', 'monitor') == 'monitor']
+            logging.info(
+                f"[STARTUP-SCAN] scheduling history scan for {len(_monitors_for_scan)} "
+                f"monitors ({self.config.startup_scan_days} days each)"
+            )
+            for w in _monitors_for_scan:
+                if w['phone'] not in self._startup_scan_done:
+                    self._startup_scan_done.add(w['phone'])
+                    asyncio.create_task(self._run_startup_scan(w))
+
         # === SOURCE REGISTRY + POLLING SCHEDULER + MESSAGE CLAIM ===
         # 1. أنشئ MessageClaim (atomic dedup مع claim_token + lease)
         self.message_claim = MessageClaim(self.prod_db)
@@ -9145,6 +9327,8 @@ async def api_joined_groups_handler(request):
             "FROM group_states WHERE state IN ('JOINED', 'ALREADY_MEMBER') ORDER BY last_seen DESC LIMIT 100")
         joined_rows = await cursor.fetchall()
 
+        # [Security / Req-1] Mask joiner phones when the dashboard is open.
+        _show_full = _api_should_show_full_pii()
         groups = []
         for r in joined_rows:
             groups.append({
@@ -9152,7 +9336,7 @@ async def api_joined_groups_handler(request):
                 "group_title": r[0] or '',
                 "group_link": r[1] or '',
                 "status": r[6] or 'JOINED',
-                "joined_by_phone": r[2] or '',
+                "joined_by_phone": (r[2] or '') if _show_full else _redact_phone(r[2]),
                 "join_date": r[4] or '',
                 "member_count": r[3] or 0,
             })
@@ -9205,6 +9389,9 @@ async def api_joiners_status_handler(request):
     try:
         # اجلب كل الفدائيين من Supabase
         joiners = await db.get_watchers_by_role("joiner")
+        # [Security / Req-1] Mask phones in the open-dashboard mode so a public
+        # scrape of /api/joiners_status cannot enumerate every joiner phone.
+        _show_full = _api_should_show_full_pii()
         joiners_data = []
         for j in joiners:
             jphone = j['phone']
@@ -9214,7 +9401,7 @@ async def api_joiners_status_handler(request):
             client = monitor.user_clients.get(jphone)
             is_connected = bool(client and client.is_connected())
             joiners_data.append({
-                'phone': jphone,
+                'phone': jphone if _show_full else _redact_phone(jphone),
                 'display_name': w.get('display_name', '') if w else '',
                 'connected': is_connected,
                 'daily_joins': daily_joins,
@@ -9237,7 +9424,7 @@ async def api_joiners_status_handler(request):
                 'group_link': r[1] or '',
                 'group_title': r[2] or 'غير معروف',
                 'state': r[3] or 'JOINED',
-                'joined_by_phone': r[4] or '',
+                'joined_by_phone': (r[4] or '') if _show_full else _redact_phone(r[4]),
                 'member_count': r[5] or 0,
                 'join_date': r[6] or '',
             })
@@ -9269,7 +9456,7 @@ async def api_joiners_status_handler(request):
                 'group_link': r[1] or '',
                 'group_title': r[2] or 'غير معروف',
                 'state': r[3] or 'BANNED',
-                'joined_by_phone': r[4] or '',
+                'joined_by_phone': (r[4] or '') if _show_full else _redact_phone(r[4]),
                 'member_count': r[5] or 0,
                 'join_date': r[6] or '',
                 'last_error': r[7] or '',
@@ -9831,7 +10018,12 @@ async def api_deploy_check_handler(request):
 
     # 2. Supabase key type + connectivity test
     if db.supabase_url and db.supabase_key:
-        report["supabase"]["url"] = db.supabase_url
+        # [Security / Req-1] Mask the Supabase project host so the dashboard
+        # does not advertise the backend project URL publicly. Keep the scheme
+        # + a short prefix so the operator can still confirm it is set.
+        _supa_host = db.supabase_url.replace('https://', '').replace('http://', '')
+        _supa_masked = ('https://' + (_supa_host[:8] + '•••' if len(_supa_host) > 12 else '•••'))
+        report["supabase"]["url"] = _supa_masked
         report["supabase"]["key_type"] = "service_role" if db._supabase_key_is_service_role else "anon"
         if not db._supabase_key_is_service_role:
             report["issues"].append(
@@ -9973,6 +10165,21 @@ def _warn_dashboard_api_key_open_once() -> None:
             "down the dashboard (backward-compatible: unset = open).")
 
 
+def _api_should_show_full_pii() -> bool:
+    """[Security / Req-1] Return True only when the dashboard is behind a
+    shared secret AND the request has already passed the middleware check.
+
+    When DASHBOARD_API_KEY is UNSET, the /api/* endpoints are open to the
+    internet. In that open mode, phone numbers in joiners_status /
+    joined_groups / banned_groups must be masked via _redact_phone() so a
+    public scrape does not enumerate every watcher/joiner phone. When the
+    key IS set, the dashboard_api_key_middleware already rejected any
+    request lacking a valid X-Api-Key, so the caller is the authenticated
+    operator and may see full phones.
+    """
+    return _get_dashboard_api_key() is not None
+
+
 def _redact_phone(phone) -> str:
     """[Task 5a / A3] Mask the middle digits of a phone number for safe
     inclusion in diagnostic API responses.
@@ -10087,7 +10294,10 @@ async def main():
     logging.info("=== Telegram Help Requests Monitor v7 ===")
     # Log only a non-reversible prefix to confirm the token loaded, never the full token
     if config.bot_token:
-        logging.info(f"Bot token: {config.bot_token[:8]}...{config.bot_token[-4:]} (loaded, len={len(config.bot_token)})")
+        # [Security / Req-1] Log only the length — never any prefix/suffix of the
+        # secret. (The redacting filter would catch the pattern below too, but we
+        # avoid emitting any portion of the secret at the source.)
+        logging.info(f"Bot token: loaded (len={len(config.bot_token)})")
     else:
         logging.warning("Bot token: NOT SET")
     logging.info(f"Channel ID: {config.channel_id}")

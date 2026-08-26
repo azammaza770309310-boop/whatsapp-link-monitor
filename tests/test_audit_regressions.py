@@ -2857,6 +2857,253 @@ async def test_11a_no_real_secrets_in_source_files():
         record("11a-1: exception", False, str(e))
 
 
+# ============================================================================
+# === Requirements Audit (Req-1 Security, Req-2 Monitoring, Req-3 Link-type,
+#                          Req-8 PUBLISH-VERIFY) — 10 regression guards
+# ============================================================================
+
+async def test_req1_redacting_filter_redacts_phones_and_tokens():
+    """[Req-1/Security] _RedactingFilter must redact phone numbers, bot tokens,
+    GitHub PATs, and JWTs from log records BEFORE they reach file/stream
+    handlers. The project was previously compromised; this is the
+    defence-in-depth layer so a missed call site cannot leak phones.
+
+    NOTE: the test inputs are FAKE placeholder strings built at runtime
+    (ghp_ + 'a'*36, 1234567890: + 'a'*35, +9998887770000). No real
+    credential is committed to this source file — committing a real token
+    here would itself be the leak this test guards against (Req-1/B23)."""
+    import re as _re
+    try:
+        rf = bot._RedactingFilter()
+        # Build FAKE secret-shaped strings at runtime so no real credential
+        # is ever written to the source file.
+        _fake_phone = "+9998887770000"  # 13 digits, ITU-reserved +999 (fake)
+        _fake_bot_token = "1234567890:" + "a" * 35  # fake shape, not a real token
+        _fake_ghp = "ghp_" + "a" * 36  # fake shape, not a real PAT
+        _fake_jwt = "eyJ" + "a" * 12 + "." + "b" * 12 + "." + "c" * 12
+        cases = [
+            (f"[JOINER] selected account={_fake_phone}", r'\+\d{7,15}'),
+            (f"Bot token {_fake_bot_token}", r'\d{5,12}:[A-Za-z0-9_-]{30,}'),
+            (f"github pat {_fake_ghp}", r'ghp_[A-Za-z0-9]{36}'),
+            (f"supabase {_fake_jwt}",
+             r'eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}'),
+        ]
+        all_ok = True
+        details = []
+        for raw, forbidden_re in cases:
+            # sanity: the input MUST contain the secret pattern (else test is vacuous)
+            if not _re.search(forbidden_re, raw):
+                all_ok = False
+                details.append(f"VACUOUS input '{raw[:30]}': pattern not present")
+                continue
+            rec = logging.LogRecord("t", logging.INFO, "", 0, raw, (), None)
+            rf.filter(rec)
+            out = rec.getMessage()
+            if _re.search(forbidden_re, out):
+                all_ok = False
+                details.append(f"LEAK: pattern still present in '{out[:40]}'")
+        record("Req1-1: _RedactingFilter redacts phones/tokens/PATs/JWTs",
+               all_ok, "; ".join(details) if details else "all redacted")
+    except Exception as e:
+        record("Req1-1: exception", False, str(e))
+
+
+async def test_req1_redacting_filter_installed_in_setup_logging():
+    """[Req-1/Security] setup_logging must attach _RedactingFilter to BOTH
+    the file handler and the stdout handler so no log record bypasses it."""
+    try:
+        src = (PROJECT_ROOT / "bot.py").read_text(encoding="utf-8")
+        # locate setup_logging body
+        start = src.find("def setup_logging(level_name):")
+        end = src.find("\n\n", src.find("logging.getLogger(\"aiohttp\")", start))
+        body = src[start:end] if start >= 0 and end > start else ""
+        has_filter_class = "class _RedactingFilter" in src
+        has_add_filter_fh = "fh.addFilter(_redact)" in body
+        has_add_filter_ch = "ch.addFilter(_redact)" in body
+        record("Req1-2: setup_logging installs _RedactingFilter on both handlers",
+               has_filter_class and has_add_filter_fh and has_add_filter_ch,
+               f"class={has_filter_class} fh={has_add_filter_fh} ch={has_add_filter_ch}")
+    except Exception as e:
+        record("Req1-2: exception", False, str(e))
+
+
+async def test_req1_api_pii_masking_when_dashboard_open():
+    """[Req-1/Security] When DASHBOARD_API_KEY is unset (open dashboard),
+    _api_should_show_full_pii() must return False so phones are masked in
+    /api/joiners_status + /api/joined_groups. When set, return True (the
+    middleware already authenticated the caller)."""
+    try:
+        os.environ.pop('DASHBOARD_API_KEY', None)
+        open_mode = bot._api_should_show_full_pii()
+        os.environ['DASHBOARD_API_KEY'] = 'test-secret-key-123'
+        locked_mode = bot._api_should_show_full_pii()
+        os.environ.pop('DASHBOARD_API_KEY', None)  # restore baseline
+        record("Req1-3: _api_should_show_full_pii masks when open, shows when locked",
+               (open_mode is False) and (locked_mode is True),
+               f"open={open_mode} locked={locked_mode}")
+    except Exception as e:
+        record("Req1-3: exception", False, str(e))
+
+
+async def test_req1_bot_token_not_logged_prefix_suffix():
+    """[Req-1/Security] bot.py must NOT log bot_token[:8] or bot_token[-4:]
+    (prefix/suffix leak). Only the length is safe to log."""
+    try:
+        src = (PROJECT_ROOT / "bot.py").read_text(encoding="utf-8")
+        leak_patterns = ["bot_token[:8]", "bot_token[-4:]",
+                         "bot_token[:4]", "bot_token[-2:]"]
+        leaks = [p for p in leak_patterns if p in src]
+        record("Req1-4: no bot_token prefix/suffix in logging",
+               not leaks, f"leaks found: {leaks}")
+    except Exception as e:
+        record("Req1-4: exception", False, str(e))
+
+
+async def test_req1_supabase_url_masked_in_deploy_check():
+    """[Req-1/Security] /api/deploy_check must mask the Supabase project host,
+    not return db.supabase_url raw."""
+    try:
+        src = (PROJECT_ROOT / "bot.py").read_text(encoding="utf-8")
+        masked = "report[\"supabase\"][\"url\"] = _supa_masked" in src
+        has_raw_leak = 'report["supabase"]["url"] = db.supabase_url' in src
+        record("Req1-5: Supabase URL masked in deploy_check",
+               masked and not has_raw_leak,
+               f"masked={masked} raw_leak={has_raw_leak}")
+    except Exception as e:
+        record("Req1-5: exception", False, str(e))
+
+
+async def test_req8_delete_forwarded_request_removes_phantom_row():
+    """[Req-8/PUBLISH-VERIFY] delete_forwarded_request() must remove the
+    dedup row for a link so a phantom publish row (inserted before _send
+    failed) is rolled back and the next cycle can re-publish."""
+    from datetime import datetime
+    from unittest.mock import AsyncMock, patch
+    try:
+        db = bot.DatabaseManager(tempfile.mktemp(suffix=".db"))
+        await db.init_db()
+        try:
+            with patch.object(db, '_supabase_insert_link', new=AsyncMock()):
+                with patch.object(db, '_get_supabase_session', new=AsyncMock(return_value=None)):
+                    link = "https://t.me/Req8TestGroup"
+                    inserted = await db.insert_request(
+                        link=link, message_date=datetime.now(),
+                        group_name="g", sender_name="s", source_phone="+966",
+                        link_type="telegram")
+                    conn = await db._ensure_conn()
+                    c = await conn.execute("SELECT COUNT(*) FROM forwarded_requests")
+                    before = (await c.fetchone())[0]
+                    deleted = await db.delete_forwarded_request(link)
+                    c = await conn.execute("SELECT COUNT(*) FROM forwarded_requests")
+                    after = (await c.fetchone())[0]
+                    deleted2 = await db.delete_forwarded_request(link)
+            try: await db.close()
+            except Exception: pass
+            record("Req8-1: delete_forwarded_request removes phantom row",
+                   inserted and deleted and (after == before - 1) and (deleted2 is False),
+                   f"inserted={inserted} deleted={deleted} before={before} after={after} deleted2={deleted2}")
+        finally:
+            try: await db.close()
+            except Exception: pass
+    except Exception as e:
+        record("Req8-1: exception", False, str(e))
+
+
+async def test_req8_publish_failure_rolls_back_phantom_row():
+    """[Req-8/PUBLISH-VERIFY] On _send() failure, the publish block must
+    (a) delete the phantom forwarded_requests row, AND (b) reset group_state
+    to DISCOVERED, so the next cycle re-attempts the full publish instead of
+    silently skipping it (state=QUEUED + duplicate row = never published)."""
+    try:
+        src = (PROJECT_ROOT / "bot.py").read_text(encoding="utf-8")
+        # locate the PUBLISH_FAILED rollback branch marker
+        marker = "PUBLISH_FAILED — rolling back phantom publish row"
+        idx = src.find(marker)
+        if idx < 0:
+            record("Req8-2: publish-failure rollback branch", False,
+                   "rollback marker not found — fix may have been reverted")
+            return
+        # Search for each pattern AFTER the marker, within a generous 5000-char span.
+        BOUND = 5000
+        def _after(pat):
+            p = src.find(pat, idx)
+            return 0 < p < idx + BOUND
+        has_delete = _after("delete_forwarded_request(raw_link)")
+        has_reset = _after("set_group_state(normalized, GroupState.DISCOVERED")
+        has_retry = _after("next_retry=datetime.now() + timedelta(minutes=2)")
+        record("Req8-2: _send failure rolls back phantom row + resets state",
+               has_delete and has_reset and has_retry,
+               f"delete={has_delete} reset={has_reset} retry={has_retry}")
+    except Exception as e:
+        record("Req8-2: exception", False, str(e))
+
+
+async def test_req2_startup_scan_wired_into_start():
+    """[Req-2/Monitoring] _run_startup_scan must be CALLED from start() when
+    config.startup_scan_days is not None — previously dead code (defined but
+    never invoked), so STARTUP_SCAN_DAYS had no effect and the bot only
+    captured links from NEW messages, missing groups in older messages."""
+    try:
+        src = (PROJECT_ROOT / "bot.py").read_text(encoding="utf-8")
+        # locate start() method
+        s = src.find("async def start(self):")
+        e = src.find("\n    async def ", s + 50)
+        start_body = src[s:e] if s >= 0 and e > s else ""
+        has_gate = "self.config.startup_scan_days is not None" in start_body
+        has_call = "self._run_startup_scan(w)" in start_body
+        has_track = "_startup_scan_done" in start_body
+        record("Req2-1: _run_startup_scan wired into start()",
+               has_gate and has_call and has_track,
+               f"gate={has_gate} call={has_call} track={has_track}")
+    except Exception as e:
+        record("Req2-1: exception", False, str(e))
+
+
+async def test_req3_pre_publish_channel_exclusion_present():
+    """[Req-3/Link-type] The publish pipeline (PIPELINE-5) must resolve the
+    entity for public telegram username links and SKIP publish+join if it's
+    a broadcast channel or a User/Bot — the user wants student GROUPS only,
+    not channels or profile links in the published feed."""
+    try:
+        src = (PROJECT_ROOT / "bot.py").read_text(encoding="utf-8")
+        has_block = "PRE-PUBLISH channel/user exclusion" in src
+        has_broadcast = "is_channel_broadcast" in src
+        has_user = "'not_a_group'" in src
+        has_timeout = "asyncio.wait_for(_pp_client.get_entity(raw_link), timeout=15)" in src
+        record("Req3-1: pre-publish channel/user exclusion in PIPELINE-5",
+               has_block and has_broadcast and has_user and has_timeout,
+               f"block={has_block} broadcast={has_broadcast} user={has_user} timeout={has_timeout}")
+    except Exception as e:
+        record("Req3-1: exception", False, str(e))
+
+
+async def test_req3_scorer_marks_channels_banned():
+    """[Req-3/Link-type] The priority scorer (which already resolves entities
+    via get_entity) must mark broadcast channels and User/Bot entities as
+    BANNED so the scheduler skips them on this and future cycles."""
+    try:
+        src = (PROJECT_ROOT / "bot.py").read_text(encoding="utf-8")
+        # locate the scorer entity-resolution block (NOT the pre-publish one)
+        marker = "EXCLUDE broadcast channels — the user wants"
+        idx = src.find(marker)
+        if idx < 0:
+            record("Req3-2: scorer marks channels/users BANNED", False,
+                   "scorer channel-exclusion marker not found")
+            return
+        # Search for each pattern AFTER the scorer marker, within 5000 chars.
+        BOUND = 5000
+        def _after(pat):
+            p = src.find(pat, idx)
+            return 0 < p < idx + BOUND
+        has_broadcast_ban = _after("is_channel_broadcast") and _after("GroupState.BANNED")
+        has_user_ban = _after("not_a_group")
+        record("Req3-2: scorer marks channels + users BANNED",
+               has_broadcast_ban and has_user_ban,
+               f"broadcast_ban={has_broadcast_ban} user_ban={has_user_ban}")
+    except Exception as e:
+        record("Req3-2: exception", False, str(e))
+
+
 # === Main runner ===
 
 async def main():
@@ -2953,6 +3200,18 @@ async def main():
 
     # === Task 11a — Secrets scan ===
     await test_11a_no_real_secrets_in_source_files()
+
+    # === Requirements Audit — Req-1 Security, Req-2 Monitoring, Req-3 Link-type, Req-8 PUBLISH-VERIFY ===
+    await test_req1_redacting_filter_redacts_phones_and_tokens()
+    await test_req1_redacting_filter_installed_in_setup_logging()
+    await test_req1_api_pii_masking_when_dashboard_open()
+    await test_req1_bot_token_not_logged_prefix_suffix()
+    await test_req1_supabase_url_masked_in_deploy_check()
+    await test_req8_delete_forwarded_request_removes_phantom_row()
+    await test_req8_publish_failure_rolls_back_phantom_row()
+    await test_req2_startup_scan_wired_into_start()
+    await test_req3_pre_publish_channel_exclusion_present()
+    await test_req3_scorer_marks_channels_banned()
 
     # [infra] close all aiosqlite connections before the loop tears down
     await close_all_test_dbs()
