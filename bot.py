@@ -4912,17 +4912,12 @@ class Monitor:
                                 if now - last_warn_ts > 3600:
                                     logging.warning(
                                         "[JOURNAL-SNAPSHOT] table message_journal_snapshot "
-                                        "missing — run this SQL in Supabase SQL Editor:\n"
-                                        "CREATE TABLE IF NOT EXISTS message_journal_snapshot "
-                                        "(chat_id BIGINT NOT NULL, msg_id BIGINT NOT NULL, "
-                                        "raw_text TEXT, source_phone TEXT, chat_title TEXT, "
-                                        "chat_username TEXT, chat_link_type TEXT, "
-                                        "sender_id BIGINT, sender_name TEXT, state TEXT NOT NULL, "
-                                        "received_at DOUBLE PRECISION, "
-                                        "PRIMARY KEY (chat_id, msg_id));\n"
-                                        "CREATE UNIQUE INDEX IF NOT EXISTS "
-                                        "idx_journal_snapshot_pk ON message_journal_snapshot "
-                                        "(chat_id, msg_id);"
+                                        "missing — run the migration at "
+                                        "supabase/message_journal_snapshot.sql in Supabase SQL "
+                                        "Editor. NOTE: PostgreSQL does not support "
+                                        "CREATE POLICY IF NOT EXISTS — use "
+                                        "DROP POLICY IF EXISTS then CREATE POLICY. "
+                                        "See repo file for the exact idempotent SQL."
                                     )
                                     last_warn_ts = now
                             else:

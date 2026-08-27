@@ -39,19 +39,23 @@ def record(name, passed, detail=""):
         print(f"         {detail}")
 
 
-async def test_snapshot_sql_in_source():
-    print("\n--- Test: snapshot CREATE TABLE SQL present in bot.py ---")
+async def test_snapshot_migration_pointer_in_bot():
+    print("\n--- Test: bot.py points user to migration file (not inline SQL) ---")
     import inspect
     src = inspect.getsource(bot.Monitor)
-    record("SQL: CREATE TABLE message_journal_snapshot present",
-           'CREATE TABLE IF NOT EXISTS message_journal_snapshot' in src,
-           "missing CREATE TABLE")
-    record("SQL: PRIMARY KEY (chat_id, msg_id)",
-           'PRIMARY KEY (chat_id, msg_id)' in src,
-           "missing PK")
-    record("SQL: raw_text + state + received_at columns",
-           all(c in src for c in ('raw_text', 'state', 'received_at')),
-           "missing columns")
+    # bot.py should reference the migration file path so users run the canonical SQL
+    record("bot.py: references supabase/message_journal_snapshot.sql migration",
+           'supabase/message_journal_snapshot.sql' in src
+           or 'message_journal_snapshot.sql' in src,
+           "missing migration file pointer")
+    # bot.py must warn that CREATE POLICY IF NOT EXISTS is unsupported by Postgres
+    record("bot.py: warns CREATE POLICY IF NOT EXISTS unsupported",
+           'CREATE POLICY IF NOT EXISTS' in src,
+           "missing CREATE POLICY IF NOT EXISTS warning")
+    # bot.py must recommend the DROP-then-CREATE idempotent pattern
+    record("bot.py: recommends DROP POLICY IF EXISTS then CREATE POLICY",
+           'DROP POLICY IF EXISTS' in src,
+           "missing DROP POLICY IF EXISTS recommendation")
 
 
 async def test_snapshot_fault_tolerant():
@@ -72,7 +76,7 @@ async def test_snapshot_fault_tolerant():
 
 
 async def test_migration_sql_file_exists():
-    print("\n--- Test: ready-to-execute migration SQL file present ---")
+    print("\n--- Test: ready-to-execute migration SQL file present + correct ---")
     sql_path = PROJECT_ROOT / 'supabase' / 'message_journal_snapshot.sql'
     record("SQL file: supabase/message_journal_snapshot.sql exists",
            sql_path.exists(), f"missing {sql_path}")
@@ -86,13 +90,30 @@ async def test_migration_sql_file_exists():
                'service_role full access' in sql)
         record("SQL file: anon denied policy",
                'anon no access' in sql)
+        # Regression guard: Postgres does NOT support CREATE POLICY IF NOT EXISTS.
+        # The migration MUST use DROP POLICY IF EXISTS then CREATE POLICY instead.
+        record("SQL file: NO 'CREATE POLICY IF NOT EXISTS' (Postgres unsupported)",
+               'CREATE POLICY IF NOT EXISTS' not in sql,
+               "regression: CREATE POLICY IF NOT EXISTS reintroduced")
+        record("SQL file: uses DROP POLICY IF EXISTS (idempotent pattern)",
+               'DROP POLICY IF EXISTS' in sql,
+               "missing DROP POLICY IF EXISTS")
+        record("SQL file: has index on state",
+               'idx_journal_snapshot_state' in sql)
+        record("SQL file: has index on received_at",
+               'idx_journal_snapshot_received_at' in sql)
+        # PRIMARY KEY already creates a unique index on (chat_id, msg_id);
+        # a separate CREATE UNIQUE INDEX on the same columns is redundant.
+        record("SQL file: NO redundant unique index on PK columns",
+               'CREATE UNIQUE INDEX IF NOT EXISTS idx_journal_snapshot_pk' not in sql,
+               "regression: redundant unique index on PK columns")
 
 
 async def main():
     print("=" * 70)
     print("Supabase Journal Snapshot — Test Suite [PR-6]")
     print("=" * 70)
-    await test_snapshot_sql_in_source()
+    await test_snapshot_migration_pointer_in_bot()
     await test_snapshot_fault_tolerant()
     await test_migration_sql_file_exists()
     print("\n" + "=" * 70)
