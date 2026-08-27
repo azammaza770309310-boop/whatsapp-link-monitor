@@ -11037,6 +11037,9 @@ async def api_links_daily_handler(request):
                                      headers={"Access-Control-Allow-Origin": "*"})
 
         daily: dict = {}  # "YYYY-MM-DD" → {"whatsapp": n, "telegram": n, "other": n}
+        # [HEATMAP-VIEW] hour-of-day buckets (0..23) over the same window —
+        # answers "WHEN do links get posted?" without a second Supabase scan.
+        hourly: dict = {}  # int hour → {"whatsapp": n, "telegram": n, "other": n}
 
         if db.supabase_url and db.supabase_key:
             try:
@@ -11078,6 +11081,19 @@ async def api_links_daily_handler(request):
                             bucket[lt] += 1
                         else:
                             bucket["other"] += 1
+                        # [HEATMAP-VIEW] hour bucket — "...T05:40:00..." → 05.
+                        # Rows with a date but no time component are skipped
+                        # here (they still count toward the daily series).
+                        hh = created[11:13]
+                        if hh.isdigit():
+                            h = int(hh)
+                            if 0 <= h <= 23:
+                                hb = hourly.setdefault(
+                                    h, {"whatsapp": 0, "telegram": 0, "other": 0})
+                                if lt in ("whatsapp", "telegram"):
+                                    hb[lt] += 1
+                                else:
+                                    hb["other"] += 1
                     fetched += len(rows)
                     if len(rows) < batch_size:
                         break
@@ -11108,10 +11124,27 @@ async def api_links_daily_handler(request):
         tot_all = tot_wa + tot_tg + sum(s["other"] for s in series)
         best = max(series, key=lambda s: s["total"]) if series else None
 
+        # [HEATMAP-VIEW] continuous 24-bucket hourly series (zeros for quiet
+        # hours) + peak-hour detection (None when the window is empty).
+        hourly_series = []
+        for h in range(24):
+            hb = hourly.get(h, {"whatsapp": 0, "telegram": 0, "other": 0})
+            hourly_series.append({
+                "hour": h,
+                "whatsapp": hb["whatsapp"],
+                "telegram": hb["telegram"],
+                "other": hb.get("other", 0),
+                "total": hb["whatsapp"] + hb["telegram"] + hb.get("other", 0),
+            })
+        peak = max(hourly_series, key=lambda x: x["total"]) if hourly_series else None
+        peak_hour = ({"hour": peak["hour"], "count": peak["total"]}
+                     if peak and peak["total"] > 0 else None)
+
         payload = {
             "days": days,
             "generated_at": datetime.utcnow().isoformat() + "Z",
             "daily": series,
+            "hourly": hourly_series,
             "totals": {
                 "total": tot_all,
                 "whatsapp": tot_wa,
@@ -11119,6 +11152,7 @@ async def api_links_daily_handler(request):
                 "best_day": ({"date": best["date"], "count": best["total"]}
                              if best else None),
                 "avg_per_day": round(tot_all / days, 1) if days else 0,
+                "peak_hour": peak_hour,
             },
         }
 
@@ -11132,6 +11166,157 @@ async def api_links_daily_handler(request):
     except Exception as e:
         logging.error(f"[API] /api/links_daily error: {e}")
         return web.json_response({"error": str(e), "daily": []}, status=200,
+                                 headers={"Access-Control-Allow-Origin": "*"})
+
+
+# [SOURCE-VIEW] /api/top_groups — link-source attribution for the dashboard:
+# which groups produced the links captured in the window? Answers the
+# operator question the trend chart raised ("why did capture drop — which
+# sources went quiet?"). Fetches ONLY (created_at, group_name, link_type)
+# columns from Supabase (paginated in 1000-row batches), aggregates by
+# group_name in Python, returns the top-N with WA/TG split + first/last
+# seen + share of window total. Cached in-process for 60s (the dashboard
+# polls on the same 60s cadence as the trend chart).
+_TOP_GROUPS_CACHE = {"key": None, "payload": None, "ts": 0.0}
+
+# Group names may be NULL/empty in the links table (e.g. links captured
+# outside a monitored chat). They are bucketed instead of dropped so the
+# per-group totals still sum to the window total.
+_UNNAMED_GROUP_LABEL = "غير محدد"
+
+
+async def api_top_groups_handler(request):
+    """API endpoint: top link-producing groups for the dashboard.
+
+    Query params:
+      ?days=N    → window size in days (default 14, clamped 1..30)
+      ?limit=N   → number of groups returned (default 10, clamped 1..50)
+
+    Returns:
+      {
+        "days": 14, "limit": 10,
+        "generated_at": "<ISO>",
+        "groups": [
+          {"group": "...", "total": N, "whatsapp": N, "telegram": N,
+           "other": N, "share": 12.3,
+           "first_seen": "YYYY-MM-DD", "last_seen": "YYYY-MM-DD"},
+          ...
+        ],
+        "totals": {"total": N, "distinct_groups": N}
+      }
+    """
+    db = request.app.get("db")
+    if not db:
+        return web.json_response({"error": "not ready"}, status=503)
+
+    try:
+        days = max(1, min(30, int(request.query.get("days", "14"))))
+        limit = max(1, min(50, int(request.query.get("limit", "10"))))
+        cache_key = f"d{days}l{limit}"
+        now_ts = time.time()
+        cached = _TOP_GROUPS_CACHE
+        if (cached["key"] == cache_key and cached["payload"] is not None
+                and (now_ts - cached["ts"]) < 60.0):
+            return web.json_response(cached["payload"], status=200,
+                                     headers={"Access-Control-Allow-Origin": "*"})
+
+        # group_name → counters
+        groups: dict = {}
+
+        if db.supabase_url and db.supabase_key:
+            try:
+                session = await db._get_supabase_session()
+                since_dt = datetime.utcnow() - timedelta(days=days)
+                since_iso = since_dt.strftime("%Y-%m-%dT%H:%M:%S")
+                offset = 0
+                batch_size = 1000
+                fetched = 0
+                while True:
+                    url = (
+                        f"{db.supabase_url}/rest/v1/links"
+                        f"?select=created_at,group_name,link_type"
+                        f"&created_at=gte.{since_iso}"
+                        f"&order=created_at.asc"
+                        f"&limit={batch_size}&offset={offset}"
+                    )
+                    async with session.get(url) as r:
+                        if r.status == 200:
+                            rows = await r.json()
+                        elif r.status == 416:
+                            break
+                        else:
+                            logging.error(
+                                f"[API] /api/top_groups batch failed: {r.status}")
+                            break
+                    if not rows:
+                        break
+                    for row in rows:
+                        created = str(row.get("created_at") or "")
+                        day_key = created[:10]
+                        if len(day_key) != 10 or not day_key.startswith("20"):
+                            continue
+                        gname = (row.get("group_name") or "").strip() \
+                            or _UNNAMED_GROUP_LABEL
+                        g = groups.setdefault(gname, {
+                            "total": 0, "whatsapp": 0, "telegram": 0,
+                            "other": 0, "first": day_key, "last": day_key})
+                        g["total"] += 1
+                        lt = row.get("link_type") or "other"
+                        if lt in ("whatsapp", "telegram"):
+                            g[lt] += 1
+                        else:
+                            g["other"] += 1
+                        # created_at is ordered asc → first is the earliest.
+                        if day_key < g["first"]:
+                            g["first"] = day_key
+                        if day_key > g["last"]:
+                            g["last"] = day_key
+                    fetched += len(rows)
+                    if len(rows) < batch_size:
+                        break
+                    offset += batch_size
+                logging.info(
+                    f"[API] /api/top_groups aggregated {fetched} rows over "
+                    f"{days}d → {len(groups)} groups")
+            except Exception as e:
+                logging.warning(f"[API] /api/top_groups supabase fetch failed: {e}")
+
+        window_total = sum(g["total"] for g in groups.values())
+        ranked = sorted(groups.items(), key=lambda kv: kv[1]["total"],
+                        reverse=True)[:limit]
+        top = []
+        for gname, g in ranked:
+            top.append({
+                "group": gname,
+                "total": g["total"],
+                "whatsapp": g["whatsapp"],
+                "telegram": g["telegram"],
+                "other": g.get("other", 0),
+                "share": round(g["total"] * 100.0 / window_total, 1)
+                         if window_total else 0.0,
+                "first_seen": g["first"],
+                "last_seen": g["last"],
+            })
+
+        payload = {
+            "days": days,
+            "limit": limit,
+            "generated_at": datetime.utcnow().isoformat() + "Z",
+            "groups": top,
+            "totals": {
+                "total": window_total,
+                "distinct_groups": len(groups),
+            },
+        }
+
+        _TOP_GROUPS_CACHE.update(
+            {"key": cache_key, "payload": payload, "ts": now_ts})
+
+        return web.json_response(payload, status=200,
+                                 headers={"Access-Control-Allow-Origin": "*"})
+    except Exception as e:
+        logging.error(f"[API] /api/top_groups error: {e}")
+        return web.json_response({"error": str(e), "groups": []}, status=200,
                                  headers={"Access-Control-Allow-Origin": "*"})
 
 
@@ -11889,6 +12074,7 @@ async def start_http_server(monitor=None, db=None):
     app.router.add_get("/api/pending_approvals", api_pending_approvals_handler)  # [REQAUDIT-2]
     app.router.add_get("/api/links", api_links_handler)
     app.router.add_get("/api/links_daily", api_links_daily_handler)  # [TREND-VIEW]
+    app.router.add_get("/api/top_groups", api_top_groups_handler)  # [SOURCE-VIEW]
     app.router.add_get("/api/stats", api_stats_handler)
     app.router.add_get("/api/deploy_check", api_deploy_check_handler)  # diagnostic
     app.router.add_get("/api/joiners_status", api_joiners_status_handler)  # joiners + groups

@@ -3262,6 +3262,173 @@ def web_json_ok():
 
 
 # =========================================================================
+# [SOURCE-VIEW] /api/top_groups — link-source attribution (which groups
+# produce the most links). Guards: route registered, handler 200-shape,
+# 60s cache, days/limit clamping, narrow Supabase select + pagination,
+# unnamed-group bucketing.
+# [HEATMAP-VIEW] /api/links_daily hourly breakdown — hour-of-day buckets
+# (0..23) + peak_hour in totals.
+# =========================================================================
+
+async def test_sourceview_top_groups_route_registered():
+    """[SOURCE-VIEW-1] /api/top_groups MUST be registered in the router —
+    otherwise the dashboard top-groups card gets a 404."""
+    try:
+        src = (PROJECT_ROOT / "bot.py").read_text(encoding="utf-8")
+        record("SG-1: /api/top_groups route registered",
+               'add_get("/api/top_groups", api_top_groups_handler)' in src,
+               "route registration missing")
+    except Exception as e:
+        record("SG-1: exception", False, str(e))
+
+
+async def test_sourceview_top_groups_handler_present():
+    """[SOURCE-VIEW-2] api_top_groups_handler defined + returns CORS + 200
+    shape (groups list + totals) even when Supabase is unconfigured."""
+    try:
+        assert hasattr(bot, "api_top_groups_handler"), "handler missing"
+        db = types.SimpleNamespace(
+            supabase_url=None, supabase_key=None)
+        req = types.SimpleNamespace(
+            app={"db": db}, query={"days": "3", "limit": "5"}, headers={})
+        resp = await bot.api_top_groups_handler(req)
+        status = getattr(resp, "status", None)
+        record("SG-2: handler returns 200 with empty supabase",
+               status == 200, f"status={status}")
+        text = getattr(resp, "text", None)
+        if text is not None and hasattr(text, "strip"):
+            body = str(text)
+        else:
+            body = repr(getattr(resp, "body", ""))
+        record("SG-2b: response contains groups + totals",
+               "groups" in body and "totals" in body,
+               f"body head: {body[:120]}")
+    except Exception as e:
+        record("SG-2: exception", False, str(e))
+
+
+async def test_sourceview_top_groups_cache():
+    """[SOURCE-VIEW-3] _TOP_GROUPS_CACHE must exist and the handler must
+    serve the cached payload within 60s (protects Supabase from polling)."""
+    try:
+        record("SG-3: _TOP_GROUPS_CACHE present",
+               hasattr(bot, "_TOP_GROUPS_CACHE")
+               and isinstance(bot._TOP_GROUPS_CACHE, dict)
+               and set(bot._TOP_GROUPS_CACHE.keys()) >= {"key", "payload", "ts"},
+               "cache object missing/wrong shape")
+        db = types.SimpleNamespace(supabase_url=None, supabase_key=None)
+        req = types.SimpleNamespace(
+            app={"db": db}, query={"days": "2", "limit": "4"}, headers={})
+        await bot.api_top_groups_handler(req)
+        seeded = dict(bot._TOP_GROUPS_CACHE)
+        record("SG-3b: first call seeds the cache",
+               seeded.get("key") == "d2l4" and seeded.get("payload") is not None,
+               f"cache={ {k: type(v).__name__ for k, v in seeded.items()} }")
+        import time as _time
+        bot._TOP_GROUPS_CACHE["ts"] = _time.time()  # fresh
+        resp2 = await bot.api_top_groups_handler(req)
+        record("SG-3c: second call within 60s served from cache",
+                bot._TOP_GROUPS_CACHE["payload"] is not None
+                and getattr(resp2, "status", None) == 200,
+                f"status={getattr(resp2,'status',None)}")
+    except Exception as e:
+        record("SG-3: exception", False, str(e))
+    finally:
+        bot._TOP_GROUPS_CACHE.update({"key": None, "payload": None, "ts": 0.0})
+
+
+async def test_sourceview_top_groups_clamped():
+    """[SOURCE-VIEW-4] ?days and ?limit must clamp (1..30 / 1..50) —
+    0/negative/huge values must not produce empty or unbounded queries."""
+    try:
+        src = (PROJECT_ROOT / "bot.py").read_text(encoding="utf-8")
+        record("SG-4: days clamped 1..30 + limit clamped 1..50",
+               'max(1, min(30, int(request.query.get("days", "14"))))' in src
+               and 'max(1, min(50, int(request.query.get("limit", "10"))))' in src,
+               "clamp expressions missing")
+    except Exception as e:
+        record("SG-4: exception", False, str(e))
+
+
+async def test_sourceview_top_groups_supabase_filters():
+    """[SOURCE-VIEW-5] the Supabase fetch must select ONLY (created_at,
+    group_name, link_type), filter by created_at >= since, and paginate in
+    batches — fetching full rows would transfer ~10× more data."""
+    try:
+        src = (PROJECT_ROOT / "bot.py").read_text(encoding="utf-8")
+        h_start = src.find("async def api_top_groups_handler")
+        h_end = src.find("\nasync def ", h_start + 50)
+        body = src[h_start:h_end if h_end > 0 else h_start + 9000]
+        record("SG-5a: selects only created_at,group_name,link_type",
+               "select=created_at,group_name,link_type" in body,
+               "wide select — would over-fetch")
+        record("SG-5b: filters by created_at gte window start",
+               "created_at=gte." in body, "window filter missing")
+        record("SG-5c: paginates in 1000-row batches",
+               "batch_size = 1000" in body and "offset" in body,
+               "pagination missing — >1000-row windows truncated")
+        record("SG-5d: results ranked by total descending",
+               'key=lambda kv: kv[1]["total"]' in body and "reverse=True" in body,
+               "ranking missing — card would show unsorted groups")
+    except Exception as e:
+        record("SG-5: exception", False, str(e))
+
+
+async def test_sourceview_top_groups_unnamed_bucket():
+    """[SOURCE-VIEW-6] links with NULL/empty group_name MUST be bucketed
+    under the unnamed label (not silently dropped) — otherwise per-group
+    totals stop summing to the window total."""
+    try:
+        src = (PROJECT_ROOT / "bot.py").read_text(encoding="utf-8")
+        h_start = src.find("async def api_top_groups_handler")
+        h_end = src.find("\nasync def ", h_start + 50)
+        body = src[h_start:h_end if h_end > 0 else h_start + 9000]
+        record("SG-6: unnamed groups bucketed, not dropped",
+               '_UNNAMED_GROUP_LABEL' in src
+               and 'or _UNNAMED_GROUP_LABEL' in body,
+               "unnamed bucketing missing — window totals would undercount")
+    except Exception as e:
+        record("SG-6: exception", False, str(e))
+
+
+async def test_heatmapview_hourly_series():
+    """[HEATMAP-VIEW-1] /api/links_daily MUST include a continuous 24-bucket
+    hourly series + peak_hour in totals — hour-of-day activity without a
+    second Supabase scan."""
+    try:
+        src = (PROJECT_ROOT / "bot.py").read_text(encoding="utf-8")
+        h_start = src.find("async def api_links_daily_handler")
+        h_end = src.find("\nasync def ", h_start + 50)
+        body = src[h_start:h_end if h_end > 0 else h_start + 9000]
+        record("HM-1a: 24-bucket hourly series built",
+               "for h in range(24):" in body,
+               "hourly series construction missing")
+        record("HM-1b: hour parsed from created_at[11:13]",
+               'created[11:13]' in body,
+               "hour extraction missing")
+        record("HM-1c: peak_hour included in totals",
+               '"peak_hour": peak_hour' in body,
+               "peak_hour missing from totals")
+        # Live handler call: unconfigured Supabase → 24 zero buckets,
+        # peak_hour=None (not a crash, not a missing key).
+        assert hasattr(bot, "api_links_daily_handler"), "handler missing"
+        db = types.SimpleNamespace(supabase_url=None, supabase_key=None)
+        req = types.SimpleNamespace(
+            app={"db": db}, query={"days": "2"}, headers={})
+        resp = await bot.api_links_daily_handler(req)
+        text = getattr(resp, "text", None)
+        body_txt = str(text) if (text is not None and hasattr(text, "strip")) \
+            else repr(getattr(resp, "body", ""))
+        record("HM-1d: response contains hourly + peak_hour",
+               '"hourly"' in body_txt and "peak_hour" in body_txt,
+               f"body head: {body_txt[:120]}")
+    except Exception as e:
+        record("HM-1: exception", False, str(e))
+    finally:
+        bot._LINKS_DAILY_CACHE.update({"key": None, "payload": None, "ts": 0.0})
+
+
+# =========================================================================
 # [Task 11a] Secrets scan — source files must contain NO real secrets
 # =========================================================================
 
@@ -4224,6 +4391,15 @@ async def main():
     await test_trendview_days_clamped()
     await test_trendview_gap_filling()
     await test_trendview_supabase_pagination_filters()
+
+    # === [SOURCE-VIEW] /api/top_groups — 6 guards + [HEATMAP-VIEW] hourly ===
+    await test_sourceview_top_groups_route_registered()
+    await test_sourceview_top_groups_handler_present()
+    await test_sourceview_top_groups_cache()
+    await test_sourceview_top_groups_clamped()
+    await test_sourceview_top_groups_supabase_filters()
+    await test_sourceview_top_groups_unnamed_bucket()
+    await test_heatmapview_hourly_series()
 
     # === Task 11a — Secrets scan ===
     await test_11a_no_real_secrets_in_source_files()

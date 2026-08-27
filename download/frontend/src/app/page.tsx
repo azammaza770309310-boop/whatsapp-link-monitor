@@ -12,7 +12,7 @@ import {
   MessageCircle, Send, Search, Users, Link2,
   RefreshCw, ExternalLink, Phone, MapPin, Clock, ArrowRight,
   X, Activity, CheckCircle2, XCircle, AlertTriangle, Clock3,
-  Copy, Check, Download, TrendingUp,
+  Copy, Check, Download, TrendingUp, BarChart3, Flame,
 } from 'lucide-react'
 import type { ReactNode, MouseEvent as ReactMouseEvent, ChangeEvent } from 'react'
 
@@ -167,6 +167,35 @@ interface TrendTotals {
   telegram: number
   best_day: { date: string; count: number } | null
   avg_per_day: number
+  peak_hour?: { hour: number; count: number } | null
+}
+
+// [HEATMAP-VIEW] hour-of-day buckets from /api/links_daily — shows WHEN
+// links get posted (24 UTC buckets, peak-hour highlighted).
+interface HourlyStat {
+  hour: number
+  whatsapp: number
+  telegram: number
+  other: number
+  total: number
+}
+
+// [SOURCE-VIEW] /api/top_groups response — link-source attribution: which
+// groups produced the captured links (WA/TG split + share of window).
+interface TopGroup {
+  group: string
+  total: number
+  whatsapp: number
+  telegram: number
+  other: number
+  share: number
+  first_seen: string
+  last_seen: string
+}
+
+interface TopGroupsTotals {
+  total: number
+  distinct_groups: number
 }
 
 type ModalType =
@@ -181,6 +210,7 @@ type ModalType =
   | 'monitored_chats'
   | 'banned_groups'
   | 'pending_approvals'
+  | 'top_groups'
   | null
 
 // ===== Constants =====
@@ -232,6 +262,14 @@ export default function Home() {
   // [TREND-VIEW] daily capture trend (60s poll — server caches 60s too)
   const [trendDaily, setTrendDaily] = useState<DailyStat[]>([])
   const [trendTotals, setTrendTotals] = useState<TrendTotals | null>(null)
+  // [TREND-VIEW] window size (7/14/30) — shared by the trend chart, the
+  // hourly strip AND the top-groups card so all views stay in sync.
+  const [trendDays, setTrendDays] = useState<number>(14)
+  // [HEATMAP-VIEW] hour-of-day activity buckets
+  const [hourly, setHourly] = useState<HourlyStat[]>([])
+  // [SOURCE-VIEW] link-source attribution (top producing groups)
+  const [topGroups, setTopGroups] = useState<TopGroup[]>([])
+  const [topGroupsTotals, setTopGroupsTotals] = useState<TopGroupsTotals | null>(null)
 
   // ===== Fetch Functions =====
   const fetchStats = useCallback(async () => {
@@ -388,21 +426,44 @@ export default function Home() {
     }
   }, [])
 
-  // [TREND-VIEW] daily capture trend — 60s cadence (NOT 15s): the backend
-  // caches the aggregation for 60s and a 14-day window scans ~28K Supabase
-  // rows; polling faster would only burn quota without fresher data.
-  const fetchTrend = useCallback(async () => {
+  // [TREND-VIEW] daily capture trend + [HEATMAP-VIEW] hourly buckets —
+  // 60s cadence (NOT 15s): the backend caches the aggregation for 60s and
+  // a 14-day window can scan ~28K Supabase rows; polling faster would only
+  // burn quota without fresher data. Parametrized by window size so the
+  // 7/14/30 selector can refetch without recreating the callback.
+  const fetchTrend = useCallback(async (days: number) => {
     try {
-      const response = await fetch(`${API_URL}/api/links_daily?days=14`, {
+      const response = await fetch(`${API_URL}/api/links_daily?days=${days}`, {
         headers: buildHeaders(),
       })
       if (response.ok) {
         const data = await response.json()
         if (Array.isArray(data.daily)) setTrendDaily(data.daily)
+        if (Array.isArray(data.hourly)) setHourly(data.hourly)
         if (data.totals) setTrendTotals(data.totals)
       }
     } catch (err) {
       console.error('fetchTrend error:', err)
+    }
+  }, [])
+
+  // [SOURCE-VIEW] top link-producing groups over the same window — answers
+  // "which sources produce the most links" (and, when capture drops, which
+  // sources went quiet). limit=50 (server max) so the full modal list is
+  // available; the card slices the top 6.
+  const fetchTopGroups = useCallback(async (days: number) => {
+    try {
+      const response = await fetch(
+        `${API_URL}/api/top_groups?days=${days}&limit=50`,
+        { headers: buildHeaders() }
+      )
+      if (response.ok) {
+        const data = await response.json()
+        if (Array.isArray(data.groups)) setTopGroups(data.groups)
+        if (data.totals) setTopGroupsTotals(data.totals)
+      }
+    } catch (err) {
+      console.error('fetchTopGroups error:', err)
     }
   }, [])
 
@@ -432,11 +493,17 @@ export default function Home() {
   }, [])
 
   // [TREND-VIEW] initial load + 60s refresh cycle (see fetchTrend rationale).
+  // Re-runs when the window selector changes (7/14/30) so the chart, the
+  // hourly strip and the top-groups card all switch windows together.
   useEffect(() => {
-    fetchTrend()
-    const t = setInterval(fetchTrend, 60000)
+    const load = () => {
+      fetchTrend(trendDays)
+      fetchTopGroups(trendDays)
+    }
+    load()
+    const t = setInterval(load, 60000)
     return () => clearInterval(t)
-  }, [fetchTrend])
+  }, [fetchTrend, fetchTopGroups, trendDays])
 
   const refreshAll = useCallback(() => {
     fetchLinks()
@@ -445,9 +512,10 @@ export default function Home() {
     fetchMonitoredChats()
     fetchReadiness()
     fetchPendingApprovals()
-    fetchTrend()
+    fetchTrend(trendDays)
+    fetchTopGroups(trendDays)
     setLastUpdated(new Date())
-  }, [fetchLinks, fetchStats, fetchJoiners, fetchMonitoredChats, fetchReadiness, fetchPendingApprovals, fetchTrend])
+  }, [fetchLinks, fetchStats, fetchJoiners, fetchMonitoredChats, fetchReadiness, fetchPendingApprovals, fetchTrend, fetchTopGroups, trendDays])
 
   // [LIVE-STATUS] seconds since last successful refresh
   const secondsAgo = lastUpdated
@@ -620,7 +688,9 @@ export default function Home() {
 
         {/* [TREND-VIEW] Daily capture trend — stacked bars (Telegram bottom /
             WhatsApp top) from /api/links_daily. Hover a bar for the exact
-            day breakdown; dashed line = window average. */}
+            day breakdown; dashed line = window average.
+            [WINDOW] 7/14/30 selector — also drives the hourly strip below
+            and the top-groups card (all views share one window). */}
         {trendDaily.length > 0 && (
           <Card className="bg-slate-800/30 border-slate-700/50 backdrop-blur-sm mb-6">
             <CardHeader className="pb-2">
@@ -628,7 +698,7 @@ export default function Home() {
                 <span className="flex items-center gap-2">
                   <TrendingUp className="w-5 h-5 text-emerald-400" />
                   اتجاه الالتقاط اليومي
-                  <span className="text-xs text-slate-500 font-normal">(آخر {trendDaily.length} يوم)</span>
+                  <span className="text-xs text-slate-500 font-normal">(آخر {trendDays} يوم)</span>
                 </span>
                 <div className="flex items-center gap-2 flex-wrap">
                   {trendTotals?.best_day && (
@@ -641,6 +711,28 @@ export default function Home() {
                       ⌀ {trendTotals.avg_per_day.toLocaleString()}/يوم
                     </Badge>
                   )}
+                  {/* [WINDOW] 7/14/30-day selector (shared window) */}
+                  <div
+                    className="flex items-center gap-0.5 bg-slate-900/70 border border-slate-700/50 rounded-lg p-0.5"
+                    role="tablist"
+                    aria-label="النافذة الزمنية"
+                  >
+                    {[7, 14, 30].map((d) => (
+                      <button
+                        key={d}
+                        role="tab"
+                        aria-selected={trendDays === d}
+                        onClick={() => setTrendDays(d)}
+                        className={`px-2 py-0.5 rounded-md text-[11px] font-medium transition-colors ${
+                          trendDays === d
+                            ? 'bg-emerald-500/20 text-emerald-300 border border-emerald-500/40'
+                            : 'text-slate-400 hover:text-slate-200 border border-transparent'
+                        }`}
+                      >
+                        {d}ي
+                      </button>
+                    ))}
+                  </div>
                 </div>
               </CardTitle>
             </CardHeader>
@@ -658,6 +750,56 @@ export default function Home() {
                 <span className="flex items-center gap-1.5">
                   <span className="w-4 border-t border-dashed border-slate-400" />
                   المتوسط
+                </span>
+              </div>
+              {/* [HEATMAP-VIEW] hour-of-day activity strip — WHEN do links
+                  get posted? Peak hour highlighted in amber. */}
+              {hourly.length > 0 && <HourlyStrip hourly={hourly} />}
+            </CardContent>
+          </Card>
+        )}
+
+        {/* [SOURCE-VIEW] Top link-producing groups — link-source attribution
+            over the same window as the trend chart. Split bars show the
+            WA/TG mix; hover a row for the full breakdown + last activity. */}
+        {topGroups.length > 0 && (
+          <Card className="bg-slate-800/30 border-slate-700/50 backdrop-blur-sm mb-6">
+            <CardHeader className="pb-3">
+              <CardTitle className="flex items-center justify-between text-lg">
+                <span className="flex items-center gap-2">
+                  <BarChart3 className="w-5 h-5 text-fuchsia-400" />
+                  أعلى المصادر إنتاجاً للروابط
+                  <span className="text-xs text-slate-500 font-normal">
+                    (آخر {trendDays} يوم · {topGroupsTotals?.total.toLocaleString() || '—'} رابط)
+                  </span>
+                </span>
+                {topGroupsTotals && topGroupsTotals.distinct_groups > 0 && (
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    onClick={() => setModal('top_groups')}
+                    className="text-slate-400 hover:text-white text-xs h-7"
+                  >
+                    عرض الكل ({topGroupsTotals.distinct_groups.toLocaleString()})
+                    <ArrowRight className="w-3.5 h-3.5 mr-1 rotate-180" />
+                  </Button>
+                )}
+              </CardTitle>
+            </CardHeader>
+            <CardContent>
+              <div className="space-y-3">
+                {topGroups.slice(0, 6).map((g, i) => (
+                  <TopGroupRow key={g.group} rank={i + 1} group={g} max={topGroups[0]?.total || 1} />
+                ))}
+              </div>
+              <div className="flex items-center justify-center gap-4 mt-3 text-[10px] text-slate-400">
+                <span className="flex items-center gap-1.5">
+                  <span className="w-2.5 h-2.5 rounded-sm bg-gradient-to-r from-emerald-400 to-emerald-600" />
+                  واتساب
+                </span>
+                <span className="flex items-center gap-1.5">
+                  <span className="w-2.5 h-2.5 rounded-sm bg-gradient-to-r from-blue-400 to-blue-600" />
+                  تيليجرام
                 </span>
               </div>
             </CardContent>
@@ -1169,6 +1311,9 @@ export default function Home() {
         bannedGroups={bannedGroups}
         pendingApprovals={pendingApprovals}
         pendingSummary={pendingSummary}
+        topGroups={topGroups}
+        topGroupsTotals={topGroupsTotals}
+        trendDays={trendDays}
       />
     </div>
   )
@@ -1446,6 +1591,198 @@ function TrendChart(props: { daily: DailyStat[]; totals: TrendTotals | null }) {
   )
 }
 
+// ===== HourlyStrip — [HEATMAP-VIEW] hour-of-day activity (24 UTC bars) =====
+// Answers "WHEN do links get posted?" over the selected window. Peak hour
+// is highlighted amber; hover a bar for the exact WA/TG breakdown.
+function HourlyStrip(props: { hourly: HourlyStat[] }) {
+  const { hourly } = props
+  const [hovered, setHovered] = useState<number | null>(null)
+  if (hourly.length === 0) return null
+
+  const W = 720
+  const H = 88
+  const padL = 6
+  const padR = 6
+  const padT = 14
+  const padB = 18
+  const chartW = W - padL - padR
+  const chartH = H - padT - padB
+  const max = Math.max(...hourly.map((h) => h.total), 1)
+  const barW = chartW / hourly.length
+  const peak = hourly.reduce((a, b) => (b.total > a.total ? b : a), hourly[0])
+  const hoverStat = hovered !== null ? hourly[hovered] : null
+
+  return (
+    <div className="relative mt-4 pt-3 border-t border-slate-700/40" dir="ltr">
+      <div className="flex items-center justify-between mb-1 px-1" dir="rtl">
+        <span className="text-[10px] text-slate-500">
+          النشاط حسب الساعة (UTC)
+        </span>
+        {peak && peak.total > 0 && (
+          <span className="text-[10px] text-amber-300 flex items-center gap-1">
+            <Flame className="w-3 h-3" />
+            ذروة النشاط {String(peak.hour).padStart(2, '0')}:00
+            <span className="text-amber-400/60 font-mono">
+              ({peak.total.toLocaleString()})
+            </span>
+          </span>
+        )}
+      </div>
+      <svg
+        viewBox={`0 0 ${W} ${H}`}
+        className="w-full select-none"
+        role="img"
+        aria-label="مخطط النشاط بالساعة"
+      >
+        <defs>
+          <linearGradient id="hourGrad" x1="0" y1="0" x2="0" y2="1">
+            <stop offset="0%" stopColor="#818cf8" />
+            <stop offset="100%" stopColor="#6366f1" />
+          </linearGradient>
+        </defs>
+        {hourly.map((h, i) => {
+          const x = padL + i * barW + barW * 0.2
+          const bw = barW * 0.6
+          const bh = (h.total / max) * chartH
+          const yBase = padT + chartH
+          const isPeak = peak && h.hour === peak.hour && h.total > 0
+          const isHover = hovered === i
+          return (
+            <g
+              key={h.hour}
+              onMouseEnter={() => setHovered(i)}
+              onMouseLeave={() => setHovered(null)}
+            >
+              <rect
+                x={padL + i * barW}
+                y={padT}
+                width={barW}
+                height={chartH}
+                fill={isHover ? 'rgba(255,255,255,0.05)' : 'transparent'}
+              />
+              <rect
+                x={x}
+                y={yBase - bh}
+                width={bw}
+                height={Math.max(bh, h.total > 0 ? 2 : 0)}
+                rx="1.5"
+                fill={isPeak ? '#fbbf24' : 'url(#hourGrad)'}
+                opacity={isHover ? 1 : isPeak ? 0.95 : 0.7}
+              />
+              {/* x labels every 6 hours */}
+              {i % 6 === 0 && (
+                <text
+                  x={padL + i * barW + barW / 2}
+                  y={H - 5}
+                  textAnchor="middle"
+                  fontSize="9"
+                  fill="#64748b"
+                >
+                  {String(h.hour).padStart(2, '0')}
+                </text>
+              )}
+            </g>
+          )
+        })}
+      </svg>
+      {hoverStat && hovered !== null && (
+        <div
+          className="absolute top-7 pointer-events-none z-10 bg-slate-900/95 border border-slate-600 rounded-lg px-3 py-2 text-xs shadow-xl backdrop-blur-sm whitespace-nowrap"
+          style={{
+            left: `${((hovered + 0.5) / hourly.length) * 100}%`,
+            transform: 'translateX(-50%)',
+          }}
+          dir="rtl"
+        >
+          <p className="font-bold text-white mb-1" dir="ltr">
+            {String(hoverStat.hour).padStart(2, '0')}:00
+          </p>
+          <p className="text-slate-300">
+            الإجمالي:{' '}
+            <span className="font-bold text-white">
+              {hoverStat.total.toLocaleString()}
+            </span>
+          </p>
+          {hoverStat.whatsapp > 0 && (
+            <p className="text-emerald-400">واتساب: {hoverStat.whatsapp.toLocaleString()}</p>
+          )}
+          {hoverStat.telegram > 0 && (
+            <p className="text-blue-400">تيليجرام: {hoverStat.telegram.toLocaleString()}</p>
+          )}
+        </div>
+      )}
+    </div>
+  )
+}
+
+// ===== TopGroupRow — [SOURCE-VIEW] one ranked source row ================
+// Split bar (green WA / blue TG) scaled to the #1 group; medals for the
+// top 3; hover reveals the full breakdown + first/last activity dates.
+function TopGroupRow(props: { rank: number; group: TopGroup; max: number }) {
+  const { rank, group, max } = props
+  const medals = ['🥇', '🥈', '🥉']
+  const rankLabel = medals[rank - 1] || <span className="text-slate-500">#{rank}</span>
+  const widthPct = Math.max(2, Math.round((group.total / max) * 100))
+  const waPct = group.total
+    ? Math.round((group.whatsapp / group.total) * widthPct)
+    : 0
+  const tgPct = widthPct - waPct
+  const isUnnamed = group.group === 'غير محدد'
+
+  return (
+    <motion.div
+      initial={{ opacity: 0, x: 24 }}
+      animate={{ opacity: 1, x: 0 }}
+      transition={{ delay: Math.min(rank * 0.06, 0.4), duration: 0.35 }}
+      className="group"
+    >
+      <div className="flex items-center justify-between gap-2 mb-1">
+        <div className="flex items-center gap-2 min-w-0">
+          <span className="text-xs w-6 text-center flex-shrink-0" aria-hidden>
+            {rankLabel}
+          </span>
+          <span
+            className={`text-sm truncate ${isUnnamed ? 'text-slate-500 italic' : 'text-slate-200'}`}
+            title={group.group}
+          >
+            {group.group}
+          </span>
+        </div>
+        <div className="flex items-center gap-2 flex-shrink-0">
+          <span className="text-[10px] text-slate-500 tabular-nums">
+            {group.share.toFixed(1)}%
+          </span>
+          <span className="text-sm font-bold text-white tabular-nums">
+            {group.total.toLocaleString()}
+          </span>
+        </div>
+      </div>
+      <div className="flex h-2 rounded-full bg-slate-700/40 overflow-hidden">
+        <motion.div
+          initial={{ width: 0 }}
+          animate={{ width: `${waPct}%` }}
+          transition={{ duration: 0.6, ease: 'easeOut', delay: Math.min(rank * 0.06, 0.4) }}
+          className="h-full bg-gradient-to-r from-emerald-400 to-emerald-600"
+        />
+        <motion.div
+          initial={{ width: 0 }}
+          animate={{ width: `${tgPct}%` }}
+          transition={{ duration: 0.6, ease: 'easeOut', delay: Math.min(rank * 0.06, 0.4) + 0.08 }}
+          className="h-full bg-gradient-to-r from-blue-400 to-blue-600"
+        />
+      </div>
+      {/* hover detail line */}
+      <div className="text-[10px] text-slate-500 mt-1 h-4 opacity-0 group-hover:opacity-100 transition-opacity">
+        <span className="text-emerald-500">واتساب {group.whatsapp.toLocaleString()}</span>
+        {' · '}
+        <span className="text-blue-400">تيليجرام {group.telegram.toLocaleString()}</span>
+        {group.other > 0 && <span> · أخرى {group.other.toLocaleString()}</span>}
+        <span> · نشاط {group.first_seen} ← {group.last_seen}</span>
+      </div>
+    </motion.div>
+  )
+}
+
 // ===== StatCard Component =====
 function StatCard(props: {
   icon: ReactNode
@@ -1675,8 +2012,11 @@ function LinksModal(props: {
   bannedGroups: BannedGroup[]
   pendingApprovals: PendingApproval[]
   pendingSummary: PendingApprovalsSummary | null
+  topGroups: TopGroup[]
+  topGroupsTotals: TopGroupsTotals | null
+  trendDays: number
 }) {
-  const { type, onClose, allLinks, joiners, joinersSummary, joinedGroups, monitoredChats, monitoredSummary, bannedGroups, pendingApprovals, pendingSummary } = props
+  const { type, onClose, allLinks, joiners, joinersSummary, joinedGroups, monitoredChats, monitoredSummary, bannedGroups, pendingApprovals, pendingSummary, topGroups, topGroupsTotals, trendDays } = props
   const [searchQuery, setSearchQuery] = useState<string>('')
 
   // [UX] Esc closes the modal + / focuses the search box
@@ -1755,10 +2095,12 @@ function LinksModal(props: {
         return '🚫 المجموعات الممنوعة'
       case 'pending_approvals':
         return '✉️ بانتظار موافقة المشرف'
+      case 'top_groups':
+        return `📊 أعلى المصادر إنتاجاً (آخر ${trendDays} يوم)`
       default:
         return ''
     }
-  }, [type])
+  }, [type, trendDays])
 
   if (!type) return null
 
@@ -1782,7 +2124,7 @@ function LinksModal(props: {
           <div className="flex items-center justify-between p-4 border-b border-slate-700">
             <h2 className="text-xl font-bold text-white">{modalTitle}</h2>
             <div className="flex items-center gap-3">
-              {type !== 'joiners' && type !== 'pending_approvals' && (
+              {type !== 'joiners' && type !== 'pending_approvals' && type !== 'top_groups' && (
                 <>
                   <Badge className="bg-slate-700 text-white border-0">
                     {filteredLinks.length}
@@ -2178,6 +2520,92 @@ function LinksModal(props: {
                           <span className="font-semibold">ملاحظة:</span> {p.last_error}
                         </div>
                       )}
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+          ) : type === 'top_groups' ? (
+            <div className="flex-1 overflow-y-auto p-4" style={{ maxHeight: 'calc(95vh - 100px)' }}>
+              {topGroupsTotals && (
+                <div className="bg-fuchsia-500/5 border border-fuchsia-500/20 rounded-lg p-3 mb-4 text-xs text-fuchsia-300/90 flex items-start gap-2">
+                  <BarChart3 className="w-4 h-4 mt-0.5 flex-shrink-0" />
+                  <p>
+                    تم التقاط{' '}
+                    <span className="font-bold text-white">
+                      {topGroupsTotals.total.toLocaleString()}
+                    </span>{' '}
+                    رابط من{' '}
+                    <span className="font-bold text-white">
+                      {topGroupsTotals.distinct_groups.toLocaleString()}
+                    </span>{' '}
+                    مصدر خلال آخر {trendDays} يوم. النسبة محسوبة من إجمالي النافذة.
+                  </p>
+                </div>
+              )}
+              {topGroupsTotals && topGroupsTotals.distinct_groups > topGroups.length && (
+                <p className="text-[10px] text-slate-500 mb-3">
+                  * يتم عرض أعلى {topGroups.length} مصدر فقط من إجمالي{' '}
+                  {topGroupsTotals.distinct_groups.toLocaleString()} مصدر.
+                </p>
+              )}
+              {topGroups.length === 0 ? (
+                <div className="text-center py-20">
+                  <BarChart3 className="w-12 h-12 mx-auto text-slate-600 mb-4" />
+                  <p className="text-slate-500">لا توجد بيانات مصادر</p>
+                </div>
+              ) : (
+                <div className="space-y-2">
+                  {topGroups.map((g, i) => (
+                    <div
+                      key={g.group}
+                      className="bg-slate-800/50 rounded-lg p-3 border border-slate-700/50"
+                    >
+                      <div className="flex items-center justify-between gap-2 mb-2">
+                        <div className="flex items-center gap-2 min-w-0">
+                          <span className="text-xs w-7 text-center flex-shrink-0 font-mono text-slate-500">
+                            {i + 1}
+                          </span>
+                          <span
+                            className={`text-sm truncate ${g.group === 'غير محدد' ? 'text-slate-500 italic' : 'text-slate-200'}`}
+                            title={g.group}
+                          >
+                            {g.group}
+                          </span>
+                        </div>
+                        <div className="flex items-center gap-2 flex-shrink-0">
+                          <Badge className="bg-slate-700/50 text-slate-300 border-slate-600/40 text-[10px] tabular-nums">
+                            {g.share.toFixed(1)}%
+                          </Badge>
+                          <span className="text-sm font-bold text-white tabular-nums">
+                            {g.total.toLocaleString()}
+                          </span>
+                        </div>
+                      </div>
+                      <div className="flex h-1.5 rounded-full bg-slate-700/40 overflow-hidden mb-2">
+                        <div
+                          className="h-full bg-gradient-to-r from-emerald-400 to-emerald-600"
+                          style={{ width: `${g.total ? (g.whatsapp / g.total) * 100 : 0}%` }}
+                        />
+                        <div
+                          className="h-full bg-gradient-to-r from-blue-400 to-blue-600"
+                          style={{ width: `${g.total ? (g.telegram / g.total) * 100 : 0}%` }}
+                        />
+                      </div>
+                      <div className="flex items-center justify-between text-[10px] text-slate-400 flex-wrap gap-1">
+                        <span className="flex items-center gap-2">
+                          <span className="text-emerald-500">
+                            واتساب {g.whatsapp.toLocaleString()}
+                          </span>
+                          <span className="text-blue-400">
+                            تيليجرام {g.telegram.toLocaleString()}
+                          </span>
+                          {g.other > 0 && <span>أخرى {g.other.toLocaleString()}</span>}
+                        </span>
+                        <span className="text-slate-500" dir="ltr">
+                          {g.first_seen} → {g.last_seen}
+                        </span>
+                      </div>
                     </div>
                   ))}
                 </div>
