@@ -10992,6 +10992,149 @@ async def api_links_handler(request):
                                 status=200, headers={"Access-Control-Allow-Origin": "*"})
 
 
+# [TREND-VIEW] /api/links_daily — daily link-capture aggregation for the
+# dashboard trend chart. Fetches ONLY (created_at, link_type) columns for
+# the requested window from Supabase (paginated in 1000-row batches), then
+# aggregates by calendar day (UTC) in Python — PostgREST has no GROUP BY.
+# Result is cached in-process for 60s: the dashboard polls every 60s and a
+# 14-day window can be ~28K rows (~1.6MB) — without the cache this would
+# hammer Supabase on every dashboard refresh.
+_LINKS_DAILY_CACHE = {"key": None, "payload": None, "ts": 0.0}
+
+
+async def api_links_daily_handler(request):
+    """API endpoint: daily link counts for the dashboard trend chart.
+
+    Query params:
+      ?days=N   → window size in days (default 14, clamped 1..30)
+
+    Returns:
+      {
+        "days": 14,
+        "generated_at": "<ISO>",
+        "daily": [
+          {"date": "2026-08-28", "total": 3412,
+           "whatsapp": 120, "telegram": 3292},
+          ...
+        ],
+        "totals": {"total": N, "whatsapp": N, "telegram": N,
+                   "best_day": {"date": "...", "count": N}, "avg_per_day": N}
+      }
+    """
+    db = request.app.get("db")
+    if not db:
+        return web.json_response({"error": "not ready"}, status=503)
+
+    try:
+        days = max(1, min(30, int(request.query.get("days", "14"))))
+        # Cache key includes the window so different windows don't collide.
+        cache_key = f"d{days}"
+        now_ts = time.time()
+        cached = _LINKS_DAILY_CACHE
+        if (cached["key"] == cache_key and cached["payload"] is not None
+                and (now_ts - cached["ts"]) < 60.0):
+            return web.json_response(cached["payload"], status=200,
+                                     headers={"Access-Control-Allow-Origin": "*"})
+
+        daily: dict = {}  # "YYYY-MM-DD" → {"whatsapp": n, "telegram": n, "other": n}
+
+        if db.supabase_url and db.supabase_key:
+            try:
+                session = await db._get_supabase_session()
+                since_dt = datetime.utcnow() - timedelta(days=days)
+                since_iso = since_dt.strftime("%Y-%m-%dT%H:%M:%S")
+                offset = 0
+                batch_size = 1000
+                fetched = 0
+                while True:
+                    url = (
+                        f"{db.supabase_url}/rest/v1/links"
+                        f"?select=created_at,link_type"
+                        f"&created_at=gte.{since_iso}"
+                        f"&order=created_at.asc"
+                        f"&limit={batch_size}&offset={offset}"
+                    )
+                    async with session.get(url) as r:
+                        if r.status == 200:
+                            rows = await r.json()
+                        elif r.status == 416:
+                            break
+                        else:
+                            logging.error(
+                                f"[API] /api/links_daily batch failed: {r.status}")
+                            break
+                    if not rows:
+                        break
+                    for row in rows:
+                        created = str(row.get("created_at") or "")
+                        # created_at may be "2026-08-28T05:40:00.123456+00:00"
+                        day_key = created[:10]
+                        if len(day_key) != 10 or not day_key.startswith("20"):
+                            continue
+                        bucket = daily.setdefault(
+                            day_key, {"whatsapp": 0, "telegram": 0, "other": 0})
+                        lt = row.get("link_type") or "other"
+                        if lt in ("whatsapp", "telegram"):
+                            bucket[lt] += 1
+                        else:
+                            bucket["other"] += 1
+                    fetched += len(rows)
+                    if len(rows) < batch_size:
+                        break
+                    offset += batch_size
+                logging.info(
+                    f"[API] /api/links_daily aggregated {fetched} rows over "
+                    f"{days}d → {len(daily)} days")
+            except Exception as e:
+                logging.warning(f"[API] /api/links_daily supabase fetch failed: {e}")
+
+        # Build a continuous date series (fill gaps with zeros) oldest→newest.
+        today = datetime.utcnow().date()
+        series = []
+        for i in range(days - 1, -1, -1):
+            d = today - timedelta(days=i)
+            key = d.isoformat()
+            b = daily.get(key, {"whatsapp": 0, "telegram": 0, "other": 0})
+            series.append({
+                "date": key,
+                "whatsapp": b["whatsapp"],
+                "telegram": b["telegram"],
+                "other": b.get("other", 0),
+                "total": b["whatsapp"] + b["telegram"] + b.get("other", 0),
+            })
+
+        tot_wa = sum(s["whatsapp"] for s in series)
+        tot_tg = sum(s["telegram"] for s in series)
+        tot_all = tot_wa + tot_tg + sum(s["other"] for s in series)
+        best = max(series, key=lambda s: s["total"]) if series else None
+
+        payload = {
+            "days": days,
+            "generated_at": datetime.utcnow().isoformat() + "Z",
+            "daily": series,
+            "totals": {
+                "total": tot_all,
+                "whatsapp": tot_wa,
+                "telegram": tot_tg,
+                "best_day": ({"date": best["date"], "count": best["total"]}
+                             if best else None),
+                "avg_per_day": round(tot_all / days, 1) if days else 0,
+            },
+        }
+
+        # Refresh cache (single slot — most recent window wins; acceptable
+        # because the dashboard always requests the same window).
+        _LINKS_DAILY_CACHE.update(
+            {"key": cache_key, "payload": payload, "ts": now_ts})
+
+        return web.json_response(payload, status=200,
+                                 headers={"Access-Control-Allow-Origin": "*"})
+    except Exception as e:
+        logging.error(f"[API] /api/links_daily error: {e}")
+        return web.json_response({"error": str(e), "daily": []}, status=200,
+                                 headers={"Access-Control-Allow-Origin": "*"})
+
+
 async def api_stats_handler(request):
     """API endpoint: returns system stats for dashboard.
 
@@ -11745,6 +11888,7 @@ async def start_http_server(monitor=None, db=None):
     app.router.add_get("/api/joined_groups", api_joined_groups_handler)
     app.router.add_get("/api/pending_approvals", api_pending_approvals_handler)  # [REQAUDIT-2]
     app.router.add_get("/api/links", api_links_handler)
+    app.router.add_get("/api/links_daily", api_links_daily_handler)  # [TREND-VIEW]
     app.router.add_get("/api/stats", api_stats_handler)
     app.router.add_get("/api/deploy_check", api_deploy_check_handler)  # diagnostic
     app.router.add_get("/api/joiners_status", api_joiners_status_handler)  # joiners + groups

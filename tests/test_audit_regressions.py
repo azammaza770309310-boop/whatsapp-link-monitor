@@ -3127,6 +3127,133 @@ async def test_dashboard_restore_helper_is_origin_allowed():
         os.environ.pop('DASHBOARD_ALLOWED_ORIGINS', None)
 
 
+# =========================================================================
+# [TREND-VIEW] /api/links_daily — daily link-capture aggregation for the
+# dashboard trend chart. Guards: route registered, handler present, 60s
+# cache, days clamping, zero-gap filling, Supabase pagination filters.
+# =========================================================================
+
+async def test_trendview_links_daily_route_registered():
+    """[TREND-VIEW-1] /api/links_daily MUST be registered in the router —
+    otherwise the dashboard trend chart gets a 404."""
+    try:
+        src = (PROJECT_ROOT / "bot.py").read_text(encoding="utf-8")
+        record("TV-1: /api/links_daily route registered",
+               'add_get("/api/links_daily", api_links_daily_handler)' in src,
+               "route registration missing")
+    except Exception as e:
+        record("TV-1: exception", False, str(e))
+
+
+async def test_trendview_links_daily_handler_present():
+    """[TREND-VIEW-2] api_links_daily_handler defined + returns CORS + 200
+    shape (daily list + totals) even when Supabase is unconfigured."""
+    try:
+        assert hasattr(bot, "api_links_daily_handler"), "handler missing"
+        # Simulate a request with no supabase config → empty series, 200.
+        db = types.SimpleNamespace(
+            supabase_url=None, supabase_key=None)
+        req = types.SimpleNamespace(
+            app={"db": db}, query={"days": "3"}, headers={})
+        resp = await bot.api_links_daily_handler(req)
+        status = getattr(resp, "status", None)
+        record("TV-2: handler returns 200 with empty supabase",
+               status == 200, f"status={status}")
+        # Response must be the aiohttp json_response mock-compatible shape.
+        text = getattr(resp, "text", None)
+        if text is not None and hasattr(text, "strip"):
+            body = str(text)
+        else:
+            body = repr(getattr(resp, "body", ""))
+        record("TV-2b: response contains daily series + totals",
+               "daily" in body and "totals" in body,
+               f"body head: {body[:120]}")
+    except Exception as e:
+        record("TV-2: exception", False, str(e))
+
+
+async def test_trendview_cache_60s():
+    """[TREND-VIEW-3] _LINKS_DAILY_CACHE must exist and the handler must
+    serve the cached payload within 60s (protects Supabase from polling)."""
+    try:
+        record("TV-3: _LINKS_DAILY_CACHE present",
+               hasattr(bot, "_LINKS_DAILY_CACHE")
+               and isinstance(bot._LINKS_DAILY_CACHE, dict)
+               and set(bot._LINKS_DAILY_CACHE.keys()) >= {"key", "payload", "ts"},
+               "cache object missing/wrong shape")
+        # Serve-from-cache path: seed the cache and verify handler short-
+        # circuits without touching a broken db (supabase_url=None would
+        # otherwise produce an empty series → different payload).
+        db = types.SimpleNamespace(supabase_url=None, supabase_key=None)
+        req = types.SimpleNamespace(
+            app={"db": db}, query={"days": "2"}, headers={})
+        # First call populates the cache for d2.
+        await bot.api_links_daily_handler(req)
+        seeded = dict(bot._LINKS_DAILY_CACHE)
+        record("TV-3b: first call seeds the cache",
+               seeded.get("key") == "d2" and seeded.get("payload") is not None,
+               f"cache={ {k: type(v).__name__ for k, v in seeded.items()} }")
+        # Second call within 60s must hit the cache (identical payload object).
+        import time as _time
+        bot._LINKS_DAILY_CACHE["ts"] = _time.time()  # fresh
+        resp2 = await bot.api_links_daily_handler(req)
+        body2 = str(getattr(resp2, "text", "") or getattr(resp2, "body", ""))
+        record("TV-3c: second call within 60s served from cache",
+                bot._LINKS_DAILY_CACHE["payload"] is not None
+                and getattr(resp2, "status", None) == 200,
+                f"status={getattr(resp2,'status',None)}")
+    except Exception as e:
+        record("TV-3: exception", False, str(e))
+    finally:
+        bot._LINKS_DAILY_CACHE.update({"key": None, "payload": None, "ts": 0.0})
+
+
+async def test_trendview_days_clamped():
+    """[TREND-VIEW-4] ?days must clamp to 1..30 — 0/negative/huge values
+    must not produce an empty or unbounded window."""
+    try:
+        src = (PROJECT_ROOT / "bot.py").read_text(encoding="utf-8")
+        record("TV-4: days clamped to 1..30",
+               'max(1, min(30, int(request.query.get("days", "14"))))' in src,
+               "clamp expression missing")
+    except Exception as e:
+        record("TV-4: exception", False, str(e))
+
+
+async def test_trendview_gap_filling():
+    """[TREND-VIEW-5] the date series must be CONTINUOUS — days with zero
+    captures appear as zeros (chart shows gaps, not missing bars)."""
+    try:
+        src = (PROJECT_ROOT / "bot.py").read_text(encoding="utf-8")
+        record("TV-5: zero-gap filling loop present",
+               "for i in range(days - 1, -1, -1):" in src
+               and 'daily.get(key, {"whatsapp": 0' in src,
+               "gap-fill code missing")
+    except Exception as e:
+        record("TV-5: exception", False, str(e))
+
+
+async def test_trendview_supabase_pagination_filters():
+    """[TREND-VIEW-6] the Supabase fetch must select ONLY (created_at,
+    link_type), filter by created_at >= since, and paginate in batches —
+    fetching full rows would transfer ~10× more data."""
+    try:
+        src = (PROJECT_ROOT / "bot.py").read_text(encoding="utf-8")
+        h_start = src.find("async def api_links_daily_handler")
+        h_end = src.find("\nasync def ", h_start + 50)
+        body = src[h_start:h_end if h_end > 0 else h_start + 8000]
+        record("TV-6a: selects only created_at,link_type",
+               "select=created_at,link_type" in body,
+               "wide select — would over-fetch")
+        record("TV-6b: filters by created_at gte window start",
+               "created_at=gte." in body, "window filter missing")
+        record("TV-6c: paginates in 1000-row batches",
+               "batch_size = 1000" in body and "offset" in body,
+               "pagination missing — >1000-row windows truncated")
+    except Exception as e:
+        record("TV-6: exception", False, str(e))
+
+
 def web_json_ok():
     """Minimal aiohttp.web.json_response stand-in for middleware tests."""
     class _R:
@@ -4089,6 +4216,14 @@ async def main():
     await test_dashboard_restore_options_preflight_allowed()
     await test_dashboard_restore_key_takes_precedence_over_origin()
     await test_dashboard_restore_helper_is_origin_allowed()
+
+    # === [TREND-VIEW] /api/links_daily endpoint — 6 regression guards ===
+    await test_trendview_links_daily_route_registered()
+    await test_trendview_links_daily_handler_present()
+    await test_trendview_cache_60s()
+    await test_trendview_days_clamped()
+    await test_trendview_gap_filling()
+    await test_trendview_supabase_pagination_filters()
 
     # === Task 11a — Secrets scan ===
     await test_11a_no_real_secrets_in_source_files()

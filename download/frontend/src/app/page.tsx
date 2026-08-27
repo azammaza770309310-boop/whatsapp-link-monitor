@@ -1,6 +1,6 @@
 'use client'
 
-import { useState, useEffect, useCallback, useMemo } from 'react'
+import { useState, useEffect, useCallback, useMemo, useRef } from 'react'
 import { motion, AnimatePresence } from 'framer-motion'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { Badge } from '@/components/ui/badge'
@@ -12,6 +12,7 @@ import {
   MessageCircle, Send, Search, Users, Link2,
   RefreshCw, ExternalLink, Phone, MapPin, Clock, ArrowRight,
   X, Activity, CheckCircle2, XCircle, AlertTriangle, Clock3,
+  Copy, Check, Download, TrendingUp,
 } from 'lucide-react'
 import type { ReactNode, MouseEvent as ReactMouseEvent, ChangeEvent } from 'react'
 
@@ -150,6 +151,24 @@ interface PendingApprovalsSummary {
   self_healing: boolean
 }
 
+// [TREND-VIEW] /api/links_daily response — daily capture counts for the
+// trend chart. `other` is included for completeness (rare link types).
+interface DailyStat {
+  date: string
+  whatsapp: number
+  telegram: number
+  other: number
+  total: number
+}
+
+interface TrendTotals {
+  total: number
+  whatsapp: number
+  telegram: number
+  best_day: { date: string; count: number } | null
+  avg_per_day: number
+}
+
 type ModalType =
   | 'whatsapp'
   | 'telegram'
@@ -210,6 +229,9 @@ export default function Home() {
   const [pendingSummary, setPendingSummary] = useState<PendingApprovalsSummary | null>(null)
   const [lastUpdated, setLastUpdated] = useState<Date | null>(null)
   const [now, setNow] = useState<Date>(new Date())
+  // [TREND-VIEW] daily capture trend (60s poll — server caches 60s too)
+  const [trendDaily, setTrendDaily] = useState<DailyStat[]>([])
+  const [trendTotals, setTrendTotals] = useState<TrendTotals | null>(null)
 
   // ===== Fetch Functions =====
   const fetchStats = useCallback(async () => {
@@ -366,6 +388,24 @@ export default function Home() {
     }
   }, [])
 
+  // [TREND-VIEW] daily capture trend — 60s cadence (NOT 15s): the backend
+  // caches the aggregation for 60s and a 14-day window scans ~28K Supabase
+  // rows; polling faster would only burn quota without fresher data.
+  const fetchTrend = useCallback(async () => {
+    try {
+      const response = await fetch(`${API_URL}/api/links_daily?days=14`, {
+        headers: buildHeaders(),
+      })
+      if (response.ok) {
+        const data = await response.json()
+        if (Array.isArray(data.daily)) setTrendDaily(data.daily)
+        if (data.totals) setTrendTotals(data.totals)
+      }
+    } catch (err) {
+      console.error('fetchTrend error:', err)
+    }
+  }, [])
+
   // Initial load + auto refresh (real-time every 15s)
   useEffect(() => {
     const load = async () => {
@@ -391,6 +431,13 @@ export default function Home() {
     return () => clearInterval(t)
   }, [])
 
+  // [TREND-VIEW] initial load + 60s refresh cycle (see fetchTrend rationale).
+  useEffect(() => {
+    fetchTrend()
+    const t = setInterval(fetchTrend, 60000)
+    return () => clearInterval(t)
+  }, [fetchTrend])
+
   const refreshAll = useCallback(() => {
     fetchLinks()
     fetchStats()
@@ -398,8 +445,9 @@ export default function Home() {
     fetchMonitoredChats()
     fetchReadiness()
     fetchPendingApprovals()
+    fetchTrend()
     setLastUpdated(new Date())
-  }, [fetchLinks, fetchStats, fetchJoiners, fetchMonitoredChats, fetchReadiness, fetchPendingApprovals])
+  }, [fetchLinks, fetchStats, fetchJoiners, fetchMonitoredChats, fetchReadiness, fetchPendingApprovals, fetchTrend])
 
   // [LIVE-STATUS] seconds since last successful refresh
   const secondsAgo = lastUpdated
@@ -569,6 +617,52 @@ export default function Home() {
             onClick={() => setModal('joiners')}
           />
         </div>
+
+        {/* [TREND-VIEW] Daily capture trend — stacked bars (Telegram bottom /
+            WhatsApp top) from /api/links_daily. Hover a bar for the exact
+            day breakdown; dashed line = window average. */}
+        {trendDaily.length > 0 && (
+          <Card className="bg-slate-800/30 border-slate-700/50 backdrop-blur-sm mb-6">
+            <CardHeader className="pb-2">
+              <CardTitle className="flex items-center justify-between text-lg">
+                <span className="flex items-center gap-2">
+                  <TrendingUp className="w-5 h-5 text-emerald-400" />
+                  اتجاه الالتقاط اليومي
+                  <span className="text-xs text-slate-500 font-normal">(آخر {trendDaily.length} يوم)</span>
+                </span>
+                <div className="flex items-center gap-2 flex-wrap">
+                  {trendTotals?.best_day && (
+                    <Badge className="bg-emerald-500/20 text-emerald-300 border-emerald-500/40 text-[10px]">
+                      🏆 أعلى يوم: {trendTotals.best_day.count.toLocaleString()}
+                    </Badge>
+                  )}
+                  {trendTotals && (
+                    <Badge className="bg-slate-700/50 text-slate-300 border-slate-600/40 text-[10px]">
+                      ⌀ {trendTotals.avg_per_day.toLocaleString()}/يوم
+                    </Badge>
+                  )}
+                </div>
+              </CardTitle>
+            </CardHeader>
+            <CardContent>
+              <TrendChart daily={trendDaily} totals={trendTotals} />
+              <div className="flex items-center justify-center gap-4 mt-1 text-[10px] text-slate-400">
+                <span className="flex items-center gap-1.5">
+                  <span className="w-2.5 h-2.5 rounded-sm bg-gradient-to-b from-emerald-400 to-emerald-600" />
+                  واتساب
+                </span>
+                <span className="flex items-center gap-1.5">
+                  <span className="w-2.5 h-2.5 rounded-sm bg-gradient-to-b from-blue-400 to-blue-600" />
+                  تيليجرام
+                </span>
+                <span className="flex items-center gap-1.5">
+                  <span className="w-4 border-t border-dashed border-slate-400" />
+                  المتوسط
+                </span>
+              </div>
+            </CardContent>
+          </Card>
+        )}
 
         {/* [FLEET-VIEW] Joiner Fleet Health — from ungated /ready. Shows at a
             glance whether joins are actually being processed: connected /
@@ -1080,6 +1174,278 @@ export default function Home() {
   )
 }
 
+// ===== useCountUp Hook — [STYLING] animated count-up for StatCard =====
+function useCountUp(target: number, duration = 700): number {
+  const [val, setVal] = useState(0)
+  const prev = useRef(0)
+  useEffect(() => {
+    const from = prev.current
+    if (from === target) {
+      setVal(target)
+      return
+    }
+    let raf = 0
+    const t0 = performance.now()
+    const step = (t: number) => {
+      const p = Math.min(1, (t - t0) / duration)
+      const eased = 1 - Math.pow(1 - p, 3) // easeOutCubic
+      setVal(Math.round(from + (target - from) * eased))
+      if (p < 1) raf = requestAnimationFrame(step)
+      else prev.current = target
+    }
+    raf = requestAnimationFrame(step)
+    return () => cancelAnimationFrame(raf)
+  }, [target, duration])
+  return val
+}
+
+// ===== timeAgo — [UX] relative timestamps ("منذ 5 د") =====
+function timeAgo(iso: string, nowDate: Date = new Date()): string {
+  const t = new Date(iso).getTime()
+  if (Number.isNaN(t)) return ''
+  const m = Math.floor((nowDate.getTime() - t) / 60000)
+  if (m < 1) return 'الآن'
+  if (m < 60) return `منذ ${m} د`
+  const h = Math.floor(m / 60)
+  if (h < 24) return `منذ ${h} س`
+  const d = Math.floor(h / 24)
+  if (d < 7) return `منذ ${d} يوم`
+  return new Date(iso).toLocaleDateString('ar-SA', { day: 'numeric', month: 'short' })
+}
+
+// ===== exportCsv — [CSV-VIEW] client-side CSV export (BOM for Excel/Arabic) =====
+function exportCsv(links: LinkItem[], filename: string) {
+  const head = [
+    'id', 'link', 'type', 'group_name', 'sender_name', 'created_at',
+    'ai_approved', 'ai_is_ad', 'ai_country', 'ai_description',
+  ]
+  const esc = (v: unknown): string => {
+    const s = v === null || v === undefined ? '' : String(v)
+    return /[",\n\r]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s
+  }
+  const rows = links.map((l) =>
+    [
+      l.id, l.link, l.link_type, l.group_name, l.sender_name, l.created_at,
+      l.ai_approved === null || l.ai_approved === undefined ? '' : l.ai_approved,
+      l.ai_is_ad === null || l.ai_is_ad === undefined ? '' : l.ai_is_ad,
+      l.ai_country, l.ai_description,
+    ].map(esc).join(',')
+  )
+  // \uFEFF BOM so Excel opens Arabic text as UTF-8 instead of mojibake.
+  const csv = '\uFEFF' + [head.join(','), ...rows].join('\r\n')
+  const blob = new Blob([csv], { type: 'text/csv;charset=utf-8' })
+  const url = URL.createObjectURL(blob)
+  const a = document.createElement('a')
+  a.href = url
+  a.download = filename
+  document.body.appendChild(a)
+  a.click()
+  a.remove()
+  URL.revokeObjectURL(url)
+}
+
+// ===== CopyButton — [UX] one-click copy with visual feedback =====
+function CopyButton(props: { text: string }) {
+  const { text } = props
+  const [copied, setCopied] = useState(false)
+  const onCopy = async (e: ReactMouseEvent) => {
+    e.preventDefault()
+    e.stopPropagation()
+    try {
+      await navigator.clipboard.writeText(text)
+      setCopied(true)
+      setTimeout(() => setCopied(false), 1500)
+    } catch {
+      // clipboard API unavailable (http/non-secure) — silent no-op
+    }
+  }
+  return (
+    <button
+      onClick={onCopy}
+      className={`transition-colors ${copied ? 'text-emerald-400' : 'text-slate-500 hover:text-white'}`}
+      title={copied ? 'تم النسخ ✓' : 'نسخ الرابط'}
+      aria-label={copied ? 'تم النسخ' : 'نسخ الرابط'}
+    >
+      {copied ? <Check className="w-3.5 h-3.5" /> : <Copy className="w-3.5 h-3.5" />}
+    </button>
+  )
+}
+
+// ===== TrendChart — [TREND-VIEW] SVG stacked-bars daily capture chart =====
+function TrendChart(props: { daily: DailyStat[]; totals: TrendTotals | null }) {
+  const { daily, totals } = props
+  const [hovered, setHovered] = useState<number | null>(null)
+  if (daily.length === 0) return null
+
+  const W = 720
+  const H = 190
+  const padL = 6
+  const padR = 6
+  const padT = 16
+  const padB = 24
+  const chartW = W - padL - padR
+  const chartH = H - padT - padB
+  const max = Math.max(...daily.map((d) => d.total), 1)
+  const barW = chartW / daily.length
+  const avg = totals?.avg_per_day ?? 0
+  const avgY = padT + chartH - (avg / max) * chartH
+  const hoverStat = hovered !== null ? daily[hovered] : null
+
+  return (
+    <div className="relative" dir="ltr">
+      <svg
+        viewBox={`0 0 ${W} ${H}`}
+        className="w-full select-none"
+        role="img"
+        aria-label="مخطط الروابط اليومية"
+      >
+        <defs>
+          <linearGradient id="tgGrad" x1="0" y1="0" x2="0" y2="1">
+            <stop offset="0%" stopColor="#60a5fa" />
+            <stop offset="100%" stopColor="#2563eb" />
+          </linearGradient>
+          <linearGradient id="waGrad" x1="0" y1="0" x2="0" y2="1">
+            <stop offset="0%" stopColor="#34d399" />
+            <stop offset="100%" stopColor="#059669" />
+          </linearGradient>
+        </defs>
+
+        {/* horizontal gridlines (4) */}
+        {[0.25, 0.5, 0.75, 1].map((f) => {
+          const y = padT + chartH - f * chartH
+          return (
+            <line
+              key={f}
+              x1={padL}
+              x2={W - padR}
+              y1={y}
+              y2={y}
+              stroke="#334155"
+              strokeWidth="0.5"
+              opacity="0.35"
+            />
+          )
+        })}
+
+        {/* dashed average line */}
+        {avg > 0 && (
+          <line
+            x1={padL}
+            x2={W - padR}
+            y1={avgY}
+            y2={avgY}
+            stroke="#94a3b8"
+            strokeWidth="1"
+            strokeDasharray="5 4"
+            opacity="0.7"
+          />
+        )}
+
+        {daily.map((d, i) => {
+          const x = padL + i * barW + barW * 0.16
+          const bw = barW * 0.68
+          const tgH = (d.telegram / max) * chartH
+          const waH = (d.whatsapp / max) * chartH
+          const yBase = padT + chartH
+          const isHover = hovered === i
+          const isBest =
+            totals?.best_day && d.date === totals.best_day.date && d.total > 0
+          return (
+            <g
+              key={d.date}
+              onMouseEnter={() => setHovered(i)}
+              onMouseLeave={() => setHovered(null)}
+            >
+              {/* hover hit-area */}
+              <rect
+                x={padL + i * barW}
+                y={padT}
+                width={barW}
+                height={chartH}
+                fill={isHover ? 'rgba(255,255,255,0.05)' : 'transparent'}
+              />
+              {/* telegram (bottom, blue) */}
+              <rect
+                x={x}
+                y={yBase - tgH}
+                width={bw}
+                height={Math.max(tgH, d.telegram > 0 ? 2 : 0)}
+                rx="2"
+                fill="url(#tgGrad)"
+                opacity={isHover ? 1 : 0.8}
+                className="transition-opacity"
+              />
+              {/* whatsapp (top, green) */}
+              <rect
+                x={x}
+                y={yBase - tgH - waH}
+                width={bw}
+                height={Math.max(waH, d.whatsapp > 0 ? 2 : 0)}
+                rx="2"
+                fill="url(#waGrad)"
+                opacity={isHover ? 1 : 0.85}
+                className="transition-opacity"
+              />
+              {/* best-day crown marker */}
+              {isBest && (
+                <text
+                  x={padL + i * barW + barW / 2}
+                  y={padT - 4}
+                  textAnchor="middle"
+                  fontSize="10"
+                >
+                  👑
+                </text>
+              )}
+              {/* x labels: first / middle / last */}
+              {(i === 0 || i === daily.length - 1 || i === Math.floor(daily.length / 2)) && (
+                <text
+                  x={padL + i * barW + barW / 2}
+                  y={H - 8}
+                  textAnchor="middle"
+                  fontSize="10"
+                  fill="#64748b"
+                >
+                  {d.date.slice(5).replace('-', '/')}
+                </text>
+              )}
+            </g>
+          )
+        })}
+      </svg>
+
+      {/* floating tooltip near the hovered bar */}
+      {hoverStat && hovered !== null && (
+        <div
+          className="absolute -top-1 pointer-events-none z-10 bg-slate-900/95 border border-slate-600 rounded-lg px-3 py-2 text-xs shadow-xl backdrop-blur-sm whitespace-nowrap"
+          style={{
+            left: `${((hovered + 0.5) / daily.length) * 100}%`,
+            transform: 'translateX(-50%)',
+          }}
+          dir="rtl"
+        >
+          <p className="font-bold text-white mb-1" dir="ltr">
+            {hoverStat.date}
+          </p>
+          <p className="text-slate-300">
+            الإجمالي:{' '}
+            <span className="font-bold text-white">{hoverStat.total.toLocaleString()}</span>
+          </p>
+          <p className="text-emerald-400">
+            واتساب: {hoverStat.whatsapp.toLocaleString()}
+          </p>
+          <p className="text-blue-400">
+            تيليجرام: {hoverStat.telegram.toLocaleString()}
+          </p>
+          {hoverStat.other > 0 && (
+            <p className="text-slate-400">أخرى: {hoverStat.other.toLocaleString()}</p>
+          )}
+        </div>
+      )}
+    </div>
+  )
+}
+
 // ===== StatCard Component =====
 function StatCard(props: {
   icon: ReactNode
@@ -1090,21 +1456,25 @@ function StatCard(props: {
   onClick: () => void
 }) {
   const { icon, label, value, gradient, iconColor, onClick } = props
+  // [STYLING] animated count-up — numbers roll smoothly on every refresh
+  const animated = useCountUp(value)
   return (
     <button
       onClick={onClick}
-      className="text-right hover:scale-105 transition-transform w-full"
+      className="text-right hover:scale-105 transition-transform w-full group"
     >
       <Card
-        className={`bg-gradient-to-br ${gradient} border-slate-700/50 backdrop-blur-sm overflow-hidden`}
+        className={`bg-gradient-to-br ${gradient} border-slate-700/50 backdrop-blur-sm overflow-hidden relative`}
       >
         <CardContent className="p-4">
+          {/* subtle hover sheen */}
+          <div className="absolute inset-0 bg-gradient-to-t from-white/5 to-transparent opacity-0 group-hover:opacity-100 transition-opacity pointer-events-none" />
           <div className="flex items-center justify-between">
             <div>
               <p className="text-slate-400 text-xs mb-1">{label}</p>
-              <p className="text-2xl font-bold text-white">{value.toLocaleString()}</p>
+              <p className="text-2xl font-bold text-white">{animated.toLocaleString()}</p>
             </div>
-            <div className={`${iconColor} opacity-80`}>{icon}</div>
+            <div className={`${iconColor} opacity-80 group-hover:opacity-100 group-hover:scale-110 transition-all`}>{icon}</div>
           </div>
         </CardContent>
       </Card>
@@ -1117,13 +1487,15 @@ function LinkCard(props: { link: LinkItem; compact?: boolean; isMonitored?: bool
   const { link, compact = false, isMonitored = false } = props
   const isWhatsapp = link.link_type === 'whatsapp'
   const date = new Date(link.created_at)
-  const timeStr = date.toLocaleString('ar-SA', {
+  // [UX] full timestamp on hover; friendly relative label on display
+  const fullTimeStr = date.toLocaleString('ar-SA', {
     year: 'numeric',
     month: 'short',
     day: 'numeric',
     hour: '2-digit',
     minute: '2-digit',
   })
+  const timeStr = timeAgo(link.created_at)
   const country =
     null
   const href = safeUrl(link.link)
@@ -1141,7 +1513,8 @@ function LinkCard(props: { link: LinkItem; compact?: boolean; isMonitored?: bool
               <span className="mr-1 text-emerald-400" title="المجموعة مصدر مراقَب">●</span>
             )}
           </span>
-          <span className="text-xs text-slate-500">{timeStr}</span>
+          <span className="text-xs text-slate-500" title={fullTimeStr}>{timeStr}</span>
+          {href && <CopyButton text={href} />}
         </div>
         {href && (
           <a
@@ -1224,9 +1597,10 @@ function LinkCard(props: { link: LinkItem; compact?: boolean; isMonitored?: bool
               </Badge>
             )}
           </div>
-          <div className="flex items-center gap-1 text-slate-500 text-xs">
+          <div className="flex items-center gap-1.5 text-slate-500 text-xs">
             <Clock className="w-3 h-3" />
-            {timeStr}
+            <span title={fullTimeStr}>{timeStr}</span>
+            {href && <CopyButton text={href} />}
           </div>
         </div>
         {href ? (
@@ -1305,6 +1679,20 @@ function LinksModal(props: {
   const { type, onClose, allLinks, joiners, joinersSummary, joinedGroups, monitoredChats, monitoredSummary, bannedGroups, pendingApprovals, pendingSummary } = props
   const [searchQuery, setSearchQuery] = useState<string>('')
 
+  // [UX] Esc closes the modal + / focuses the search box
+  useEffect(() => {
+    if (!type) return
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') onClose()
+      else if (e.key === '/' && !(e.target instanceof HTMLInputElement)) {
+        e.preventDefault()
+        document.getElementById('links-search-input')?.focus()
+      }
+    }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  }, [type, onClose])
+
   const filteredLinks = useMemo((): LinkItem[] => {
     if (!type) return []
     let filtered = [...allLinks]
@@ -1335,6 +1723,13 @@ function LinksModal(props: {
 
     return filtered
   }, [type, allLinks, searchQuery])
+
+  // [CSV-VIEW] export the CURRENT filtered view (respects search + tab).
+  // Defined AFTER filteredLinks — the dep array needs its value.
+  const onExportCsv = useCallback(() => {
+    const stamp = new Date().toISOString().slice(0, 10)
+    exportCsv(filteredLinks, `links-${type || 'all'}-${stamp}.csv`)
+  }, [filteredLinks, type])
 
   const modalTitle = useMemo((): string => {
     switch (type) {
@@ -1388,9 +1783,21 @@ function LinksModal(props: {
             <h2 className="text-xl font-bold text-white">{modalTitle}</h2>
             <div className="flex items-center gap-3">
               {type !== 'joiners' && type !== 'pending_approvals' && (
-                <Badge className="bg-slate-700 text-white border-0">
-                  {filteredLinks.length}
-                </Badge>
+                <>
+                  <Badge className="bg-slate-700 text-white border-0">
+                    {filteredLinks.length}
+                  </Badge>
+                  {/* [CSV-VIEW] export current filtered view */}
+                  <button
+                    onClick={onExportCsv}
+                    disabled={filteredLinks.length === 0}
+                    className="flex items-center gap-1.5 px-2.5 py-1 rounded-md border border-emerald-500/40 bg-emerald-500/10 text-emerald-300 text-xs hover:bg-emerald-500/20 transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
+                    title="تصدير النتائج الحالية CSV (مع احترام البحث والتصفية)"
+                  >
+                    <Download className="w-3.5 h-3.5" />
+                    <span className="hidden sm:inline">CSV</span>
+                  </button>
+                </>
               )}
               {type === 'pending_approvals' && pendingSummary && (
                 <Badge className="bg-sky-500/20 text-sky-300 border-sky-500/40">
@@ -1783,7 +2190,8 @@ function LinksModal(props: {
                 <div className="relative">
                   <Search className="absolute right-3 top-1/2 -translate-y-1/2 w-4 h-4 text-slate-400" />
                   <Input
-                    placeholder="ابحث في الروابط..."
+                    id="links-search-input"
+                    placeholder="ابحث في الروابط... (اضغط / للتركيز)"
                     value={searchQuery}
                     onChange={(e: ChangeEvent<HTMLInputElement>) =>
                       setSearchQuery(e.target.value)
