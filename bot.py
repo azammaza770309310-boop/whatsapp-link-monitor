@@ -2810,12 +2810,19 @@ class Monitor:
         # الهدف: لو حُذفت الرسالة قبل اكتمال PRE-CACHE metadata، يقدر
         # _on_message_deleted يسحب الرابط من LRB ويدخله dedup/queue.
         # Key: (chat_id, msg_id) → List[normalized_link]
+        # [PR-LRB-TTL] قيمة _link_ring[key] تظل List[str] فقط (backward-
+        # compat مع الاختبارات والـ Raw hook). الـtimestamps تُخزَّن في
+        # _link_ring_ts (parallel dict بنفس الـkey) حتى لا تكسر صيغة القيمة.
         self._link_ring: Dict[Tuple[int, int], List[str]] = {}
+        self._link_ring_ts: Dict[Tuple[int, int], float] = {}  # received_at per key
         self._link_ring_lock = asyncio.Lock()
         self._link_ring_ttl = 300   # 5 دقائق (أطول من cache لاحتمال وصول Delete متأخر)
         self._link_ring_cap = 20000 # حد أقصى لمنع نمو الذاكرة بلا حدود
-        self._link_ring_evicted = 0 # عدّاد للمراقبة
-        self._link_ring_hits = 0    # عدّاد ضربات الإنقاذ من LRB
+        self._link_ring_evicted = 0 # عدّاد للمراقبة (size-based eviction)
+        self._link_ring_ttl_evicted = 0  # عدّاد للمراقبة (TTL-based eviction)
+        # [PR-CLEANUP] حذف self._link_ring_hits = 0 — كان dead code:
+        # يُهيّأ في __init__ لكن لا يُزاد ولا يُقرأ في أي مكان إنتاجي
+        # (الميتريك الحقيقي يعيش في link_system.py record_link_ring_hit).
         # === ACTIVE POLLING WORKER ===
         # بدل الاعتماد على NewMessage events فقط (اللي قد تتأخر أو تُحذف قبل ما توصل),
         # نضيف polling نشط: كل 3 ثواني نسحب آخر 3 رسائل من كل مجموعة نشطة
@@ -3680,54 +3687,95 @@ class Monitor:
     # === LINK RING BUFFER helpers (PR-1) ===
     async def _link_ring_put(self, chat_id, msg_id, normalized_links: List[str]) -> None:
         """يخزّن الروابط المُستخرَجة (normalized) في LRB فوراً.
-        لا ينتظر metadata. لا يستخدم API. لا يكسر الـpipeline عند الفشل."""
+        لا ينتظر metadata. لا يستخدم API. لا يكسر الـpipeline عند الفشل.
+        [PR-LRB-TTL] يخزّن received_at في _link_ring_ts لتفعيل TTL eviction
+        الفعلي (سابقًا كان الـeviction يعتمد على الحجم فقط، فالروابط القديمة
+        كانت تبقى حتى تُدفع بروابط جديدة — الآن يطردها _link_ring_evict
+        بعد تجاوز TTL 300s حتى لو لم يصل الحد)."""
         if not normalized_links or chat_id is None or msg_id is None:
             return
+        key = (int(chat_id), int(msg_id))
         try:
             async with self._link_ring_lock:
+                # [PR-LRB-TTL] نظّف بشكل دفاعي الـ_link_ring_ts (لو موجود)
+                ts_dict = getattr(self, '_link_ring_ts', None)
                 # حماية من نمو الذاكرة: لو تجاوزنا الحد، اطرد أقدم 10% دفعة واحدة
                 if len(self._link_ring) >= self._link_ring_cap:
                     # اطرد 10% الأقدم (بترتيب الإدراج — أبسط وأسرع)
                     drop_n = max(1, self._link_ring_cap // 10)
                     for k in list(self._link_ring.keys())[:drop_n]:
                         self._link_ring.pop(k, None)
+                        if ts_dict is not None:
+                            ts_dict.pop(k, None)  # [PR-LRB-TTL] نظّف الـtimestamps
                     self._link_ring_evicted += drop_n
-                self._link_ring[(int(chat_id), int(msg_id))] = list(normalized_links)
+                # [PR-LRB-TTL] lazy TTL sweep: لو عندنا > 1000 entry،
+                # اطرد المنتهي صلاحية أولاً (تجنّب إضاعة الـcap على entries قديمة)
+                if ts_dict is not None and len(ts_dict) > 1000:
+                    cutoff = time.time() - self._link_ring_ttl
+                    expired = [k for k, ts in ts_dict.items() if ts < cutoff]
+                    for k in expired[:500]:  # cap per-put work
+                        self._link_ring.pop(k, None)
+                        ts_dict.pop(k, None)
+                    self._link_ring_ttl_evicted += len(expired[:500])
+                self._link_ring[key] = list(normalized_links)
+                if ts_dict is not None:
+                    ts_dict[key] = time.time()  # [PR-LRB-TTL] stamp
         except Exception as e:
             logging.debug(f"[LRB] put error ({chat_id},{msg_id}): {e}")
 
     async def _link_ring_pop(self, chat_id, msg_id) -> List[str]:
         """يسحب ويحذف روابط رسالة من LRB. يعيد [] لو غير موجود.
-        يدعم البحث عبر كل الشاتات لو chat_id=None (لأحداث الحذف بدون chat_id)."""
+        يدعم البحث عبر كل الشاتات لو chat_id=None (لأحداث الحذف بدون chat_id).
+        [PR-LRB-TTL] يحذف الـtimestamp المرتبط بالـkey أيضًا (حتى لا يبقى شبحًا)."""
         try:
             async with self._link_ring_lock:
+                ts_dict = getattr(self, '_link_ring_ts', None)  # defensive
                 if chat_id is not None:
-                    return self._link_ring.pop((int(chat_id), int(msg_id)), [])
+                    key = (int(chat_id), int(msg_id))
+                    if ts_dict is not None:
+                        ts_dict.pop(key, None)  # [PR-LRB-TTL] نظّف
+                    return self._link_ring.pop(key, [])
                 # chat_id مجهول — ابحث بالـmsg_id فقط (نادر، قد يخلط بين شاتات)
                 for key, val in list(self._link_ring.items()):
                     if key[1] == int(msg_id):
                         self._link_ring.pop(key, None)
+                        if ts_dict is not None:
+                            ts_dict.pop(key, None)  # [PR-LRB-TTL] نظّف
                         return val
         except Exception as e:
             logging.debug(f"[LRB] pop error ({chat_id},{msg_id}): {e}")
         return []
 
     async def _link_ring_evict(self) -> int:
-        """يطرد المدخلات المنتهية الصلاحية (> TTL). يعيد عدد المُطرَد."""
+        """يطرد المدخلات المنتهية الصلاحية (> TTL). يعيد عدد المُطرَد.
+        [PR-LRB-TTL] eviction حقيقي بالـTTL: نطرد كل entry عمرها >
+        _link_ring_ttl (300s افتراضيًا). سابقًا كان الـeviction يعتمد
+        على الحجم فقط (size-based) — فالروابط القديمة كانت تبقى أبدًا
+        حتى يصل الـcap، مما يعطّل مبرّر الـTTL المُعلَن. الآن TTL فعلي.
+        نسخّن أيضًا size-based eviction كـfallback لو فشل الـtimestamp لـ
+        بعض الـkeys (defensive)."""
         now = time.time()
         cutoff = now - self._link_ring_ttl
         evicted = 0
         try:
             async with self._link_ring_lock:
-                # LRB لا يخزّن received_at (نخزن links فقط) — لذا نعتمد على
-                # الحجم الإجمالي بدل الوقت. هذا مقصود: الروابط صغيرة، وحد
-                # الـcap + هذا الـeviction كافيان. (TTL مفيد فقط لو خزّنا timestamps.)
-                # نطرد أقدم 10% لو قاربنا الحد.
+                ts_dict = getattr(self, '_link_ring_ts', None)  # defensive
+                # [PR-LRB-TTL] المرحلة 1: طرد المنتهي بالـTTL (الأولوية)
+                if ts_dict is not None:
+                    expired = [k for k, ts in ts_dict.items() if ts < cutoff]
+                    for k in expired:
+                        self._link_ring.pop(k, None)
+                        ts_dict.pop(k, None)
+                    evicted = len(expired)
+                    self._link_ring_ttl_evicted += evicted
+                # المرحلة 2: size-based fallback (لو فشل TTL لسبب ما)
                 if len(self._link_ring) > int(self._link_ring_cap * 0.9):
                     drop_n = len(self._link_ring) // 10
                     for k in list(self._link_ring.keys())[:drop_n]:
                         self._link_ring.pop(k, None)
-                    evicted = drop_n
+                        if ts_dict is not None:
+                            ts_dict.pop(k, None)
+                    evicted += drop_n
                     self._link_ring_evicted += drop_n
         except Exception as e:
             logging.debug(f"[LRB] evict error: {e}")
@@ -5435,6 +5483,16 @@ class Monitor:
                             except Exception: pass
                             try: await self.metrics.record_delete_rescued('link_ring')
                             except Exception: pass
+                            # [PR-LRB-LOG] سجل صريح بأن الإنقاذ تم من LRB —
+                            # سابقًا كان هذا المسار صامتًا تمامًا (لا يوجد أي
+                            # [DELETE-HANDLER] log قبل الـcontinue) — فلم يكن
+                            # للمُشغّل دليل جنائي على وقوع الإنقاذ. الآن نُصدر
+                            # log INFO واضح يحمل msg_id + chat_id + new_count.
+                            logging.info(
+                                f"[DELETE-HANDLER] ✅ LRB-RESCUED msg_id={deleted_msg_id} "
+                                f"chat_id={chat_id} new_count={rescued} "
+                                f"source={source_phone}"
+                            )
                             # سجّل في journal للتحقيق (raw_text=None — link-only)
                             if self._journal_enabled() and chat_id is not None:
                                 try:
@@ -5464,6 +5522,12 @@ class Monitor:
                                 if key[1] == deleted_msg_id:
                                     cached_msg = self._msg_cache.pop(key, None)
                                     break
+                    # [PR-METRICS-FIX] علّم المصدر كـ'cache' لو وُجدت الرسالة
+                    # في الـ_​msg_cache — سابقًا كان rescue_source يبقى None،
+                    # فكان record_delete_rescued لا يُستدعى أبدًا لهذا المسار
+                    # رغم أن HELP text للميتريك يدّعي تغطية cache.
+                    if cached_msg is not None and rescue_source is None:
+                        rescue_source = 'cache'
 
                     # === المصدر 3: message_journal (durable — يصمد بعد restart/TTL) ===
                     if not cached_msg and self._journal_enabled():
@@ -5584,6 +5648,23 @@ class Monitor:
                             chat_link_type, orig_chat_id, orig_source_phone, deleted_msg_id,
                             pipeline_tag='DELETE-HANDLER')
 
+                        # [PR-METRICS-FIX] سجّل الميتريك لإنقاذ cache/journal/
+                        # get_messages — سابقًا كان record_delete_rescued يُستدعى
+                        # فقط في فرع LRB (bot.py:5436)، فلم تُحتسب أي من إنقاذات
+                        # cache/journal/get_messages رغم أن HELP text يدّعيها.
+                        # نستدعيها هنا بصورة best-effort مع source label صريح.
+                        try:
+                            await self.metrics.record_delete_rescued(
+                                rescue_source or 'cache')
+                        except Exception:
+                            pass
+                        # سجل لوج جنائي صريح للمسار غير-LRB أيضًا
+                        logging.info(
+                            f"[DELETE-HANDLER] ✅ {rescue_source or 'cache'}-RESCUED "
+                            f"msg_id={deleted_msg_id} chat_id={orig_chat_id} "
+                            f"new_count={1 if rescued else 0} source={orig_source_phone}"
+                        )
+
                         # === Mark as PROCESSED (claim_token verified) ===
                         if self.message_claim and claim_token:
                             ok = await self.message_claim.mark_processed(
@@ -5642,6 +5723,19 @@ class Monitor:
                         self._msg_cache.pop(key, None)
                 if expired_keys:
                     logging.debug(f"[CACHE] cleaned {len(expired_keys)} expired messages (size={len(self._msg_cache)})")
+                # [PR-LRB-TTL] شغّل LRB eviction الدوري — سابقًا كان
+                # _link_ring_evict معرّفًا لكن لا أحد يستدعيه (dead code path).
+                # الآن نُشغّله هنا كل 30s ليطرده entries المنتهية بالـTTL فعليًا.
+                try:
+                    evicted = await self._link_ring_evict()
+                    if evicted > 0:
+                        logging.debug(
+                            f"[LRB] TTL-evicted {evicted} entries "
+                            f"(size={len(self._link_ring)}, "
+                            f"ttl_evicted_total={self._link_ring_ttl_evicted})"
+                        )
+                except Exception as lrb_e:
+                    logging.debug(f"[LRB] periodic evict error: {lrb_e}")
                 # ملخص INFO دوري للرسائل بلا نص (رؤية جنائية بدون spam)
                 if getattr(self, '_no_text_count', 0) > 0:
                     logging.info(
@@ -5903,6 +5997,19 @@ class Monitor:
                         state='no_links')
                     continue
                 
+                # [PR-POLLING-LRB] اكتب الروابط المُستخرَجة في LRB أيضًا —
+                # سابقًا كان الـpolling يكتب فقط _msg_cache (مصدر الإنقاذ #2)،
+                # فلو حُذفت الرسالة قبل استهلاك الـcache (أو بعد TTL 120s)،
+                # لم يكن مسار LRB (مصدر #1 الأسرع) يحتوي الروابط. الآن نُوحّد
+                # مسار الالتقاط: كل من Raw hook + NewMessage + Polling يكتبون
+                # LRB، فيصبح الإنقاذ مستقلاً عن أي مسار التقاط واحد.
+                try:
+                    await self._link_ring_put(
+                        chat_id, msg.id,
+                        [l.get('normalized') or l.get('raw') for l in links])
+                except Exception:
+                    pass  # LRB فشل — لكن cache + journal سيغطّان
+
                 # الرسالة فيها روابط — عالجها كأنها NewMessage
                 logging.info(
                     f"[POLLING] 📨🔗 New link found via polling from '{chat_title[:30]}' "
@@ -8523,6 +8630,41 @@ class Monitor:
                     await self.prod_db.set_setting('join_paused', 'true')
                     logging.warning(f"[AUTO-PAUSE] PeerFlood/Ban detected → join_paused=true in DB")
 
+                elif status == "ACCOUNT_SATURATED":
+                    # [PR-CHANNELS-TOO-MUCH] Account has joined too many
+                    # channels/supergroups (ChannelsTooMuchError from Telegram).
+                    # This is account-level saturation — NOT transient:
+                    # retrying in 30 min would just hit the same limit and
+                    # burn another API call. Disable the account for join
+                    # (joiner_enabled=0) so the joiner selector skips it for
+                    # future links, and retry only after 24h to give the
+                    # operator time to leave some channels manually.
+                    state_to_set = GroupState.FAILED
+                    state_error = 'channels_too_much'
+                    final_status = 'QUEUED'
+                    next_retry = datetime.now() + timedelta(hours=24)
+                    await self.metrics.record_skip('channels_too_much')
+                    # Disable the account for join (async, best-effort)
+                    try:
+                        await self.db._supabase_update_watcher(
+                            phone, joiner_enabled=0)
+                        logging.error(
+                            f"[AUTO-DISABLE] {phone} ChannelsTooMuchError "
+                            f"→ joiner_enabled=0 (account saturated — re-enable "
+                            f"manually after leaving some channels)"
+                        )
+                    except Exception as dis_e:
+                        logging.error(
+                            f"[AUTO-DISABLE] failed to disable {phone} "
+                            f"after ChannelsTooMuch: {dis_e} — account may "
+                            f"keep being selected for join"
+                        )
+                    logging.warning(
+                        f"[LINK id={link_id}] [PIPELINE-6] 🚫 {phone} "
+                        f"ACCOUNT_SATURATED: {raw_link[:60]} — account "
+                        f"disabled for join, retry in 24h"
+                    )
+
                 elif status == "RATE_LIMITED":
                     final_status = 'QUEUED'
                     next_retry = datetime.now() + timedelta(minutes=10)
@@ -9805,6 +9947,13 @@ class Monitor:
                 # and is pending approval. Without this import the outer
                 # `except Exception` swallowed it as FAILED → infinite retry.
                 InviteRequestSentError,
+                # [PR-CHANNELS-TOO-MUCH] raised when the user account has joined
+                # too many channels/supergroups (Telegram account-level limit).
+                # This is NOT a transient failure: retrying in 30 min won't help
+                # — the account itself is saturated. Must disable the account for
+                # join (set joiner_enabled=0) and retry only after 24h to give
+                # the operator time to leave some channels manually.
+                ChannelsTooMuchError,
             )
 
             link_type = link_data['link_type']
@@ -9859,6 +10008,16 @@ class Monitor:
                 except ChatWriteForbiddenError:
                     logging.error(f"[JOIN] ❌ ChatWriteForbidden phone={phone} link={raw_link[:50]}")
                     return False, "PRIVATE", None
+                except ChannelsTooMuchError as e:
+                    # [PR-CHANNELS-TOO-MUCH] Account has joined too many
+                    # channels/supergroups. This is account-level saturation —
+                    # NOT transient. Caller must disable the account for join
+                    # and retry only after 24h.
+                    logging.error(
+                        f"[JOIN] ❌ ChannelsTooMuch phone={phone} link={raw_link[:50]} "
+                        f"— account saturated (joined too many channels)"
+                    )
+                    return False, "ACCOUNT_SATURATED", None
 
                 # === POST-JOIN VERIFICATION ===
                 logging.info(f"[JOIN] Verifying membership after IMPORT_INVITE for {phone}...")
@@ -9959,6 +10118,14 @@ class Monitor:
                 except ChatWriteForbiddenError:
                     logging.error(f"[JOIN] ❌ ChatWriteForbidden phone={phone} link={raw_link[:50]}")
                     return False, "PRIVATE", None
+                except ChannelsTooMuchError as e:
+                    # [PR-CHANNELS-TOO-MUCH] Same semantics as ImportChatInvite
+                    # path above — account saturated, disable + 24h retry.
+                    logging.error(
+                        f"[JOIN] ❌ ChannelsTooMuch phone={phone} link={raw_link[:50]} "
+                        f"— account saturated (joined too many channels)"
+                    )
+                    return False, "ACCOUNT_SATURATED", None
                 except Exception as e:
                     logging.error(f"[JOIN] ❌ {type(e).__name__}: {str(e)[:80]} phone={phone} link={raw_link[:50]}")
                     return False, "FAILED", None
@@ -10992,6 +11159,10 @@ async def metrics_handler(request):
     duplicate_links_skipped = msum.get('total_duplicates', 0)
     link_forwarded_total = msum.get('link_forwarded_total', 0)
     floodwait_total = msum.get('total_floodwait', 0)
+    # [PR-LRB-TTL] عدّادات eviction لمراقبة صحة الـLRB
+    link_ring_evicted_size = getattr(monitor, '_link_ring_evicted', 0)
+    link_ring_evicted_ttl = getattr(monitor, '_link_ring_ttl_evicted', 0)
+    link_ring_size = len(getattr(monitor, '_link_ring', {}) or {})
     # Fleet health (connected vs disconnected joiners)
     fh = getattr(monitor, '_fleet_health', {}) or {}
     connected_joiners = fh.get('connected_joiners', 0)
@@ -11021,9 +11192,19 @@ monitor_login_sessions {login_sessions}
 # HELP link_capture_total Total links captured (NewMessage + Raw + Polling)
 # TYPE link_capture_total counter
 link_capture_total {link_capture_total}
-# HELP link_ring_hits Links rescued from Link Ring Buffer after delete
+# HELP link_ring_hits Links rescued from Link Ring Buffer after delete (LRB-only path)
 # TYPE link_ring_hits counter
 link_ring_hits {link_ring_hits}
+# [PR-LRB-TTL] new observability counters for LRB health
+# HELP link_ring_size Current number of entries in Link Ring Buffer
+# TYPE link_ring_size gauge
+link_ring_size {link_ring_size}
+# HELP link_ring_evicted_size_total Entries evicted from LRB by size-based fallback (cap reached)
+# TYPE link_ring_evicted_size_total counter
+link_ring_evicted_size_total {link_ring_evicted_size}
+# HELP link_ring_evicted_ttl_total Entries evicted from LRB by TTL (older than 300s)
+# TYPE link_ring_evicted_ttl_total counter
+link_ring_evicted_ttl_total {link_ring_evicted_ttl}
 # HELP delete_miss_total Messages deleted before any delivery (no rescue possible)
 # TYPE delete_miss_total counter
 delete_miss_total {delete_miss_total}

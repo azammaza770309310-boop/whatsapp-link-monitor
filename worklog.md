@@ -1858,3 +1858,70 @@ Stage Summary:
 - **Migration fix deployed**: `96eb1f7` على origin/main يحمل الـSQL المصحَّح (DROP+CREATE POLICY) + 5 حرّاس انحدار تمنع عودة خطأ `CREATE POLICY IF NOT EXISTS`.
 - **الـsecret hygiene**: service_role JWT استُخدم عبر env vars فقط، لم يُطبَع. GitHub PAT كذلك. توصية التدوير ما زالت قائمة (كلاهما كُشفا نصيًا في المحادثة).
 - **المانع الوحيد المتبقي**: anon RLS denial المباشر يتطلب anon key (لا أملكه). لكن: (1) migration نفّذت الـpolicy بنجاح، (2) gate-level 401 مؤكَّد للوصول بلا apikey. الـpolicy موجودة ومُطبَّقة.
+
+---
+Task ID: FORENSIC-FIX-1to6
+Agent: senior (continuation session)
+Task: تنفيذ الإصلاحات الستة المُستنتجة من Forensic Verification السابق: (1) ChannelsTooMuchError → ACCOUNT_SATURATED + تعطيل الحساب، (2) Metrics Delete Rescue لكل المصادر، (3) Log LRB-RESCUED الصريح، (4) LRB TTL حقيقي، (5) Polling يكتب LRB، (6) تنظيف dead code.
+
+Work Log:
+- قرأت الكود الفعلي في /home/z/wlm/bot.py (11714 سطر بعد الإصلاحات) و link_system.py.
+- راجعت 6 أولويات المستخدم بدقة قبل البدء بالتعديل.
+- **PRIORITY 1 — ChannelsTooMuchError → ACCOUNT_SATURATED**:
+  - استوردت `ChannelsTooMuchError` من `telethon.errors` في `_join_group_safe` (bot.py:9808-9814) مع تعليق يشرح الـrationale.
+  - أضفت `except ChannelsTooMuchError:` في فرع `telegram_private` (ImportChatInviteRequest path) — يرجع `(False, "ACCOUNT_SATURATED", None)`.
+  - أضفت `except ChannelsTooMuchError:` في فرع `telegram` (JoinChannelRequest path) — نفس الـreturn.
+  - أضفت فرع `elif status == "ACCOUNT_SATURATED":` في PIPELINE-6 caller (bot.py:8526-8559):
+    * `GroupState.FAILED` + `state_error='channels_too_much'`
+    * `final_status='QUEUED'` مع `next_retry=+24h` (بدلًا من 30min)
+    * تعطيل الحساب فورًا: `await self.db._supabase_update_watcher(phone, joiner_enabled=0)` (try/except للتحمل)
+    * تسجيل `[AUTO-DISABLE]` ERROR log
+    * تسجيل `[PIPELINE-6] 🚫 ACCOUNT_SATURATED` WARNING log
+    * استدعاء `metrics.record_skip('channels_too_much')`
+- **PRIORITY 3 — [DELETE-HANDLER] LRB-RESCUED log** (bot.py:5438-5447):
+  - أضفت `logging.info(f"[DELETE-HANDLER] ✅ LRB-RESCUED msg_id={deleted_msg_id} chat_id={chat_id} new_count={rescued} source={source_phone}")` قبل `continue` الصامت في فرع LRB hit.
+  - سابقًا كان هذا المسار صامتًا تمامًا — لم يصدر أي `[DELETE-HANDLER]` log قبل الـcontinue.
+- **PRIORITY 2 — Metrics Delete Rescue (cache/journal/get_messages)**:
+  - أضفت `if cached_msg is not None and rescue_source is None: rescue_source = 'cache'` بعد pop من `_msg_cache` (bot.py:5477-5482) — سابقًا كان `rescue_source` يبقى `None` لمسار cache.
+  - أضفت استدعاء `await self.metrics.record_delete_rescued(rescue_source or 'cache')` بعد `_rescue_enqueue_links` ينجح في مسار cache/journal/get_messages (bot.py:5603-5612).
+  - أضفت `[DELETE-HANDLER] ✅ {source}-RESCUED ...` log لنفس المسار (bot.py:5613-5618).
+  - النتيجة: `delete_rescued_total` الآن يُزاد لكل المصادر الأربعة (LRB/cache/journal/get_messages)، فأخيرًا يطابق HELP text المُعلَن.
+- **PRIORITY 5 — Polling يكتب LRB** (bot.py:5939-5950):
+  - في `_poll_one_chat`، بعد `links = LinkNormalizer.extract_links(msg.raw_text)` و `if not links` block، أضفت استدعاء `await self._link_ring_put(chat_id, msg.id, [...])` (try/except best-effort).
+  - سابقًا كان polling يكتب فقط `_msg_cache` (مصدر الإنقاذ #2). الآن يكتب LRB أيضًا (مصدر #1)، فيصبح الإنقاذ مستقلاً عن مسار التقاط واحد.
+  - الآن جميع مسارات الالتقاط الثلاثة (Raw hook + NewMessage + Polling) تكتب LRB.
+- **PRIORITY 4 — LRB TTL حقيقي**:
+  - أضفت `self._link_ring_ts: Dict[Tuple[int, int], float] = {}` كـparallel dict للـtimestamps (bot.py:2817) — للحفاظ على backward-compatibility (قيمة `_link_ring[key]` تظل `List[str]` كما تتوقع الاختبارات).
+  - أضفت `self._link_ring_ttl_evicted = 0` counter للمراقبة (bot.py:2822).
+  - أعادت كتابة `_link_ring_put` (bot.py:3686-3724): يخزّن `ts_dict[key] = time.time()` + lazy TTL sweep لو > 1000 entry.
+  - أعادت كتابة `_link_ring_pop` (bot.py:3726-3747): يحذف الـtimestamp المرتبط عند الـpop.
+  - أعادت كتابة `_link_ring_evict` (bot.py:3749-3782): المرحلة 1 = TTL eviction حقيقي (يطرد entries عمرها > 300s)؛ المرحلة 2 = size-based fallback.
+  - جعلت كل الـmethods defensive عبر `ts_dict = getattr(self, '_link_ring_ts', None)` حتى لا تنكسر الاختبارات التي لا تُهيّئ `_link_ring_ts`.
+  - أضفت استدعاء `_link_ring_evict()` دوريًا في `_msg_cache_cleanup` (bot.py:5714-5726) كل 30s — سابقًا كان `_link_ring_evict` معرّفًا لكن لا أحد يستدعيه (dead path).
+- **PRIORITY 6 — تنظيف dead code + إضافة metrics للـTTL**:
+  - حذفت `self._link_ring_hits = 0` من `__init__` (bot.py:2823 سابقًا) — كان dead code: يُهيّأ لكن لا يُزاد ولا يُقرأ في أي مكان إنتاجي. الميتريك الحقيقي يعيش في `link_system.py` (`record_link_ring_hit`).
+  - أضفت 3 عدّادات جديدة في /metrics endpoint (bot.py:11152-11155, 11188-11197):
+    * `link_ring_size` (gauge) — عدد entries الحالي في LRB
+    * `link_ring_evicted_size_total` (counter) — entries طُردت بسبب size-based fallback
+    * `link_ring_evicted_ttl_total` (counter) — entries طُردت بسبب TTL (الـcounter الجديد)
+  - حدّثت HELP text لـ`link_ring_hits` لتوضيح أنه LRB-only path.
+  - HELP text لـ`delete_rescued_total` الآن صادق (بعد Priority 2 يغطّي cache/journal/LRB/get_messages فعليًا).
+
+Stage Summary:
+- **6/6 priorities implemented** في `/home/z/wlm/bot.py` فقط (لم ألمس link_system.py — تغييراتي كلها في bot.py).
+- **Syntax valid**: `python3 -c "import ast; ast.parse(open('bot.py').read())"` → OK.
+- **Tests PASS**: 18/18 targeted tests + 106/106 audit regressions + 29/29 (journal+safety+security+extractor) + 53/53 (source_registry+supabase+phase3+deployment) = 206/206 PASS. لا كسور.
+- **Backward-compatible**: استخدمت `getattr(self, '_link_ring_ts', None)` في كل methods LRB لتفادي كسر الاختبارات التي تُنشئ fake monitor بـ`_link_ring={}` فقط.
+- **العلاقات بين الإصلاحات**: Priority 1 منفصل تمامًا. Priority 2+3 يتعاونان (كلاهما في `_on_message_deleted`). Priority 4+5 يتعاونان (Polling يكتب LRB → LRB TTL eviction يطرد لاحقًا). Priority 6 نظّف ما تركته Priority 4 من counters جديدة.
+- **No commit/push**: لم أعمل commit ولا push. التغييرات محلية في working tree فقط. المستخدم يقرر متى يلتزم.
+- **Files modified**: 
+  - `/home/z/wlm/bot.py` (الحجم: ~619KB بعد +5KB من الإصلاحات)
+- **No new files created**. لم أُنشئ tests جديدة (تعليمات النظام: "do not write any test code").
+- **PR tag conventions** المُستخدمة في تعليقات الكود:
+  - `[PR-CHANNELS-TOO-MUCH]` — Priority 1 (3 مواقع)
+  - `[PR-LRB-LOG]` — Priority 3 (1 موقع)
+  - `[PR-METRICS-FIX]` — Priority 2 (2 موقع)
+  - `[PR-POLLING-LRB]` — Priority 5 (1 موقع)
+  - `[PR-LRB-TTL]` — Priority 4 (10 مواقع)
+  - `[PR-CLEANUP]` — Priority 6 (1 موقع)
+- **ما يحتاجه المستخدم لتفعيل Priority 1 في الإنتاج**: deploy الكود الجديد إلى Render. بمجرد النشر، أي `ChannelsTooMuchError` سيُعطّل الحساب تلقائيًا ويعيد المحاولة بعد 24h بدلًا من 30min. الحسابات المُعطّلة يمكن إعادة تفعيلها يدويًا عبر Supabase (`joiner_enabled=1`) بعد مغادرة بعض القنوات.
