@@ -2854,12 +2854,19 @@ async def test_5a_redact_phone_masks_middle():
 async def test_dashboard_restore_allowed_origins_env_parse():
     """[DASHBOARD-RESTORE-1] _get_dashboard_allowed_origins parses the env
     correctly: comma-separated, strips whitespace, strips trailing slashes,
-    ignores empty entries. Returns [] when env unset."""
+    ignores empty entries. UNSET env → code-deployed DEFAULT (the official
+    Vercel dashboard — DASHBOARD-RESTORE-2); empty-string env → [] (opt-out)."""
     try:
-        # unset → []
+        # unset → code-deployed default allowlist (DASHBOARD-RESTORE-2)
         os.environ.pop('DASHBOARD_ALLOWED_ORIGINS', None)
         got = bot._get_dashboard_allowed_origins()
-        record("DR-1a: unset env → []", got == [], f"got {got}")
+        record("DR-1a: unset env → default allowlist (code-deployed)",
+               got == [bot._DASHBOARD_DEFAULT_ALLOWED_ORIGINS], f"got {got}")
+        # empty-string env → [] (explicit opt-out → fully fail-closed)
+        os.environ['DASHBOARD_ALLOWED_ORIGINS'] = ""
+        got = bot._get_dashboard_allowed_origins()
+        record("DR-1a2: empty-string env → [] (opt-out)",
+               got == [], f"got {got}")
         # single
         os.environ['DASHBOARD_ALLOWED_ORIGINS'] = "https://dash.example.com"
         got = bot._get_dashboard_allowed_origins()
@@ -2872,6 +2879,13 @@ async def test_dashboard_restore_allowed_origins_env_parse():
         got = bot._get_dashboard_allowed_origins()
         record("DR-1c: multi + whitespace + trailing-slash normalized",
                got == ["https://a.vercel.app", "https://b.vercel.app"],
+               f"got {got}")
+        # env override beats the code default
+        os.environ['DASHBOARD_ALLOWED_ORIGINS'] = "https://other.example.com"
+        got = bot._get_dashboard_allowed_origins()
+        record("DR-1d: env override beats code default",
+               got == ["https://other.example.com"]
+               and bot._DASHBOARD_DEFAULT_ALLOWED_ORIGINS not in got,
                f"got {got}")
     except Exception as e:
         record("DR-1: exception", False, str(e))
@@ -2965,14 +2979,16 @@ async def test_dashboard_restore_unallowed_origin_rejected():
 
 
 async def test_dashboard_restore_empty_allowlist_fail_closed():
-    """[DASHBOARD-RESTORE-5] When the allowlist is EMPTY (env unset) AND
-    the key is unset, the middleware MUST return 401 (no implicit trust).
-    This guards against a regression that accidentally allow-lists
-    everything."""
+    """[DASHBOARD-RESTORE-5] When the allowlist is EXPLICITLY EMPTIED (env
+    set to empty string — the opt-out) AND the key is unset, the middleware
+    MUST return 401 (no implicit trust). DASHBOARD-RESTORE-2 changed the
+    unset-env default to the official Vercel URL, so the fail-closed mode
+    now requires the explicit empty-string opt-out. This guards against a
+    regression that accidentally allow-lists arbitrary origins."""
     try:
         os.environ.pop('DASHBOARD_API_KEY', None)
         os.environ.pop('API_FAIL_OPEN', None)
-        os.environ.pop('DASHBOARD_ALLOWED_ORIGINS', None)
+        os.environ['DASHBOARD_ALLOWED_ORIGINS'] = ""  # explicit opt-out
         bot._DASHBOARD_API_KEY_WARNED['open'] = False
         req = MagicMock()
         req.path = "/api/links"
@@ -2981,11 +2997,24 @@ async def test_dashboard_restore_empty_allowlist_fail_closed():
         handler = AsyncMock(return_value=web_json_ok())
         resp = await bot.dashboard_api_key_middleware(req, handler)
         is_401 = hasattr(resp, 'status') and resp.status == 401
-        record("DR-5: empty allowlist + key unset → 401 (no implicit trust)",
+        record("DR-5: empty-string allowlist (opt-out) + key unset → 401",
                is_401 and not handler.called,
                f"status={getattr(resp,'status',None)} called={handler.called}")
+        # Unrelated origin ALSO 401 under opt-out
+        req_evil = MagicMock()
+        req_evil.path = "/api/links"
+        req_evil.method = "GET"
+        req_evil.headers = {"Origin": "https://evil.example.com"}
+        handler2 = AsyncMock(return_value=web_json_ok())
+        resp2 = await bot.dashboard_api_key_middleware(req_evil, handler2)
+        is_401b = hasattr(resp2, 'status') and resp2.status == 401
+        record("DR-5b: opt-out mode → any origin 401 (fully fail-closed)",
+               is_401b and not handler2.called,
+               f"status={getattr(resp2,'status',None)} called={handler2.called}")
     except Exception as e:
         record("DR-5: exception", False, str(e))
+    finally:
+        os.environ.pop('DASHBOARD_ALLOWED_ORIGINS', None)
 
 
 async def test_dashboard_restore_options_preflight_allowed():
@@ -3073,12 +3102,25 @@ async def test_dashboard_restore_helper_is_origin_allowed():
         req3.headers = {"Origin": "https://evil.example.com"}
         record("DR-8c: unallowed Origin → False",
                bot._is_origin_allowed(req3) is False, "reject failed")
-        # empty allowlist
-        os.environ.pop('DASHBOARD_ALLOWED_ORIGINS', None)
+        # explicit opt-out (empty string) → empty allowlist → False
+        os.environ['DASHBOARD_ALLOWED_ORIGINS'] = ""
         req4 = MagicMock()
         req4.headers = {"Origin": "https://anything.com"}
-        record("DR-8d: empty allowlist → False (no implicit trust)",
+        record("DR-8d: explicit opt-out (empty env) → False (no implicit trust)",
                bot._is_origin_allowed(req4) is False, "implicit trust bug")
+        # unset env → code-deployed default allowlist → matches official origin
+        os.environ.pop('DASHBOARD_ALLOWED_ORIGINS', None)
+        req5 = MagicMock()
+        req5.headers = {"Origin": bot._DASHBOARD_DEFAULT_ALLOWED_ORIGINS}
+        record("DR-8e: unset env → default allowlist matches official origin",
+               bot._is_origin_allowed(req5) is True,
+               "code-deployed default not honored")
+        # unset env → default allowlist does NOT match unrelated origin
+        req6 = MagicMock()
+        req6.headers = {"Origin": "https://unrelated.example.com"}
+        record("DR-8f: unset env → default allowlist rejects unrelated origin",
+               bot._is_origin_allowed(req6) is False,
+               "default allowlist too permissive")
     except Exception as e:
         record("DR-8: exception", False, str(e))
     finally:

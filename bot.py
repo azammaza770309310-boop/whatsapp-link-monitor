@@ -11499,14 +11499,37 @@ def _api_fail_open() -> bool:
 # convenient restore for the public dashboard, not a complete security
 # boundary on its own.
 # -------------------------------------------------------------------
+# [DASHBOARD-RESTORE-2] Code-deployed DEFAULT allowlist. The first fix
+# (12c6c35) put the Vercel URL in render.yaml as a `value:` env var, but
+# Render does NOT auto-apply new render.yaml env vars to EXISTING services
+# (blueprint sync limitation) — verified live: the 12c6c35 code deployed
+# but the env var never landed, leaving the dashboard 401-broken for 2+
+# days while waiting for a manual Render-dashboard entry that never came.
+# The fix: bake the official dashboard origin into the code (deploys via
+# plain git push, which DOES auto-deploy), and keep the env var as an
+# override:
+#   - DASHBOARD_ALLOWED_ORIGINS unset  → default (official Vercel URL).
+#   - DASHBOARD_ALLOWED_ORIGINS="url"  → operator override (comma-list).
+#   - DASHBOARD_ALLOWED_ORIGINS=""     → explicit opt-out (empty allowlist,
+#     fully fail-closed; for operators who want key-only access).
+_DASHBOARD_DEFAULT_ALLOWED_ORIGINS = (
+    "https://whatsapp-monitor-jzp9pilke-azzam10.vercel.app"
+)
+
+
 def _get_dashboard_allowed_origins() -> list:
     """Return trusted dashboard origins (exact match, trailing slash stripped).
 
-    Set via DASHBOARD_ALLOWED_ORIGINS env, comma-separated, e.g.:
-      https://whatsapp-monitor-jzp9pilke-azzam10.vercel.app
-    Empty by default → no keyless access (fail-closed preserved).
+    Priority: DASHBOARD_ALLOWED_ORIGINS env (comma-separated) → if the env
+    var is UNSET, falls back to _DASHBOARD_DEFAULT_ALLOWED_ORIGINS (the
+    official Vercel dashboard — code-deployed because Render doesn't sync
+    new render.yaml env vars to existing services). Setting the env var to
+    an empty string disables keyless access entirely (opt-out).
     """
-    raw = os.environ.get("DASHBOARD_ALLOWED_ORIGINS") or ""
+    if "DASHBOARD_ALLOWED_ORIGINS" in os.environ:
+        raw = os.environ.get("DASHBOARD_ALLOWED_ORIGINS") or ""
+    else:
+        raw = _DASHBOARD_DEFAULT_ALLOWED_ORIGINS
     return [o.strip().rstrip("/") for o in raw.split(",") if o.strip()]
 
 

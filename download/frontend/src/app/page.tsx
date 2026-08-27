@@ -112,6 +112,44 @@ interface BannedGroup {
   last_error: string
 }
 
+// [FLEET-VIEW] /ready response — ungated health endpoint. fleet_health is
+// the live joiner-fleet snapshot (REQAUDIT-3): without it the operator
+// couldn't see that ALL joiners were in FloodWait while /ready said "ready".
+interface FleetHealth {
+  connected_joiners: number
+  floodwait_joiners_count: number
+  disconnected_joiners_count: number
+  safety_guard_blocked_joiners: number
+  all_joiners_unavailable: boolean
+}
+
+interface ReadinessData {
+  status: string
+  bot_connected: boolean
+  db_connected: boolean
+  active_watchers: number
+  scan_running: boolean
+  fleet_health?: FleetHealth
+}
+
+// [PENDING-VIEW] /api/pending_approvals response — groups where a join
+// request was sent and we're awaiting admin approval (REQAUDIT-2). The
+// 30-min self-healing recheck loop flips them to JOINED on approval.
+interface PendingApproval {
+  id: number
+  group_link: string
+  status: string
+  joined_by_phone: string
+  since: string
+  last_error: string
+}
+
+interface PendingApprovalsSummary {
+  total_pending_approval: number
+  recheck_interval_seconds: number
+  self_healing: boolean
+}
+
 type ModalType =
   | 'whatsapp'
   | 'telegram'
@@ -123,6 +161,7 @@ type ModalType =
   | 'joined_groups'
   | 'monitored_chats'
   | 'banned_groups'
+  | 'pending_approvals'
   | null
 
 // ===== Constants =====
@@ -165,6 +204,12 @@ export default function Home() {
   // catch" that left the operator staring at a blank dashboard with no
   // clue why every card was empty.
   const [apiError, setApiError] = useState<string | null>(null)
+  // [FLEET-VIEW + PENDING-VIEW + LIVE-STATUS] new operational data
+  const [readiness, setReadiness] = useState<ReadinessData | null>(null)
+  const [pendingApprovals, setPendingApprovals] = useState<PendingApproval[]>([])
+  const [pendingSummary, setPendingSummary] = useState<PendingApprovalsSummary | null>(null)
+  const [lastUpdated, setLastUpdated] = useState<Date | null>(null)
+  const [now, setNow] = useState<Date>(new Date())
 
   // ===== Fetch Functions =====
   const fetchStats = useCallback(async () => {
@@ -274,22 +319,92 @@ export default function Home() {
     }
   }, [])
 
+  // [FLEET-VIEW] /ready is UNGATED (health probe) → works even when
+  // DASHBOARD_API_KEY blocks /api/* — the fleet card always shows live data.
+  const fetchReadiness = useCallback(async () => {
+    try {
+      const response = await fetch(`${API_URL}/ready`, {
+        headers: { Accept: 'application/json' },
+      })
+      if (response.ok) {
+        const data = await response.json()
+        setReadiness({
+          status: data.status || 'unknown',
+          bot_connected: !!data.bot_connected,
+          db_connected: !!data.db_connected,
+          active_watchers: data.active_watchers || 0,
+          scan_running: !!data.scan_running,
+          fleet_health: data.fleet_health
+            ? {
+                connected_joiners: data.fleet_health.connected_joiners || 0,
+                floodwait_joiners_count: data.fleet_health.floodwait_joiners_count || 0,
+                disconnected_joiners_count: data.fleet_health.disconnected_joiners_count || 0,
+                safety_guard_blocked_joiners: data.fleet_health.safety_guard_blocked_joiners || 0,
+                all_joiners_unavailable: !!data.fleet_health.all_joiners_unavailable,
+              }
+            : undefined,
+        })
+      }
+    } catch (err) {
+      console.error('fetchReadiness error:', err)
+    }
+  }, [])
+
+  // [PENDING-VIEW] groups awaiting admin approval (REQAUDIT-2 lifecycle).
+  const fetchPendingApprovals = useCallback(async () => {
+    try {
+      const response = await fetch(`${API_URL}/api/pending_approvals`, {
+        headers: buildHeaders(),
+      })
+      if (response.ok) {
+        const data = await response.json()
+        setPendingApprovals(data.pending_approvals || [])
+        setPendingSummary(data.stats || null)
+      }
+    } catch (err) {
+      console.error('fetchPendingApprovals error:', err)
+    }
+  }, [])
+
   // Initial load + auto refresh (real-time every 15s)
   useEffect(() => {
     const load = async () => {
-      await Promise.all([fetchLinks(), fetchStats(), fetchJoiners(), fetchMonitoredChats()])
+      await Promise.all([
+        fetchLinks(),
+        fetchStats(),
+        fetchJoiners(),
+        fetchMonitoredChats(),
+        fetchReadiness(),
+        fetchPendingApprovals(),
+      ])
+      setLastUpdated(new Date())
     }
     load()
     const interval = setInterval(load, 15000) // 15s for real-time updates
     return () => clearInterval(interval)
-  }, [fetchLinks, fetchStats, fetchJoiners, fetchMonitoredChats])
+  }, [fetchLinks, fetchStats, fetchJoiners, fetchMonitoredChats, fetchReadiness, fetchPendingApprovals])
+
+  // [LIVE-STATUS] 1s ticker so "قبل X ثانية" freshness stays live between
+  // the 15s data refreshes.
+  useEffect(() => {
+    const t = setInterval(() => setNow(new Date()), 1000)
+    return () => clearInterval(t)
+  }, [])
 
   const refreshAll = useCallback(() => {
     fetchLinks()
     fetchStats()
     fetchJoiners()
     fetchMonitoredChats()
-  }, [fetchLinks, fetchStats, fetchJoiners, fetchMonitoredChats])
+    fetchReadiness()
+    fetchPendingApprovals()
+    setLastUpdated(new Date())
+  }, [fetchLinks, fetchStats, fetchJoiners, fetchMonitoredChats, fetchReadiness, fetchPendingApprovals])
+
+  // [LIVE-STATUS] seconds since last successful refresh
+  const secondsAgo = lastUpdated
+    ? Math.max(0, Math.floor((now.getTime() - lastUpdated.getTime()) / 1000))
+    : null
   return (
     <div className="min-h-screen bg-gradient-to-br from-slate-950 via-slate-900 to-slate-950 text-white">
       <div className="fixed inset-0 overflow-hidden pointer-events-none">
@@ -316,14 +431,74 @@ export default function Home() {
                 <p className="text-slate-400 text-xs">نظام سحب الروابط الذكي</p>
               </div>
             </div>
-            <Button
-              variant="ghost"
-              size="sm"
-              onClick={refreshAll}
-              className="text-slate-400 hover:text-white"
-            >
-              <RefreshCw className="w-4 h-4" />
-            </Button>
+            <div className="flex items-center gap-2 md:gap-3">
+              {/* [LIVE-STATUS] Connection pill — the incident lesson: the
+                  dashboard failed silently for 2 days. Now the header always
+                  shows whether the API is reachable + how fresh the data is. */}
+              <div
+                className={`flex items-center gap-2 px-3 py-1.5 rounded-full border text-xs font-medium backdrop-blur-sm ${
+                  apiError
+                    ? 'border-rose-500/40 bg-rose-500/10 text-rose-300'
+                    : 'border-emerald-500/40 bg-emerald-500/10 text-emerald-300'
+                }`}
+                title={apiError || 'الاتصال بالخادم يعمل بشكل طبيعي'}
+              >
+                <span className="relative flex w-2 h-2">
+                  <span
+                    className={`absolute inline-flex w-full h-full rounded-full opacity-75 animate-ping ${
+                      apiError ? 'bg-rose-400' : 'bg-emerald-400'
+                    }`}
+                  />
+                  <span
+                    className={`relative inline-flex w-2 h-2 rounded-full ${
+                      apiError ? 'bg-rose-500' : 'bg-emerald-500'
+                    }`}
+                  />
+                </span>
+                <span className="hidden sm:inline">
+                  {apiError ? 'انقطع الاتصال' : 'متصل'}
+                </span>
+                {!apiError && secondsAgo !== null && (
+                  <span className="text-emerald-400/70 font-mono text-[10px]">
+                    · {secondsAgo <= 0 ? 'الآن' : `قبل ${secondsAgo}ث`}
+                  </span>
+                )}
+              </div>
+              {/* [FLEET-VIEW] readiness micro-badges (ungated /ready data) */}
+              {readiness && (
+                <div className="hidden md:flex items-center gap-1.5">
+                  <span
+                    className={`flex items-center gap-1 px-2 py-1 rounded-md text-[10px] font-medium border ${
+                      readiness.bot_connected
+                        ? 'border-emerald-500/30 bg-emerald-500/10 text-emerald-300'
+                        : 'border-rose-500/30 bg-rose-500/10 text-rose-300'
+                    }`}
+                    title="اتصال بوت تيليجرام"
+                  >
+                    بوت {readiness.bot_connected ? '✓' : '✗'}
+                  </span>
+                  <span
+                    className={`flex items-center gap-1 px-2 py-1 rounded-md text-[10px] font-medium border ${
+                      readiness.db_connected
+                        ? 'border-emerald-500/30 bg-emerald-500/10 text-emerald-300'
+                        : 'border-rose-500/30 bg-rose-500/10 text-rose-300'
+                    }`}
+                    title="اتصال قاعدة البيانات"
+                  >
+                    قاعدة {readiness.db_connected ? '✓' : '✗'}
+                  </span>
+                </div>
+              )}
+              <Button
+                variant="ghost"
+                size="sm"
+                onClick={refreshAll}
+                className="text-slate-400 hover:text-white"
+                aria-label="تحديث البيانات"
+              >
+                <RefreshCw className="w-4 h-4" />
+              </Button>
+            </div>
           </div>
         </motion.div>
 
@@ -394,6 +569,135 @@ export default function Home() {
             onClick={() => setModal('joiners')}
           />
         </div>
+
+        {/* [FLEET-VIEW] Joiner Fleet Health — from ungated /ready. Shows at a
+            glance whether joins are actually being processed: connected /
+            floodwait / disconnected / safety-guard-blocked joiners + a red
+            alert when ALL joiners are unavailable. */}
+        {readiness?.fleet_health && (
+          <Card className="bg-slate-800/30 border-slate-700/50 backdrop-blur-sm mb-6">
+            <CardHeader className="pb-3">
+              <CardTitle className="flex items-center justify-between text-lg">
+                <span className="flex items-center gap-2">
+                  <Activity className="w-5 h-5 text-cyan-400" />
+                  صحة أسطول الانضمام
+                </span>
+                {readiness.fleet_health.all_joiners_unavailable ? (
+                  <Badge className="bg-rose-500/20 text-rose-300 border-rose-500/40 animate-pulse">
+                    ⛔ كل الحسابات غير متاحة
+                  </Badge>
+                ) : readiness.fleet_health.floodwait_joiners_count > 0 ? (
+                  <Badge className="bg-amber-500/20 text-amber-300 border-amber-500/40">
+                    ⏳ FloodWait × {readiness.fleet_health.floodwait_joiners_count}
+                  </Badge>
+                ) : (
+                  <Badge className="bg-emerald-500/20 text-emerald-300 border-emerald-500/40">
+                    ✅ يعمل بشكل طبيعي
+                  </Badge>
+                )}
+              </CardTitle>
+            </CardHeader>
+            <CardContent>
+              <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
+                <div className="bg-emerald-500/10 border border-emerald-500/30 rounded-lg p-3 text-center">
+                  <CheckCircle2 className="w-5 h-5 text-emerald-400 mx-auto mb-1" />
+                  <p className="text-2xl font-bold text-emerald-400">
+                    {readiness.fleet_health.connected_joiners}
+                  </p>
+                  <p className="text-xs text-slate-400 mt-1">متصل وجاهز</p>
+                </div>
+                <div className="bg-amber-500/10 border border-amber-500/30 rounded-lg p-3 text-center">
+                  <Clock3 className="w-5 h-5 text-amber-400 mx-auto mb-1" />
+                  <p className="text-2xl font-bold text-amber-400">
+                    {readiness.fleet_health.floodwait_joiners_count}
+                  </p>
+                  <p className="text-xs text-slate-400 mt-1">FloodWait مؤقت</p>
+                </div>
+                <div className="bg-red-500/10 border border-red-500/30 rounded-lg p-3 text-center">
+                  <XCircle className="w-5 h-5 text-red-400 mx-auto mb-1" />
+                  <p className="text-2xl font-bold text-red-400">
+                    {readiness.fleet_health.disconnected_joiners_count}
+                  </p>
+                  <p className="text-xs text-slate-400 mt-1">غير متصل</p>
+                </div>
+                <div className="bg-purple-500/10 border border-purple-500/30 rounded-lg p-3 text-center">
+                  <AlertTriangle className="w-5 h-5 text-purple-400 mx-auto mb-1" />
+                  <p className="text-2xl font-bold text-purple-400">
+                    {readiness.fleet_health.safety_guard_blocked_joiners}
+                  </p>
+                  <p className="text-xs text-slate-400 mt-1">حظر وقائي</p>
+                </div>
+              </div>
+              {readiness.scan_running && (
+                <p className="text-xs text-cyan-400/80 mt-3 flex items-center gap-1.5">
+                  <span className="w-1.5 h-1.5 rounded-full bg-cyan-400 animate-pulse" />
+                  فحص المحفوظات التاريخية يعمل الآن...
+                </p>
+              )}
+            </CardContent>
+          </Card>
+        )}
+
+        {/* [PENDING-VIEW] Groups awaiting admin approval — REQAUDIT-2
+            lifecycle. The 30-min self-healing recheck loop flips these to
+            JOINED automatically once an admin approves the join request. */}
+        {pendingSummary && pendingSummary.total_pending_approval > 0 && (
+          <Card className="bg-slate-800/30 border-slate-700/50 backdrop-blur-sm mb-6">
+            <CardHeader className="pb-3">
+              <CardTitle className="flex items-center justify-between text-lg">
+                <span className="flex items-center gap-2">
+                  <Clock3 className="w-5 h-5 text-sky-400" />
+                  بانتظار موافقة المشرف
+                </span>
+                <div className="flex items-center gap-2">
+                  {pendingSummary.self_healing && (
+                    <Badge className="bg-sky-500/20 text-sky-300 border-sky-500/40 text-[10px]">
+                      🔄 فحص تلقائي كل {Math.round(pendingSummary.recheck_interval_seconds / 60)} دقيقة
+                    </Badge>
+                  )}
+                  <Badge className="bg-sky-500/20 text-sky-300 border-sky-500/40">
+                    {pendingSummary.total_pending_approval} مجموعة
+                  </Badge>
+                </div>
+              </CardTitle>
+            </CardHeader>
+            <CardContent>
+              <button
+                onClick={() => setModal('pending_approvals')}
+                className="w-full text-right hover:scale-[1.01] transition-transform"
+              >
+                <div className="bg-slate-700/30 rounded-lg p-3 border border-slate-700">
+                  <div className="flex items-center justify-between mb-2">
+                    <h4 className="text-sm font-semibold text-slate-300">
+                      ✉️ طلبات انضمام مُعلّقة (تُشفى تلقائيًا عند القبول)
+                    </h4>
+                    <ArrowRight className="w-4 h-4 text-slate-400" />
+                  </div>
+                  <div className="space-y-1">
+                    {pendingApprovals.slice(0, 4).map((p) => (
+                      <div
+                        key={p.id}
+                        className="bg-slate-900/50 rounded p-2 text-xs flex items-center justify-between"
+                      >
+                        <span className="text-white truncate flex-1 font-mono" dir="ltr">
+                          {p.group_link || '؟'}
+                        </span>
+                        <span className="text-slate-500 mr-2 font-mono text-[10px]">
+                          {p.joined_by_phone}
+                        </span>
+                      </div>
+                    ))}
+                    {pendingApprovals.length > 4 && (
+                      <p className="text-xs text-slate-500 text-center pt-1">
+                        + {pendingApprovals.length - 4} طلب آخر...
+                      </p>
+                    )}
+                  </div>
+                </div>
+              </button>
+            </CardContent>
+          </Card>
+        )}
 
         {/* AI Stats Section */}
         {stats?.ai_stats && (
@@ -739,8 +1043,22 @@ export default function Home() {
           </CardContent>
         </Card>
 
-        <footer className="mt-10 text-center text-slate-500 text-xs">
+        <footer className="mt-10 text-center text-slate-500 text-xs pb-6">
           <p>نظام مراقبة الروابط © 2026</p>
+          <p className="mt-1 flex items-center justify-center gap-1.5">
+            <span className="w-1 h-1 rounded-full bg-slate-600 animate-pulse" />
+            تحديث تلقائي كل 15 ثانية
+            {lastUpdated && (
+              <span className="text-slate-600">
+                · آخر تحديث{' '}
+                {lastUpdated.toLocaleTimeString('ar-SA', {
+                  hour: '2-digit',
+                  minute: '2-digit',
+                  second: '2-digit',
+                })}
+              </span>
+            )}
+          </p>
         </footer>
       </div>
 
@@ -755,6 +1073,8 @@ export default function Home() {
         monitoredChats={monitoredChats}
         monitoredSummary={monitoredSummary}
         bannedGroups={bannedGroups}
+        pendingApprovals={pendingApprovals}
+        pendingSummary={pendingSummary}
       />
     </div>
   )
@@ -979,8 +1299,10 @@ function LinksModal(props: {
   monitoredChats: MonitoredChat[]
   monitoredSummary: MonitoredSummary | null
   bannedGroups: BannedGroup[]
+  pendingApprovals: PendingApproval[]
+  pendingSummary: PendingApprovalsSummary | null
 }) {
-  const { type, onClose, allLinks, joiners, joinersSummary, joinedGroups, monitoredChats, monitoredSummary, bannedGroups } = props
+  const { type, onClose, allLinks, joiners, joinersSummary, joinedGroups, monitoredChats, monitoredSummary, bannedGroups, pendingApprovals, pendingSummary } = props
   const [searchQuery, setSearchQuery] = useState<string>('')
 
   const filteredLinks = useMemo((): LinkItem[] => {
@@ -1036,6 +1358,8 @@ function LinksModal(props: {
         return '👁️ المجموعات المراقبة (تصنيف AI)'
       case 'banned_groups':
         return '🚫 المجموعات الممنوعة'
+      case 'pending_approvals':
+        return '✉️ بانتظار موافقة المشرف'
       default:
         return ''
     }
@@ -1063,9 +1387,14 @@ function LinksModal(props: {
           <div className="flex items-center justify-between p-4 border-b border-slate-700">
             <h2 className="text-xl font-bold text-white">{modalTitle}</h2>
             <div className="flex items-center gap-3">
-              {type !== 'joiners' && (
+              {type !== 'joiners' && type !== 'pending_approvals' && (
                 <Badge className="bg-slate-700 text-white border-0">
                   {filteredLinks.length}
+                </Badge>
+              )}
+              {type === 'pending_approvals' && pendingSummary && (
+                <Badge className="bg-sky-500/20 text-sky-300 border-sky-500/40">
+                  {pendingSummary.total_pending_approval}
                 </Badge>
               )}
               <button
@@ -1376,6 +1705,72 @@ function LinksModal(props: {
                           </span>
                         )}
                       </div>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+          ) : type === 'pending_approvals' ? (
+            <div className="flex-1 overflow-y-auto p-4" style={{ maxHeight: 'calc(95vh - 100px)' }}>
+              {pendingSummary && pendingSummary.self_healing && (
+                <div className="bg-sky-500/5 border border-sky-500/20 rounded-lg p-3 mb-4 text-xs text-sky-300/90 flex items-start gap-2">
+                  <Clock3 className="w-4 h-4 mt-0.5 flex-shrink-0" />
+                  <p>
+                    حلقة الفحص الذاتي تتحقق من كل طلب كل{' '}
+                    {Math.round(pendingSummary.recheck_interval_seconds / 60)} دقيقة — عند قبول
+                    المشرف تنتقل المجموعة تلقائيًا إلى «منضم». لا حاجة لأي إجراء منك.
+                  </p>
+                </div>
+              )}
+              {pendingApprovals.length === 0 ? (
+                <div className="text-center py-20">
+                  <CheckCircle2 className="w-12 h-12 mx-auto text-slate-600 mb-4" />
+                  <p className="text-slate-500">لا توجد طلبات معلّقة</p>
+                </div>
+              ) : (
+                <div className="space-y-2">
+                  {pendingApprovals.map((p) => (
+                    <div
+                      key={p.id}
+                      className="bg-slate-800/50 rounded-lg p-3 border border-sky-900/30"
+                    >
+                      <div className="flex items-start justify-between mb-2">
+                        <div className="flex-1 min-w-0">
+                          <a
+                            href={safeUrl(p.group_link) || '#'}
+                            target="_blank"
+                            rel="noopener noreferrer"
+                            className="text-xs text-blue-400 hover:text-blue-300 truncate block font-mono"
+                            dir="ltr"
+                          >
+                            {p.group_link || '؟'}
+                          </a>
+                        </div>
+                        <Badge variant="outline" className="border-sky-500/40 text-sky-400 ml-2">
+                          ✉️ معلّق
+                        </Badge>
+                      </div>
+                      <div className="flex items-center justify-between text-xs text-slate-400 mt-2">
+                        <span className="font-mono" dir="ltr">
+                          حساب الانضمام: {p.joined_by_phone || '؟'}
+                        </span>
+                        {p.since && (
+                          <span>
+                            منذ{' '}
+                            {new Date(p.since).toLocaleString('ar-SA', {
+                              day: 'numeric',
+                              month: 'short',
+                              hour: '2-digit',
+                              minute: '2-digit',
+                            })}
+                          </span>
+                        )}
+                      </div>
+                      {p.last_error && (
+                        <div className="bg-slate-500/5 border border-slate-500/20 rounded p-2 text-xs text-slate-400 mt-2">
+                          <span className="font-semibold">ملاحظة:</span> {p.last_error}
+                        </div>
+                      )}
                     </div>
                   ))}
                 </div>
