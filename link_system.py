@@ -370,6 +370,20 @@ class RateLimiter:
         next_retry = time.time() + seconds
         await self.db.set_floodwait(phone, next_retry)
         logging.warning(f"[RATE] {phone} FloodWait: {seconds}s (retry after {datetime.fromtimestamp(next_retry).strftime('%H:%M:%S')})")
+        # [PR-METRICS-FLOODWAIT] increment metrics counter — سابقًا كان
+        # rate_limiter.record_floodwait() يكتب DB state فقط (يضبط
+        # floodwait_tracker table)، فالميتريك floodwait_total كان يُزاد
+        # فقط من PIPELINE-6 caller (status="FLOODWAIT") وليس من مسارات
+        # polling/reconcile. النتيجة: floodwait_total: 0 في /metrics رغم
+        # أن fleet_health.floodwait_joiners_count >= 1.
+        # الآن لو أُعطِي RateLimiter مرجعًا للميتريك (يُضبط من bot.py
+        # بعد إنشائه)، يُزاد العدّاد عند كل FloodWait من أي مسار.
+        _metrics = getattr(self, 'metrics', None)
+        if _metrics is not None:
+            try:
+                await _metrics.record_floodwait(phone)
+            except Exception as _m_e:
+                logging.debug(f"[RATE] metrics.record_floodwait failed: {_m_e}")
 
 
 # -------------------------------------------------------------------

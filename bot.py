@@ -2784,6 +2784,13 @@ class Monitor:
         self.floodwait_mgr = FloodWaitManager(self.prod_db)
         self.membership_cache = MembershipCache(self.prod_db, self.rate_limiter)
         self.metrics = Metrics()
+        # [PR-METRICS-FLOODWAIT] اربط metrics بـrate_limiter حتى يُزاد
+        # floodwait_total عند كل FloodWait من polling/reconcile paths
+        # وليس فقط من PIPELINE-6 caller. (أنظر link_system.py:368-386.)
+        try:
+            self.rate_limiter.metrics = self.metrics
+        except Exception:
+            pass  # rate_limiter قد لا يكون له attribute metrics (defensive)
         self._scheduler_task = None
         # Emergency Controls (DB-backed, survives restart)
         self._join_paused = True  # افتراضي: متوقف حتى /resume_join
@@ -8319,6 +8326,15 @@ class Monitor:
                         if published:
                             logging.info(f"[LINK id={link_id}] [PUBLISH] success message_id={msg_id}")
                             logging.info(f"[LINK id={link_id}] [PIPELINE-5] ✅ PUBLISHED_VERIFIED message_id={msg_id}")
+                            # [PR-METRICS-PUBLISH] increment link_forwarded_total —
+                            # سابقًا كان record_link_forwarded() معرّف في link_system.py:608
+                            # لكن لا أحد يستدعيه في bot.py، فكان الميتريك يُخرج 0 دائمًا
+                            # في /metrics رغم أن الروابط كانت تُنشَر فعليًا. الآن
+                            # يُزاد عند كل PUBLISHED_VERIFIED موثّق.
+                            try:
+                                await self.metrics.record_link_forwarded()
+                            except Exception as _lf_e:
+                                logging.debug(f"[METRIC] record_link_forwarded failed: {_lf_e}")
                         else:
                             logging.error(f"[LINK id={link_id}] [PUBLISH] failed reason=send_failed link={raw_link[:60]}")
                             logging.error(f"[LINK id={link_id}] [PIPELINE-5] ❌ PUBLISH_FAILED — rolling back phantom publish row + retry in 2 min")
@@ -11159,6 +11175,20 @@ async def metrics_handler(request):
     duplicate_links_skipped = msum.get('total_duplicates', 0)
     link_forwarded_total = msum.get('link_forwarded_total', 0)
     floodwait_total = msum.get('total_floodwait', 0)
+    # [PR-METRICS-SKIP-EXPOSE] اكشف سبب كل skip في /metrics — سابقًا كان
+    # skip_reasons dict يعيش في الذاكرة فقط ولا يظهر في /metrics. المُشغّل
+    # كان يعجز عن رؤية لماذا تُتجاهل الروابط (blacklist/already_joined/
+    # publish_failed_send/ai_rejected/no_joiner_*/gulf_filter_*/...).
+    skip_reasons = msum.get('skip_reasons', {}) or {}
+    # [PR-METRICS-QUEUE] اكشف queue depth في /metrics — سابقًا كان مرئيًا
+    # فقط عبر /api/stats (المُحمي بـ DASHBOARD_API_KEY). المُشغّل يحتاج
+    # رؤية التراكم دون مصادقة ليعرف هل هناك backlog.
+    link_queue_pending = -1
+    try:
+        if getattr(monitor, 'prod_db', None) is not None:
+            link_queue_pending = await monitor.prod_db.get_queue_size()
+    except Exception as _q_e:
+        link_queue_pending = -1
     # [PR-LRB-TTL] عدّادات eviction لمراقبة صحة الـLRB
     link_ring_evicted_size = getattr(monitor, '_link_ring_evicted', 0)
     link_ring_evicted_ttl = getattr(monitor, '_link_ring_ttl_evicted', 0)
@@ -11235,6 +11265,16 @@ high_risk_chats {high_risk_chats}
 # HELP tight_poll_active 1 if tight-poll loop is active
 # TYPE tight_poll_active gauge
 tight_poll_active {tight_poll_active}
+# [PR-METRICS-QUEUE] queue depth (links waiting for processing)
+# HELP link_queue_pending Links currently queued for processing
+# TYPE link_queue_pending gauge
+link_queue_pending {link_queue_pending}
+# [PR-METRICS-SKIP-EXPOSE] per-reason skip breakdown — lets operator see
+# WHY links are being dropped (blacklist, already_joined, ai_rejected,
+# publish_failed_send, no_joiner_*, gulf_filter_*, low_member_count, etc.)
+# HELP link_skip_total Links skipped by central dedup/policy, by reason
+# TYPE link_skip_total counter
+{chr(10).join(f'link_skip_total{{reason="{r}"}} {c}' for r, c in sorted(skip_reasons.items(), key=lambda x: -x[1])) if skip_reasons else '# (no skips recorded yet)'}
 """
     return web.Response(text=metrics, content_type="text/plain")
 

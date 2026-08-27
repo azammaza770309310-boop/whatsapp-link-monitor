@@ -1925,3 +1925,97 @@ Stage Summary:
   - `[PR-LRB-TTL]` — Priority 4 (10 مواقع)
   - `[PR-CLEANUP]` — Priority 6 (1 موقع)
 - **ما يحتاجه المستخدم لتفعيل Priority 1 في الإنتاج**: deploy الكود الجديد إلى Render. بمجرد النشر، أي `ChannelsTooMuchError` سيُعطّل الحساب تلقائيًا ويعيد المحاولة بعد 24h بدلًا من 30min. الحسابات المُعطّلة يمكن إعادة تفعيلها يدويًا عبر Supabase (`joiner_enabled=1`) بعد مغادرة بعض القنوات.
+
+---
+Task ID: POST-DEPLOY-DAY1-OBSERVABILITY
+Agent: senior (continuation session — 24h post-deploy)
+Task: بعد مرور يوم كامل على نشر commit ab1559d (PRIORITY 1-6) إلى Render الإنتاج، فحص دقيق للـdashboard والـ/metrics لاكتشاف مشاكل الإنتاج وحلها بأعلى دقة.
+
+Work Log:
+- فحص /ready → bot_connected=true, db_connected=true, active_watchers=4.
+- فحص /metrics (64 سطر Prometheus format):
+  * link_capture_total=4781, delete_rescued_total=274, link_ring_hits=272
+  * link_ring_evicted_ttl_total=3417 ← PRIORITY 4 (LRB TTL) يعمل! ✅
+  * link_ring_size=21, link_ring_evicted_size_total=0 ← TTL eviction كافٍ، لا حاجة للـsize fallback
+  * delete_miss_total=2807, duplicate_links_skipped=2869
+  * 🚨 link_forwarded_total=0 ← ميتريك محرج
+  * 🚨 floodwait_total=0 رغم floodwait_joiners_count=1 من /ready
+  * connected_joiners=1 (من ~3-4 متوقعة), disconnected_accounts=1
+- استنسخت repo GitHub (azammaza770309310-boop/whatsapp-link-monitor) للفحص.
+- أكّدت أن commit ab1559d منشور فعلاً (HEAD == origin/main).
+- شخّصت 4 مشاكل observability حرجة:
+
+  **PROBLEM 1: `link_forwarded_total` دائمًا 0 (ميتريك مكسور)**
+  - PROVEN: `record_link_forwarded()` معرّف في link_system.py:608 لكن لا يُستدعى في أي مكان في bot.py.
+  - النتيجة: /metrics يُخرج 0 رغم أن الروابط تُنشَر فعليًا.
+  - الأثر: المُشغّل يعجز عن معرفة هل النشر يعمل أم لا.
+
+  **PROBLEM 2: `floodwait_total` لا يعكس المسار الكامل**
+  - PROVEN: `metrics.record_floodwait()` يُستدعى فقط في PIPELINE-6 caller (bot.py:8615, 8628) لـstatus=FLOODWAIT/BANNED.
+  - لكن `rate_limiter.record_floodwait(phone, seconds)` (link_system.py:368) يكتب DB state فقط، لا يُزاد الميتريك.
+  - يُستدعى من polling/reconcile/membership_cache paths (link_system.py:516, 523 + bot.py joiner).
+  - النتيجة: floodwait خارج مسار join لا يُحصى في /metrics.
+
+  **PROBLEM 3: `skip_reasons` غير مكشوفة في /metrics**
+  - PROVEN: skip_reasons dict يعيش في Metrics singleton (link_system.py:564, 644-650).
+  - يُحصى عدد per-reason (blacklist_*, already_joined, banned, ai_rejected, publish_failed_send, no_joiner_*, gulf_filter_*, low_member_count, channels_too_much, is_channel, invalid_link).
+  - لكن /metrics handler لا يُخرج أيًا منها.
+  - النتيجة: المُشغّل يعجز عن معرفة لماذا تُتجاهل الروابط دون فتح /api/skip_reasons (مُحمي بـDASHBOARD_API_KEY).
+
+  **PROBLEM 4: queue depth غير مكشوف في /metrics**
+  - PROVEN: get_queue_size() متاح (link_system.py:1123) لكنه مرئي فقط عبر /api/stats (مُحمي بـauth).
+  - النتيجة: المُشغّل يعجز عن رؤية backlog دون مصادقة.
+
+- طبّقت 4 إصلاحات دقيقة (+54 سطر، صفر حذف):
+
+  **Fix #1 — record_link_forwarded after PUBLISHED_VERIFIED** (bot.py:8322-8330):
+    - أضفت `await self.metrics.record_link_forwarded()` بعد الـlog line `[PIPELINE-5] ✅ PUBLISHED_VERIFIED`.
+    - try/except best-effort حتى لا يكسر النشر لو فشل الميتريك.
+
+  **Fix #2 — skip_reasons breakdown in /metrics** (bot.py:11171-11175 + 11261-11270):
+    - أضفت `skip_reasons = msum.get('skip_reasons', {}) or {}` في section البيانات.
+    - أضفت إخراج Prometheus labeled: `link_skip_total{reason="<reason>"} <count>` لكل سبب موجود.
+    - يستخدم chr(10).join(f-string generator) لإخراج سطر لكل reason.
+    - لو لا skips: يُخرج `# (no skips recorded yet)` تعليق.
+
+  **Fix #3 — link_queue_pending gauge in /metrics** (bot.py:11176-11184 + 11261-11264):
+    - أضفت `link_queue_pending = await monitor.prod_db.get_queue_size()` (defensive).
+    - أضفت سطر gauge: `link_queue_pending {link_queue_pending}`.
+    - لو فشل (prod_db غير متاح): -1 (Prometheus-valid).
+
+  **Fix #4 — metrics wiring to RateLimiter** (link_system.py:373-386 + bot.py:2787-2793):
+    - أضفت optional `metrics` attribute على RateLimiter (defensive getattr).
+    - `record_floodwait()` الآن يستدعي `metrics.record_floodwait(phone)` لو الميتريك متاح.
+    - في bot.py __init__: `self.rate_limiter.metrics = self.metrics` بعد الإنشاء (try/except defensive).
+    - النتيجة: أي FloodWait من polling/reconcile/membership_cache يُحصى في /metrics تلقائيًا.
+
+- التحقق النهائي:
+  - `python3 -c "import ast; ast.parse(...)"` على bot.py + link_system.py + source_registry.py → OK.
+  - 598/598 tests PASS (كل suites تُشغَّل كـpython3 scripts مباشرة):
+    test_delete_rescue 15/15, test_account_safety 10/10, test_api_security 13/13, test_audit_regressions 190/190, test_deployment_updated 35/35, test_extractor_comparison 3/3, test_fast_delete_rescue_evidence 16/16, test_link_capture 21/21, test_message_journal 66/66, test_phase3_contracts 96/96, test_raw_hook 13/13, test_source_registry 103/103, test_supabase_snapshot 17/17.
+  - لا انكسارات (صفر فشل).
+
+Stage Summary:
+- **4/4 observability bugs موثّقة ومُصلَحة**.
+- **+54 سطر، صفر حذف** في bot.py (40) + link_system.py (14).
+- **PR tag conventions**:
+  - `[PR-METRICS-PUBLISH]` — Fix #1 (1 موقع: bot.py:8322-8330)
+  - `[PR-METRICS-SKIP-EXPOSE]` — Fix #2 (2 موقع: bot.py:11171-11175, 11265-11270)
+  - `[PR-METRICS-QUEUE]` — Fix #3 (2 موقع: bot.py:11176-11184, 11261-11264)
+  - `[PR-METRICS-FLOODWAIT]` — Fix #4 (2 موقع: link_system.py:373-386, bot.py:2787-2793)
+- **Backward-compatible**: كل التغييرات defensive (getattr/try-except) — لا كسر للاختبارات التي تستخدم AsyncMock للميتريك.
+- **No tests added** (سياسة المشروع: tests/ مكتوبة بإستخدام unittest.mock.AsyncMock لا pytest-asyncio).
+- **No new files created**.
+- **Pending**: commit + push إلى origin/main → Render auto-deploy سيُلتقط التغييرات.
+- **Pre-deploy production state captured**:
+  * /metrics: link_forwarded_total=0, floodwait_total=0, link_queue_pending= غير متاح, skip_reasons= غير مكشوفة
+  * /ready: connected_joiners=1, disconnected_accounts=1, floodwait_joiners_count=1
+- **Post-deploy expected state** (after push + Render restart):
+  * link_forwarded_total سيبدأ بالزيادة عند كل PUBLISHED_VERIFIED
+  * floodwait_total سيعكس كل FloodWait من أي مسار
+  * link_queue_pending gauge يُظهر backlog مباشرة
+  * link_skip_total{reason="..."} يكشف لماذا تُتجاهل الروابط
+- **Action still required from operator** (ليست مشاكل كود، إعدادات Render):
+  * تشخيص لماذا 1 من 3-4 joiners متصل فقط (disconnected_joiners_count=1).
+  * التحقق من DASHBOARD_API_KEY على Render (كل /api/* يُرجِع 401).
+  * مراقبة link_queue_pending بعد النشر — لو >0 بتراكم، السبب غالبًا fleet degradation.
