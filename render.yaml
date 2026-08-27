@@ -98,6 +98,20 @@ services:
       # it to lock /api/* behind an X-Api-Key header. Leave empty for open access. ===
       - key: DASHBOARD_API_KEY
         sync: false
+      # === [DASHBOARD-RESTORE] Trusted-origin allowlist — RESTORES the Vercel
+      # dashboard that PR-7 (commit b6017b5) accidentally broke on 2026-08-26.
+      # When DASHBOARD_API_KEY is unset, the /api/* middleware rejects every
+      # request with 401 unless the request Origin matches one of these
+      # exact origins. The browser sets Origin on cross-origin fetches and it
+      # is a forbidden header (JS cannot override it), so this grants the
+      # official dashboard keyless access without exposing a secret in the
+      # browser bundle. PII stays masked (phones via _redact_phone) because
+      # DASHBOARD_API_KEY remains unset — origin-allow is a convenience, not
+      # a complete security boundary. For full protection set DASHBOARD_API_KEY.
+      # Comma-separated; trailing slashes are stripped. Override in Render
+      # dashboard if the Vercel project URL changes. ===
+      - key: DASHBOARD_ALLOWED_ORIGINS
+        value: "https://whatsapp-monitor-jzp9pilke-azzam10.vercel.app"
       # === [L07] LEASE_DURATION_S — MessageClaim lease window (was hardcoded
       # 60s). 180s tolerates a 4-account fan-out under FloodWait without
       # prematurely re-claiming in-flight work. ===

@@ -129,6 +129,19 @@ type ModalType =
 const API_URL: string =
   process.env.NEXT_PUBLIC_API_URL || 'https://whatsapp-userbot-yzm7.onrender.com'
 
+// [DASHBOARD-RESTORE] Optional shared-secret — if the operator sets
+// DASHBOARD_API_KEY on Render AND mirrors it here as
+// NEXT_PUBLIC_DASHBOARD_API_KEY on Vercel, the dashboard sends the
+// X-Api-Key header (defense-in-depth). When unset, the dashboard
+// relies on the backend's DASHBOARD_ALLOWED_ORIGINS allowlist.
+const API_KEY: string | undefined = process.env.NEXT_PUBLIC_DASHBOARD_API_KEY
+
+function buildHeaders(): Record<string, string> {
+  const h: Record<string, string> = { Accept: 'application/json' }
+  if (API_KEY) h['X-Api-Key'] = API_KEY
+  return h
+}
+
 function safeUrl(url: string | null | undefined): string | null {
   if (!url || typeof url !== 'string') return null
   const trimmed = url.trim()
@@ -148,12 +161,16 @@ export default function Home() {
   const [bannedGroups, setBannedGroups] = useState<BannedGroup[]>([])
   const [loading, setLoading] = useState<boolean>(true)
   const [modal, setModal] = useState<ModalType>(null)
+  // [DASHBOARD-RESTORE] Visible error state — replaces the old "silent
+  // catch" that left the operator staring at a blank dashboard with no
+  // clue why every card was empty.
+  const [apiError, setApiError] = useState<string | null>(null)
 
   // ===== Fetch Functions =====
   const fetchStats = useCallback(async () => {
     try {
       const response = await fetch(`${API_URL}/api/stats`, {
-        headers: { Accept: 'application/json' },
+        headers: buildHeaders(),
       })
       if (response.ok) {
         const data = await response.json()
@@ -172,16 +189,23 @@ export default function Home() {
               }
             : undefined,
         })
+        setApiError(null)
+      } else if (response.status === 401) {
+        setApiError(
+          'فشل الاتصال بالخادم (401): مفتاح API غير مُهيّأ. راجع DASHBOARD_ALLOWED_ORIGINS في Render، أو اضبط NEXT_PUBLIC_DASHBOARD_API_KEY في Vercel.'
+        )
+      } else {
+        setApiError(`فشل تحميل الإحصائيات (HTTP ${response.status})`)
       }
-    } catch {
-      // silent
+    } catch (err) {
+      setApiError('تعذّر الوصول إلى الخادم — تحقق من اتصال الإنترنت أو حالة Render.')
     }
   }, [])
 
   const fetchLinks = useCallback(async () => {
     try {
       const response = await fetch(`${API_URL}/api/links?limit=5000`, {
-        headers: { Accept: 'application/json' },
+        headers: buildHeaders(),
       })
       if (response.ok) {
         const data = await response.json()
@@ -190,16 +214,26 @@ export default function Home() {
           setAllLinks(links)
           setLoading(false)
         }
+        setApiError(null)
+      } else if (response.status === 401) {
+        setLoading(false)
+        setApiError(
+          'فشل تحميل الروابط (401): الخادم يرفض الطلب. فعّل DASHBOARD_ALLOWED_ORIGINS في Render أو اضبط مفتاح API.'
+        )
+      } else {
+        setLoading(false)
+        setApiError(`فشل تحميل الروابط (HTTP ${response.status})`)
       }
-    } catch {
-      // silent
+    } catch (err) {
+      setLoading(false)
+      setApiError('تعذّر الوصول إلى الخادم — تحقق من اتصال الإنترنت أو حالة Render.')
     }
   }, [])
 
   const fetchJoiners = useCallback(async () => {
     try {
       const response = await fetch(`${API_URL}/api/joiners_status`, {
-        headers: { Accept: 'application/json' },
+        headers: buildHeaders(),
       })
       if (response.ok) {
         const data = await response.json()
@@ -207,6 +241,10 @@ export default function Home() {
         setJoinersSummary(data.summary || null)
         setJoinedGroups(data.joined_groups || [])
         setBannedGroups(data.banned_groups || [])
+      } else if (response.status === 401) {
+        setApiError(
+          'فشل تحميل بيانات الحسابات (401): الخادم يرفض الطلب — راجع إعدادات DASHBOARD_ALLOWED_ORIGINS.'
+        )
       } else {
         console.error('fetchJoiners HTTP error:', response.status)
       }
@@ -218,12 +256,16 @@ export default function Home() {
   const fetchMonitoredChats = useCallback(async () => {
     try {
       const response = await fetch(`${API_URL}/api/monitored_chats`, {
-        headers: { Accept: 'application/json' },
+        headers: buildHeaders(),
       })
       if (response.ok) {
         const data = await response.json()
         setMonitoredChats(data.chats || [])
         setMonitoredSummary(data.summary || null)
+      } else if (response.status === 401) {
+        setApiError(
+          'فشل تحميل المجموعات المراقبة (401): الخادم يرفض الطلب — راجع إعدادات DASHBOARD_ALLOWED_ORIGINS.'
+        )
       } else {
         console.error('fetchMonitoredChats HTTP error:', response.status)
       }
@@ -284,6 +326,38 @@ export default function Home() {
             </Button>
           </div>
         </motion.div>
+
+        {/* [DASHBOARD-RESTORE] Visible error banner — replaces the old silent
+            failure mode where every card was just empty with no clue why. */}
+        {apiError && (
+          <motion.div
+            initial={{ opacity: 0, y: -10 }}
+            animate={{ opacity: 1, y: 0 }}
+            className="mb-6"
+          >
+            <div className="flex items-start gap-3 p-4 rounded-xl border border-rose-500/40 bg-rose-950/40 backdrop-blur-sm">
+              <AlertTriangle className="w-5 h-5 text-rose-400 mt-0.5 flex-shrink-0" />
+              <div className="flex-1 min-w-0">
+                <p className="text-sm font-bold text-rose-200 mb-1">
+                  خطأ في الاتصال بالخادم
+                </p>
+                <p className="text-xs text-rose-300/90 leading-relaxed">
+                  {apiError}
+                </p>
+                <p className="text-[10px] text-rose-400/70 mt-2 font-mono">
+                  API: {API_URL} · مرّبع الطلب كل 15 ثانية تلقائيًا
+                </p>
+              </div>
+              <button
+                onClick={refreshAll}
+                className="text-rose-300 hover:text-white transition-colors flex-shrink-0"
+                aria-label="إعادة المحاولة"
+              >
+                <RefreshCw className="w-4 h-4" />
+              </button>
+            </div>
+          </motion.div>
+        )}
 
         {/* Main Stats Cards */}
         <div className="grid grid-cols-2 md:grid-cols-4 gap-3 md:gap-4 mb-6">

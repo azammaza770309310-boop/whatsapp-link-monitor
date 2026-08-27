@@ -2842,6 +2842,249 @@ async def test_5a_redact_phone_masks_middle():
         record("5a-4: exception", False, str(e))
 
 
+# =========================================================================
+# [DASHBOARD-RESTORE] Trusted-origin allowlist — 8 regression guards.
+# Restores the Vercel dashboard that PR-7 (commit b6017b5, 2026-08-26)
+# accidentally broke: PR-7 made /api/* fail-closed when DASHBOARD_API_KEY
+# is unset, but the Vercel frontend sends no X-Api-Key → every fetch got
+# 401 → dashboard showed zero data. The fix grants keyless access to the
+# trusted dashboard Origin (browser-forbidden header, JS cannot spoof).
+# =========================================================================
+
+async def test_dashboard_restore_allowed_origins_env_parse():
+    """[DASHBOARD-RESTORE-1] _get_dashboard_allowed_origins parses the env
+    correctly: comma-separated, strips whitespace, strips trailing slashes,
+    ignores empty entries. Returns [] when env unset."""
+    try:
+        # unset → []
+        os.environ.pop('DASHBOARD_ALLOWED_ORIGINS', None)
+        got = bot._get_dashboard_allowed_origins()
+        record("DR-1a: unset env → []", got == [], f"got {got}")
+        # single
+        os.environ['DASHBOARD_ALLOWED_ORIGINS'] = "https://dash.example.com"
+        got = bot._get_dashboard_allowed_origins()
+        record("DR-1b: single origin parsed",
+               got == ["https://dash.example.com"], f"got {got}")
+        # comma-separated + whitespace + trailing slash
+        os.environ['DASHBOARD_ALLOWED_ORIGINS'] = (
+            " https://a.vercel.app/ , https://b.vercel.app/ ,  "
+        )
+        got = bot._get_dashboard_allowed_origins()
+        record("DR-1c: multi + whitespace + trailing-slash normalized",
+               got == ["https://a.vercel.app", "https://b.vercel.app"],
+               f"got {got}")
+    except Exception as e:
+        record("DR-1: exception", False, str(e))
+    finally:
+        os.environ.pop('DASHBOARD_ALLOWED_ORIGINS', None)
+
+
+async def test_dashboard_restore_origin_match_grants_access():
+    """[DASHBOARD-RESTORE-2] When DASHBOARD_API_KEY is unset AND the request
+    Origin is in the allowlist, the middleware MUST call the handler (no
+    X-Api-Key required). This is the core fix that restores the Vercel
+    dashboard without exposing a browser-key."""
+    try:
+        os.environ.pop('DASHBOARD_API_KEY', None)
+        os.environ.pop('API_FAIL_OPEN', None)
+        os.environ['DASHBOARD_ALLOWED_ORIGINS'] = (
+            "https://whatsapp-monitor-jzp9pilke-azzam10.vercel.app"
+        )
+        bot._DASHBOARD_API_KEY_WARNED['open'] = False
+        req = MagicMock()
+        req.path = "/api/links"
+        req.method = "GET"
+        req.headers = {"Origin":
+                       "https://whatsapp-monitor-jzp9pilke-azzam10.vercel.app"}
+        handler = AsyncMock(return_value=web_json_ok())
+        await bot.dashboard_api_key_middleware(req, handler)
+        record("DR-2: trusted Origin + key unset → handler invoked",
+               handler.called,
+               "middleware rejected the trusted dashboard origin — Vercel "
+               "dashboard stays broken")
+    except Exception as e:
+        record("DR-2: exception", False, str(e))
+    finally:
+        os.environ.pop('DASHBOARD_ALLOWED_ORIGINS', None)
+
+
+async def test_dashboard_restore_referer_fallback_match():
+    """[DASHBOARD-RESTORE-3] When Origin is absent (same-origin / older
+    browsers), the middleware falls back to parsing Referer and grants
+    access if the referer-origin matches the allowlist."""
+    try:
+        os.environ.pop('DASHBOARD_API_KEY', None)
+        os.environ.pop('API_FAIL_OPEN', None)
+        os.environ['DASHBOARD_ALLOWED_ORIGINS'] = (
+            "https://whatsapp-monitor-jzp9pilke-azzam10.vercel.app"
+        )
+        bot._DASHBOARD_API_KEY_WARNED['open'] = False
+        req = MagicMock()
+        req.path = "/api/stats"
+        req.method = "GET"
+        req.headers = {
+            "Referer": ("https://whatsapp-monitor-jzp9pilke-azzam10.vercel.app/"
+                        "dashboard?tab=links")
+        }
+        handler = AsyncMock(return_value=web_json_ok())
+        await bot.dashboard_api_key_middleware(req, handler)
+        record("DR-3: Referer fallback matches allowlist → handler invoked",
+               handler.called, "Referer fallback not honored")
+    except Exception as e:
+        record("DR-3: exception", False, str(e))
+    finally:
+        os.environ.pop('DASHBOARD_ALLOWED_ORIGINS', None)
+
+
+async def test_dashboard_restore_unallowed_origin_rejected():
+    """[DASHBOARD-RESTORE-4] When the Origin is NOT in the allowlist AND
+    DASHBOARD_API_KEY is unset AND API_FAIL_OPEN is false, the middleware
+    MUST return 401. This proves the allowlist is a real boundary, not
+    a blanket allow-everything."""
+    try:
+        os.environ.pop('DASHBOARD_API_KEY', None)
+        os.environ.pop('API_FAIL_OPEN', None)
+        os.environ['DASHBOARD_ALLOWED_ORIGINS'] = (
+            "https://whatsapp-monitor-jzp9pilke-azzam10.vercel.app"
+        )
+        bot._DASHBOARD_API_KEY_WARNED['open'] = False
+        req = MagicMock()
+        req.path = "/api/links"
+        req.method = "GET"
+        req.headers = {"Origin": "https://evil.example.com"}
+        handler = AsyncMock(return_value=web_json_ok())
+        resp = await bot.dashboard_api_key_middleware(req, handler)
+        is_401 = hasattr(resp, 'status') and resp.status == 401
+        record("DR-4: untrusted Origin → 401 fail-closed",
+               is_401 and not handler.called,
+               f"status={getattr(resp,'status',None)} called={handler.called}")
+    except Exception as e:
+        record("DR-4: exception", False, str(e))
+    finally:
+        os.environ.pop('DASHBOARD_ALLOWED_ORIGINS', None)
+
+
+async def test_dashboard_restore_empty_allowlist_fail_closed():
+    """[DASHBOARD-RESTORE-5] When the allowlist is EMPTY (env unset) AND
+    the key is unset, the middleware MUST return 401 (no implicit trust).
+    This guards against a regression that accidentally allow-lists
+    everything."""
+    try:
+        os.environ.pop('DASHBOARD_API_KEY', None)
+        os.environ.pop('API_FAIL_OPEN', None)
+        os.environ.pop('DASHBOARD_ALLOWED_ORIGINS', None)
+        bot._DASHBOARD_API_KEY_WARNED['open'] = False
+        req = MagicMock()
+        req.path = "/api/links"
+        req.method = "GET"
+        req.headers = {"Origin": "https://whatsapp-monitor-jzp9pilke-azzam10.vercel.app"}
+        handler = AsyncMock(return_value=web_json_ok())
+        resp = await bot.dashboard_api_key_middleware(req, handler)
+        is_401 = hasattr(resp, 'status') and resp.status == 401
+        record("DR-5: empty allowlist + key unset → 401 (no implicit trust)",
+               is_401 and not handler.called,
+               f"status={getattr(resp,'status',None)} called={handler.called}")
+    except Exception as e:
+        record("DR-5: exception", False, str(e))
+
+
+async def test_dashboard_restore_options_preflight_allowed():
+    """[DASHBOARD-RESTORE-6] OPTIONS preflight on /api/* MUST return 204 with
+    CORS headers (Access-Control-Allow-Headers includes X-Api-Key). Without
+    this, any future frontend that sends X-Api-Key triggers a preflight that
+    the old middleware rejected with 401 (OPTIONS carries no key)."""
+    try:
+        os.environ['DASHBOARD_API_KEY'] = "secret-123"  # even with key set
+        req = MagicMock()
+        req.path = "/api/stats"
+        req.method = "OPTIONS"
+        req.headers = {}  # OPTIONS carries no X-Api-Key
+        handler = AsyncMock(return_value=web_json_ok())
+        resp = await bot.dashboard_api_key_middleware(req, handler)
+        status = getattr(resp, 'status', None)
+        # Pull CORS headers off the mock response (aiohttp web.json_response)
+        hdrs = getattr(resp, 'headers', {}) or {}
+        allow_headers = hdrs.get('Access-Control-Allow-Headers', '')
+        record("DR-6: OPTIONS preflight → 204 + CORS headers",
+               status == 204 and 'X-Api-Key' in allow_headers and not handler.called,
+               f"status={status} allow_headers={allow_headers!r}")
+    except Exception as e:
+        record("DR-6: exception", False, str(e))
+    finally:
+        os.environ.pop('DASHBOARD_API_KEY', None)
+
+
+async def test_dashboard_restore_key_takes_precedence_over_origin():
+    """[DASHBOARD-RESTORE-7] When DASHBOARD_API_KEY IS set, the origin
+    allowlist is BYPASSED — the key is the sole gate. This means: a trusted
+    Origin + key set + no X-Api-Key → 401 (the operator explicitly chose
+    key-only mode)."""
+    try:
+        os.environ['DASHBOARD_API_KEY'] = "secret-key-456"
+        os.environ['DASHBOARD_ALLOWED_ORIGINS'] = (
+            "https://whatsapp-monitor-jzp9pilke-azzam10.vercel.app"
+        )
+        bot._DASHBOARD_API_KEY_WARNED['open'] = False
+        req = MagicMock()
+        req.path = "/api/links"
+        req.method = "GET"
+        req.headers = {
+            "Origin": "https://whatsapp-monitor-jzp9pilke-azzam10.vercel.app"
+        }  # trusted origin, BUT no X-Api-Key
+        handler = AsyncMock(return_value=web_json_ok())
+        resp = await bot.dashboard_api_key_middleware(req, handler)
+        is_401 = hasattr(resp, 'status') and resp.status == 401
+        record("DR-7: key set → origin allowlist bypassed (key sole gate)",
+               is_401 and not handler.called,
+               f"status={getattr(resp,'status',None)} called={handler.called}")
+    except Exception as e:
+        record("DR-7: exception", False, str(e))
+    finally:
+        os.environ.pop('DASHBOARD_API_KEY', None)
+        os.environ.pop('DASHBOARD_ALLOWED_ORIGINS', None)
+
+
+async def test_dashboard_restore_helper_is_origin_allowed():
+    """[DASHBOARD-RESTORE-8] _is_origin_allowed() directly: True for matching
+    Origin, True for matching Referer, False for unallowed Origin, False
+    when allowlist empty. White-box test of the helper itself."""
+    try:
+        os.environ['DASHBOARD_ALLOWED_ORIGINS'] = (
+            "https://whatsapp-monitor-jzp9pilke-azzam10.vercel.app"
+        )
+        # match Origin
+        req1 = MagicMock()
+        req1.headers = {"Origin":
+                         "https://whatsapp-monitor-jzp9pilke-azzam10.vercel.app"}
+        record("DR-8a: matching Origin → True",
+               bot._is_origin_allowed(req1) is True, "match failed")
+        # match Referer (no Origin)
+        req2 = MagicMock()
+        req2.headers = {"Referer":
+                        "https://whatsapp-monitor-jzp9pilke-azzam10.vercel.app/x"}
+        # MagicMock returns a MagicMock for .get on dict-like — use real dict
+        req2.headers = {
+            "Referer": "https://whatsapp-monitor-jzp9pilke-azzam10.vercel.app/x"
+        }
+        record("DR-8b: matching Referer (no Origin) → True",
+               bot._is_origin_allowed(req2) is True, "referer fallback failed")
+        # unallowed
+        req3 = MagicMock()
+        req3.headers = {"Origin": "https://evil.example.com"}
+        record("DR-8c: unallowed Origin → False",
+               bot._is_origin_allowed(req3) is False, "reject failed")
+        # empty allowlist
+        os.environ.pop('DASHBOARD_ALLOWED_ORIGINS', None)
+        req4 = MagicMock()
+        req4.headers = {"Origin": "https://anything.com"}
+        record("DR-8d: empty allowlist → False (no implicit trust)",
+               bot._is_origin_allowed(req4) is False, "implicit trust bug")
+    except Exception as e:
+        record("DR-8: exception", False, str(e))
+    finally:
+        os.environ.pop('DASHBOARD_ALLOWED_ORIGINS', None)
+
+
 def web_json_ok():
     """Minimal aiohttp.web.json_response stand-in for middleware tests."""
     class _R:
@@ -3793,6 +4036,17 @@ async def main():
     await test_5a_middleware_exempt_health_endpoints()
     await test_5a_middleware_unset_means_open()
     await test_5a_redact_phone_masks_middle()
+
+    # === [DASHBOARD-RESTORE] Trusted-origin allowlist — restores the Vercel
+    # dashboard that PR-7 (commit b6017b5) accidentally broke on 2026-08-26. ===
+    await test_dashboard_restore_allowed_origins_env_parse()
+    await test_dashboard_restore_origin_match_grants_access()
+    await test_dashboard_restore_referer_fallback_match()
+    await test_dashboard_restore_unallowed_origin_rejected()
+    await test_dashboard_restore_empty_allowlist_fail_closed()
+    await test_dashboard_restore_options_preflight_allowed()
+    await test_dashboard_restore_key_takes_precedence_over_origin()
+    await test_dashboard_restore_helper_is_origin_allowed()
 
     # === Task 11a — Secrets scan ===
     await test_11a_no_real_secrets_in_source_files()
