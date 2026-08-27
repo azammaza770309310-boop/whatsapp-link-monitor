@@ -2019,3 +2019,46 @@ Stage Summary:
   * تشخيص لماذا 1 من 3-4 joiners متصل فقط (disconnected_joiners_count=1).
   * التحقق من DASHBOARD_API_KEY على Render (كل /api/* يُرجِع 401).
   * مراقبة link_queue_pending بعد النشر — لو >0 بتراكم، السبب غالبًا fleet degradation.
+
+---
+Task ID: POST-DEPLOY-DAY1-VERIFICATION
+Agent: senior (continuation session — post-push verification)
+Task: التحقق من أن إصلاحات الـobservability الأربعة منشورة فعليًا على Render الإنتاج وأن الـmetrics الجديدة تعرض بيانات صادقة.
+
+Work Log:
+- Push commit 8ca09a2 إلى origin/main نجح (`ab1559d..8ca09a2 main -> main`).
+- انتظرت 90s لـRender auto-deploy، ثم تحققت من /ready → `all_joiners_unavailable: true` (البوت أعاد التشغيل للتو).
+- انتظرت 60s إضافية لاستكمال إعادة التشغيل ثم فحص /metrics.
+
+Post-deploy /metrics verification (النتائج المؤكّدة):
+- ✅ **Fix #1 confirmed**: `link_forwarded_total 1` (was 0 قبل النشر).
+- ✅ **Fix #2 confirmed**: 4 skip_reasons مكتشفة:
+  - `link_skip_total{reason="blacklist_blacklist_60 قروب متنوع"} 24`
+  - `link_skip_total{reason="blacklist_blacklist_بنات تبوك"} 4`
+  - `link_skip_total{reason="blacklist_blacklist_تعطير المنزل"} 2`
+  - `link_skip_total{reason="blacklist_blacklist_فضفضة"} 2`
+- ✅ **Fix #3 confirmed**: `link_queue_pending 61` (61 رابط في queue ينتظر المعالجة).
+- ✅ **Fix #4 confirmed**: `floodwait_total 1` (1 FloodWait event منذ restart).
+
+Post-deploy /ready fleet_health:
+- `connected_joiners: 2` (up من 1 — تحسّن)
+- `floodwait_joiners_count: 0` (انمحى بعد restart)
+- `disconnected_joiners_count: 1` (لا يزال حساب واحد غير متصل)
+- `all_joiners_unavailable: false` (النظام يعمل بـ2 من 3)
+
+Stage Summary:
+- **4/4 إصلاحات مؤكّدة في الإنتاج** خلال ~3 دقائق من الـpush.
+- الـPrometheus endpoint `/metrics` الآن يعرض 4 ميتريكس جديدة:
+  1. `link_forwarded_total` (counter)
+  2. `link_queue_pending` (gauge)
+  3. `link_skip_total{reason="..."}` (labeled counter)
+  4. `floodwait_total` (counter) — الآن يعكس كل FloodWait من أي مسار
+- **Production diagnostic snapshot** (1 min بعد restart):
+  * 1 رابط نُشِر بنجاح منذ restart
+  * 61 رابط في queue (backlog — يحتاج متابعة)
+  * 32 skip بسبب blacklist (متوقع — فلتر محتوى)
+  * 1 FloodWait event منذ restart
+- **Action required** (ليست bugs، تشخيص operator):
+  * مراقبة `link_queue_pending` — لو ظل 61+ يزداد، السبب fleet degradation (1 disconnected account)
+  * التحقق من الحساب المُنفصل: متابعة `/ready` fleet_health.disconnected_joiners_count
+  * rotate الـGitHub PAT بعد التأكد من استقرار النشر (تم استخدام token مؤقت في session).
