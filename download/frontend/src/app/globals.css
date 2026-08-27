@@ -41,3 +41,13 @@
 ::-webkit-scrollbar-thumb:hover {
   background: hsl(217 33% 35%);
 }
+
+/* [NAV] hide the horizontal scrollbar on the sticky quick-nav chip bar —
+   the chips hint scrollability by being partially cut off on mobile. */
+.no-scrollbar {
+  -ms-overflow-style: none;
+  scrollbar-width: none;
+}
+.no-scrollbar::-webkit-scrollbar {
+  display: none;
+}

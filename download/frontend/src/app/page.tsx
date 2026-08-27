@@ -13,7 +13,7 @@ import {
   RefreshCw, ExternalLink, Phone, MapPin, Clock, ArrowRight,
   X, Activity, CheckCircle2, XCircle, AlertTriangle, Clock3,
   Copy, Check, Download, TrendingUp, BarChart3, Flame,
-  VolumeX, ShieldCheck,
+  VolumeX, ShieldCheck, UserCircle2, BellRing,
 } from 'lucide-react'
 import type { ReactNode, MouseEvent as ReactMouseEvent, ChangeEvent } from 'react'
 
@@ -199,6 +199,27 @@ interface TopGroupsTotals {
   distinct_groups: number
 }
 
+// [SENDERS-VIEW] /api/top_senders response — WHO posts the links. The
+// leaderboard is PII-free by construction (the backend never selects
+// sender_contact); top_group + groups_count give the WHERE context.
+interface TopSender {
+  sender: string
+  total: number
+  whatsapp: number
+  telegram: number
+  other: number
+  share: number
+  groups_count: number
+  top_group: string
+  first_seen: string
+  last_seen: string
+}
+
+interface TopSendersTotals {
+  total: number
+  distinct_senders: number
+}
+
 // [SOURCE-HEALTH] a producing source whose last_seen is aging — the client
 // computes daysQuiet from the 30-day top-groups snapshot.
 type QuietSource = TopGroup & { daysQuiet: number }
@@ -216,7 +237,28 @@ type ModalType =
   | 'banned_groups'
   | 'pending_approvals'
   | 'top_groups'
+  | 'top_senders'
   | null
+
+// [ALERT-VIEW] one consolidated attention item surfaced by the strip.
+interface AttentionItem {
+  id: string
+  tone: 'rose' | 'amber' | 'sky'
+  text: string
+}
+
+// [NAV] quick-jump sections for the sticky chip bar.
+const NAV_SECTIONS: { id: string; label: string }[] = [
+  { id: 'sec-overview', label: 'نظرة عامة' },
+  { id: 'sec-trend', label: 'الاتجاه' },
+  { id: 'sec-sources', label: 'المصادر' },
+  { id: 'sec-senders', label: 'المرسلون' },
+  { id: 'sec-health', label: 'الصحة' },
+  { id: 'sec-fleet', label: 'الأسطول' },
+  { id: 'sec-ai', label: 'الذكاء' },
+  { id: 'sec-monitored', label: 'المراقبة' },
+  { id: 'sec-joiners', label: 'الفدائيون' },
+]
 
 // ===== Constants =====
 const API_URL: string =
@@ -286,6 +328,11 @@ export default function Home() {
   // [SOURCE-HEALTH] independent 30-day top-groups snapshot for quiet-source
   // detection (NOT tied to trendDays — see fetchSourceHealth rationale).
   const [healthGroups, setHealthGroups] = useState<TopGroup[]>([])
+  // [SENDERS-VIEW] top link posters (WHO) — same window as the trend chart.
+  const [topSenders, setTopSenders] = useState<TopSender[]>([])
+  const [topSendersTotals, setTopSendersTotals] = useState<TopSendersTotals | null>(null)
+  // [ALERT-VIEW] dismissed attention-strip ids (session-lifetime).
+  const [dismissedAlerts, setDismissedAlerts] = useState<Set<string>>(new Set())
 
   // ===== Fetch Functions =====
   const fetchStats = useCallback(async () => {
@@ -503,6 +550,27 @@ export default function Home() {
     }
   }, [])
 
+  // [SENDERS-VIEW] top link posters over the shared window — completes the
+  // WHAT (trend) / WHEN (hourly) / WHERE (groups) picture with WHO. The
+  // endpoint is PII-free (no sender_contact ever fetched), so the card needs
+  // no masking logic. limit=50 (server max) so the full modal list arrives;
+  // the card slices the top 6.
+  const fetchTopSenders = useCallback(async (days: number) => {
+    try {
+      const response = await fetch(
+        `${API_URL}/api/top_senders?days=${days}&limit=50`,
+        { headers: buildHeaders() }
+      )
+      if (response.ok) {
+        const data = await response.json()
+        if (Array.isArray(data.senders)) setTopSenders(data.senders)
+        if (data.totals) setTopSendersTotals(data.totals)
+      }
+    } catch (err) {
+      console.error('fetchTopSenders error:', err)
+    }
+  }, [])
+
   // Initial load + auto refresh (real-time every 15s)
   useEffect(() => {
     const load = async () => {
@@ -530,17 +598,19 @@ export default function Home() {
 
   // [TREND-VIEW] initial load + 60s refresh cycle (see fetchTrend rationale).
   // Re-runs when the window selector changes (7/14/30) so the chart, the
-  // hourly strip and the top-groups card all switch windows together.
+  // hourly strip, the top-groups card AND the top-senders card all switch
+  // windows together.
   useEffect(() => {
     const load = () => {
       fetchTrend(trendDays)
       fetchTopGroups(trendDays)
+      fetchTopSenders(trendDays)
       fetchSourceHealth()
     }
     load()
     const t = setInterval(load, 60000)
     return () => clearInterval(t)
-  }, [fetchTrend, fetchTopGroups, fetchSourceHealth, trendDays])
+  }, [fetchTrend, fetchTopGroups, fetchTopSenders, fetchSourceHealth, trendDays])
 
   const refreshAll = useCallback(() => {
     fetchLinks()
@@ -551,9 +621,10 @@ export default function Home() {
     fetchPendingApprovals()
     fetchTrend(trendDays)
     fetchTopGroups(trendDays)
+    fetchTopSenders(trendDays)
     fetchSourceHealth()
     setLastUpdated(new Date())
-  }, [fetchLinks, fetchStats, fetchJoiners, fetchMonitoredChats, fetchReadiness, fetchPendingApprovals, fetchTrend, fetchTopGroups, fetchSourceHealth, trendDays])
+  }, [fetchLinks, fetchStats, fetchJoiners, fetchMonitoredChats, fetchReadiness, fetchPendingApprovals, fetchTrend, fetchTopGroups, fetchTopSenders, fetchSourceHealth, trendDays])
 
   // [LIVE-STATUS] seconds since last successful refresh
   const secondsAgo = lastUpdated
@@ -579,6 +650,49 @@ export default function Home() {
       .filter((g) => g.daysQuiet >= QUIET_AFTER_DAYS)
       .sort((a, b) => b.total - a.total)
   }, [healthGroups])
+
+  // [ALERT-VIEW] consolidated attention items — everything that needs the
+  // operator's eye WITHOUT scrolling: stopped top sources (the Aug-19
+  // cluster lesson: the info existed in the quiet-sources card but required
+  // scrolling to notice), AI backlog ratio, fleet-down. Rendered as one
+  // dismissible strip under the header so nothing critical hides below
+  // the fold. Ids stay stable across refreshes so a dismissal sticks.
+  const attentionItems = useMemo((): AttentionItem[] => {
+    const items: AttentionItem[] = []
+    const stopped = quietSources.filter((q) => q.daysQuiet >= STOPPED_AFTER_DAYS)
+    if (stopped.length > 0) {
+      const top = stopped[0]
+      const extra = stopped.length - 1
+      items.push({
+        id: 'stopped-sources',
+        tone: 'rose',
+        text: `${stopped.length} مصدر متوقف (≥${STOPPED_AFTER_DAYS} أيام بدون روابط) — الأكبر: «${top.group}» (${top.total.toLocaleString()} رابط، صامت منذ ${top.daysQuiet} يوم)${extra > 0 ? ` و+${extra} آخرين` : ''}`,
+      })
+    }
+    const ai = stats?.ai_stats
+    if (ai && ai.ai_pending + ai.ai_approved + ai.ai_rejected + ai.ai_ads > 200) {
+      const processed = ai.ai_approved + ai.ai_rejected + ai.ai_ads
+      const total = processed + ai.ai_pending
+      const ratio = total > 0 ? (ai.ai_pending / total) * 100 : 0
+      if (ratio > 90) {
+        items.push({
+          id: 'ai-backlog',
+          tone: 'amber',
+          text: `تراكم فحص الذكاء الاصطناعي: ${ai.ai_pending.toLocaleString()} رابط بانتظار الفحص (${ratio.toFixed(1)}% من الإجمالي) — فعّل AI_DRAIN_ENABLED لتشغيل المعالجة الخلفية`,
+        })
+      }
+    }
+    if (readiness?.fleet_health?.all_joiners_unavailable) {
+      items.push({
+        id: 'fleet-down',
+        tone: 'rose',
+        text: 'جميع حسابات الانضمام غير متاحة — لا يمكن الانضمام للمجموعات الجديدة حتى عودة الأسطول',
+      })
+    }
+    return items
+  }, [quietSources, stats, readiness])
+
+  const visibleAlerts = attentionItems.filter((a) => !dismissedAlerts.has(a.id))
   return (
     <div className="min-h-screen bg-gradient-to-br from-slate-950 via-slate-900 to-slate-950 text-white">
       <div className="fixed inset-0 overflow-hidden pointer-events-none">
@@ -676,6 +790,86 @@ export default function Home() {
           </div>
         </motion.div>
 
+        {/* [NAV] Sticky quick-jump chips — the dashboard grew to ~10 cards;
+            without navigation the operator scrolls blind. Chips anchor-jump
+            to sections and stay pinned while scrolling (backdrop blur).
+            Horizontally scrollable on mobile via overflow-x-auto. */}
+        <nav
+          aria-label="التنقل السريع"
+          className="sticky top-0 z-40 -mx-4 px-4 py-2 mb-5 bg-slate-950/80 backdrop-blur-md border-b border-slate-800/60"
+        >
+          <div className="flex items-center gap-1.5 overflow-x-auto no-scrollbar">
+            {NAV_SECTIONS.map((s) => (
+              <a
+                key={s.id}
+                href={`#${s.id}`}
+                onClick={(e) => {
+                  e.preventDefault()
+                  document.getElementById(s.id)?.scrollIntoView({ behavior: 'smooth', block: 'start' })
+                }}
+                className="px-2.5 py-1 rounded-full text-[11px] font-medium text-slate-400 hover:text-white hover:bg-slate-800/80 border border-slate-700/50 whitespace-nowrap transition-colors flex-shrink-0"
+              >
+                {s.label}
+              </a>
+            ))}
+          </div>
+        </nav>
+
+        {/* [ALERT-VIEW] Attention strip — dismissible consolidated alerts.
+            The Aug-19 lesson: the quiet-sources card KNEW 5+ sources died on
+            the same day, but the operator had to scroll to see it. This strip
+            puts "needs your eye" facts above the fold. */}
+        {visibleAlerts.length > 0 && (
+          <motion.div
+            initial={{ opacity: 0, y: -8 }}
+            animate={{ opacity: 1, y: 0 }}
+            className="mb-6 space-y-2"
+            role="alert"
+            aria-live="polite"
+          >
+            {visibleAlerts.map((a) => (
+              <div
+                key={a.id}
+                className={`flex items-start gap-3 p-3 rounded-xl border backdrop-blur-sm ${
+                  a.tone === 'rose'
+                    ? 'border-rose-500/40 bg-rose-950/30'
+                    : a.tone === 'amber'
+                      ? 'border-amber-500/40 bg-amber-950/30'
+                      : 'border-sky-500/40 bg-sky-950/30'
+                }`}
+              >
+                <BellRing
+                  className={`w-4 h-4 mt-0.5 flex-shrink-0 ${
+                    a.tone === 'rose' ? 'text-rose-400' : a.tone === 'amber' ? 'text-amber-400' : 'text-sky-400'
+                  }`}
+                />
+                <p
+                  className={`flex-1 min-w-0 text-xs leading-relaxed ${
+                    a.tone === 'rose' ? 'text-rose-200/90' : a.tone === 'amber' ? 'text-amber-200/90' : 'text-sky-200/90'
+                  }`}
+                >
+                  {a.text}
+                </p>
+                <button
+                  onClick={() =>
+                    setDismissedAlerts((prev) => new Set(prev).add(a.id))
+                  }
+                  className={`transition-colors flex-shrink-0 ${
+                    a.tone === 'rose'
+                      ? 'text-rose-300/70 hover:text-white'
+                      : a.tone === 'amber'
+                        ? 'text-amber-300/70 hover:text-white'
+                        : 'text-sky-300/70 hover:text-white'
+                  }`}
+                  aria-label="تجاهل هذا التنبيه"
+                >
+                  <X className="w-4 h-4" />
+                </button>
+              </div>
+            ))}
+          </motion.div>
+        )}
+
         {/* [DASHBOARD-RESTORE] Visible error banner — replaces the old silent
             failure mode where every card was just empty with no clue why. */}
         {apiError && (
@@ -714,7 +908,8 @@ export default function Home() {
           initial={{ opacity: 0, y: 10 }}
           animate={{ opacity: 1, y: 0 }}
           transition={{ duration: 0.3 }}
-          className="grid grid-cols-2 md:grid-cols-4 gap-3 md:gap-4 mb-6"
+          id="sec-overview"
+          className="grid grid-cols-2 md:grid-cols-4 gap-3 md:gap-4 mb-6 scroll-mt-20"
         >
           {!stats && !apiError ? (
             [0, 1, 2, 3].map((i) => (
@@ -769,7 +964,7 @@ export default function Home() {
             [WINDOW] 7/14/30 selector — also drives the hourly strip below
             and the top-groups card (all views share one window). */}
         {trendDaily.length > 0 && (
-          <Card className="bg-slate-800/30 border-slate-700/50 backdrop-blur-sm mb-6">
+          <Card id="sec-trend" className="bg-slate-800/30 border-slate-700/50 backdrop-blur-sm mb-6 scroll-mt-20">
             <CardHeader className="pb-2">
               <CardTitle className="flex items-center justify-between text-lg">
                 <span className="flex items-center gap-2">
@@ -840,7 +1035,7 @@ export default function Home() {
             over the same window as the trend chart. Split bars show the
             WA/TG mix; hover a row for the full breakdown + last activity. */}
         {topGroups.length > 0 && (
-          <Card className="bg-slate-800/30 border-slate-700/50 backdrop-blur-sm mb-6">
+          <Card id="sec-sources" className="bg-slate-800/30 border-slate-700/50 backdrop-blur-sm mb-6 scroll-mt-20">
             <CardHeader className="pb-3">
               <CardTitle className="flex items-center justify-between text-lg">
                 <span className="flex items-center gap-2">
@@ -883,6 +1078,66 @@ export default function Home() {
           </Card>
         )}
 
+        {/* [SENDERS-VIEW] Top link posters — WHO posts the links (the trend
+            answers WHAT, the hourly strip WHEN, top-groups WHERE). Same
+            window as the trend chart; split bars show the WA/TG mix; hover a
+            row for the breakdown + the group they post in most. */}
+        {topSenders.length > 0 && (
+          <motion.div
+            initial={{ opacity: 0, y: 12 }}
+            animate={{ opacity: 1, y: 0 }}
+            transition={{ duration: 0.35 }}
+          >
+            <Card id="sec-senders" className="bg-slate-800/30 border-slate-700/50 backdrop-blur-sm mb-6 scroll-mt-20">
+              <CardHeader className="pb-3">
+                <CardTitle className="flex items-center justify-between text-lg">
+                  <span className="flex items-center gap-2">
+                    <UserCircle2 className="w-5 h-5 text-teal-400" />
+                    أكثر المرسلين نشراً للروابط
+                    <span className="text-xs text-slate-500 font-normal">
+                      (آخر {trendDays} يوم · {topSendersTotals?.total.toLocaleString() || '—'} رابط)
+                    </span>
+                  </span>
+                  {topSendersTotals && topSendersTotals.distinct_senders > 0 && (
+                    <Button
+                      variant="ghost"
+                      size="sm"
+                      onClick={() => setModal('top_senders')}
+                      className="text-slate-400 hover:text-white text-xs h-7"
+                    >
+                      عرض الكل ({topSendersTotals.distinct_senders.toLocaleString()})
+                      <ArrowRight className="w-3.5 h-3.5 mr-1 rotate-180" />
+                    </Button>
+                  )}
+                </CardTitle>
+              </CardHeader>
+              <CardContent>
+                <div className="space-y-3">
+                  {topSenders.slice(0, 6).map((s, i) => (
+                    <TopSenderRow
+                      key={s.sender}
+                      rank={i + 1}
+                      sender={s}
+                      max={topSenders[0]?.total || 1}
+                    />
+                  ))}
+                </div>
+                <div className="flex items-center justify-center gap-4 mt-3 text-[10px] text-slate-400">
+                  <span className="flex items-center gap-1.5">
+                    <span className="w-2.5 h-2.5 rounded-sm bg-gradient-to-r from-emerald-400 to-emerald-600" />
+                    واتساب
+                  </span>
+                  <span className="flex items-center gap-1.5">
+                    <span className="w-2.5 h-2.5 rounded-sm bg-gradient-to-r from-blue-400 to-blue-600" />
+                    تيليجرام
+                  </span>
+                  <span className="text-slate-600">· بدون بيانات هواتف (خصوصية)</span>
+                </div>
+              </CardContent>
+            </Card>
+          </motion.div>
+        )}
+
         {/* [SOURCE-HEALTH] Quiet sources — producing sources from the last
             30 days that went silent (2+ days without a single link).
             Surfaces capture-drop causes (a group that removed the watcher,
@@ -894,7 +1149,7 @@ export default function Home() {
             animate={{ opacity: 1, y: 0 }}
             transition={{ duration: 0.35 }}
           >
-            <Card className="bg-slate-800/30 border-slate-700/50 backdrop-blur-sm mb-6">
+            <Card id="sec-health" className="bg-slate-800/30 border-slate-700/50 backdrop-blur-sm mb-6 scroll-mt-20">
               <CardHeader className="pb-3">
                 <CardTitle className="flex items-center justify-between text-lg">
                   <span className="flex items-center gap-2">
@@ -1012,7 +1267,7 @@ export default function Home() {
             floodwait / disconnected / safety-guard-blocked joiners + a red
             alert when ALL joiners are unavailable. */}
         {readiness?.fleet_health && (
-          <Card className="bg-slate-800/30 border-slate-700/50 backdrop-blur-sm mb-6">
+          <Card id="sec-fleet" className="bg-slate-800/30 border-slate-700/50 backdrop-blur-sm mb-6 scroll-mt-20">
             <CardHeader className="pb-3">
               <CardTitle className="flex items-center justify-between text-lg">
                 <span className="flex items-center gap-2">
@@ -1138,7 +1393,7 @@ export default function Home() {
 
         {/* AI Stats Section */}
         {stats?.ai_stats && (
-          <Card className="bg-slate-800/30 border-slate-700/50 backdrop-blur-sm mb-6">
+          <Card id="sec-ai" className="bg-slate-800/30 border-slate-700/50 backdrop-blur-sm mb-6 scroll-mt-20">
             <CardHeader>
               <CardTitle className="flex items-center justify-between text-lg">
                 <span className="flex items-center gap-2">
@@ -1265,7 +1520,7 @@ export default function Home() {
           </Card>
         )}
         {/* Monitored Chats Section — المجموعات المراقبة (بطاقة واحدة) */}
-        <Card className="bg-slate-800/30 border-slate-700/50 backdrop-blur-sm mb-6">
+        <Card id="sec-monitored" className="bg-slate-800/30 border-slate-700/50 backdrop-blur-sm mb-6 scroll-mt-20">
           <CardHeader>
             <CardTitle className="flex items-center justify-between text-lg">
               <span className="flex items-center gap-2">
@@ -1345,7 +1600,7 @@ export default function Home() {
         </Card>
 
         {/* Joiner Dashboard Section */}
-        <Card className="bg-slate-800/30 border-slate-700/50 backdrop-blur-sm mb-6">
+        <Card id="sec-joiners" className="bg-slate-800/30 border-slate-700/50 backdrop-blur-sm mb-6 scroll-mt-20">
           <CardHeader>
             <CardTitle className="flex items-center justify-between text-lg">
               <span className="flex items-center gap-2">
@@ -1572,6 +1827,8 @@ export default function Home() {
         pendingSummary={pendingSummary}
         topGroups={topGroups}
         topGroupsTotals={topGroupsTotals}
+        topSenders={topSenders}
+        topSendersTotals={topSendersTotals}
         trendDays={trendDays}
       />
     </div>
@@ -1977,6 +2234,82 @@ function HourlyStrip(props: { hourly: HourlyStat[] }) {
 // ===== TopGroupRow — [SOURCE-VIEW] one ranked source row ================
 // Split bar (green WA / blue TG) scaled to the #1 group; medals for the
 // top 3; hover reveals the full breakdown + first/last activity dates.
+// ===== TopSenderRow — [SENDERS-VIEW] one ranked sender row =====
+function TopSenderRow(props: { rank: number; sender: TopSender; max: number }) {
+  const { rank, sender, max } = props
+  const medals = ['🥇', '🥈', '🥉']
+  const rankLabel = medals[rank - 1] || <span className="text-slate-500">#{rank}</span>
+  const widthPct = Math.max(2, Math.round((sender.total / max) * 100))
+  const waPct = sender.total
+    ? Math.round((sender.whatsapp / sender.total) * widthPct)
+    : 0
+  const tgPct = widthPct - waPct
+  const isUnnamed = sender.sender === 'غير محدد'
+
+  return (
+    <motion.div
+      initial={{ opacity: 0, x: 24 }}
+      animate={{ opacity: 1, x: 0 }}
+      transition={{ delay: Math.min(rank * 0.06, 0.4), duration: 0.35 }}
+      className="group"
+    >
+      <div className="flex items-center justify-between gap-2 mb-1">
+        <div className="flex items-center gap-2 min-w-0">
+          <span className="text-xs w-6 text-center flex-shrink-0" aria-hidden>
+            {rankLabel}
+          </span>
+          <span
+            className={`text-sm truncate ${isUnnamed ? 'text-slate-500 italic' : 'text-slate-200'}`}
+            title={sender.sender}
+          >
+            {sender.sender}
+          </span>
+          {/* groups-count chip — cross-posters stand out */}
+          {sender.groups_count > 1 && (
+            <span
+              className="text-[9px] px-1.5 py-0.5 rounded-full border border-teal-500/30 bg-teal-500/10 text-teal-300 whitespace-nowrap flex-shrink-0"
+              title={`نشر في ${sender.groups_count} مجموعة مختلفة`}
+            >
+              {sender.groups_count} مجموعة
+            </span>
+          )}
+        </div>
+        <div className="flex items-center gap-2 flex-shrink-0">
+          <span className="text-[10px] text-slate-500 tabular-nums">
+            {sender.share.toFixed(1)}%
+          </span>
+          <span className="text-sm font-bold text-white tabular-nums">
+            {sender.total.toLocaleString()}
+          </span>
+        </div>
+      </div>
+      <div className="flex h-2 rounded-full bg-slate-700/40 overflow-hidden">
+        <motion.div
+          initial={{ width: 0 }}
+          animate={{ width: `${waPct}%` }}
+          transition={{ duration: 0.6, ease: 'easeOut', delay: Math.min(rank * 0.06, 0.4) }}
+          className="h-full bg-gradient-to-r from-emerald-400 to-emerald-600"
+        />
+        <motion.div
+          initial={{ width: 0 }}
+          animate={{ width: `${tgPct}%` }}
+          transition={{ duration: 0.6, ease: 'easeOut', delay: Math.min(rank * 0.06, 0.4) + 0.08 }}
+          className="h-full bg-gradient-to-r from-blue-400 to-blue-600"
+        />
+      </div>
+      {/* hover detail line — WA/TG split + the group they post in most */}
+      <div className="text-[10px] text-slate-500 mt-1 h-4 opacity-0 group-hover:opacity-100 transition-opacity">
+        <span className="text-emerald-500">واتساب {sender.whatsapp.toLocaleString()}</span>
+        {' · '}
+        <span className="text-blue-400">تيليجرام {sender.telegram.toLocaleString()}</span>
+        {sender.other > 0 && <span> · أخرى {sender.other.toLocaleString()}</span>}
+        <span> · الأكثر في: <span className="text-slate-400">{sender.top_group}</span></span>
+        <span> · نشاط {sender.first_seen} ← {sender.last_seen}</span>
+      </div>
+    </motion.div>
+  )
+}
+
 function TopGroupRow(props: { rank: number; group: TopGroup; max: number }) {
   const { rank, group, max } = props
   const medals = ['🥇', '🥈', '🥉']
@@ -2273,9 +2606,11 @@ function LinksModal(props: {
   pendingSummary: PendingApprovalsSummary | null
   topGroups: TopGroup[]
   topGroupsTotals: TopGroupsTotals | null
+  topSenders: TopSender[]
+  topSendersTotals: TopSendersTotals | null
   trendDays: number
 }) {
-  const { type, onClose, allLinks, joiners, joinersSummary, joinedGroups, monitoredChats, monitoredSummary, bannedGroups, pendingApprovals, pendingSummary, topGroups, topGroupsTotals, trendDays } = props
+  const { type, onClose, allLinks, joiners, joinersSummary, joinedGroups, monitoredChats, monitoredSummary, bannedGroups, pendingApprovals, pendingSummary, topGroups, topGroupsTotals, topSenders, topSendersTotals, trendDays } = props
   const [searchQuery, setSearchQuery] = useState<string>('')
 
   // [UX] Esc closes the modal + / focuses the search box
@@ -2356,6 +2691,8 @@ function LinksModal(props: {
         return '✉️ بانتظار موافقة المشرف'
       case 'top_groups':
         return `📊 أعلى المصادر إنتاجاً (آخر ${trendDays} يوم)`
+      case 'top_senders':
+        return `👤 أكثر المرسلين نشراً (آخر ${trendDays} يوم)`
       default:
         return ''
     }
@@ -2383,7 +2720,7 @@ function LinksModal(props: {
           <div className="flex items-center justify-between p-4 border-b border-slate-700">
             <h2 className="text-xl font-bold text-white">{modalTitle}</h2>
             <div className="flex items-center gap-3">
-              {type !== 'joiners' && type !== 'pending_approvals' && type !== 'top_groups' && (
+              {type !== 'joiners' && type !== 'pending_approvals' && type !== 'top_groups' && type !== 'top_senders' && (
                 <>
                   <Badge className="bg-slate-700 text-white border-0">
                     {filteredLinks.length}
@@ -2865,6 +3202,103 @@ function LinksModal(props: {
                           {g.first_seen} → {g.last_seen}
                         </span>
                       </div>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+          ) : type === 'top_senders' ? (
+            <div className="flex-1 overflow-y-auto p-4" style={{ maxHeight: 'calc(95vh - 100px)' }}>
+              {topSendersTotals && (
+                <div className="bg-teal-500/5 border border-teal-500/20 rounded-lg p-3 mb-4 text-xs text-teal-300/90 flex items-start gap-2">
+                  <UserCircle2 className="w-4 h-4 mt-0.5 flex-shrink-0" />
+                  <p>
+                    نشر{' '}
+                    <span className="font-bold text-white">
+                      {topSendersTotals.total.toLocaleString()}
+                    </span>{' '}
+                    رابط{' '}
+                    <span className="font-bold text-white">
+                      {topSendersTotals.distinct_senders.toLocaleString()}
+                    </span>{' '}
+                    مرسل خلال آخر {trendDays} يوم. القائمة بدون أرقام هواتف (خصوصية).
+                  </p>
+                </div>
+              )}
+              {topSendersTotals && topSendersTotals.distinct_senders > topSenders.length && (
+                <p className="text-[10px] text-slate-500 mb-3">
+                  * يتم عرض أعلى {topSenders.length} مرسل فقط من إجمالي{' '}
+                  {topSendersTotals.distinct_senders.toLocaleString()} مرسل.
+                </p>
+              )}
+              {topSenders.length === 0 ? (
+                <div className="text-center py-20">
+                  <UserCircle2 className="w-12 h-12 mx-auto text-slate-600 mb-4" />
+                  <p className="text-slate-500">لا توجد بيانات مرسلين</p>
+                </div>
+              ) : (
+                <div className="space-y-2">
+                  {topSenders.map((s, i) => (
+                    <div
+                      key={s.sender}
+                      className="bg-slate-800/50 rounded-lg p-3 border border-slate-700/50"
+                    >
+                      <div className="flex items-center justify-between gap-2 mb-2">
+                        <div className="flex items-center gap-2 min-w-0">
+                          <span className="text-xs w-7 text-center flex-shrink-0 font-mono text-slate-500">
+                            {i + 1}
+                          </span>
+                          <span
+                            className={`text-sm truncate ${s.sender === 'غير محدد' ? 'text-slate-500 italic' : 'text-slate-200'}`}
+                            title={s.sender}
+                          >
+                            {s.sender}
+                          </span>
+                          {s.groups_count > 1 && (
+                            <span
+                              className="text-[9px] px-1.5 py-0.5 rounded-full border border-teal-500/30 bg-teal-500/10 text-teal-300 whitespace-nowrap flex-shrink-0"
+                              title={`نشر في ${s.groups_count} مجموعة مختلفة`}
+                            >
+                              {s.groups_count} مجموعة
+                            </span>
+                          )}
+                        </div>
+                        <div className="flex items-center gap-2 flex-shrink-0">
+                          <Badge className="bg-slate-700/50 text-slate-300 border-slate-600/40 text-[10px] tabular-nums">
+                            {s.share.toFixed(1)}%
+                          </Badge>
+                          <span className="text-sm font-bold text-white tabular-nums">
+                            {s.total.toLocaleString()}
+                          </span>
+                        </div>
+                      </div>
+                      <div className="flex h-1.5 rounded-full bg-slate-700/40 overflow-hidden mb-2">
+                        <div
+                          className="h-full bg-gradient-to-r from-emerald-400 to-emerald-600"
+                          style={{ width: `${s.total ? (s.whatsapp / s.total) * 100 : 0}%` }}
+                        />
+                        <div
+                          className="h-full bg-gradient-to-r from-blue-400 to-blue-600"
+                          style={{ width: `${s.total ? (s.telegram / s.total) * 100 : 0}%` }}
+                        />
+                      </div>
+                      <div className="flex items-center justify-between text-[10px] text-slate-400 flex-wrap gap-1">
+                        <span className="flex items-center gap-2">
+                          <span className="text-emerald-500">
+                            واتساب {s.whatsapp.toLocaleString()}
+                          </span>
+                          <span className="text-blue-400">
+                            تيليجرام {s.telegram.toLocaleString()}
+                          </span>
+                          {s.other > 0 && <span>أخرى {s.other.toLocaleString()}</span>}
+                        </span>
+                        <span className="text-slate-500" dir="ltr">
+                          {s.first_seen} → {s.last_seen}
+                        </span>
+                      </div>
+                      <p className="text-[10px] text-slate-500 mt-1 truncate" title={s.top_group}>
+                        الأكثر نشراً في: <span className="text-slate-400">{s.top_group}</span>
+                      </p>
                     </div>
                   ))}
                 </div>

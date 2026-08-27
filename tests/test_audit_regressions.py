@@ -3429,6 +3429,185 @@ async def test_heatmapview_hourly_series():
 
 
 # =========================================================================
+# [SENDERS-VIEW] /api/top_senders — WHO posts the links (sender leaderboard).
+# Guards: route registered, handler 200-shape, 60s cache, clamping, narrow
+# PII-free select (sender_contact NEVER fetched), ranking, unnamed bucket.
+# =========================================================================
+
+async def test_sendersview_top_senders_route_registered():
+    """[SENDERS-VIEW-1] /api/top_senders MUST be registered in the router —
+    otherwise the dashboard senders card gets a 404."""
+    try:
+        src = (PROJECT_ROOT / "bot.py").read_text(encoding="utf-8")
+        record("TS-1: /api/top_senders route registered",
+               'add_get("/api/top_senders", api_top_senders_handler)' in src,
+               "route registration missing")
+    except Exception as e:
+        record("TS-1: exception", False, str(e))
+
+
+async def test_sendersview_top_senders_handler_present():
+    """[SENDERS-VIEW-2] api_top_senders_handler defined + returns CORS + 200
+    shape (senders list + totals) even when Supabase is unconfigured."""
+    try:
+        assert hasattr(bot, "api_top_senders_handler"), "handler missing"
+        db = types.SimpleNamespace(
+            supabase_url=None, supabase_key=None)
+        req = types.SimpleNamespace(
+            app={"db": db}, query={"days": "3", "limit": "5"}, headers={})
+        resp = await bot.api_top_senders_handler(req)
+        status = getattr(resp, "status", None)
+        record("TS-2: handler returns 200 with empty supabase",
+               status == 200, f"status={status}")
+        text = getattr(resp, "text", None)
+        if text is not None and hasattr(text, "strip"):
+            body = str(text)
+        else:
+            body = repr(getattr(resp, "body", ""))
+        record("TS-2b: response contains senders + totals",
+               "senders" in body and "totals" in body,
+               f"body head: {body[:120]}")
+    except Exception as e:
+        record("TS-2: exception", False, str(e))
+
+
+async def test_sendersview_top_senders_cache():
+    """[SENDERS-VIEW-3] _TOP_SENDERS_CACHE must exist and the handler must
+    serve the cached payload within 60s (protects Supabase from polling)."""
+    try:
+        record("TS-3: _TOP_SENDERS_CACHE present",
+               hasattr(bot, "_TOP_SENDERS_CACHE")
+               and isinstance(bot._TOP_SENDERS_CACHE, dict)
+               and set(bot._TOP_SENDERS_CACHE.keys()) >= {"key", "payload", "ts"},
+               "cache object missing/wrong shape")
+        db = types.SimpleNamespace(supabase_url=None, supabase_key=None)
+        req = types.SimpleNamespace(
+            app={"db": db}, query={"days": "2", "limit": "4"}, headers={})
+        await bot.api_top_senders_handler(req)
+        seeded = dict(bot._TOP_SENDERS_CACHE)
+        record("TS-3b: first call seeds the cache",
+               seeded.get("key") == "d2l4" and seeded.get("payload") is not None,
+               f"cache={ {k: type(v).__name__ for k, v in seeded.items()} }")
+        import time as _time
+        bot._TOP_SENDERS_CACHE["ts"] = _time.time()  # fresh
+        resp2 = await bot.api_top_senders_handler(req)
+        record("TS-3c: second call within 60s served from cache",
+                bot._TOP_SENDERS_CACHE["payload"] is not None
+                and getattr(resp2, "status", None) == 200,
+                f"status={getattr(resp2,'status',None)}")
+    except Exception as e:
+        record("TS-3: exception", False, str(e))
+    finally:
+        bot._TOP_SENDERS_CACHE.update({"key": None, "payload": None, "ts": 0.0})
+
+
+async def test_sendersview_top_senders_pii_free_select():
+    """[SENDERS-VIEW-4] the Supabase fetch must select ONLY (created_at,
+    sender_name, group_name, link_type) — sender_contact (phones posted in
+    messages) must NEVER be selected or returned: the leaderboard is
+    PII-free by construction."""
+    try:
+        src = (PROJECT_ROOT / "bot.py").read_text(encoding="utf-8")
+        h_start = src.find("async def api_top_senders_handler")
+        h_end = src.find("\nasync def ", h_start + 50)
+        body = src[h_start:h_end if h_end > 0 else h_start + 9000]
+        record("TS-4a: selects only created_at,sender_name,group_name,link_type",
+               "select=created_at,sender_name,group_name,link_type" in body,
+               "wide select — PII or over-fetch risk")
+        record("TS-4b: sender_contact never selected in top_senders",
+               "sender_contact" not in body,
+               "sender_contact selected — PII leak risk in leaderboard")
+        record("TS-4c: filters by created_at gte window start",
+               "created_at=gte." in body, "window filter missing")
+        record("TS-4d: paginates in 1000-row batches",
+               "batch_size = 1000" in body and "offset" in body,
+               "pagination missing — >1000-row windows truncated")
+        record("TS-4e: results ranked by total descending",
+               'key=lambda kv: kv[1]["total"]' in body and "reverse=True" in body,
+               "ranking missing — card would show unsorted senders")
+    except Exception as e:
+        record("TS-4: exception", False, str(e))
+
+
+async def test_sendersview_top_senders_unnamed_bucket():
+    """[SENDERS-VIEW-5] links with NULL/empty sender_name MUST be bucketed
+    under the unnamed label (not dropped) so per-sender totals sum to the
+    window total; top_group derived from the per-sender group counter."""
+    try:
+        src = (PROJECT_ROOT / "bot.py").read_text(encoding="utf-8")
+        h_start = src.find("async def api_top_senders_handler")
+        h_end = src.find("\nasync def ", h_start + 50)
+        body = src[h_start:h_end if h_end > 0 else h_start + 9000]
+        record("TS-5a: unnamed senders bucketed, not dropped",
+               '_UNNAMED_SENDER_LABEL' in src
+               and 'or _UNNAMED_SENDER_LABEL' in body,
+               "unnamed bucketing missing — window totals would undercount")
+        record("TS-5b: per-sender group attribution present",
+               '"groups_count"' in body and '"top_group"' in body,
+               "group attribution missing — card loses WHERE context")
+    except Exception as e:
+        record("TS-5: exception", False, str(e))
+
+
+# =========================================================================
+# [PII-FIX] /api/links PII redaction — source_phone (watcher account phone)
+# and phone-form sender_contact must be masked when the dashboard is open
+# (trusted-origin / fail-open modes). @usernames stay (public handles).
+# =========================================================================
+
+async def test_piifix_links_redaction_wired():
+    """[PII-FIX-1] /api/links handler must redact source_phone +
+    sender_contact when _api_should_show_full_pii() is False."""
+    try:
+        src = (PROJECT_ROOT / "bot.py").read_text(encoding="utf-8")
+        h_start = src.find("async def api_links_handler")
+        h_end = src.find("\nasync def ", h_start + 50)
+        body = src[h_start:h_end if h_end > 0 else h_start + 12000]
+        record("PR-1a: /api/links applies _api_should_show_full_pii gate",
+               "_api_should_show_full_pii()" in body,
+               "PII gate missing from /api/links")
+        record("PR-1b: source_phone redacted via _redact_phone",
+               '_redact_phone(row.get("source_phone"))' in body,
+               "source_phone not redacted — watcher phone leaks raw")
+        record("PR-1c: sender_contact redacted via _redact_sender_contact",
+               '_redact_sender_contact(' in body,
+               "sender_contact not redacted — posted phones leak raw")
+    except Exception as e:
+        record("PR-1: exception", False, str(e))
+
+
+async def test_piifix_redact_sender_contact_unit():
+    """[PII-FIX-2] _redact_sender_contact unit behavior: phones masked,
+    @usernames kept, empty safe, bare-digit legacy values masked."""
+    try:
+        f = getattr(bot, "_redact_sender_contact", None)
+        record("PR-2: _redact_sender_contact defined", callable(f),
+               "helper missing")
+        if not callable(f):
+            return
+        phone_in = "\U0001F4F1 +96651234567"
+        phone_out = f(phone_in)
+        record("PR-2a: phone-form contact masked",
+               phone_out.startswith("\U0001F4F1")
+               and "•" in phone_out and "1234567" not in phone_out,
+               f"in={phone_in!r} out={phone_out!r}")
+        username_in = "\u2708\ufe0f @someuser"
+        record("PR-2b: @username kept unchanged",
+               f(username_in) == username_in,
+               f"in={username_in!r} out={f(username_in)!r}")
+        record("PR-2c: empty/None safe",
+               f("") == "" and f(None) == "",
+               f"empty={f('')!r} none={f(None)!r}")
+        bare = "0551234567"
+        bare_out = f(bare)
+        record("PR-2d: bare legacy digits masked",
+               "•" in bare_out and "1234567" not in bare_out,
+               f"in={bare!r} out={bare_out!r}")
+    except Exception as e:
+        record("PR-2: exception", False, str(e))
+
+
+# =========================================================================
 # [Task 11a] Secrets scan — source files must contain NO real secrets
 # =========================================================================
 
@@ -4400,6 +4579,15 @@ async def main():
     await test_sourceview_top_groups_supabase_filters()
     await test_sourceview_top_groups_unnamed_bucket()
     await test_heatmapview_hourly_series()
+
+    # === [SENDERS-VIEW] /api/top_senders + [PII-FIX] /api/links redaction ===
+    await test_sendersview_top_senders_route_registered()
+    await test_sendersview_top_senders_handler_present()
+    await test_sendersview_top_senders_cache()
+    await test_sendersview_top_senders_pii_free_select()
+    await test_sendersview_top_senders_unnamed_bucket()
+    await test_piifix_links_redaction_wired()
+    await test_piifix_redact_sender_contact_unit()
 
     # === Task 11a — Secrets scan ===
     await test_11a_no_real_secrets_in_source_files()

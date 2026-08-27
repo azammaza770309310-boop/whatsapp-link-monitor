@@ -10983,6 +10983,21 @@ async def api_links_handler(request):
                 logging.error(f"[API] /api/links batch error: {e}")
                 break
 
+        # [Security / PII] /api/links used to return source_phone (the
+        # WATCHER account phone) and sender_contact (phones posted inside
+        # messages) UNMASKED — inconsistent with the trusted-origin posture
+        # where every other endpoint masks PII via _api_should_show_full_pii().
+        # The dashboard never displays source_phone, so redacting it costs
+        # nothing; sender_contact phones get masked while @usernames stay.
+        _show_full = _api_should_show_full_pii()
+        if not _show_full:
+            for row in all_links:
+                if row.get("source_phone"):
+                    row["source_phone"] = _redact_phone(row.get("source_phone"))
+                if row.get("sender_contact"):
+                    row["sender_contact"] = _redact_sender_contact(
+                        row.get("sender_contact"))
+
         return web.json_response({"links": all_links, "count": len(all_links)},
                                 status=200, headers={"Access-Control-Allow-Origin": "*"})
 
@@ -11317,6 +11332,163 @@ async def api_top_groups_handler(request):
     except Exception as e:
         logging.error(f"[API] /api/top_groups error: {e}")
         return web.json_response({"error": str(e), "groups": []}, status=200,
+                                 headers={"Access-Control-Allow-Origin": "*"})
+
+
+# [SENDERS-VIEW] /api/top_senders — WHO posts the links? The dashboard
+# already answers WHAT (trend), WHEN (hourly), WHERE (top groups); this
+# endpoint completes the picture with the top link POSTERS aggregated by
+# sender_name over the window. Deliberately PII-free: sender_contact (which
+# can contain phones posted inside messages) is NEVER selected or returned —
+# display names are public inside the groups anyway, so the leaderboard
+# needs no masking logic at all. Same efficiency pattern as top_groups:
+# narrow Supabase select (created_at, sender_name, group_name, link_type),
+# 1000-row paginated batches, 60s in-process cache keyed d{days}l{limit}.
+_TOP_SENDERS_CACHE = {"key": None, "payload": None, "ts": 0.0}
+
+_UNNAMED_SENDER_LABEL = "غير محدد"
+
+
+async def api_top_senders_handler(request):
+    """API endpoint: top link-posting senders for the dashboard.
+
+    Query params:
+      ?days=N    → window size in days (default 14, clamped 1..30)
+      ?limit=N   → number of senders returned (default 10, clamped 1..50)
+
+    Returns:
+      {
+        "days": 14, "limit": 10,
+        "generated_at": "<ISO>",
+        "senders": [
+          {"sender": "...", "total": N, "whatsapp": N, "telegram": N,
+           "other": N, "share": 12.3, "groups_count": N,
+           "top_group": "...", "first_seen": "YYYY-MM-DD",
+           "last_seen": "YYYY-MM-DD"},
+          ...
+        ],
+        "totals": {"total": N, "distinct_senders": N}
+      }
+    """
+    db = request.app.get("db")
+    if not db:
+        return web.json_response({"error": "not ready"}, status=503)
+
+    try:
+        days = max(1, min(30, int(request.query.get("days", "14"))))
+        limit = max(1, min(50, int(request.query.get("limit", "10"))))
+        cache_key = f"d{days}l{limit}"
+        now_ts = time.time()
+        cached = _TOP_SENDERS_CACHE
+        if (cached["key"] == cache_key and cached["payload"] is not None
+                and (now_ts - cached["ts"]) < 60.0):
+            return web.json_response(cached["payload"], status=200,
+                                     headers={"Access-Control-Allow-Origin": "*"})
+
+        # sender_name → counters (+ per-group counter for top_group)
+        senders: dict = {}
+
+        if db.supabase_url and db.supabase_key:
+            try:
+                session = await db._get_supabase_session()
+                since_dt = datetime.utcnow() - timedelta(days=days)
+                since_iso = since_dt.strftime("%Y-%m-%dT%H:%M:%S")
+                offset = 0
+                batch_size = 1000
+                fetched = 0
+                while True:
+                    url = (
+                        f"{db.supabase_url}/rest/v1/links"
+                        f"?select=created_at,sender_name,group_name,link_type"
+                        f"&created_at=gte.{since_iso}"
+                        f"&order=created_at.asc"
+                        f"&limit={batch_size}&offset={offset}"
+                    )
+                    async with session.get(url) as r:
+                        if r.status == 200:
+                            rows = await r.json()
+                        elif r.status == 416:
+                            break
+                        else:
+                            logging.error(
+                                f"[API] /api/top_senders batch failed: {r.status}")
+                            break
+                    if not rows:
+                        break
+                    for row in rows:
+                        created = str(row.get("created_at") or "")
+                        day_key = created[:10]
+                        if len(day_key) != 10 or not day_key.startswith("20"):
+                            continue
+                        sname = (row.get("sender_name") or "").strip() \
+                            or _UNNAMED_SENDER_LABEL
+                        gname = (row.get("group_name") or "").strip() \
+                            or _UNNAMED_GROUP_LABEL
+                        s = senders.setdefault(sname, {
+                            "total": 0, "whatsapp": 0, "telegram": 0,
+                            "other": 0, "first": day_key, "last": day_key,
+                            "groups": {}})
+                        s["total"] += 1
+                        lt = row.get("link_type") or "other"
+                        if lt in ("whatsapp", "telegram"):
+                            s[lt] += 1
+                        else:
+                            s["other"] += 1
+                        if day_key < s["first"]:
+                            s["first"] = day_key
+                        if day_key > s["last"]:
+                            s["last"] = day_key
+                        s["groups"][gname] = s["groups"].get(gname, 0) + 1
+                    fetched += len(rows)
+                    if len(rows) < batch_size:
+                        break
+                    offset += batch_size
+                logging.info(
+                    f"[API] /api/top_senders aggregated {fetched} rows over "
+                    f"{days}d → {len(senders)} senders")
+            except Exception as e:
+                logging.warning(f"[API] /api/top_senders supabase fetch failed: {e}")
+
+        window_total = sum(s["total"] for s in senders.values())
+        ranked = sorted(senders.items(), key=lambda kv: kv[1]["total"],
+                        reverse=True)[:limit]
+        top = []
+        for sname, s in ranked:
+            top_group = (max(s["groups"].items(), key=lambda kv: kv[1])[0]
+                         if s["groups"] else _UNNAMED_GROUP_LABEL)
+            top.append({
+                "sender": sname,
+                "total": s["total"],
+                "whatsapp": s["whatsapp"],
+                "telegram": s["telegram"],
+                "other": s.get("other", 0),
+                "share": round(s["total"] * 100.0 / window_total, 1)
+                         if window_total else 0.0,
+                "groups_count": len(s["groups"]),
+                "top_group": top_group,
+                "first_seen": s["first"],
+                "last_seen": s["last"],
+            })
+
+        payload = {
+            "days": days,
+            "limit": limit,
+            "generated_at": datetime.utcnow().isoformat() + "Z",
+            "senders": top,
+            "totals": {
+                "total": window_total,
+                "distinct_senders": len(senders),
+            },
+        }
+
+        _TOP_SENDERS_CACHE.update(
+            {"key": cache_key, "payload": payload, "ts": now_ts})
+
+        return web.json_response(payload, status=200,
+                                 headers={"Access-Control-Allow-Origin": "*"})
+    except Exception as e:
+        logging.error(f"[API] /api/top_senders error: {e}")
+        return web.json_response({"error": str(e), "senders": []}, status=200,
                                  headers={"Access-Control-Allow-Origin": "*"})
 
 
@@ -11964,6 +12136,37 @@ def _redact_phone(phone) -> str:
     return f"{s[:4]}{'•' * (len(s) - 6)}{s[-2:]}"
 
 
+def _redact_sender_contact(contact) -> str:
+    """[Security / PII] Redact a sender_contact value for open-dashboard mode.
+
+    sender_contact comes from extract_sender_contact() and is either:
+      - "📱 +9665xxxxxxx"  → a phone posted in the message → MASK the digits
+      - "✈️ @username"      → a public Telegram handle → keep as-is (not PII)
+      - "" / None          → ""
+
+    Legacy rows may store bare digits without the emoji prefix — those are
+    treated as phones and masked too. Never raises.
+    """
+    if contact is None:
+        return ""
+    s = str(contact).strip()
+    if not s:
+        return ""
+    if s.startswith("\u2708\ufe0f"):
+        # Telegram @username — a public handle, not PII.
+        return s
+    if s.startswith("\U0001F4F1"):
+        # "📱 <phone>" — strip the emoji, mask the phone, re-attach.
+        phone_part = s[2:].strip()
+        return "\U0001F4F1 " + _redact_phone(phone_part)
+    # Bare value: mask if it looks like a phone (digits with optional +),
+    # otherwise return unchanged (free-text usernames etc.).
+    cleaned = s.lstrip("+").replace(" ", "").replace("-", "")
+    if cleaned.isdigit() and len(cleaned) >= 7:
+        return _redact_phone(s)
+    return s
+
+
 @web.middleware
 async def dashboard_api_key_middleware(request, handler):
     """Gates /api/* routes behind an optional X-Api-Key shared secret OR
@@ -12075,6 +12278,7 @@ async def start_http_server(monitor=None, db=None):
     app.router.add_get("/api/links", api_links_handler)
     app.router.add_get("/api/links_daily", api_links_daily_handler)  # [TREND-VIEW]
     app.router.add_get("/api/top_groups", api_top_groups_handler)  # [SOURCE-VIEW]
+    app.router.add_get("/api/top_senders", api_top_senders_handler)  # [SENDERS-VIEW]
     app.router.add_get("/api/stats", api_stats_handler)
     app.router.add_get("/api/deploy_check", api_deploy_check_handler)  # diagnostic
     app.router.add_get("/api/joiners_status", api_joiners_status_handler)  # joiners + groups
