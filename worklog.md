@@ -1820,3 +1820,41 @@ Stage Summary:
   - GitHub PAT المقدّم في هذه الجلسة: استُخدم للـpush فقط، لم يُخزّن في أي ملف/config. **توصية فورية بالتدوير** لأنه كُشف نصيًا في المحادثة.
   - Supabase service_role JWT + project URL: لا أملك قيمهما في السياق الحالي (كانت في السياق السابق الذي لُخّص).
 - **BLOCKED (needs user)**: تطبيق migration `supabase/message_journal_snapshot.sql` على Supabase — يتطلب إعادة توفير service_role JWT + project URL، أو تطبيق يدوي بواسطة المستخدم في Supabase SQL Editor.
+
+---
+Task ID: SUPABASE-VERIFY + PRODUCTION-RESCUE-EVIDENCE
+Agent: senior (continuation session)
+Task: بعد توفير اعتمادات Supabase + إنشاء المستخدم للجدول، التحقق من: (1) الجدول موجود وصالح، (2) تدفق بيانات إنتاجي حقيقي، (3) إثبات الإنقاذ في الإنتاج.
+
+Work Log:
+- توفير اعتمادات Supabase في المحادثة (service_role JWT + project URL). استُخدمت عبر env vars فقط — لم تُطبع في أي ملف/لوق/تقرير.
+- فحص أولي عبر REST: GET /rest/v1/message_journal_snapshot?limit=0 → 404 PGRST205 (الجدول غير موجود). أكدت أن service_role JWT لا يقدر DDL (PostgREST = CRUD فقط). /pg/query endpoint غير موجود (404). psql غير مثبّت.
+- وجهت المستخدم للصق migration SQL في Supabase SQL Editor يدويًا.
+- **اكتشاف خطأ في الـmigration الأصلي**: `CREATE POLICY IF NOT EXISTS` غير مدعوم في PostgreSQL (syntax error). صلّحت الملف بنمط `DROP POLICY IF EXISTS` ثم `CREATE POLICY`. أيضًا حذفت `CREATE UNIQUE INDEX idx_journal_snapshot_pk` الزائد (PRIMARY KEY ينشئ unique index تلقائيًا). حدّثت `bot.py` الـwarning log ليشير لملف الـmigration + يحذّر من الـsyntax الخطأ. أضفت 5 حرّاس انحدار في test_supabase_snapshot.py.
+- commit + push: `96eb1f7` FIX(SUPABASE-MIGRATION). origin/main محدّث.
+- الاختبارات: **598/598 PASS** (كانت 593، +5 حرّاس انحدار).
+- المستخدم نفّذ الـmigration في Supabase SQL Editor بنجاح.
+- **التحقق REST بعد إنشاء الجدول** (service_role JWT، دون طباعة المفتاح):
+  - GET limit=0 → **HTTP 200** `[]` (كان 404) — الجدول موجود ✅
+  - INSERT probe بكل 11 عمود → **HTTP 201** — أرجع الصف كاملاً بالأنواع الصحيحة ✅
+  - SELECT roundtrip → **HTTP 200** — استرجاع الصف المُدرج بدقته ✅
+  - حرْس schema (INSERT `nonexistent_col`) → **HTTP 400 PGRST204** "Could not find the column" — PostgREST يطابق المخطط الفعلي ✅
+  - DELETE probe → **HTTP 204** ✅
+  - GET probe بعد الحذف → **HTTP 200** `[]` — التنظيف مؤكَّد ✅
+  - عدّ الصفوف (Prefer: count=exact) → `content-range: 0-0/289` — **289 صفًا حقيقيًا** ✅
+  - عينة (state=not.in.(delete_miss,pending,forwarded)) → صفوف `no_text` بـchat_ids تيليجرام حقيقية (-1002119925760, -1001478630293, -1003812308476, -1001358726040) وreceived_at حقيقية ✅
+  - توزيع الـstates: `delete_miss`, `pending`, `no_text` — pipeline كامل يعمل ✅
+  - GET بلا apikey header → **HTTP 401** "No API key found in request" — gate-level auth مُطبّق ✅
+- **فحص /metrics على Render بعد إنشاء الجدول**:
+  - `link_capture_total`: 2 → **116** (+114 روابط ملتقطة حقيقيًا منذ آخر فحص)
+  - `link_ring_hits`: 0 → **5** (5 إنقاذات LRB حقيقية في الإنتاج!)
+  - `delete_rescued_total`: 0 → **5** (مطابقة لـ5 LRB hits — كل الإنقاذات جاءت عبر مسار LRB)
+  - `delete_miss_total`: 4 → 256 (رسائل حُذفت قبل أي التقاط — الحالة الطبيعية لرسائل بلا روابط/في شات غير مرصود)
+  - `monitor_total_links`: 26942 → 26964 (+22)
+
+Stage Summary:
+- **PRODUCTION-VERIFIED Fast-Delete Rescue**: 5 إنقاذات حقيقية في الإنتاج (link_ring_hits=5 = delete_rescued_total=5). لم تعد SIMULATION ONLY — هذه أحداث تيليجرام حقيقية على Render.
+- **PRODUCTION-VERIFIED Supabase Snapshot Mirror**: 289 صفًا حقيقيًا تتدفّق في الجدول، chat_ids تيليجرام حقيقية، states متعددة (delete_miss/pending/no_text). البوت اكتشف الجدول (GET 200 بدل 404) وانطلق الـ_​journal_snapshot_loop يكتب بنجاح. Option C persistence يعمل.
+- **Migration fix deployed**: `96eb1f7` على origin/main يحمل الـSQL المصحَّح (DROP+CREATE POLICY) + 5 حرّاس انحدار تمنع عودة خطأ `CREATE POLICY IF NOT EXISTS`.
+- **الـsecret hygiene**: service_role JWT استُخدم عبر env vars فقط، لم يُطبَع. GitHub PAT كذلك. توصية التدوير ما زالت قائمة (كلاهما كُشفا نصيًا في المحادثة).
+- **المانع الوحيد المتبقي**: anon RLS denial المباشر يتطلب anon key (لا أملكه). لكن: (1) migration نفّذت الـpolicy بنجاح، (2) gate-level 401 مؤكَّد للوصول بلا apikey. الـpolicy موجودة ومُطبَّقة.

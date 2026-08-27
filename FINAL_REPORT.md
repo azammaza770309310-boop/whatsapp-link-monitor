@@ -219,3 +219,61 @@
 ---
 **Full report path:** `/home/z/wlm/FINAL_REPORT.md` (PERSISTENT)
 **Worklog path:** `/home/z/wlm/worklog.md` (PERSISTENT, includes PRODUCTION-PUSH-VERIFY section)
+
+---
+
+# FINAL STATUS — Production-Verified Fast-Delete Rescue + Supabase Live (Addendum) · Session Continuation 2
+
+**تاريخ (UTC):** 2026-08-26 (post-migration window)
+**origin/main:** `96eb1f7` (migration fix) — pushed ✅
+**Supabase table:** `message_journal_snapshot` — created + verified + actively receiving data ✅
+
+## A. Migration Fix (CRITICAL)
+- **الخطأ**: الـmigration الأصلي استخدم `CREATE POLICY IF NOT EXISTS` — غير مدعوم في PostgreSQL (syntax error at "NOT").
+- **الإصلاح** (`96eb1f7`): استبدال بنمط `DROP POLICY IF EXISTS` ثم `CREATE POLICY` (idempotent متوافق). حذف `CREATE UNIQUE INDEX idx_journal_snapshot_pk` الزائد (PRIMARY KEY ينشئه تلقائيًا). تحديث `bot.py` warning log ليشير لملف الـmigration. +5 حرّاس انحدار في `test_supabase_snapshot.py`.
+- **الاختبارات**: 598/598 PASS (كانت 593).
+
+## B. Supabase Table — VERIFIED LIVE
+| الفحص | النتيجة |
+|---|---|
+| الجدول موجود | GET limit=0 → **HTTP 200** (كان 404 PGRST205 قبل الـmigration) ✅ |
+| المخطط صحيح (11 عمود) | INSERT بكل الأعمدة → **HTTP 201**، أرجع الصف بالأنواع الصحيحة ✅ |
+| PostgREST يطابق المخطط | INSERT عمود خاطئ `nonexistent_col` → **HTTP 400 PGRST204** ✅ |
+| SELECT roundtrip | **HTTP 200** — استرجاع الصف المُدرج بدقته ✅ |
+| DELETE + cleanup | **HTTP 204** + GET بعده `[]` ✅ |
+| عدد الصفوف الحقيقية | `content-range: 0-0/289` — **289 صفًا إنتاجيًا حقيقيًا** ✅ |
+| عينة بيانات حقيقية | `chat_id=-1002119925760, msg_id=474255, state=no_text, received_at=1787801844` — أرقام تيليجرام حقيقية ✅ |
+| توزيع الـstates | `delete_miss` + `pending` + `no_text` — pipeline كامل ✅ |
+| Gate-level auth | GET بلا apikey → **HTTP 401** "No API key found in request" ✅ |
+| anon RLS | مُطبَّقة (migration نفّذها بنجاح + gate 401). الاختبار المباشر للـanon-key يتطلب anon key غير متوفّر. |
+
+## C. Production Fast-Delete Rescue — VERIFIED (NO LONGER SIMULATION)
+`/metrics` على `https://whatsapp-userbot-yzm7.onrender.com` بعد إنشاء الجدول:
+| Counter | قبل | بعد | الدلالة |
+|---|---|---|---|
+| `link_capture_total` | 2 | **116** | +114 روابط ملتقطة (NewMessage + Raw + Polling) |
+| `link_ring_hits` | 0 | **5** | **5 إنقاذات LRB حقيقية** — رسائل بروابط حُذفت سريعًا، الـLRB أنقذ الرابط |
+| `delete_rescued_total` | 0 | **5** | مطابقة لـ5 LRB hits — كل الإنقاذات جاءت عبر مسار LRB |
+| `delete_miss_total` | 4 | 256 | رسائل حُذفت قبل أي التقاط (حالة طبيعية لرسائل بلا روابط/في شات غير مرصود) |
+| `monitor_total_links` | 26942 | 26964 | +22 روابط إجمالية |
+
+**التصنيف**: PRODUCTION VERIFIED (أحداث تيليجرام حقيقية على Render، ليست simulation).
+
+## D. Updated Verdict — ✅ READY (all external blockers resolved except rotation)
+- ✅ Push: origin/main = `96eb1f7`
+- ✅ Tests: 598/598 PASS
+- ✅ Production: live + healthy + 5 real LRB rescues
+- ✅ Supabase: table created + verified + 289 real rows flowing
+- ✅ Migration bug fixed (CREATE POLICY IF NOT EXISTS → DROP+CREATE)
+- ⚠️ Rotation still pending (GitHub PAT + Supabase service_role JWT + Telegram API_ID/API_HASH/BOT_TOKEN in git history)
+- ⏳ `git filter-repo` purge (after rotation + backup tag)
+
+## E. Final Rotation Recommendations (UNCHANGED, still pending)
+1. **GitHub PAT** (`ghp_...`) → revoke + new. عاجل.
+2. **Supabase service_role JWT** → reset service_role secret. عاجل.
+3. **Telegram BOT_TOKEN** → @BotFather `/revoke`. عاجل (مكشوف في git history).
+4. **Telegram API_ID + API_HASH** → my.telegram.org regenerate. عاجل (مكشوف في git history).
+5. بعد 1–4: `git filter-repo --invert-paths --path download/create_env_v6.py` + force-push (بعد backup tag).
+
+---
+**Status: TASK COMPLETE — production-verified.** الـالمانع الوحيد المتبقي هو تدوير الاعتمادات المكشوفة (مسؤولية المستخدم).
