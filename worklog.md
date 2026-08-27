@@ -1778,3 +1778,45 @@ Stage Summary:
   2. لـcontrolled trial: ضبط DASHBOARD_API_KEY في Render + إرسال رسالة اختبار لمجموعة مملوكة + حذفها سريعًا + قراءة /metrics قبل/بعد
   3. لـSHA verification: PAT سليم لـGitHub push (لكن غير ضروري لأن runtime behavior لا يتغير)
   4. لـSupabase state: JWT سليم من Supabase Dashboard → Settings → API → service_role secret
+
+---
+Task ID: PRODUCTION-PUSH-VERIFY
+Agent: senior (continuation session)
+Task: Push الـcommits المحلية المتبقية إلى origin/main بالـGitHub PAT الجديد، التحقق من Render auto-deploy، تشغيل الاختبارات، وتحديث التقرير النهائي.
+
+Work Log:
+- قرأت الحالة: origin/main كان على df4d984 (4 commits دُفعت بين الجلسات)، HEAD المحلي على a9c67bb → متقدّم بـ2 commits فقط (5c4d563 + a9c67bb).
+- أنشأت credential helper مؤقت `/tmp/gh_cred_helper.sh` يقرأ GH_TOKEN من env (لا يخزّن التوكن في ملف/config/git history).
+- نفّذت push: `GH_TOKEN=<provided> git -c credential.helper=/tmp/gh_cred_helper.sh push origin main` مع sed redaction للإخراج.
+- النتيجة: `df4d984..a9c67bb main -> main` exit=0 ✅. حذفت الـhelper script وunset GH_TOKEN فورًا.
+- تحققت: `git fetch origin` → origin/main = a9c67bb = local HEAD، ahead=0 behind=0 ✅.
+- فحص إنتاجي مباشر على `https://whatsapp-userbot-yzm7.onrender.com`:
+  - `/ready` HTTP 200: bot_connected=true, db_connected=true, active_watchers=4
+  - `/metrics` HTTP 200: الـcounters الجديدة من commit d81b682 منشورة (link_capture_total=2, delete_miss_total=4, delete_rescued_total=0, link_ring_hits=0, duplicate_links_skipped=0, floodwait_total=0, connected_joiners=0). الكود الجديد مُنشور ✅.
+  - `/api/polling_status` HTTP 401: DASHBOARD_API_KEY fail-closed يعمل ✅.
+  - ملاحظة: العدادات reset بسبب إعادة التشغيل بعد deploy (الـ4 rescues السابقة كانت من عملية سابقة).
+- ثبّتّ dependencies الناقصة: `pip install aiosqlite telethon python-dotenv PySocks`.
+- شغّلت كل 13 ملف اختبار standalone:
+  - test_account_safety 10/10, test_api_security 13/13, test_audit_regressions 190/190, test_delete_rescue 15/15, test_deployment_updated 35/35, test_extractor_comparison 3/3, test_fast_delete_rescue_evidence 16/16, test_link_capture 21/21, test_message_journal 66/66, test_phase3_contracts 96/96, test_raw_hook 13/13, test_source_registry 103/103, test_supabase_snapshot 12/12.
+  - **GRAND TOTAL: 593/593 PASS, 0 FAIL** ✅.
+- فحص أمني للأسرار التاريخية في git history:
+  - commits 68dbb53, 66779fe, 52427b0 ما زالت موجودة وتُعدّل `download/create_env_v6.py`.
+  - في هذه الـcommits، الملف يحتوي قيم Telegram حقيقية: API_ID=36421189, API_HASH=<32hex redacted>, BOT_TOKEN=8821033695:<redacted>.
+  - الـHEAD الحالي للمستودع نظيف: نفس الملف يحتوي placeholders فقط (YOUR_API_ID_HERE) ✅.
+  - لا توكنات GitHub PAT أو Supabase JWT في history أو current tree ✅.
+
+Stage Summary:
+- **PUSH COMPLETE**: origin/main = a9c67bb (متطابق مع HEAD المحلي). كل الـcommits المحلية منشورة.
+- **PRODUCTION VERIFIED**:
+  - ✅ Bot liveness + readiness + db_connected + active_watchers=4
+  - ✅ New link-capture metrics counters live (PR-OBSERVABILITY deployed)
+  - ✅ DASHBOARD_API_KEY fail-closed (PR-7 working in production)
+  - ⚠️ connected_joiners=0 / all_joiners_unavailable=true — الـjoiner fleet في حالة غير متصلة (يتطابق مع ملخص الحسابات الثلاثة المعروفة: FloodWait/Disconnected/Restricted)
+- **TESTS VERIFIED**: 593/593 PASS (baseline مؤكد بعد الـpush).
+- **SIMULATION PROOF** (test_fast_delete_rescue_evidence.py): 25/25 RESCUED_ONCE, 100% capture+rescue rate, 0 misses, 0 duplicate leaks, median delete→rescue 1.525-2.498ms عبر كل التأخيرات، link-only rescue (بدون metadata) ينجح، Raw+NewMessage → enqueue واحد.
+- **SECRET HYGIENE STATUS**:
+  - Current tree: CLEAN ✅
+  - git history: Telegram credentials (API_ID/API_HASH/BOT_TOKEN) مكشوفة في 3 commits — تتطلب rotation + filter-repo.
+  - GitHub PAT المقدّم في هذه الجلسة: استُخدم للـpush فقط، لم يُخزّن في أي ملف/config. **توصية فورية بالتدوير** لأنه كُشف نصيًا في المحادثة.
+  - Supabase service_role JWT + project URL: لا أملك قيمهما في السياق الحالي (كانت في السياق السابق الذي لُخّص).
+- **BLOCKED (needs user)**: تطبيق migration `supabase/message_journal_snapshot.sql` على Supabase — يتطلب إعادة توفير service_role JWT + project URL، أو تطبيق يدوي بواسطة المستخدم في Supabase SQL Editor.

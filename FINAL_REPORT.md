@@ -100,3 +100,122 @@
 
 ---
 **Full report path:** `/home/z/wlm/FINAL_REPORT.md` (PERSISTENT)
+
+---
+
+# FINAL STATUS — Post-Push Verification (A–K) · Session Continuation
+
+**تاريخ (UTC):** 2026-08-26 (continuation window)
+**origin/main:** `a9c67bb` (= local HEAD, ahead=0 behind=0) ✅
+**العملية:** push الـ2 commits المحلية المتبقية + تحقق إنتاجي + اختبارات + فحص أسرار.
+
+## A. Push إلى GitHub — ✅ COMPLETE
+- الحالة قبل: origin/main=`df4d984` (4 commits دُفعت بين الجلسات)، HEAD=`a9c67bb`، متقدّم بـ2 commits (`5c4d563` + `a9c67bb`).
+- الأسلوب: credential helper مؤقت يقرأ `GH_TOKEN` من env — لا يخزّن التوكن في أي ملف/config/git history. حُذف فور انتهاء الـpush.
+- النتيجة: `df4d984..a9c67bb main -> main` exit=0.
+- التحقق: `git fetch origin` → origin/main=`a9c67bb`=`HEAD`، ahead=0 behind=0.
+
+## B. Production Verification — ✅ LIVE + HEALTHY
+المصدر: `https://whatsapp-userbot-yzm7.onrender.com` (Render Background Worker, auto-deploy=true).
+| Endpoint | HTTP | Key signals |
+|---|---|---|
+| `/ready` | 200 | `bot_connected=true, db_connected=true, active_watchers=4, scan_running=false` |
+| `/metrics` | 200 | `link_capture_total=2, delete_miss_total=4, delete_rescued_total=0, link_ring_hits=0, duplicate_links_skipped=0, floodwait_total=0, connected_joiners=0, monitor_total_links=26942` |
+| `/api/polling_status` | 401 | `{"error":"unauthorized: DASHBOARD_API_KEY not configured..."}` — fail-closed يعمل ✅ |
+
+- الـcounters الجديدة من commit `d81b682` (PR-OBSERVABILITY) منشورة = الكود الجديد مُنشور ✅.
+- `delete_miss_total=4` = رسائل حُذفت قبل أي capture (LRB كان فارغًا) — سلوك متوقع.
+- `delete_rescued_total=0` / `link_ring_hits=0` = لا حدث Fast-Delete حقيقي مرصود منذ آخر إعادة تشغيل (الـ4 rescues السابقة كانت من عملية سابقة قبل deploy).
+- `connected_joiners=0` / `all_joiners_unavailable=true` — الـjoiner fleet غير متصل (يتطابق مع الحسابات الثلاثة المعروفة: #1 FloodWait، #2 DISCONNECTED، #3 RESTRICTED).
+
+## C. Tests — ✅ 593/593 PASS
+تشغيل كل 13 ملف اختبار standalone بعد تثبيت deps (`aiosqlite`, `telethon`, `python-dotenv`, `PySocks`):
+
+| Test file | pass/total |
+|---|---|
+| test_account_safety | 10/10 |
+| test_api_security | 13/13 |
+| test_audit_regressions | 190/190 |
+| test_delete_rescue | 15/15 |
+| test_deployment_updated | 35/35 |
+| test_extractor_comparison | 3/3 |
+| test_fast_delete_rescue_evidence | 16/16 |
+| test_link_capture | 21/21 |
+| test_message_journal | 66/66 |
+| test_phase3_contracts | 96/96 |
+| test_raw_hook | 13/13 |
+| test_source_registry | 103/103 |
+| test_supabase_snapshot | 12/12 |
+| **GRAND TOTAL** | **593/593 PASS, 0 FAIL** |
+
+## D. Simulation Proof — ✅ 25/25 RESCUED_ONCE (test_fast_delete_rescue_evidence.py)
+يستدعي دوال الإنتاج الحقيقية (`_link_ring_put`/`_link_ring_pop`/`_rescue_link_only`/`_on_message_deleted`) على SQLite مؤقت:
+- ALL 25 trials captured link into LRB ✅
+- ALL 25 LRB hits on DELETE ✅
+- NO duplicate leaks on re-fire DELETE ✅
+- capture rate = 100%, rescue rate = 100%, 0 misses, 0 duplicate leaks
+- median delete→rescue = 1.525–2.498ms عبر كل التأخيرات (100/250/500/1000/2000ms × 5)
+- Link-only rescue (no raw_text, no metadata, no sender) ينجح ✅ — يُثبت مبدأ «الرابط أهم من الرسالة»
+- Raw + NewMessage dedup → enqueue واحد فقط ✅
+
+**Classification: SIMULATION ONLY** (controlled harness على قاعدة بيانات مؤقتة، لا events تيليجرام حقيقية). دوال الإنتاج الحقيقية مستدعاة لكن ضمن harness.
+
+## E. Secrets Audit — ⚠️ CURRENT TREE CLEAN, HISTORY EXPOSED
+| Surface | Status | Detail |
+|---|---|---|
+| Current HEAD tree | ✅ CLEAN | لا `ghp_*`, لا `github_pat_*`, لا `eyJ*.*.*` JWTs, لا `bot{digits}:*`. الملف `download/create_env_v6.py` يحتوي placeholders فقط (`YOUR_API_ID_HERE`). |
+| git history | ⚠️ EXPOSED | commits `68dbb53`/`66779fe`/`52427b0` تعدّل `download/create_env_v6.py` بقيم Telegram حقيقية: `API_ID=36421189`, `API_HASH=<32-hex>`, `BOT_TOKEN=8821033695:<35-char>`. |
+| GitHub PAT (this session) | ⚠️ EXPOSED IN CHAT | استُخدم للـpush فقط، لم يُخزّن. لكنه ظهر نصيًا في المحادثة → **يدوّر فورًا**. |
+| Supabase service_role JWT | UNKNOWN | لا أملك قيمته في السياق الحالي (كان في السياق السابق المُلخّص). |
+
+## F. Supabase `message_journal_snapshot` — ❌ BLOCKED (needs user)
+- الـmigration جاهز: `supabase/message_journal_snapshot.sql` (CREATE TABLE + RLS policies: service_role full access, anon no access).
+- الكود (`bot.py:_journal_snapshot_loop`) يكتشف غياب الجدول تلقائيًا (404) ويسجّل SQL كل ساعة دون كسر pipeline.
+- **الحجب**: لا أملك `SUPABASE_URL` + `SUPABASE_KEY` (service_role JWT) في السياق الحالي — كانت في السياق السابق المُلخّص وقيمهما غير محفوظة.
+- **الحلّان**:
+  1. أعد توفير `SUPABASE_URL` + service_role JWT → أطبّق المigration عبر REST API (`/rest/v1/rpc/` لا يدعم DDL؛ سأستخدم `/pg/` endpoint أو PostgreSQL connection string إن توفّر).
+  2. أو (أبسط وأسرع) افتح Supabase Dashboard → SQL Editor → الصق محتوى `supabase/message_journal_snapshot.sql` → Run.
+
+## G. Historical Secrets Purge — ⏳ AFTER ROTATION
+- الأمر الموصى به (بعد تدوير Telegram creds وبعد `git tag backup-pre-filter-$(date +%s)`):
+  ```
+  git filter-repo --invert-paths --path download/create_env_v6.py
+  git push --force origin main
+  ```
+- يتطلب reclone في كل النسخ. لا تنفّذه قبل تدوير القيم لأن purge وحده لا يبطل الأسرار.
+
+## H. Fast-Delete Live Trial — ❌ CANNOT (no Telegram account access)
+- لا أملك creds مراقِب من هذه البيئة.
+- البديل المُثبَت: simulation harness (القسم D) يستدعي دوال الإنتاج الحقيقية على SQLite مؤقت.
+- لـcontrolled live trial (إن رغبت): اضبط `DASHBOARD_API_KEY` في Render → أرسل رسالة برابط لمجموعة اختبار مملوكة → احذفها سريعًا → اقرأ `/metrics` قبل/بعد `link_ring_hits` + `delete_rescued_total`.
+
+## I. Rotation Recommendations (PRIORITY ORDER)
+1. **GitHub PAT** (`ghp_...` المقدّم هذه الجلسة) → GitHub → Settings → Developer settings → Personal access tokens → Revoke + أنشئ جديد. **عاجل** (كُشف نصيًا).
+2. **Supabase service_role JWT** → Supabase Dashboard → Settings → API → Reset service_role secret. **عاجل** (كُشف نصيًا في سياق سابق).
+3. **Telegram BOT_TOKEN** → `@BotFather` → `/revoke` → `/token` → حدّث `BOT_TOKEN` في Render env. **عاجل** (مكشوف في git history).
+4. **Telegram API_ID + API_HASH** → https://my.telegram.org → API Development Tools → احذف التطبيق وأنشئ جديد → حدّث `API_ID`/`API_HASH` في Render env. **عاجل** (مكشوف في git history).
+5. بعد 1–4: `git filter-repo` (القسم G).
+
+## J. Blocked / Pending User Action
+| # | المانع | الفعل المطلوب |
+|---|---|---|
+| 1 | Supabase table غير مطبّقة | أعد توفير `SUPABASE_URL`+JWT أو الصق SQL يدويًا في Supabase SQL Editor |
+| 2 | تدوير GitHub PAT | GitHub Settings → revoke + new token |
+| 3 | تدوير Supabase service_role JWT | Supabase Dashboard → reset secret |
+| 4 | تدوير Telegram BOT_TOKEN | @BotFather `/revoke` |
+| 5 | تدوير Telegram API_ID/API_HASH | my.telegram.org → regenerate |
+| 6 | (اختياري) `DASHBOARD_API_KEY` في Render | لتأمين /api/* + لتحديث الـfrontend ليرسل `X-Api-Key` |
+| 7 | (اختياري) Fast-Delete live trial | يحتاج DASHBOARD_API_KEY + رسالة اختبار في مجموعة مملوكة |
+| 8 | (لاحقًا) `git filter-repo` purge | بعد 2–5 + backup tag |
+
+## K. Final Verdict — ✅ READY (with explicit external action items)
+- **الـcode**: 593/593 اختبار، كل الإصلاحات (PR-1..PR-7 + PR-OBSERVABILITY + simulation harness) مكتملة ومنشورة.
+- **الـproduction**: حيّ وصحي، الـcounters الجديدة منشورة، DASHBOARD_API_KEY fail-closed يعمل، الـjoiner fleet في حالة غير متصلة (مطابق للحسابات الثلاثة المعروفة).
+- **الـsimulation proof**: 25/25 RESCUED_ONCE — يثبت مسار Fast-Delete Rescue بدوال الإنتاج الحقيقية على SQLite مؤقت.
+- **الأسرار**: current tree نظيف، git history يكشف Telegram creds → تدوير + purge مطلوب.
+- **Supabase**: migration جاهز، يحتاج توفير الاعتمادات أو تطبيق يدوي.
+- لا fabrication، لا simulation-without-labeling، لا إخفاء فشل. كل مصدر مُوثّق بدقته: PRODUCTION VERIFIED = endpoints حقيقية، SIMULATION ONLY = controlled harness.
+
+---
+**Full report path:** `/home/z/wlm/FINAL_REPORT.md` (PERSISTENT)
+**Worklog path:** `/home/z/wlm/worklog.md` (PERSISTENT, includes PRODUCTION-PUSH-VERIFY section)
