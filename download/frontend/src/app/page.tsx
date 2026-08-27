@@ -13,6 +13,7 @@ import {
   RefreshCw, ExternalLink, Phone, MapPin, Clock, ArrowRight,
   X, Activity, CheckCircle2, XCircle, AlertTriangle, Clock3,
   Copy, Check, Download, TrendingUp, BarChart3, Flame,
+  VolumeX, ShieldCheck,
 } from 'lucide-react'
 import type { ReactNode, MouseEvent as ReactMouseEvent, ChangeEvent } from 'react'
 
@@ -198,6 +199,10 @@ interface TopGroupsTotals {
   distinct_groups: number
 }
 
+// [SOURCE-HEALTH] a producing source whose last_seen is aging — the client
+// computes daysQuiet from the 30-day top-groups snapshot.
+type QuietSource = TopGroup & { daysQuiet: number }
+
 type ModalType =
   | 'whatsapp'
   | 'telegram'
@@ -229,6 +234,14 @@ function buildHeaders(): Record<string, string> {
   if (API_KEY) h['X-Api-Key'] = API_KEY
   return h
 }
+
+// [SOURCE-HEALTH] quiet-source detection thresholds — a source that
+// produced links within the last 30 days but has been silent for 2+ days
+// is "quieting"; 5+ days means it effectively stopped (watcher removed,
+// group went private, or the audience moved on).
+const HEALTH_WINDOW_DAYS = 30
+const QUIET_AFTER_DAYS = 2
+const STOPPED_AFTER_DAYS = 5
 
 function safeUrl(url: string | null | undefined): string | null {
   if (!url || typeof url !== 'string') return null
@@ -270,6 +283,9 @@ export default function Home() {
   // [SOURCE-VIEW] link-source attribution (top producing groups)
   const [topGroups, setTopGroups] = useState<TopGroup[]>([])
   const [topGroupsTotals, setTopGroupsTotals] = useState<TopGroupsTotals | null>(null)
+  // [SOURCE-HEALTH] independent 30-day top-groups snapshot for quiet-source
+  // detection (NOT tied to trendDays — see fetchSourceHealth rationale).
+  const [healthGroups, setHealthGroups] = useState<TopGroup[]>([])
 
   // ===== Fetch Functions =====
   const fetchStats = useCallback(async () => {
@@ -467,6 +483,26 @@ export default function Home() {
     }
   }, [])
 
+  // [SOURCE-HEALTH] 30-day top-groups snapshot for quiet-source detection.
+  // Deliberately independent of the trend window (trendDays): a source that
+  // stopped 20 days ago is invisible in a 7/14-day window — only the widest
+  // window reliably detects it. The server caches per (days,limit) key for
+  // 60s, so this extra poll is cheap.
+  const fetchSourceHealth = useCallback(async () => {
+    try {
+      const response = await fetch(
+        `${API_URL}/api/top_groups?days=${HEALTH_WINDOW_DAYS}&limit=50`,
+        { headers: buildHeaders() }
+      )
+      if (response.ok) {
+        const data = await response.json()
+        if (Array.isArray(data.groups)) setHealthGroups(data.groups)
+      }
+    } catch (err) {
+      console.error('fetchSourceHealth error:', err)
+    }
+  }, [])
+
   // Initial load + auto refresh (real-time every 15s)
   useEffect(() => {
     const load = async () => {
@@ -499,11 +535,12 @@ export default function Home() {
     const load = () => {
       fetchTrend(trendDays)
       fetchTopGroups(trendDays)
+      fetchSourceHealth()
     }
     load()
     const t = setInterval(load, 60000)
     return () => clearInterval(t)
-  }, [fetchTrend, fetchTopGroups, trendDays])
+  }, [fetchTrend, fetchTopGroups, fetchSourceHealth, trendDays])
 
   const refreshAll = useCallback(() => {
     fetchLinks()
@@ -514,13 +551,34 @@ export default function Home() {
     fetchPendingApprovals()
     fetchTrend(trendDays)
     fetchTopGroups(trendDays)
+    fetchSourceHealth()
     setLastUpdated(new Date())
-  }, [fetchLinks, fetchStats, fetchJoiners, fetchMonitoredChats, fetchReadiness, fetchPendingApprovals, fetchTrend, fetchTopGroups, trendDays])
+  }, [fetchLinks, fetchStats, fetchJoiners, fetchMonitoredChats, fetchReadiness, fetchPendingApprovals, fetchTrend, fetchTopGroups, fetchSourceHealth, trendDays])
 
   // [LIVE-STATUS] seconds since last successful refresh
   const secondsAgo = lastUpdated
     ? Math.max(0, Math.floor((now.getTime() - lastUpdated.getTime()) / 1000))
     : null
+
+  // [SOURCE-HEALTH] sources that went quiet — last_seen 2+ days ago within
+  // the 30-day health window. Ranked by volume: the bigger the source, the
+  // bigger the capture impact of its silence. Computed entirely client-side
+  // from the existing /api/top_groups payload (no new endpoint needed).
+  const quietSources = useMemo<QuietSource[]>(() => {
+    if (healthGroups.length === 0) return []
+    const todayStart = new Date()
+    todayStart.setHours(0, 0, 0, 0)
+    return healthGroups
+      .map((g) => {
+        const last = new Date(`${g.last_seen}T00:00:00`)
+        const days = Number.isFinite(last.getTime())
+          ? Math.round((todayStart.getTime() - last.getTime()) / 86_400_000)
+          : 0
+        return { ...g, daysQuiet: Math.max(0, days) }
+      })
+      .filter((g) => g.daysQuiet >= QUIET_AFTER_DAYS)
+      .sort((a, b) => b.total - a.total)
+  }, [healthGroups])
   return (
     <div className="min-h-screen bg-gradient-to-br from-slate-950 via-slate-900 to-slate-950 text-white">
       <div className="fixed inset-0 overflow-hidden pointer-events-none">
@@ -650,41 +708,60 @@ export default function Home() {
           </motion.div>
         )}
 
-        {/* Main Stats Cards */}
-        <div className="grid grid-cols-2 md:grid-cols-4 gap-3 md:gap-4 mb-6">
-          <StatCard
-            icon={<Link2 className="w-5 h-5" />}
-            label="إجمالي الروابط"
-            value={stats?.total_links ?? 0}
-            gradient="from-emerald-500/20 to-emerald-500/5"
-            iconColor="text-emerald-400"
-            onClick={() => setModal('all_links')}
-          />
-          <StatCard
-            icon={<MessageCircle className="w-5 h-5" />}
-            label="🟢 واتساب"
-            value={stats?.whatsapp_links ?? 0}
-            gradient="from-green-500/20 to-green-500/5"
-            iconColor="text-green-400"
-            onClick={() => setModal('whatsapp')}
-          />
-          <StatCard
-            icon={<Send className="w-5 h-5" />}
-            label="🔵 تيليجرام"
-            value={stats?.telegram_links ?? 0}
-            gradient="from-blue-500/20 to-blue-500/5"
-            iconColor="text-blue-400"
-            onClick={() => setModal('telegram')}
-          />
-          <StatCard
-            icon={<Users className="w-5 h-5" />}
-            label="المراقبون"
-            value={stats?.active_watchers ?? 0}
-            gradient="from-purple-500/20 to-purple-500/5"
-            iconColor="text-purple-400"
-            onClick={() => setModal('joiners')}
-          />
-        </div>
+        {/* Main Stats Cards — [STYLING] skeleton tiles during the very
+            first fetch (no zero-flash); animate in once data lands. */}
+        <motion.div
+          initial={{ opacity: 0, y: 10 }}
+          animate={{ opacity: 1, y: 0 }}
+          transition={{ duration: 0.3 }}
+          className="grid grid-cols-2 md:grid-cols-4 gap-3 md:gap-4 mb-6"
+        >
+          {!stats && !apiError ? (
+            [0, 1, 2, 3].map((i) => (
+              <Card key={i} className="bg-slate-800/30 border-slate-700/50 backdrop-blur-sm">
+                <CardContent className="p-4">
+                  <Skeleton className="h-3 w-1/2 mb-2.5" />
+                  <Skeleton className="h-7 w-2/3" />
+                </CardContent>
+              </Card>
+            ))
+          ) : (
+            <>
+              <StatCard
+                icon={<Link2 className="w-5 h-5" />}
+                label="إجمالي الروابط"
+                value={stats?.total_links ?? 0}
+                gradient="from-emerald-500/20 to-emerald-500/5"
+                iconColor="text-emerald-400"
+                onClick={() => setModal('all_links')}
+              />
+              <StatCard
+                icon={<MessageCircle className="w-5 h-5" />}
+                label="🟢 واتساب"
+                value={stats?.whatsapp_links ?? 0}
+                gradient="from-green-500/20 to-green-500/5"
+                iconColor="text-green-400"
+                onClick={() => setModal('whatsapp')}
+              />
+              <StatCard
+                icon={<Send className="w-5 h-5" />}
+                label="🔵 تيليجرام"
+                value={stats?.telegram_links ?? 0}
+                gradient="from-blue-500/20 to-blue-500/5"
+                iconColor="text-blue-400"
+                onClick={() => setModal('telegram')}
+              />
+              <StatCard
+                icon={<Users className="w-5 h-5" />}
+                label="المراقبون"
+                value={stats?.active_watchers ?? 0}
+                gradient="from-purple-500/20 to-purple-500/5"
+                iconColor="text-purple-400"
+                onClick={() => setModal('joiners')}
+              />
+            </>
+          )}
+        </motion.div>
 
         {/* [TREND-VIEW] Daily capture trend — stacked bars (Telegram bottom /
             WhatsApp top) from /api/links_daily. Hover a bar for the exact
@@ -804,6 +881,130 @@ export default function Home() {
               </div>
             </CardContent>
           </Card>
+        )}
+
+        {/* [SOURCE-HEALTH] Quiet sources — producing sources from the last
+            30 days that went silent (2+ days without a single link).
+            Surfaces capture-drop causes (a group that removed the watcher,
+            went private, or dried up) BEFORE the daily totals visibly dip.
+            Data: /api/top_groups?days=30 (client-side daysQuiet). */}
+        {healthGroups.length > 0 && (
+          <motion.div
+            initial={{ opacity: 0, y: 12 }}
+            animate={{ opacity: 1, y: 0 }}
+            transition={{ duration: 0.35 }}
+          >
+            <Card className="bg-slate-800/30 border-slate-700/50 backdrop-blur-sm mb-6">
+              <CardHeader className="pb-3">
+                <CardTitle className="flex items-center justify-between text-lg">
+                  <span className="flex items-center gap-2">
+                    <VolumeX className="w-5 h-5 text-orange-400" />
+                    مصادر هادئة
+                    <span className="text-xs text-slate-500 font-normal">
+                      (آخر {HEALTH_WINDOW_DAYS} يوم · أعلى 50 مصدراً)
+                    </span>
+                  </span>
+                  {quietSources.length > 0 ? (
+                    <Badge className="bg-rose-500/20 text-rose-300 border-rose-500/40">
+                      🔇 {quietSources.length} مصدر
+                    </Badge>
+                  ) : (
+                    <Badge className="bg-emerald-500/20 text-emerald-300 border-emerald-500/40">
+                      ✅ نشطة
+                    </Badge>
+                  )}
+                </CardTitle>
+              </CardHeader>
+              <CardContent>
+                {quietSources.length === 0 ? (
+                  <div className="flex items-center gap-3 p-3 rounded-lg border border-emerald-500/30 bg-emerald-500/10">
+                    <ShieldCheck className="w-5 h-5 text-emerald-400 flex-shrink-0" />
+                    <p className="text-sm text-emerald-200">
+                      كل المصادر النشطة أنتجت روابط خلال آخر يومين — لا يوجد توقف ملحوظ.
+                    </p>
+                  </div>
+                ) : (
+                  <div className="space-y-2.5">
+                    {quietSources.slice(0, 5).map((g, i) => {
+                      const stopped = g.daysQuiet >= STOPPED_AFTER_DAYS
+                      // silence-age bar — fills up the 30-day track as the
+                      // source stays quiet (amber = slowing, red = stopped)
+                      const stalenessPct = Math.min(
+                        100,
+                        Math.max(4, Math.round((g.daysQuiet / HEALTH_WINDOW_DAYS) * 100))
+                      )
+                      return (
+                        <motion.div
+                          key={g.group}
+                          initial={{ opacity: 0, x: 20 }}
+                          animate={{ opacity: 1, x: 0 }}
+                          transition={{ delay: Math.min(i * 0.07, 0.35), duration: 0.3 }}
+                          className="group bg-slate-900/50 rounded-lg p-3 border border-slate-700/50 hover:border-slate-600/60 transition-colors"
+                          title={`نشاط ${g.first_seen} ← ${g.last_seen} · واتساب ${g.whatsapp.toLocaleString()} / تيليجرام ${g.telegram.toLocaleString()}`}
+                        >
+                          <div className="flex items-center justify-between gap-2 mb-2">
+                            <div className="flex items-center gap-2 min-w-0">
+                              <span className="text-xs w-6 text-center flex-shrink-0" aria-hidden>
+                                {stopped ? '⏹️' : '🐢'}
+                              </span>
+                              <span
+                                className={`text-sm truncate ${g.group === 'غير محدد' ? 'text-slate-500 italic' : 'text-slate-200'}`}
+                                title={g.group}
+                              >
+                                {g.group}
+                              </span>
+                            </div>
+                            <div className="flex items-center gap-2 flex-shrink-0">
+                              <span className="text-[10px] text-slate-500 tabular-nums whitespace-nowrap">
+                                {g.total.toLocaleString()} رابط
+                              </span>
+                              <span
+                                className={`text-[10px] px-2 py-0.5 rounded-full border font-medium whitespace-nowrap ${
+                                  stopped
+                                    ? 'border-rose-500/40 bg-rose-500/10 text-rose-300'
+                                    : 'border-amber-500/40 bg-amber-500/10 text-amber-300'
+                                }`}
+                              >
+                                {stopped ? 'متوقف' : 'تباطؤ'} · منذ {g.daysQuiet} يوم
+                              </span>
+                            </div>
+                          </div>
+                          <div className="flex items-center gap-2">
+                            <div className="flex-1 flex h-1.5 rounded-full bg-slate-700/40 overflow-hidden">
+                              <motion.div
+                                initial={{ width: 0 }}
+                                animate={{ width: `${stalenessPct}%` }}
+                                transition={{ duration: 0.6, ease: 'easeOut', delay: Math.min(i * 0.07, 0.35) }}
+                                className={`h-full ${
+                                  stopped
+                                    ? 'bg-gradient-to-r from-rose-500 to-red-600'
+                                    : 'bg-gradient-to-r from-amber-400 to-orange-500'
+                                }`}
+                              />
+                            </div>
+                            <span className="text-[9px] text-slate-600">30ي</span>
+                          </div>
+                          {/* hover detail line — same pattern as TopGroupRow */}
+                          <div className="text-[10px] text-slate-500 mt-1.5 h-4 opacity-0 group-hover:opacity-100 transition-opacity">
+                            <span className="text-emerald-500">واتساب {g.whatsapp.toLocaleString()}</span>
+                            {' · '}
+                            <span className="text-blue-400">تيليجرام {g.telegram.toLocaleString()}</span>
+                            {g.other > 0 && <span> · أخرى {g.other.toLocaleString()}</span>}
+                            <span> · نشاط {g.first_seen} ← {g.last_seen}</span>
+                          </div>
+                        </motion.div>
+                      )
+                    })}
+                    {quietSources.length > 5 && (
+                      <p className="text-[10px] text-slate-500 text-center">
+                        + {quietSources.length - 5} مصادر هادئة أخرى (المعروض: الأعلى حجماً)
+                      </p>
+                    )}
+                  </div>
+                )}
+              </CardContent>
+            </Card>
+          </motion.div>
         )}
 
         {/* [FLEET-VIEW] Joiner Fleet Health — from ungated /ready. Shows at a
@@ -1002,6 +1203,64 @@ export default function Home() {
                   <p className="text-xs text-slate-400 mt-1">⏳ لم يُفحص</p>
                 </div>
               </div>
+              {/* [AI-PROGRESS] classification backlog at a glance — how much
+                  of the captured corpus the AI classifier has processed.
+                  With a 26K+ backlog the four raw counters above don't convey
+                  the scale; the progress bar makes it obvious at a glance. */}
+              {(() => {
+                const processed =
+                  stats.ai_stats.ai_approved +
+                  stats.ai_stats.ai_rejected +
+                  stats.ai_stats.ai_ads
+                const totalAi = processed + stats.ai_stats.ai_pending
+                const pct = totalAi > 0 ? (processed / totalAi) * 100 : 0
+                return (
+                  <div className="mt-3">
+                    <div className="flex items-center justify-between text-[10px] text-slate-400 mb-1.5">
+                      <span>
+                        تقدّم الفحص:{' '}
+                        <span className="text-emerald-300 font-semibold">
+                          {processed.toLocaleString()}
+                        </span>{' '}
+                        من {totalAi.toLocaleString()} رابط
+                      </span>
+                      <span className="tabular-nums">{pct.toFixed(1)}%</span>
+                    </div>
+                    <div
+                      className="h-2.5 rounded-full bg-slate-700/50 overflow-hidden border border-slate-700/40"
+                      role="progressbar"
+                      aria-label="تقدّم فحص الذكاء الاصطناعي"
+                      aria-valuenow={Math.round(pct)}
+                      aria-valuemin={0}
+                      aria-valuemax={100}
+                    >
+                      {/* min 0.8% width so a tiny ratio is still visible */}
+                      <motion.div
+                        initial={{ width: 0 }}
+                        animate={{ width: `${Math.max(pct, 0.8)}%` }}
+                        transition={{ duration: 0.8, ease: 'easeOut' }}
+                        className="h-full bg-gradient-to-r from-emerald-400 to-teal-500"
+                      />
+                    </div>
+                    <p className="text-[10px] text-slate-500 mt-1.5">
+                      {stats.ai_stats.ai_pending > 0 ? (
+                        <>
+                          متبقي{' '}
+                          <span className="text-amber-300 font-semibold">
+                            {stats.ai_stats.ai_pending.toLocaleString()}
+                          </span>{' '}
+                          رابط بانتظار الفحص
+                          {stats.ai_stats.ai_batch_mode
+                            ? ' · وضع الدفعات: الفحص مؤجل'
+                            : ''}
+                        </>
+                      ) : (
+                        'اكتمل فحص جميع الروابط ✅'
+                      )}
+                    </p>
+                  </div>
+                )
+              })()}
             </CardContent>
           </Card>
         )}
