@@ -14,7 +14,7 @@ import {
   X, Activity, CheckCircle2, XCircle, AlertTriangle, Clock3,
   Copy, Check, Download, TrendingUp, BarChart3, Flame,
   VolumeX, ShieldCheck, UserCircle2, BellRing, Target, ArrowUp,
-  ArrowLeftRight, ChevronLeft, ZoomIn, Users2,
+  ArrowLeftRight, ChevronLeft, ChevronRight, ZoomIn, Users2,
 } from 'lucide-react'
 import type { ReactNode, MouseEvent as ReactMouseEvent, ChangeEvent } from 'react'
 
@@ -34,6 +34,14 @@ interface LinkItem {
   ai_description?: string | null
   ai_country?: string | null
   ai_is_ad?: boolean | null
+}
+
+// [DRILL-HISTORY] one stop in the WHO↔WHERE cross-drill chain. The
+// navigation stack keeps every drill the operator left via a cross-drill
+// swap so the breadcrumb bar can walk (or jump) back through it.
+interface DrillStop {
+  kind: 'group' | 'sender'
+  name: string
 }
 
 interface AIStats {
@@ -505,6 +513,11 @@ export default function Home() {
   // [SENDER-DRILL] the sender whose detail modal is open (null = closed).
   // The modal self-fetches /api/sender_detail with the shared trend window.
   const [senderDetail, setSenderDetail] = useState<string | null>(null)
+  // [DRILL-HISTORY] navigation stack for the WHO↔WHERE cross-drill chain.
+  // Every cross-drill swap pushes the drill being left; the breadcrumb
+  // bar lets the operator walk back through the chain (or jump several
+  // steps) instead of Esc-to-start. Reset whenever a fresh drill opens.
+  const [drillHistory, setDrillHistory] = useState<DrillStop[]>([])
   // [TREND-COMPARE] overlay the previous period as ghost bars behind the
   // current window (positionally sliced from the 30-day delta series).
   const [compareMode, setCompareMode] = useState<boolean>(false)
@@ -809,6 +822,98 @@ export default function Home() {
     const t = setInterval(load, 60000)
     return () => clearInterval(t)
   }, [fetchTrend, fetchTopGroups, fetchTopSenders, fetchSourceHealth, fetchDeltaSeries, trendDays])
+
+  // ===== [DRILL-HISTORY] chain navigation =====
+  // Fresh entry (card row / view-all modal / deep link) starts a NEW chain:
+  // any stale history from a previous exploration is discarded.
+  const openDrillFresh = useCallback((kind: 'group' | 'sender', name: string) => {
+    setDrillHistory([])
+    if (kind === 'group') {
+      setSenderDetail(null)
+      setGroupDetail(name)
+    } else {
+      setGroupDetail(null)
+      setSenderDetail(name)
+    }
+  }, [])
+
+  // Cross-drill swap (from INSIDE a drill modal): push the drill being
+  // left onto the stack, then open the target. Capped at 12 stops so a
+  // long exploration session can't overflow the bar.
+  const crossDrill = useCallback(
+    (kind: 'group' | 'sender', name: string) => {
+      const current: DrillStop[] = []
+      if (groupDetail) current.push({ kind: 'group', name: groupDetail })
+      if (senderDetail) current.push({ kind: 'sender', name: senderDetail })
+      setDrillHistory([...drillHistory, ...current].slice(-12))
+      if (kind === 'group') {
+        setSenderDetail(null)
+        setGroupDetail(name)
+      } else {
+        setGroupDetail(null)
+        setSenderDetail(name)
+      }
+    },
+    [groupDetail, senderDetail, drillHistory]
+  )
+
+  // Jump back to an earlier stop (its index in drillHistory). The stack is
+  // truncated after it — the chosen stop becomes the current drill. Pass
+  // the LAST index for a simple one-step back.
+  const drillBackTo = useCallback(
+    (index: number) => {
+      const stop = drillHistory[index]
+      if (!stop) return
+      if (stop.kind === 'group') {
+        setSenderDetail(null)
+        setGroupDetail(stop.name)
+      } else {
+        setGroupDetail(null)
+        setSenderDetail(stop.name)
+      }
+      setDrillHistory(drillHistory.slice(0, index))
+    },
+    [drillHistory]
+  )
+
+  // Close everything (X / Esc / overlay click) and reset the chain.
+  const closeDrill = useCallback(() => {
+    setGroupDetail(null)
+    setSenderDetail(null)
+    setDrillHistory([])
+  }, [])
+
+  // ===== [DRILL-DEEPLINK] shareable drill URLs =====
+  // The open drill is mirrored into the URL hash (#g=… / #s=…) via
+  // replaceState (no browser-history pollution), so the operator can
+  // bookmark or share a specific WHO/WHERE view (the dashboard itself is
+  // SSO-protected, so the link is only useful to authorized viewers).
+  // On load, a hash re-opens that drill as a fresh chain.
+  useEffect(() => {
+    const m = window.location.hash.match(/^#(g|s)=(.+)$/)
+    if (!m) return
+    try {
+      const name = decodeURIComponent(m[2])
+      if (name) openDrillFresh(m[1] === 'g' ? 'group' : 'sender', name)
+    } catch {
+      // malformed hash — ignore, dashboard loads normally
+    }
+    // run once on mount: parse the entry hash
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
+
+  // Keep the hash in sync with the open drill (replace, not push: browser
+  // back should leave the page rather than fight the modal state).
+  useEffect(() => {
+    const want = groupDetail
+      ? `#g=${encodeURIComponent(groupDetail)}`
+      : senderDetail
+        ? `#s=${encodeURIComponent(senderDetail)}`
+        : ''
+    if (window.location.hash !== want) {
+      window.history.replaceState(null, '', want || window.location.pathname)
+    }
+  }, [groupDetail, senderDetail])
 
   const refreshAll = useCallback(() => {
     fetchLinks()
@@ -1524,7 +1629,7 @@ export default function Home() {
                     rank={i + 1}
                     group={g}
                     max={topGroups[0]?.total || 1}
-                    onClick={() => setGroupDetail(g.group)}
+                    onClick={() => openDrillFresh('group', g.group)}
                   />
                 ))}
               </div>
@@ -1587,7 +1692,7 @@ export default function Home() {
                       rank={i + 1}
                       sender={s}
                       max={topSenders[0]?.total || 1}
-                      onClick={() => setSenderDetail(s.sender)}
+                      onClick={() => openDrillFresh('sender', s.sender)}
                     />
                   ))}
                 </div>
@@ -1668,14 +1773,14 @@ export default function Home() {
                           animate={{ opacity: 1, x: 0 }}
                           transition={{ delay: Math.min(i * 0.07, 0.35), duration: 0.3 }}
                           className="group bg-slate-900/50 rounded-lg p-3 border border-slate-700/50 hover:border-slate-600/60 transition-colors cursor-pointer"
-                          onClick={() => setGroupDetail(g.group)}
+                          onClick={() => openDrillFresh('group', g.group)}
                           role="button"
                           tabIndex={0}
                           aria-label={`عرض تفاصيل ${g.group}`}
                           onKeyDown={(e) => {
                             if (e.key === 'Enter' || e.key === ' ') {
                               e.preventDefault()
-                              setGroupDetail(g.group)
+                              openDrillFresh('group', g.group)
                             }
                           }}
                           title={`نشاط ${g.first_seen} ← ${g.last_seen} · واتساب ${g.whatsapp.toLocaleString()} / تيليجرام ${g.telegram.toLocaleString()} — اضغط لعرض التفاصيل`}
@@ -2324,11 +2429,11 @@ export default function Home() {
         trendDays={trendDays}
         onOpenGroupDetail={(g) => {
           setModal(null)
-          setGroupDetail(g)
+          openDrillFresh('group', g)
         }}
         onOpenSenderDetail={(s) => {
           setModal(null)
-          setSenderDetail(s)
+          openDrillFresh('sender', s)
         }}
       />
 
@@ -2341,11 +2446,10 @@ export default function Home() {
             key={groupDetail}
             group={groupDetail}
             days={trendDays}
-            onClose={() => setGroupDetail(null)}
-            onOpenSender={(s) => {
-              setGroupDetail(null)
-              setSenderDetail(s)
-            }}
+            history={drillHistory}
+            onJumpBack={drillBackTo}
+            onClose={closeDrill}
+            onOpenSender={(s) => crossDrill('sender', s)}
           />
         )}
       </AnimatePresence>
@@ -2360,11 +2464,10 @@ export default function Home() {
             key={senderDetail}
             sender={senderDetail}
             days={trendDays}
-            onClose={() => setSenderDetail(null)}
-            onOpenGroup={(g) => {
-              setSenderDetail(null)
-              setGroupDetail(g)
-            }}
+            history={drillHistory}
+            onJumpBack={drillBackTo}
+            onClose={closeDrill}
+            onOpenGroup={(g) => crossDrill('group', g)}
           />
         )}
       </AnimatePresence>
@@ -3347,6 +3450,71 @@ function LinkCard(props: { link: LinkItem; compact?: boolean; isMonitored?: bool
   )
 }
 
+// ===== DrillBreadcrumb — [DRILL-HISTORY] chain navigation bar =====
+// Renders the WHO↔WHERE cross-drill chain as clickable chips: every
+// previous stop jumps back to it (truncating the stack after it); the
+// current drill is highlighted and NOT clickable (it's the modal title).
+// Kind-colored to match the drill identities: fuchsia = group (WHERE),
+// teal = sender (WHO). Horizontally scrollable for long chains / mobile.
+function DrillBreadcrumb(props: {
+  history: DrillStop[]
+  current: DrillStop
+  onBack: () => void
+  onJumpBack: (index: number) => void
+}) {
+  const { history, current, onBack, onJumpBack } = props
+  if (history.length === 0) return null
+  const chipStyle = (kind: DrillStop['kind']) =>
+    kind === 'group'
+      ? 'border-fuchsia-500/40 bg-fuchsia-500/10 text-fuchsia-200 hover:bg-fuchsia-500/25'
+      : 'border-teal-500/40 bg-teal-500/10 text-teal-200 hover:bg-teal-500/25'
+  const kindGlyph = (kind: DrillStop['kind']) => (kind === 'group' ? '📁' : '👤')
+  return (
+    <div
+      className="flex items-center gap-1.5 px-4 py-2 border-b border-slate-700/60 bg-slate-950/40 overflow-x-auto no-scrollbar"
+      dir="rtl"
+      role="navigation"
+      aria-label="مسار التنقل بين التفاصيل"
+    >
+      {/* one-step back — the most common action gets a labeled button */}
+      <button
+        onClick={onBack}
+        className="flex items-center gap-1 flex-shrink-0 text-[11px] text-slate-300 bg-slate-700/40 hover:bg-slate-600/60 border border-slate-600/50 rounded-md px-2 py-1 transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-emerald-400/60"
+        aria-label="رجوع إلى التفاصيل السابقة"
+      >
+        <ChevronRight className="w-3.5 h-3.5" aria-hidden />
+        رجوع
+      </button>
+      {history.map((stop, i) => (
+        <span key={`${stop.kind}:${stop.name}:${i}`} className="flex items-center gap-1.5 flex-shrink-0">
+          <button
+            onClick={() => onJumpBack(i)}
+            className={`max-w-[120px] truncate text-[11px] rounded-md border px-2 py-1 transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-emerald-400/60 ${chipStyle(stop.kind)}`}
+            title={`${stop.name} — رجوع إلى هنا`}
+            aria-label={`رجوع إلى ${stop.kind === 'group' ? 'المصدر' : 'المرسل'} ${stop.name}`}
+          >
+            {kindGlyph(stop.kind)} {stop.name}
+          </button>
+          {/* separator points in the RTL flow direction (right → left) */}
+          <ChevronLeft className="w-3 h-3 text-slate-600 flex-shrink-0" aria-hidden />
+        </span>
+      ))}
+      {/* current stop — highlighted, not clickable (it's the open modal) */}
+      <span
+        className={`max-w-[140px] truncate text-[11px] rounded-md border px-2 py-1 flex-shrink-0 font-semibold ${
+          current.kind === 'group'
+            ? 'border-fuchsia-400/60 bg-fuchsia-500/25 text-white'
+            : 'border-teal-400/60 bg-teal-500/25 text-white'
+        }`}
+        title={current.name}
+        aria-current="page"
+      >
+        {kindGlyph(current.kind)} {current.name}
+      </span>
+    </div>
+  )
+}
+
 // ===== [GROUP-DRILL] GroupDetailModal — per-group drill-down =====
 // Opened by clicking a top-group or quiet-source row. Self-fetches
 // /api/group_detail?group=X&days=N (the shared trend window) and shows:
@@ -3359,10 +3527,12 @@ function LinkCard(props: { link: LinkItem; compact?: boolean; isMonitored?: bool
 function GroupDetailModal(props: {
   group: string
   days: number
+  history: DrillStop[]
+  onJumpBack: (index: number) => void
   onClose: () => void
   onOpenSender?: (sender: string) => void
 }) {
-  const { group, days, onClose, onOpenSender } = props
+  const { group, days, history, onJumpBack, onClose, onOpenSender } = props
   const [data, setData] = useState<GroupDetailData | null>(null)
   const [loading, setLoading] = useState<boolean>(true)
   const [error, setError] = useState<string | null>(null)
@@ -3406,6 +3576,13 @@ function GroupDetailModal(props: {
   const waPctOfTotal = data && data.totals.total
     ? Math.round((data.totals.whatsapp / data.totals.total) * 100)
     : 0
+  // [DRILL-DEEPLINK] shareable URL for THIS drill view (#g=…) — copied
+  // to the clipboard by the header copy button. The modal only renders
+  // client-side (after a user click), so window is always defined here;
+  // the guard keeps the expression SSR-safe regardless.
+  const shareUrl = typeof window !== 'undefined'
+    ? `${window.location.origin}${window.location.pathname}#g=${encodeURIComponent(group)}`
+    : ''
 
   return (
     <AnimatePresence>
@@ -3425,8 +3602,8 @@ function GroupDetailModal(props: {
           role="dialog"
           aria-label={`تفاصيل المصدر ${group}`}
         >
-          {/* Header */}
-          <div className="flex items-center justify-between p-4 border-b border-slate-700 gap-3">
+          {/* Header — fuchsia identity with a subtle gradient tint */}
+          <div className="flex items-center justify-between p-4 border-b border-slate-700 gap-3 bg-gradient-to-l from-fuchsia-500/10 to-transparent">
             <div className="flex items-center gap-2.5 min-w-0">
               <div className="w-9 h-9 rounded-lg bg-fuchsia-500/15 border border-fuchsia-500/30 flex items-center justify-center flex-shrink-0">
                 <Users2 className="w-4.5 h-4.5 text-fuchsia-400" />
@@ -3440,14 +3617,28 @@ function GroupDetailModal(props: {
                 </p>
               </div>
             </div>
-            <button
-              onClick={onClose}
-              className="text-slate-400 hover:text-white transition-colors flex-shrink-0"
-              aria-label="إغلاق"
-            >
-              <X className="w-5 h-5" />
-            </button>
+            <div className="flex items-center gap-2 flex-shrink-0">
+              {/* [DRILL-DEEPLINK] copy a shareable link to this drill view */}
+              <CopyButton text={shareUrl} />
+              <button
+                onClick={onClose}
+                className="text-slate-400 hover:text-white transition-colors flex-shrink-0"
+                aria-label="إغلاق"
+              >
+                <X className="w-5 h-5" />
+              </button>
+            </div>
           </div>
+
+          {/* [DRILL-HISTORY] breadcrumb bar — walk back through the
+              cross-drill chain (or jump several steps) instead of
+              starting over. Hidden while the chain has a single stop. */}
+          <DrillBreadcrumb
+            history={history}
+            current={{ kind: 'group', name: group }}
+            onBack={() => onJumpBack(history.length - 1)}
+            onJumpBack={onJumpBack}
+          />
 
           {/* Content */}
           <div className="p-4 overflow-y-auto flex-1">
@@ -3640,10 +3831,12 @@ function GroupDetailModal(props: {
 function SenderDetailModal(props: {
   sender: string
   days: number
+  history: DrillStop[]
+  onJumpBack: (index: number) => void
   onClose: () => void
   onOpenGroup?: (group: string) => void
 }) {
-  const { sender, days, onClose, onOpenGroup } = props
+  const { sender, days, history, onJumpBack, onClose, onOpenGroup } = props
   const [data, setData] = useState<SenderDetailData | null>(null)
   const [loading, setLoading] = useState<boolean>(true)
   const [error, setError] = useState<string | null>(null)
@@ -3690,6 +3883,11 @@ function SenderDetailModal(props: {
   const tgPctOfTotal = data && data.totals.total
     ? Math.round((data.totals.telegram / data.totals.total) * 100)
     : 0
+  // [DRILL-DEEPLINK] shareable URL for THIS drill view (#s=…) — see
+  // GroupDetailModal.shareUrl for the SSR-safety rationale.
+  const shareUrl = typeof window !== 'undefined'
+    ? `${window.location.origin}${window.location.pathname}#s=${encodeURIComponent(sender)}`
+    : ''
 
   return (
     <AnimatePresence>
@@ -3709,8 +3907,8 @@ function SenderDetailModal(props: {
           role="dialog"
           aria-label={`تفاصيل المرسل ${sender}`}
         >
-          {/* Header — teal (sender identity), mirrors the senders card */}
-          <div className="flex items-center justify-between p-4 border-b border-slate-700 gap-3">
+          {/* Header — teal (sender identity) with a subtle gradient tint */}
+          <div className="flex items-center justify-between p-4 border-b border-slate-700 gap-3 bg-gradient-to-l from-teal-500/10 to-transparent">
             <div className="flex items-center gap-2.5 min-w-0">
               <div className="w-9 h-9 rounded-lg bg-teal-500/15 border border-teal-500/30 flex items-center justify-center flex-shrink-0">
                 <UserCircle2 className="w-4.5 h-4.5 text-teal-400" />
@@ -3724,14 +3922,26 @@ function SenderDetailModal(props: {
                 </p>
               </div>
             </div>
-            <button
-              onClick={onClose}
-              className="text-slate-400 hover:text-white transition-colors flex-shrink-0"
-              aria-label="إغلاق"
-            >
-              <X className="w-5 h-5" />
-            </button>
+            <div className="flex items-center gap-2 flex-shrink-0">
+              {/* [DRILL-DEEPLINK] copy a shareable link to this drill view */}
+              <CopyButton text={shareUrl} />
+              <button
+                onClick={onClose}
+                className="text-slate-400 hover:text-white transition-colors flex-shrink-0"
+                aria-label="إغلاق"
+              >
+                <X className="w-5 h-5" />
+              </button>
+            </div>
           </div>
+
+          {/* [DRILL-HISTORY] breadcrumb bar — see GroupDetailModal */}
+          <DrillBreadcrumb
+            history={history}
+            current={{ kind: 'sender', name: sender }}
+            onBack={() => onJumpBack(history.length - 1)}
+            onJumpBack={onJumpBack}
+          />
 
           {/* Content */}
           <div className="p-4 overflow-y-auto flex-1">
