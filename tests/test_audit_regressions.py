@@ -3353,23 +3353,32 @@ async def test_sourceview_top_groups_clamped():
 async def test_sourceview_top_groups_supabase_filters():
     """[SOURCE-VIEW-5] the Supabase fetch must select ONLY (created_at,
     group_name, link_type), filter by created_at >= since, and paginate in
-    batches — fetching full rows would transfer ~10× more data."""
+    batches — fetching full rows would transfer ~10× more data.
+    [QUIET-DIGEST] the aggregation moved into the shared helper
+    _fetch_window_group_activity (used by BOTH /api/top_groups and the
+    quiet-source watch loop) — the query-shape guards follow it there."""
     try:
         src = (PROJECT_ROOT / "bot.py").read_text(encoding="utf-8")
-        h_start = src.find("async def api_top_groups_handler")
+        h_start = src.find("async def _fetch_window_group_activity")
         h_end = src.find("\nasync def ", h_start + 50)
-        body = src[h_start:h_end if h_end > 0 else h_start + 9000]
+        helper_body = src[h_start:h_end if h_end > 0 else h_start + 9000]
+        r_start = src.find("async def api_top_groups_handler")
+        r_end = src.find("\nasync def ", r_start + 50)
+        handler_body = src[r_start:r_end if r_end > 0 else r_start + 9000]
         record("SG-5a: selects only created_at,group_name,link_type",
-               "select=created_at,group_name,link_type" in body,
+               "select=created_at,group_name,link_type" in helper_body,
                "wide select — would over-fetch")
         record("SG-5b: filters by created_at gte window start",
-               "created_at=gte." in body, "window filter missing")
+               "created_at=gte." in helper_body, "window filter missing")
         record("SG-5c: paginates in 1000-row batches",
-               "batch_size = 1000" in body and "offset" in body,
+               "batch_size = 1000" in helper_body and "offset" in helper_body,
                "pagination missing — >1000-row windows truncated")
         record("SG-5d: results ranked by total descending",
-               'key=lambda kv: kv[1]["total"]' in body and "reverse=True" in body,
+               'key=lambda kv: kv[1]["total"]' in handler_body and "reverse=True" in handler_body,
                "ranking missing — card would show unsorted groups")
+        record("SG-5e: handler delegates to the shared helper",
+               "await _fetch_window_group_activity(db, days)" in handler_body,
+               "handler no longer uses the shared aggregation — QUIET-DIGEST and the dashboard would drift")
     except Exception as e:
         record("SG-5: exception", False, str(e))
 
@@ -3377,15 +3386,16 @@ async def test_sourceview_top_groups_supabase_filters():
 async def test_sourceview_top_groups_unnamed_bucket():
     """[SOURCE-VIEW-6] links with NULL/empty group_name MUST be bucketed
     under the unnamed label (not silently dropped) — otherwise per-group
-    totals stop summing to the window total."""
+    totals stop summing to the window total. [QUIET-DIGEST] the bucketing
+    moved into the shared _fetch_window_group_activity helper."""
     try:
         src = (PROJECT_ROOT / "bot.py").read_text(encoding="utf-8")
-        h_start = src.find("async def api_top_groups_handler")
+        h_start = src.find("async def _fetch_window_group_activity")
         h_end = src.find("\nasync def ", h_start + 50)
-        body = src[h_start:h_end if h_end > 0 else h_start + 9000]
+        helper_body = src[h_start:h_end if h_end > 0 else h_start + 9000]
         record("SG-6: unnamed groups bucketed, not dropped",
                '_UNNAMED_GROUP_LABEL' in src
-               and 'or _UNNAMED_GROUP_LABEL' in body,
+               and 'or _UNNAMED_GROUP_LABEL' in helper_body,
                "unnamed bucketing missing — window totals would undercount")
     except Exception as e:
         record("SG-6: exception", False, str(e))
@@ -3812,12 +3822,14 @@ async def test_windowalign_handlers_use_calendar_window():
     the shared calendar-window helper AND bounds-check each row's day_key —
     otherwise a plain now-N timestamp pulls a partial first calendar day
     whose rows land in hourly/counter buckets but outside the series
-    (totals disagree across endpoints for the same ?days value)."""
+    (totals disagree across endpoints for the same ?days value).
+    [QUIET-DIGEST] top_groups' fetch now lives in the shared
+    _fetch_window_group_activity helper — its alignment guard follows."""
     try:
         src = (PROJECT_ROOT / "bot.py").read_text(encoding="utf-8")
         for name, tag in (
                 ("api_links_daily_handler", "links_daily"),
-                ("api_top_groups_handler", "top_groups"),
+                ("_fetch_window_group_activity", "top_groups"),
                 ("api_top_senders_handler", "top_senders")):
             h_start = src.find(f"async def {name}")
             h_end = src.find("\nasync def ", h_start + 50)
@@ -3983,6 +3995,193 @@ async def test_senderdrill_series_and_clamp():
                "rolling now-N fetch — Σ groups ≠ totals.total")
     except Exception as e:
         record("SD-5: exception", False, str(e))
+
+
+# =========================================================================
+# [QUIET-DIGEST] Quiet-source watch — Telegram push alerts to OWNER_ID
+# when an important link source (group) goes quiet for 2+ days. Guards:
+# shared aggregation helper, pure decision function semantics, Monitor
+# loop wiring (spawn + supervisor + stop), alert senders best-effort.
+# =========================================================================
+
+async def test_quietdigest_helper_present_and_unconfigured_safe():
+    """[QUIET-DIGEST-1] _fetch_window_group_activity must exist and return
+    {} when Supabase is unconfigured (loop treats it as "no data this
+    cycle" — silent skip, next cycle retries)."""
+    try:
+        assert hasattr(bot, "_fetch_window_group_activity"), \
+            "shared aggregation helper missing"
+        db = types.SimpleNamespace(supabase_url=None, supabase_key=None)
+        out = await bot._fetch_window_group_activity(db, 30)
+        record("QD-1a: helper present + unconfigured supabase → {}",
+               out == {}, f"got {out!r}")
+        # helper must NOT hit _get_supabase_session when unconfigured
+        db2 = types.SimpleNamespace(
+            supabase_url=None, supabase_key=None,
+            _get_supabase_session=AsyncMock(side_effect=RuntimeError(
+                "must not be called")))
+        out2 = await bot._fetch_window_group_activity(db2, 30)
+        record("QD-1b: skips session creation when unconfigured",
+               out2 == {} and not db2._get_supabase_session.called,
+               "session was created despite unconfigured supabase")
+    except Exception as e:
+        record("QD-1: exception", False, str(e))
+
+
+async def test_quietdigest_compute_pure_semantics():
+    """[QUIET-DIGEST-2] _compute_quiet_alerts — the complete decision
+    matrix: new alert / below-min-volume ignored / not-yet-quiet ignored /
+    recent-alert seeds (no spam) / 7-day re-alert / recovery / malformed
+    date skipped safely."""
+    try:
+        from datetime import date as _date
+        today = _date(2026, 8, 28)
+        quiet_day = "2026-08-25"   # 3 days silent
+        fresh_day = "2026-08-27"   # 1 day — not yet quiet
+        groups = {
+            # important + never alerted → NEW alert
+            "قناة فسنجون": {"total": 136, "last": quiet_day},
+            # quiet but BELOW min volume → ignored entirely
+            "tiny": {"total": 5, "last": quiet_day},
+            # important but only 1 day silent → not quiet yet
+            "جامعة الملك سعود": {"total": 129, "last": fresh_day},
+            # alerted 1 day ago, still quiet → SEED (no re-alert spam)
+            "أثر جازان": {"total": 179, "last": quiet_day},
+            # alerted 8 days ago, still quiet → RE-ALERT
+            "Azzam Bot": {"total": 4680, "last": "2026-08-04"},
+            # alerted + active again → RECOVERY
+            "طلاب جامعة جدة": {"total": 79, "last": fresh_day},
+            # malformed date → skipped safely
+            "bad-date": {"total": 999, "last": "not-a-date"},
+        }
+        alerted = {
+            "أثر جازان": {"day": "2026-08-27", "volume": 179},
+            "Azzam Bot": {"day": "2026-08-20", "volume": 4680},
+            "طلاب جامعة جدة": {"day": "2026-08-26", "volume": 79},
+        }
+        new_a, re_a, seed, rec = bot._compute_quiet_alerts(groups, today, alerted)
+
+        record("QD-2a: quiet + important + never alerted → new alert",
+               [t[0] for t in new_a] == ["قناة فسنجون"]
+               and new_a[0][1] == 136 and new_a[0][3] == 3,
+               f"new_alerts={new_a!r}")
+        record("QD-2b: below min volume → no alert at all",
+               all(t[0] != "tiny" for t in new_a + re_a + seed),
+               "tiny source alerted — would spam the owner")
+        record("QD-2c: 1 day of silence → not quiet yet",
+               all(t[0] != "جامعة الملك سعود" for t in new_a + re_a + seed),
+               "alerted before the 2-day threshold")
+        record("QD-2d: alerted yesterday + still quiet → seed (no re-alert)",
+               [t[0] for t in seed] == ["أثر جازان"],
+               f"seed={seed!r}")
+        record("QD-2e: alerted 8d ago + still quiet → re-alert",
+               [t[0] for t in re_a] == ["Azzam Bot"] and re_a[0][3] == 24,
+               f"re_alerts={re_a!r}")
+        record("QD-2f: alerted + produced again → recovery",
+               [t[0] for t in rec] == ["طلاب جامعة جدة"],
+               f"recovered={rec!r}")
+        record("QD-2g: malformed date skipped safely",
+               all(t[0] != "bad-date" for t in new_a + re_a + seed + rec),
+               "malformed date crashed or alerted")
+        # empty-state startup: everything quiet lands in new_alerts (the
+        # loop sends ONE digest + seeds — never N individual alerts).
+        new_b, re_b, seed_b, rec_b = bot._compute_quiet_alerts(
+            groups, today, {})
+        record("QD-2h: empty state → all quiet+important are new_alerts",
+               sorted(t[0] for t in new_b) ==
+               sorted(["قناة فسنجون", "أثر جازان", "Azzam Bot"])
+               and not re_b and not rec_b,
+               f"startup would double-handle: new={new_b!r}")
+    except Exception as e:
+        record("QD-2: exception", False, str(e))
+
+
+async def test_quietdigest_monitor_wiring():
+    """[QUIET-DIGEST-3] Monitor must have the loop + senders, _quiet_alerted
+    state in __init__, the task spawned in run(), supervised in
+    _supervisor_loop, and cancelled in stop()."""
+    try:
+        src = (PROJECT_ROOT / "bot.py").read_text(encoding="utf-8")
+        record("QD-3a: Monitor methods present (loop + 3 senders)",
+               all(hasattr(bot.Monitor, m) for m in (
+                   "_quiet_source_watch_loop",
+                   "_send_quiet_source_alert",
+                   "_send_quiet_source_digest",
+                   "_send_quiet_source_recovery")),
+               "method missing")
+        record("QD-3b: _quiet_alerted state initialized in __init__",
+               "self._quiet_alerted: Dict[str, Dict] = {}" in src,
+               "state not initialized — AttributeError on first cycle")
+        record("QD-3c: task spawned alongside fleet-health in run()",
+               "self._quiet_source_task = asyncio.create_task("
+               "self._quiet_source_watch_loop())" in src,
+               "spawn missing — loop never runs")
+        sup_start = src.find("async def _supervisor_loop")
+        sup_end = src.find("\n    async def ", sup_start + 50)
+        sup_body = src[sup_start:sup_end if sup_end > 0 else sup_start + 12000]
+        record("QD-3d: supervisor resurrects a dead quiet-source task",
+               "_quiet_source_task" in sup_body
+               and "restarted quiet_source_watch" in sup_body,
+               "unsupervised — a dead loop means silent alerts forever")
+        record("QD-3e: stop() cancels the quiet-source task",
+               "quiet_source_task = getattr(self, '_quiet_source_task', None)"
+               in src,
+               "not cancelled — shutdown hang risk")
+        record("QD-3f: loop uses the shared aggregation helper",
+               "await _fetch_window_group_activity(" in src
+               and "_QUIET_SOURCE_WINDOW_DAYS" in src,
+               "loop reimplements the fetch — drifts from /api/top_groups")
+        record("QD-3g: first cycle sends ONE digest, not N alerts",
+               "await self._send_quiet_source_digest(digest)" in src
+               and "first_cycle" in src,
+               "restart would burst N individual alerts")
+    except Exception as e:
+        record("QD-3: exception", False, str(e))
+
+
+async def test_quietdigest_senders_best_effort():
+    """[QUIET-DIGEST-4] all 3 senders must be best-effort: log ALWAYS,
+    message only when OWNER_ID set + bot connected. OWNER_ID unset → no
+    crash, no send. A failing bot_client must not raise either."""
+    try:
+        mon = bot.Monitor.__new__(bot.Monitor)  # no __init__ (no event loop deps)
+        mon.config = types.SimpleNamespace(owner_id=None)
+        mon.bot_client = None
+        # OWNER_ID unset → log-only, no exception
+        await bot.Monitor._send_quiet_source_alert(
+            mon, "قناة فسنجون", 136, "2026-08-25", 3)
+        await bot.Monitor._send_quiet_source_digest(
+            mon, [("Azzam Bot", 4680, "2026-08-04", 24)])
+        await bot.Monitor._send_quiet_source_recovery(mon, "طلاب جامعة جدة", 79)
+        record("QD-4a: OWNER_ID unset → log-only, no crash", True, "")
+
+        # OWNER_ID set + bot connected but send fails → swallowed
+        failing_client = types.SimpleNamespace(
+            is_connected=lambda: True,
+            send_message=AsyncMock(side_effect=RuntimeError("tg down")))
+        mon.config = types.SimpleNamespace(owner_id=123)
+        mon.bot_client = failing_client
+        await bot.Monitor._send_quiet_source_alert(
+            mon, "g", 10, "2026-08-25", 3)
+        record("QD-4b: failing bot_client swallowed (no raise)",
+               True, "")
+        # happy path: Markdown first
+        ok_client = types.SimpleNamespace(
+            is_connected=lambda: True, send_message=AsyncMock())
+        mon.bot_client = ok_client
+        await bot.Monitor._send_quiet_source_alert(
+            mon, "قناة فسنجون", 136, "2026-08-25", 3)
+        args = ok_client.send_message.await_args
+        body = args.args[1] if args and args.args else ""
+        record("QD-4c: alert message shape (title/volume/silence)",
+               "SOURCE WENT QUIET" in body and "136 links" in body
+               and "3 days ago" in body and "قناة فسنجون" in body,
+               f"body={body!r}")
+        record("QD-4d: Markdown parse mode preferred",
+               args.kwargs.get("parse_mode") == "Markdown" if args else False,
+               f"kwargs={args.kwargs if args else None!r}")
+    except Exception as e:
+        record("QD-4: exception", False, str(e))
 
 
 # =========================================================================
@@ -4984,6 +5183,12 @@ async def main():
     await test_senderdrill_cache()
     await test_senderdrill_pii_free_select()
     await test_senderdrill_series_and_clamp()
+
+    # === [QUIET-DIGEST] Quiet-source watch — 19 regression records ===
+    await test_quietdigest_helper_present_and_unconfigured_safe()
+    await test_quietdigest_compute_pure_semantics()
+    await test_quietdigest_monitor_wiring()
+    await test_quietdigest_senders_best_effort()
 
     # === Task 11a — Secrets scan ===
     await test_11a_no_real_secrets_in_source_files()

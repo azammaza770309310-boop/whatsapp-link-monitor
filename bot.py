@@ -2775,6 +2775,12 @@ class Monitor:
             'fleet_down_alerted': False,
         }
         self._joiner_fleet_health_task: Optional[asyncio.Task] = None
+        # ===== [QUIET-DIGEST] Quiet-source watch state =====
+        # group_name → {"day": "YYYY-MM-DD" (last alert), "volume": N}.
+        # In-memory only: a restart re-seeds via the first-cycle digest
+        # (ONE consolidated message, not N individual alerts).
+        self._quiet_alerted: Dict[str, Dict] = {}
+        self._quiet_source_task: Optional[asyncio.Task] = None
         # محلل الذكاء الاصطناعي
         self.ai_analyzer = AIAnalyzer()
         self._startup_scan_done: Set[str] = set()
@@ -4211,6 +4217,15 @@ class Monitor:
                     self._joiner_fleet_health_task = asyncio.create_task(
                         self._joiner_fleet_health_loop())
                     logging.warning("[SUPERVISOR] restarted joiner_fleet_health")
+                # 11b. [QUIET-DIGEST] Quiet-source watch loop (30-min cycle).
+                # If this dies, the operator stops getting alerts when an
+                # important link source goes quiet — capture drops would
+                # again be noticed only days later on the dashboard.
+                if (getattr(self, '_quiet_source_task', None) is None
+                        or self._quiet_source_task.done()) and self._running:
+                    self._quiet_source_task = asyncio.create_task(
+                        self._quiet_source_watch_loop())
+                    logging.warning("[SUPERVISOR] restarted quiet_source_watch")
                 # 12. [REQAUDIT-3] Per-account user_client loops. Previously
                 # these were fire-and-forget in self._user_tasks and NOT
                 # supervised — a terminal `return` on not_authorized (now
@@ -4392,6 +4407,168 @@ class Monitor:
                         pass
         except Exception as e:
             logging.warning(f"[FLEET-HEALTH] alert send failed: {e}")
+
+    # ===================================================================
+    # [QUIET-DIGEST] Quiet-source watch — link sources that went silent
+    # ===================================================================
+    async def _quiet_source_watch_loop(self):
+        """[QUIET-DIGEST] Every _QUIET_SOURCE_CHECK_INTERVAL (30 min),
+        aggregate the last 30 days of per-group link activity (shared
+        helper — same data as /api/top_groups) and push Telegram alerts
+        to OWNER_ID when an important source goes quiet:
+
+          * FIRST cycle after startup  → one consolidated digest of all
+            currently-quiet sources (restart-safe, no N-message burst),
+            then the state is seeded so only NEW events alert.
+          * NEW quiet source           → immediate single alert.
+          * still quiet                → re-alert every 7 days.
+          * previously-alerted source
+            produces links again       → short recovery note.
+
+        Best-effort: OWNER_ID unset or bot disconnected → log-only
+        (same posture as _send_fleet_down_alert). Supabase unavailable →
+        skip the cycle silently (next cycle retries).
+        """
+        # Let the bot connect + first links land before judging silence.
+        await asyncio.sleep(120)
+        first_cycle = True
+        while self._running:
+            try:
+                groups = await _fetch_window_group_activity(
+                    self.db, _QUIET_SOURCE_WINDOW_DAYS)
+                if groups:
+                    today = datetime.utcnow().date()
+                    new_alerts, re_alerts, seed, recovered = \
+                        _compute_quiet_alerts(
+                            groups, today, self._quiet_alerted)
+
+                    if first_cycle:
+                        # Startup digest: everything currently quiet in
+                        # ONE message; seed state (no individual alerts).
+                        digest = sorted(
+                            new_alerts + re_alerts + seed,
+                            key=lambda t: t[1], reverse=True)[:15]
+                        if digest:
+                            await self._send_quiet_source_digest(digest)
+                        for gname, _v, _ls, _sd in (new_alerts
+                                                    + re_alerts + seed):
+                            self._quiet_alerted[gname] = {
+                                "day": today.isoformat(),
+                                "volume": _v,
+                            }
+                        # Recoveries can't exist on the first cycle
+                        # (state was empty) — nothing to do for them.
+                        first_cycle = False
+                    else:
+                        for gname, volume, last_seen, sd in new_alerts:
+                            await self._send_quiet_source_alert(
+                                gname, volume, last_seen, sd)
+                            self._quiet_alerted[gname] = {
+                                "day": today.isoformat(),
+                                "volume": volume,
+                            }
+                        for gname, volume, last_seen, sd in re_alerts:
+                            await self._send_quiet_source_alert(
+                                gname, volume, last_seen, sd,
+                                is_realert=True)
+                            self._quiet_alerted[gname] = {
+                                "day": today.isoformat(),
+                                "volume": volume,
+                            }
+                        for gname, volume in recovered:
+                            await self._send_quiet_source_recovery(
+                                gname, volume)
+                            self._quiet_alerted.pop(gname, None)
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logging.error(f"[QUIET-SOURCE] error: {e}", exc_info=True)
+            await asyncio.sleep(_QUIET_SOURCE_CHECK_INTERVAL)
+
+    async def _send_quiet_source_alert(self, group_name, volume, last_seen,
+                                       silence_days, is_realert=False):
+        """[QUIET-DIGEST] Push a single quiet-source alert to OWNER_ID.
+        Best-effort — log always, message only if reachable."""
+        title = "*SOURCE STILL QUIET*" if is_realert else "*SOURCE WENT QUIET*"
+        emoji = "🔇" if is_realert else "⚠️"
+        msg = (
+            f"{emoji} {title}\n"
+            f"Group: {group_name}\n"
+            f"Volume (30d): {volume} links\n"
+            f"Last link: {last_seen} ({silence_days} days ago)\n"
+            f"Dashboard → المصادر → drill into the group for its timeline"
+        )
+        logging.warning(f"[QUIET-SOURCE] {msg.replace(chr(10), ' | ')}")
+        oid = self.config.owner_id
+        if oid is None:
+            return
+        try:
+            if self.bot_client and self.bot_client.is_connected():
+                try:
+                    await self.bot_client.send_message(
+                        oid, msg, parse_mode='Markdown')
+                except Exception:
+                    try:
+                        await self.bot_client.send_message(oid, msg)
+                    except Exception:
+                        pass
+        except Exception as e:
+            logging.warning(f"[QUIET-SOURCE] alert send failed: {e}")
+
+    async def _send_quiet_source_digest(self, digest_entries):
+        """[QUIET-DIGEST] ONE consolidated startup digest: the currently-
+        quiet important sources, ranked by 30d volume (top 15)."""
+        lines = [
+            f"{i}. {name} — {vol} links, silent {sd}d"
+            for i, (name, vol, _ls, sd) in enumerate(digest_entries, 1)
+        ]
+        msg = (
+            f"📴 *QUIET SOURCES DIGEST*\n"
+            f"{len(digest_entries)} important source(s) produced no links "
+            f"for 2+ days:\n" + "\n".join(lines) +
+            f"\n(New quiet-source alerts will follow automatically)"
+        )
+        logging.warning(f"[QUIET-SOURCE] {msg.replace(chr(10), ' | ')}")
+        oid = self.config.owner_id
+        if oid is None:
+            return
+        try:
+            if self.bot_client and self.bot_client.is_connected():
+                try:
+                    await self.bot_client.send_message(
+                        oid, msg, parse_mode='Markdown')
+                except Exception:
+                    try:
+                        await self.bot_client.send_message(oid, msg)
+                    except Exception:
+                        pass
+        except Exception as e:
+            logging.warning(f"[QUIET-SOURCE] digest send failed: {e}")
+
+    async def _send_quiet_source_recovery(self, group_name, volume):
+        """[QUIET-DIGEST] Short recovery note — a previously-alerted
+        source produced links again."""
+        msg = (
+            f"✅ *SOURCE ACTIVE AGAIN*\n"
+            f"Group: {group_name}\n"
+            f"30d volume: {volume} links"
+        )
+        logging.info(f"[QUIET-SOURCE] {msg.replace(chr(10), ' | ')}")
+        oid = self.config.owner_id
+        if oid is None:
+            return
+        try:
+            if self.bot_client and self.bot_client.is_connected():
+                try:
+                    await self.bot_client.send_message(
+                        oid, msg, parse_mode='Markdown')
+                except Exception:
+                    try:
+                        await self.bot_client.send_message(oid, msg)
+                    except Exception:
+                        pass
+        except Exception as e:
+            logging.warning(f"[QUIET-SOURCE] recovery send failed: {e}")
 
     # ===================================================================
     # [L03] Polling-watchdog — dedicated, more frequent scheduler restart
@@ -10356,6 +10533,17 @@ class Monitor:
             self._joiner_fleet_health_task = asyncio.create_task(self._joiner_fleet_health_loop())
             logging.info("🛡️ Joiner Fleet Health monitor started (60s cycle — alerts on full-fleet outage)")
 
+        # [QUIET-DIGEST] Quiet-source watch — 30-min cycle. Aggregates the
+        # last 30 days of per-group link activity (shared helper with
+        # /api/top_groups) and pushes a Telegram alert to OWNER_ID when an
+        # important source (≥20 links/30d) goes quiet for 2+ days: ONE
+        # consolidated digest on the first cycle (restart-safe), then
+        # individual alerts for new quiet events + 7-day re-alerts +
+        # recovery notes. Best-effort (OWNER_ID unset → log-only).
+        if not hasattr(self, '_quiet_source_task') or self._quiet_source_task is None or self._quiet_source_task.done():
+            self._quiet_source_task = asyncio.create_task(self._quiet_source_watch_loop())
+            logging.info("📴 Quiet-source watch started (30-min cycle — alerts OWNER_ID when a top source goes quiet)")
+
         # === LEGACY POLLING WORKER — DISABLED ===
         # The legacy _active_polling_worker is superseded by PollingScheduler
         # (which covers ALL sources, not just Top-200, and uses fair scheduling).
@@ -10419,12 +10607,14 @@ class Monitor:
         pending_recheck_task = getattr(self, '_pending_approval_recheck_task', None)
         # [REQAUDIT-3] joiner fleet health task
         fleet_health_task = getattr(self, '_joiner_fleet_health_task', None)
+        # [QUIET-DIGEST] quiet-source watch task
+        quiet_source_task = getattr(self, '_quiet_source_task', None)
         tasks = [self._bot_task, self._keep_alive_task, self._joiner_task,
                  scorer_task, cache_cleanup_task, polling_task,
                  registry_task, polling_scheduler_task, claim_cleanup_task,
                  journal_recovery_task, supervisor_task, polling_watchdog_task,
                  journal_snapshot_task, ai_drainer_task, pending_recheck_task,
-                 fleet_health_task,
+                 fleet_health_task, quiet_source_task,
                  ] + list(self._user_tasks.values()) + self._current_scan_tasks
         for t in tasks:
             if t and not t.done():
@@ -11226,6 +11416,180 @@ _TOP_GROUPS_CACHE = {"key": None, "payload": None, "ts": 0.0}
 _UNNAMED_GROUP_LABEL = "غير محدد"
 
 
+async def _fetch_window_group_activity(db, days):
+    """[QUIET-DIGEST] Shared aggregation: group_name → counters over the
+    calendar window (last N days ending today, aligned to start-of-day —
+    exactly the series window /api/links_daily shows).
+
+    Extracted from api_top_groups_handler so the quiet-source watch loop
+    (Monitor._quiet_source_watch_loop) can read the SAME data with the
+    SAME guards without going through the HTTP layer. Returns a dict:
+      {group_name: {"total": N, "whatsapp": N, "telegram": N, "other": N,
+                    "first": "YYYY-MM-DD", "last": "YYYY-MM-DD"}}
+    Supabase unconfigured / fetch failure → {} (callers treat as "no
+    data this cycle" — the dashboard handler additionally degrades to an
+    empty payload exactly as before).
+    """
+    groups: dict = {}
+    if not (getattr(db, "supabase_url", None) and getattr(db, "supabase_key", None)):
+        return groups
+    try:
+        session = await db._get_supabase_session()
+        # [WINDOW-ALIGN] calendar-day window (same as links_daily /
+        # group_detail) so top_groups totals agree with the trend
+        # chart's totals for the same ?days value.
+        since_iso, window_start_iso, today_iso = \
+            _calendar_window_bounds(days)
+        offset = 0
+        batch_size = 1000
+        while True:
+            url = (
+                f"{db.supabase_url}/rest/v1/links"
+                f"?select=created_at,group_name,link_type"
+                f"&created_at=gte.{since_iso}"
+                f"&order=created_at.asc"
+                f"&limit={batch_size}&offset={offset}"
+            )
+            async with session.get(url) as r:
+                if r.status == 200:
+                    rows = await r.json()
+                elif r.status == 416:
+                    break
+                else:
+                    logging.error(
+                        f"[API] group-activity batch failed: {r.status}")
+                    break
+            if not rows:
+                break
+            for row in rows:
+                created = str(row.get("created_at") or "")
+                day_key = created[:10]
+                if len(day_key) != 10 or not day_key.startswith("20"):
+                    continue
+                # [WINDOW-ALIGN] defensive bounds check — keeps the
+                # aggregated window exactly the calendar series window
+                # even with clock-skewed or future-dated rows.
+                if day_key < window_start_iso or day_key > today_iso:
+                    continue
+                gname = (row.get("group_name") or "").strip() \
+                    or _UNNAMED_GROUP_LABEL
+                g = groups.setdefault(gname, {
+                    "total": 0, "whatsapp": 0, "telegram": 0,
+                    "other": 0, "first": day_key, "last": day_key})
+                g["total"] += 1
+                lt = row.get("link_type") or "other"
+                if lt in ("whatsapp", "telegram"):
+                    g[lt] += 1
+                else:
+                    g["other"] += 1
+                # created_at is ordered asc → first is the earliest.
+                if day_key < g["first"]:
+                    g["first"] = day_key
+                if day_key > g["last"]:
+                    g["last"] = day_key
+            if len(rows) < batch_size:
+                break
+            offset += batch_size
+    except Exception as e:
+        logging.warning(f"[API] group-activity supabase fetch failed: {e}")
+        return {}
+    return groups
+
+
+# ===================================================================
+# [QUIET-DIGEST] Quiet-source watch — push a Telegram alert to OWNER_ID
+# when an IMPORTANT link source (group) stops producing. Operational
+# lesson from the Aug-19 cluster: five university groups went silent on
+# the same day and the capture drop was only noticed DAYS later on the
+# dashboard trend chart. The operator doesn't stare at the dashboard
+# 24/7 — the bot does, and it can say something the moment a top source
+# dries up.
+#
+# Semantics (constants below are module-level so tests can reason
+# about them without instantiating a Monitor):
+#   * qualifies as "important"  → ≥ _QUIET_SOURCE_MIN_VOLUME links in
+#     the last 30 days (tiny one-off groups must not spam the owner).
+#   * "went quiet"              → no link for ≥ _QUIET_SOURCE_DAYS full
+#     days (2 = two overnight gaps — same threshold as the dashboard's
+#     quiet-sources card, QUIET_AFTER_DAYS=2).
+#   * alert                     → ONE message per source when it FIRST
+#     crosses the threshold; re-alert only every
+#     _QUIET_SOURCE_REALERT_DAYS while it stays quiet (escalation, not
+#     spam).
+#   * recovery                  → a short "active again" note when a
+#     previously-alerted source produces links again.
+#   * startup digest            → after a (re)start the in-memory alert
+#     state is empty; the FIRST cycle sends ONE consolidated digest of
+#     currently-quiet sources (instead of N individual alerts) and
+#     seeds the state so subsequent alerts are only for NEW events.
+#   * OWNER_ID unset / bot disconnected → log-only (same best-effort
+#     posture as _send_fleet_down_alert).
+# ===================================================================
+_QUIET_SOURCE_CHECK_INTERVAL = 1800   # 30 min between checks
+_QUIET_SOURCE_MIN_VOLUME = 20         # links in 30d to qualify as important
+_QUIET_SOURCE_DAYS = 2                # full days of silence before alerting
+_QUIET_SOURCE_REALERT_DAYS = 7        # re-alert cadence while still quiet
+_QUIET_SOURCE_WINDOW_DAYS = 30        # look-back window
+
+
+def _compute_quiet_alerts(groups, today, alerted):
+    """[QUIET-DIGEST] Pure decision function for the quiet-source watch
+    loop — no I/O, fully unit-testable.
+
+    Args:
+      groups:   {name: {"total": N, "last": "YYYY-MM-DD", ...}} — the
+                30-day aggregation from _fetch_window_group_activity.
+      today:    datetime.date — "now".
+      alerted:  {name: {"day": "YYYY-MM-DD", "volume": N}} — sources
+                already alerted (and when), persisted in memory across
+                cycles by the loop.
+
+    Returns a 4-tuple of lists:
+      new_alerts:  [(name, volume, last_seen, silence_days)] — crossed
+                   the quiet threshold, never alerted before.
+      re_alerts:   same shape — still quiet, last alert ≥ REALERT days
+                   ago (periodic escalation).
+      seed:        same shape — currently quiet but already covered by
+                   the alert state (first-cycle digest content; the
+                   loop seeds these instead of alerting them).
+      recovered:   [(name, volume)] — were alerted, produced links
+                   again within the last _QUIET_SOURCE_DAYS days.
+    """
+    new_alerts, re_alerts, seed, recovered = [], [], [], []
+    for gname, g in groups.items():
+        volume = g.get("total", 0)
+        last_seen = g.get("last") or ""
+        try:
+            last_date = datetime.strptime(last_seen, "%Y-%m-%d").date()
+        except ValueError:
+            continue  # malformed/missing date — cannot judge quietness
+        silence_days = (today - last_date).days
+        was_alerted = gname in alerted
+
+        if silence_days >= _QUIET_SOURCE_DAYS:
+            if volume < _QUIET_SOURCE_MIN_VOLUME:
+                continue  # not important enough to alert about
+            if not was_alerted:
+                new_alerts.append((gname, volume, last_seen, silence_days))
+            else:
+                try:
+                    prev_day = datetime.strptime(
+                        alerted[gname]["day"], "%Y-%m-%d").date()
+                except (KeyError, ValueError):
+                    prev_day = None
+                if prev_day is None or \
+                        (today - prev_day).days >= _QUIET_SOURCE_REALERT_DAYS:
+                    re_alerts.append(
+                        (gname, volume, last_seen, silence_days))
+                else:
+                    seed.append(
+                        (gname, volume, last_seen, silence_days))
+        elif was_alerted:
+            # silence broke (source produced a link again) → recovery
+            recovered.append((gname, volume))
+    return new_alerts, re_alerts, seed, recovered
+
+
 async def api_top_groups_handler(request):
     """API endpoint: top link-producing groups for the dashboard.
 
@@ -11261,74 +11625,14 @@ async def api_top_groups_handler(request):
             return web.json_response(cached["payload"], status=200,
                                      headers={"Access-Control-Allow-Origin": "*"})
 
-        # group_name → counters
-        groups: dict = {}
-
-        if db.supabase_url and db.supabase_key:
-            try:
-                session = await db._get_supabase_session()
-                # [WINDOW-ALIGN] calendar-day window (same as links_daily /
-                # group_detail) so top_groups totals agree with the trend
-                # chart's totals for the same ?days value.
-                since_iso, window_start_iso, today_iso = \
-                    _calendar_window_bounds(days)
-                offset = 0
-                batch_size = 1000
-                fetched = 0
-                while True:
-                    url = (
-                        f"{db.supabase_url}/rest/v1/links"
-                        f"?select=created_at,group_name,link_type"
-                        f"&created_at=gte.{since_iso}"
-                        f"&order=created_at.asc"
-                        f"&limit={batch_size}&offset={offset}"
-                    )
-                    async with session.get(url) as r:
-                        if r.status == 200:
-                            rows = await r.json()
-                        elif r.status == 416:
-                            break
-                        else:
-                            logging.error(
-                                f"[API] /api/top_groups batch failed: {r.status}")
-                            break
-                    if not rows:
-                        break
-                    for row in rows:
-                        created = str(row.get("created_at") or "")
-                        day_key = created[:10]
-                        if len(day_key) != 10 or not day_key.startswith("20"):
-                            continue
-                        # [WINDOW-ALIGN] defensive bounds check — keeps the
-                        # aggregated window exactly the calendar series
-                        # window even with clock-skewed or future-dated rows.
-                        if day_key < window_start_iso or day_key > today_iso:
-                            continue
-                        gname = (row.get("group_name") or "").strip() \
-                            or _UNNAMED_GROUP_LABEL
-                        g = groups.setdefault(gname, {
-                            "total": 0, "whatsapp": 0, "telegram": 0,
-                            "other": 0, "first": day_key, "last": day_key})
-                        g["total"] += 1
-                        lt = row.get("link_type") or "other"
-                        if lt in ("whatsapp", "telegram"):
-                            g[lt] += 1
-                        else:
-                            g["other"] += 1
-                        # created_at is ordered asc → first is the earliest.
-                        if day_key < g["first"]:
-                            g["first"] = day_key
-                        if day_key > g["last"]:
-                            g["last"] = day_key
-                    fetched += len(rows)
-                    if len(rows) < batch_size:
-                        break
-                    offset += batch_size
-                logging.info(
-                    f"[API] /api/top_groups aggregated {fetched} rows over "
-                    f"{days}d → {len(groups)} groups")
-            except Exception as e:
-                logging.warning(f"[API] /api/top_groups supabase fetch failed: {e}")
+        # [QUIET-DIGEST] aggregation extracted to the shared helper —
+        # the quiet-source watch loop reads the SAME data with the SAME
+        # guards (one query shape, one set of window-alignment tests).
+        groups = await _fetch_window_group_activity(db, days)
+        if groups:
+            logging.info(
+                f"[API] /api/top_groups aggregated window over "
+                f"{days}d → {len(groups)} groups")
 
         window_total = sum(g["total"] for g in groups.values())
         ranked = sorted(groups.items(), key=lambda kv: kv[1]["total"],

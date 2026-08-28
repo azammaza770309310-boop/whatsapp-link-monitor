@@ -1,7 +1,7 @@
 'use client'
 
 import { useState, useEffect, useCallback, useMemo, useRef } from 'react'
-import { motion, AnimatePresence } from 'framer-motion'
+import { motion, AnimatePresence, MotionConfig } from 'framer-motion'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
@@ -883,12 +883,29 @@ export default function Home() {
     setDrillHistory([])
   }, [])
 
-  // ===== [DRILL-DEEPLINK] shareable drill URLs =====
-  // The open drill is mirrored into the URL hash (#g=… / #s=…) via
-  // replaceState (no browser-history pollution), so the operator can
-  // bookmark or share a specific WHO/WHERE view (the dashboard itself is
-  // SSO-protected, so the link is only useful to authorized viewers).
-  // On load, a hash re-opens that drill as a fresh chain.
+  // ===== [DRILL-DEEPLINK + BACK-FWD] shareable drill URLs + browser
+  // back/forward integration =====
+  // The open drill is mirrored into the URL hash (#g=… / #s=…). A drill
+  // session occupies exactly ONE browser-history entry:
+  //   * opening the FIRST drill of a session → pushState, so browser
+  //     Back closes the whole modal (the #1 instinct on mobile);
+  //   * cross-drills / breadcrumb jumps within the session →
+  //     replaceState (Back exits the modal; the breadcrumb bar walks
+  //     the chain — two separate mental models, two controls);
+  //   * closing via X/Esc/overlay → history.back() when we own the
+  //     pushed entry; popstate then lands on the hash-less dashboard
+  //     entry. Deep-linked loads (no pushed entry of ours) clear the
+  //     hash via replaceState instead.
+  //   * popstate (browser Back/Forward) → sync state FROM the hash: a
+  //     drill hash re-opens that drill (Forward after closing, or Back
+  //     inside a deep-link session); an empty hash closes any open
+  //     drill.
+  // The mount-parse effect below still re-opens a shared #hash as a
+  // fresh chain on load (bookmark/share flows unchanged).
+  const drillEntryPushedRef = useRef<boolean>(false) // we pushed this session's entry
+  const exitDrillRef = useRef<boolean>(false) // closing via our own history.back()
+  const firstSyncRef = useRef<boolean>(true) // skip mount run (parse effect owns it)
+
   useEffect(() => {
     const m = window.location.hash.match(/^#(g|s)=(.+)$/)
     if (!m) return
@@ -902,18 +919,79 @@ export default function Home() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 
-  // Keep the hash in sync with the open drill (replace, not push: browser
-  // back should leave the page rather than fight the modal state).
+  // State → URL: keep the hash in sync with the open drill (ONE history
+  // entry per drill session — see the block comment above).
   useEffect(() => {
+    if (firstSyncRef.current) {
+      firstSyncRef.current = false
+      return
+    }
     const want = groupDetail
       ? `#g=${encodeURIComponent(groupDetail)}`
       : senderDetail
         ? `#s=${encodeURIComponent(senderDetail)}`
         : ''
-    if (window.location.hash !== want) {
-      window.history.replaceState(null, '', want || window.location.pathname)
+    const cur = window.location.hash
+    if (cur === want) return
+    if (want) {
+      if (drillEntryPushedRef.current) {
+        // mid-session navigation (cross-drill / breadcrumb jump)
+        window.history.replaceState(null, '', want)
+      } else {
+        // first drill of a session → one pushed entry; Back closes it
+        window.history.pushState(null, '', want)
+        drillEntryPushedRef.current = true
+      }
+    } else if (drillEntryPushedRef.current) {
+      // closing a session we pushed → pop our entry; popstate lands
+      // hash-less and the exitDrillRef guard covers the deep-link edge
+      // where the entry below ours still carries a stale drill hash.
+      drillEntryPushedRef.current = false
+      exitDrillRef.current = true
+      window.history.back()
+    } else {
+      // deep-linked load (nothing of ours to pop) → clear the hash
+      window.history.replaceState(null, '', window.location.pathname)
     }
   }, [groupDetail, senderDetail])
+
+  // URL → state: browser Back/Forward while a drill hash is (or was)
+  // open. This is what makes the modal feel like a real page-level view.
+  useEffect(() => {
+    const onPop = () => {
+      const m = window.location.hash.match(/^#(g|s)=(.+)$/)
+      if (m) {
+        if (exitDrillRef.current) {
+          // our own close-via-back() landed on a stale drill entry
+          // (deep-link case) — replace it with the dashboard entry
+          exitDrillRef.current = false
+          window.history.replaceState(null, '', window.location.pathname)
+          return
+        }
+        try {
+          const name = decodeURIComponent(m[2])
+          if (!name) return
+          const kind = m[1] === 'g' ? 'group' : 'sender'
+          if ((kind === 'group' && groupDetail === name)
+            || (kind === 'sender' && senderDetail === name)) return
+          openDrillFresh(kind, name)
+          drillEntryPushedRef.current = true
+        } catch {
+          // malformed hash — ignore
+        }
+      } else if (exitDrillRef.current) {
+        exitDrillRef.current = false
+      } else if (groupDetail || senderDetail) {
+        // Back from the drill entry → dashboard: close the modal
+        setGroupDetail(null)
+        setSenderDetail(null)
+        setDrillHistory([])
+        drillEntryPushedRef.current = false
+      }
+    }
+    window.addEventListener('popstate', onPop)
+    return () => window.removeEventListener('popstate', onPop)
+  }, [groupDetail, senderDetail, openDrillFresh])
 
   const refreshAll = useCallback(() => {
     fetchLinks()
@@ -1121,7 +1199,10 @@ export default function Home() {
   }, [])
 
   return (
-    <div className="min-h-screen bg-gradient-to-br from-slate-950 via-slate-900 to-slate-950 text-white">
+    // [A11Y] reducedMotion="user": framer-motion disables transform/layout
+    // animations for users with prefers-reduced-motion (opacity fades stay).
+    <MotionConfig reducedMotion="user">
+      <div className="min-h-screen bg-gradient-to-br from-slate-950 via-slate-900 to-slate-950 text-white">
       <div className="fixed inset-0 overflow-hidden pointer-events-none">
         <div className="absolute -top-40 -right-40 w-96 h-96 bg-emerald-500/10 rounded-full blur-3xl" />
         <div className="absolute -bottom-40 -left-40 w-96 h-96 bg-blue-500/10 rounded-full blur-3xl" />
@@ -2492,6 +2573,7 @@ export default function Home() {
         )}
       </AnimatePresence>
     </div>
+    </MotionConfig>
   )
 }
 
@@ -2503,6 +2585,14 @@ function useCountUp(target: number, duration = 700): number {
     const from = prev.current
     if (from === target) {
       setVal(target)
+      return
+    }
+    // [A11Y] reduced-motion users get the final value instantly — no
+    // rAF count-up animation.
+    if (typeof window !== 'undefined'
+      && window.matchMedia?.('(prefers-reduced-motion: reduce)').matches) {
+      setVal(target)
+      prev.current = target
       return
     }
     let raf = 0
@@ -2518,6 +2608,104 @@ function useCountUp(target: number, duration = 700): number {
     return () => cancelAnimationFrame(raf)
   }, [target, duration])
   return val
+}
+
+// ===== useModalA11y — [A11Y/STYLING] dialog semantics + focus trap =====
+// Every overlay modal (LinksModal / GroupDetailModal / SenderDetailModal)
+// gets proper dialog semantics (role="dialog" + aria-modal + aria-label),
+// initial focus on the dialog itself, a Tab focus trap (keyboard users
+// can no longer tab into the page BEHIND the overlay — focus cycled
+// between the first/last focusable child), focus restoration to the
+// pre-modal element on close, and a body scroll-lock while open.
+//
+// A MODULE-LEVEL STACK coordinates overlapping modal lifecycles: during a
+// cross-drill, AnimatePresence keeps the outgoing modal mounted for its
+// exit animation while the incoming one is already active. The FIRST
+// entry of a modal session owns the lock: it captures the pre-modal
+// scroll/focus state, and ONLY the transition back to an empty stack
+// restores it (intermediate entries capture the LOCKED state — restoring
+// that would leave the page scrolled-locked forever, which is exactly
+// the bug the stack exists to prevent).
+const __modalA11yStack: object[] = []
+let __modalA11yBase = {
+  prevOverflow: '',
+  prevFocus: null as HTMLElement | null,
+}
+
+function useModalA11y(active: boolean, label: string) {
+  const ref = useRef<HTMLDivElement | null>(null)
+  useEffect(() => {
+    if (!active) return
+    const entry = {}
+    const isFirst = __modalA11yStack.length === 0
+    if (isFirst) {
+      __modalA11yBase = {
+        prevOverflow: document.body.style.overflow,
+        prevFocus: document.activeElement as HTMLElement | null,
+      }
+      document.body.style.overflow = 'hidden'
+    }
+    __modalA11yStack.push(entry)
+    ref.current?.focus()
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key !== 'Tab') return
+      const root = ref.current
+      if (!root) return
+      const focusables = Array.from(
+        root.querySelectorAll<HTMLElement>(
+          'a[href], button:not([disabled]), input:not([disabled]),'
+          + ' select:not([disabled]), textarea:not([disabled]),'
+          + ' [tabindex]:not([tabindex="-1"])'
+        )
+      ).filter((el) => el.offsetParent !== null || el === document.activeElement)
+      if (focusables.length === 0) {
+        e.preventDefault()
+        return
+      }
+      const first = focusables[0]
+      const last = focusables[focusables.length - 1]
+      const activeEl = document.activeElement
+      if (activeEl === root) {
+        // focus sits on the dialog container itself: Tab enters at the
+        // first child, Shift+Tab cycles to the LAST child (the browser's
+        // default would leave the dialog backwards into the page).
+        e.preventDefault()
+        if (e.shiftKey) last.focus()
+        else first.focus()
+        return
+      }
+      if (e.shiftKey && activeEl === first) {
+        e.preventDefault()
+        last.focus()
+      } else if (!e.shiftKey && activeEl === last) {
+        e.preventDefault()
+        first.focus()
+      }
+    }
+    document.addEventListener('keydown', onKey)
+    return () => {
+      const idx = __modalA11yStack.indexOf(entry)
+      if (idx >= 0) __modalA11yStack.splice(idx, 1)
+      if (__modalA11yStack.length === 0) {
+        document.body.style.overflow = __modalA11yBase.prevOverflow
+        // restore focus only if the pre-modal element still exists
+        const pf = __modalA11yBase.prevFocus
+        if (pf && pf.isConnected) {
+          pf.focus?.()
+        }
+      }
+    }
+  }, [active])
+  return useMemo(() => ({
+    ref,
+    dialogProps: {
+      role: 'dialog' as const,
+      'aria-modal': true as const,
+      'aria-label': label,
+      tabIndex: -1,
+    },
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }), [label])
 }
 
 // ===== timeAgo — [UX] relative timestamps ("منذ 5 د") =====
@@ -3572,6 +3760,9 @@ function GroupDetailModal(props: {
     return () => window.removeEventListener('keydown', onKey)
   }, [onClose])
 
+  // [A11Y] dialog semantics + focus trap + scroll-lock for this modal
+  const a11y = useModalA11y(true, `تفاصيل المصدر ${group}`)
+
   const maxSender = data?.senders[0]?.total || 1
   const waPctOfTotal = data && data.totals.total
     ? Math.round((data.totals.whatsapp / data.totals.total) * 100)
@@ -3594,13 +3785,13 @@ function GroupDetailModal(props: {
         onClick={onClose}
       >
         <motion.div
+          ref={a11y.ref}
+          {...a11y.dialogProps}
           initial={{ scale: 0.95, opacity: 0 }}
           animate={{ scale: 1, opacity: 1 }}
           exit={{ scale: 0.95, opacity: 0 }}
-          className="bg-slate-900 border border-slate-700 rounded-xl max-w-3xl w-full max-h-[95vh] overflow-hidden flex flex-col"
+          className="bg-slate-900 border border-slate-700 rounded-xl max-w-3xl w-full max-h-[95vh] overflow-hidden flex flex-col focus:outline-none focus-visible:ring-2 focus-visible:ring-fuchsia-500/60"
           onClick={(e: ReactMouseEvent) => e.stopPropagation()}
-          role="dialog"
-          aria-label={`تفاصيل المصدر ${group}`}
         >
           {/* Header — fuchsia identity with a subtle gradient tint */}
           <div className="flex items-center justify-between p-4 border-b border-slate-700 gap-3 bg-gradient-to-l from-fuchsia-500/10 to-transparent">
@@ -3641,7 +3832,7 @@ function GroupDetailModal(props: {
           />
 
           {/* Content */}
-          <div className="p-4 overflow-y-auto flex-1">
+          <div className="p-4 overflow-y-auto flex-1 modal-scroll">
             {loading ? (
               <div className="flex flex-col items-center justify-center py-14 gap-3">
                 <RefreshCw className="w-8 h-8 text-emerald-400 animate-spin" />
@@ -3876,6 +4067,9 @@ function SenderDetailModal(props: {
     return () => window.removeEventListener('keydown', onKey)
   }, [onClose])
 
+  // [A11Y] dialog semantics + focus trap + scroll-lock for this modal
+  const a11y = useModalA11y(true, `تفاصيل المرسل ${sender}`)
+
   const maxGroup = data?.groups[0]?.total || 1
   const waPctOfTotal = data && data.totals.total
     ? Math.round((data.totals.whatsapp / data.totals.total) * 100)
@@ -3899,13 +4093,13 @@ function SenderDetailModal(props: {
         onClick={onClose}
       >
         <motion.div
+          ref={a11y.ref}
+          {...a11y.dialogProps}
           initial={{ scale: 0.95, opacity: 0 }}
           animate={{ scale: 1, opacity: 1 }}
           exit={{ scale: 0.95, opacity: 0 }}
-          className="bg-slate-900 border border-slate-700 rounded-xl max-w-3xl w-full max-h-[95vh] overflow-hidden flex flex-col"
+          className="bg-slate-900 border border-slate-700 rounded-xl max-w-3xl w-full max-h-[95vh] overflow-hidden flex flex-col focus:outline-none focus-visible:ring-2 focus-visible:ring-teal-500/60"
           onClick={(e: ReactMouseEvent) => e.stopPropagation()}
-          role="dialog"
-          aria-label={`تفاصيل المرسل ${sender}`}
         >
           {/* Header — teal (sender identity) with a subtle gradient tint */}
           <div className="flex items-center justify-between p-4 border-b border-slate-700 gap-3 bg-gradient-to-l from-teal-500/10 to-transparent">
@@ -3944,7 +4138,7 @@ function SenderDetailModal(props: {
           />
 
           {/* Content */}
-          <div className="p-4 overflow-y-auto flex-1">
+          <div className="p-4 overflow-y-auto flex-1 modal-scroll">
             {loading ? (
               <div className="flex flex-col items-center justify-center py-14 gap-3">
                 <RefreshCw className="w-8 h-8 text-teal-400 animate-spin" />
@@ -4234,6 +4428,9 @@ function LinksModal(props: {
     }
   }, [type, trendDays])
 
+  // [A11Y] dialog semantics + focus trap + scroll-lock for this modal
+  const a11y = useModalA11y(!!type, modalTitle || 'نافذة تفاصيل')
+
   if (!type) return null
 
   return (
@@ -4246,10 +4443,12 @@ function LinksModal(props: {
         onClick={onClose}
       >
         <motion.div
+          ref={a11y.ref}
+          {...a11y.dialogProps}
           initial={{ scale: 0.95, opacity: 0 }}
           animate={{ scale: 1, opacity: 1 }}
           exit={{ scale: 0.95, opacity: 0 }}
-          className="bg-slate-900 border border-slate-700 rounded-xl max-w-5xl w-full max-h-[95vh] overflow-hidden flex flex-col"
+          className="bg-slate-900 border border-slate-700 rounded-xl max-w-5xl w-full max-h-[95vh] overflow-hidden flex flex-col focus:outline-none focus-visible:ring-2 focus-visible:ring-emerald-500/60"
           onClick={(e: ReactMouseEvent) => e.stopPropagation()}
         >
           {/* Header */}
@@ -4289,7 +4488,7 @@ function LinksModal(props: {
 
           {/* Content */}
           {type === 'joiners' ? (
-            <div className="p-4 overflow-y-auto flex-1">
+            <div className="p-4 overflow-y-auto flex-1 modal-scroll">
               {joinersSummary && (
                 <div className="grid grid-cols-3 gap-3 mb-4">
                   <div className="bg-emerald-500/10 border border-emerald-500/30 rounded-lg p-4 text-center">
@@ -4377,7 +4576,7 @@ function LinksModal(props: {
               </div>
             </div>
           ) : type === 'joined_groups' ? (
-            <div className="flex-1 overflow-y-auto p-4" style={{ maxHeight: 'calc(95vh - 100px)' }}>
+            <div className="flex-1 overflow-y-auto p-4 modal-scroll" style={{ maxHeight: 'calc(95vh - 100px)' }}>
               {joinedGroups.length === 0 ? (
                 <div className="text-center py-20">
                   <Users className="w-12 h-12 mx-auto text-slate-600 mb-4" />
@@ -4440,7 +4639,7 @@ function LinksModal(props: {
               )}
             </div>
           ) : type === 'monitored_chats' ? (
-            <div className="flex-1 overflow-y-auto p-4" style={{ maxHeight: 'calc(95vh - 100px)' }}>
+            <div className="flex-1 overflow-y-auto p-4 modal-scroll" style={{ maxHeight: 'calc(95vh - 100px)' }}>
               {/* Summary Stats */}
               {monitoredSummary && (
                 <div className="grid grid-cols-4 gap-3 mb-4">
@@ -4535,7 +4734,7 @@ function LinksModal(props: {
               )}
             </div>
           ) : type === 'banned_groups' ? (
-            <div className="flex-1 overflow-y-auto p-4" style={{ maxHeight: 'calc(95vh - 100px)' }}>
+            <div className="flex-1 overflow-y-auto p-4 modal-scroll" style={{ maxHeight: 'calc(95vh - 100px)' }}>
               {bannedGroups.length === 0 ? (
                 <div className="text-center py-20">
                   <XCircle className="w-12 h-12 mx-auto text-slate-600 mb-4" />
@@ -4592,7 +4791,7 @@ function LinksModal(props: {
               )}
             </div>
           ) : type === 'pending_approvals' ? (
-            <div className="flex-1 overflow-y-auto p-4" style={{ maxHeight: 'calc(95vh - 100px)' }}>
+            <div className="flex-1 overflow-y-auto p-4 modal-scroll" style={{ maxHeight: 'calc(95vh - 100px)' }}>
               {pendingSummary && pendingSummary.self_healing && (
                 <div className="bg-sky-500/5 border border-sky-500/20 rounded-lg p-3 mb-4 text-xs text-sky-300/90 flex items-start gap-2">
                   <Clock3 className="w-4 h-4 mt-0.5 flex-shrink-0" />
@@ -4658,7 +4857,7 @@ function LinksModal(props: {
               )}
             </div>
           ) : type === 'top_groups' ? (
-            <div className="flex-1 overflow-y-auto p-4" style={{ maxHeight: 'calc(95vh - 100px)' }}>
+            <div className="flex-1 overflow-y-auto p-4 modal-scroll" style={{ maxHeight: 'calc(95vh - 100px)' }}>
               {topGroupsTotals && (
                 <div className="bg-fuchsia-500/5 border border-fuchsia-500/20 rounded-lg p-3 mb-4 text-xs text-fuchsia-300/90 flex items-start gap-2">
                   <BarChart3 className="w-4 h-4 mt-0.5 flex-shrink-0" />
@@ -4754,7 +4953,7 @@ function LinksModal(props: {
               )}
             </div>
           ) : type === 'top_senders' ? (
-            <div className="flex-1 overflow-y-auto p-4" style={{ maxHeight: 'calc(95vh - 100px)' }}>
+            <div className="flex-1 overflow-y-auto p-4 modal-scroll" style={{ maxHeight: 'calc(95vh - 100px)' }}>
               {topSendersTotals && (
                 <div className="bg-teal-500/5 border border-teal-500/20 rounded-lg p-3 mb-4 text-xs text-teal-300/90 flex items-start gap-2">
                   <UserCircle2 className="w-4 h-4 mt-0.5 flex-shrink-0" />
@@ -4887,7 +5086,7 @@ function LinksModal(props: {
               </div>
 
               {/* Links list — div عادي مع scroll بدل ScrollArea */}
-              <div className="flex-1 overflow-y-auto p-4" style={{ maxHeight: 'calc(95vh - 200px)' }}>
+              <div className="flex-1 overflow-y-auto p-4 modal-scroll" style={{ maxHeight: 'calc(95vh - 200px)' }}>
                 {filteredLinks.length === 0 ? (
                   <div className="text-center py-20">
                     <Link2 className="w-12 h-12 mx-auto text-slate-600 mb-4" />
