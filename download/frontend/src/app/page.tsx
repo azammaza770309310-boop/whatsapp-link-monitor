@@ -14,6 +14,7 @@ import {
   X, Activity, CheckCircle2, XCircle, AlertTriangle, Clock3,
   Copy, Check, Download, TrendingUp, BarChart3, Flame,
   VolumeX, ShieldCheck, UserCircle2, BellRing, Target, ArrowUp,
+  ArrowLeftRight, ChevronLeft, ZoomIn, Users2,
 } from 'lucide-react'
 import type { ReactNode, MouseEvent as ReactMouseEvent, ChangeEvent } from 'react'
 
@@ -218,6 +219,36 @@ interface TopSender {
 interface TopSendersTotals {
   total: number
   distinct_senders: number
+}
+
+// [GROUP-DRILL] /api/group_detail response — per-group drill-down opened
+// by clicking a top-group / quiet-source row. PII-free by construction
+// (the backend selects sender_name only — never contacts/phones).
+interface GroupDetailSender {
+  sender: string
+  total: number
+  whatsapp: number
+  telegram: number
+  other: number
+  share: number
+  first_seen: string
+  last_seen: string
+}
+
+interface GroupDetailData {
+  group: string
+  days: number
+  totals: {
+    total: number
+    whatsapp: number
+    telegram: number
+    other: number
+    distinct_senders: number
+  }
+  first_seen: string | null
+  last_seen: string | null
+  daily: DailyStat[]
+  senders: GroupDetailSender[]
 }
 
 // [SOURCE-HEALTH] a producing source whose last_seen is aging — the client
@@ -440,6 +471,12 @@ export default function Home() {
   // 7 days against the previous 7, so it needs a fixed wide window (the
   // server caches per-days key for 60s — the extra poll is cheap).
   const [deltaDaily, setDeltaDaily] = useState<DailyStat[]>([])
+  // [GROUP-DRILL] the group whose detail modal is open (null = closed).
+  // The modal self-fetches /api/group_detail with the shared trend window.
+  const [groupDetail, setGroupDetail] = useState<string | null>(null)
+  // [TREND-COMPARE] overlay the previous period as ghost bars behind the
+  // current window (positionally sliced from the 30-day delta series).
+  const [compareMode, setCompareMode] = useState<boolean>(false)
   // [NAV-SPY] currently visible section (drives the active chip highlight)
   // and the back-to-top button visibility.
   const [activeSection, setActiveSection] = useState<string>('sec-overview')
@@ -885,6 +922,20 @@ export default function Home() {
     }
   }, [deltaDaily])
 
+  // [TREND-COMPARE] the previous window of the same length as the current
+  // trend window, sliced positionally from the END of the 30-day delta
+  // series (date-robust: aligned by position, same convention as the delta
+  // badges). Null when there isn't enough history (e.g. a 30-day window
+  // needs 60 days) — the toggle hides and compareMode force-resets.
+  const prevWindow = useMemo(() => {
+    if (!deltaDaily || deltaDaily.length < trendDays * 2) return null
+    return deltaDaily.slice(-trendDays * 2, -trendDays)
+  }, [deltaDaily, trendDays])
+
+  useEffect(() => {
+    if (!prevWindow) setCompareMode(false)
+  }, [prevWindow])
+
   // [NAV-SPY] scroll-spy — highlights the quick-nav chip of the section
   // currently in view. A top band (rootMargin) decides "active": the section
   // whose top edge crosses the upper 20–40% of the viewport wins. Sections
@@ -1242,6 +1293,27 @@ export default function Home() {
                       ⌀ {trendTotals.avg_per_day.toLocaleString()}/يوم
                     </Badge>
                   )}
+                  {/* [TREND-COMPARE] overlay the previous window as ghost
+                      bars — answers "are we up or down vs last week?"
+                      directly on the chart. Hidden when the 30-day delta
+                      series can't cover a previous window of this length. */}
+                  {prevWindow && (
+                    <button
+                      onClick={() => setCompareMode((v) => !v)}
+                      role="switch"
+                      aria-checked={compareMode}
+                      aria-label="مقارنة بالفترة السابقة"
+                      title="إظهار أعمدة الفترة السابقة (باهتة) خلف الأعمدة الحالية"
+                      className={`flex items-center gap-1 px-2 py-0.5 rounded-md text-[11px] font-medium border transition-colors ${
+                        compareMode
+                          ? 'bg-amber-500/20 text-amber-300 border-amber-500/50'
+                          : 'bg-slate-900/70 text-slate-400 border-slate-700/50 hover:text-slate-200'
+                      }`}
+                    >
+                      <ArrowLeftRight className="w-3 h-3" />
+                      <span className="hidden sm:inline">مقارنة</span>
+                    </button>
+                  )}
                   {/* [WINDOW] 7/14/30-day selector (shared window) */}
                   <div
                     className="flex items-center gap-0.5 bg-slate-900/70 border border-slate-700/50 rounded-lg p-0.5"
@@ -1268,8 +1340,12 @@ export default function Home() {
               </CardTitle>
             </CardHeader>
             <CardContent>
-              <TrendChart daily={trendDaily} totals={trendTotals} />
-              <div className="flex items-center justify-center gap-4 mt-1 text-[10px] text-slate-400">
+              <TrendChart
+                daily={trendDaily}
+                totals={trendTotals}
+                prev={compareMode && prevWindow ? prevWindow : undefined}
+              />
+              <div className="flex items-center justify-center gap-4 mt-1 text-[10px] text-slate-400 flex-wrap">
                 <span className="flex items-center gap-1.5">
                   <span className="w-2.5 h-2.5 rounded-sm bg-gradient-to-b from-emerald-400 to-emerald-600" />
                   واتساب
@@ -1282,6 +1358,12 @@ export default function Home() {
                   <span className="w-4 border-t border-dashed border-slate-400" />
                   المتوسط
                 </span>
+                {compareMode && prevWindow && (
+                  <span className="flex items-center gap-1.5 text-slate-500">
+                    <span className="w-2.5 h-2.5 rounded-sm bg-slate-500/40 border border-slate-500/60" />
+                    الفترة السابقة
+                  </span>
+                )}
               </div>
               {/* [HEATMAP-VIEW] hour-of-day activity strip — WHEN do links
                   get posted? Peak hour highlighted in amber. */}
@@ -1406,7 +1488,13 @@ export default function Home() {
             <CardContent>
               <div className="space-y-3">
                 {topGroups.slice(0, 6).map((g, i) => (
-                  <TopGroupRow key={g.group} rank={i + 1} group={g} max={topGroups[0]?.total || 1} />
+                  <TopGroupRow
+                    key={g.group}
+                    rank={i + 1}
+                    group={g}
+                    max={topGroups[0]?.total || 1}
+                    onClick={() => setGroupDetail(g.group)}
+                  />
                 ))}
               </div>
               <div className="flex items-center justify-center gap-4 mt-3 text-[10px] text-slate-400">
@@ -1417,6 +1505,10 @@ export default function Home() {
                 <span className="flex items-center gap-1.5">
                   <span className="w-2.5 h-2.5 rounded-sm bg-gradient-to-r from-blue-400 to-blue-600" />
                   تيليجرام
+                </span>
+                <span className="flex items-center gap-1 text-slate-600">
+                  <ZoomIn className="w-3 h-3" />
+                  اضغط على أي مصدر لعرض مرسليه ومنحناه اليومي
                 </span>
               </div>
             </CardContent>
@@ -1539,8 +1631,18 @@ export default function Home() {
                           initial={{ opacity: 0, x: 20 }}
                           animate={{ opacity: 1, x: 0 }}
                           transition={{ delay: Math.min(i * 0.07, 0.35), duration: 0.3 }}
-                          className="group bg-slate-900/50 rounded-lg p-3 border border-slate-700/50 hover:border-slate-600/60 transition-colors"
-                          title={`نشاط ${g.first_seen} ← ${g.last_seen} · واتساب ${g.whatsapp.toLocaleString()} / تيليجرام ${g.telegram.toLocaleString()}`}
+                          className="group bg-slate-900/50 rounded-lg p-3 border border-slate-700/50 hover:border-slate-600/60 transition-colors cursor-pointer"
+                          onClick={() => setGroupDetail(g.group)}
+                          role="button"
+                          tabIndex={0}
+                          aria-label={`عرض تفاصيل ${g.group}`}
+                          onKeyDown={(e) => {
+                            if (e.key === 'Enter' || e.key === ' ') {
+                              e.preventDefault()
+                              setGroupDetail(g.group)
+                            }
+                          }}
+                          title={`نشاط ${g.first_seen} ← ${g.last_seen} · واتساب ${g.whatsapp.toLocaleString()} / تيليجرام ${g.telegram.toLocaleString()} — اضغط لعرض التفاصيل`}
                         >
                           <div className="flex items-center justify-between gap-2 mb-2">
                             <div className="flex items-center gap-2 min-w-0">
@@ -1585,12 +1687,21 @@ export default function Home() {
                             <span className="text-[9px] text-slate-600">30ي</span>
                           </div>
                           {/* hover detail line — same pattern as TopGroupRow */}
-                          <div className="text-[10px] text-slate-500 mt-1.5 h-4 opacity-0 group-hover:opacity-100 transition-opacity">
-                            <span className="text-emerald-500">واتساب {g.whatsapp.toLocaleString()}</span>
-                            {' · '}
-                            <span className="text-blue-400">تيليجرام {g.telegram.toLocaleString()}</span>
-                            {g.other > 0 && <span> · أخرى {g.other.toLocaleString()}</span>}
-                            <span> · نشاط {g.first_seen} ← {g.last_seen}</span>
+                          <div className="text-[10px] text-slate-500 mt-1.5 flex items-center justify-between gap-2">
+                            <div className="opacity-0 group-hover:opacity-100 transition-opacity truncate">
+                              <span className="text-emerald-500">واتساب {g.whatsapp.toLocaleString()}</span>
+                              {' · '}
+                              <span className="text-blue-400">تيليجرام {g.telegram.toLocaleString()}</span>
+                              {g.other > 0 && <span> · أخرى {g.other.toLocaleString()}</span>}
+                              <span> · نشاط {g.first_seen} ← {g.last_seen}</span>
+                            </div>
+                            <span
+                              className="flex items-center gap-0.5 text-slate-500 group-hover:text-emerald-400 flex-shrink-0 transition-colors"
+                              aria-hidden
+                            >
+                              <ZoomIn className="w-3 h-3" />
+                              تفاصيل
+                            </span>
                           </div>
                         </motion.div>
                       )
@@ -2175,7 +2286,24 @@ export default function Home() {
         topSenders={topSenders}
         topSendersTotals={topSendersTotals}
         trendDays={trendDays}
+        onOpenGroupDetail={(g) => {
+          setModal(null)
+          setGroupDetail(g)
+        }}
       />
+
+      {/* [GROUP-DRILL] per-group detail modal — opened by clicking a
+          top-group / quiet-source row */}
+      <AnimatePresence>
+        {groupDetail && (
+          <GroupDetailModal
+            key={groupDetail}
+            group={groupDetail}
+            days={trendDays}
+            onClose={() => setGroupDetail(null)}
+          />
+        )}
+      </AnimatePresence>
 
       {/* [NAV-SPY] back-to-top — appears after ~1.5 viewport heights of
           scrolling (the dashboard is long); smooth-scrolls home. Fixed to
@@ -2298,8 +2426,12 @@ function CopyButton(props: { text: string }) {
 }
 
 // ===== TrendChart — [TREND-VIEW] SVG stacked-bars daily capture chart =====
-function TrendChart(props: { daily: DailyStat[]; totals: TrendTotals | null }) {
-  const { daily, totals } = props
+function TrendChart(props: {
+  daily: DailyStat[]
+  totals: TrendTotals | null
+  prev?: DailyStat[]
+}) {
+  const { daily, totals, prev } = props
   const [hovered, setHovered] = useState<number | null>(null)
   if (daily.length === 0) return null
 
@@ -2311,11 +2443,18 @@ function TrendChart(props: { daily: DailyStat[]; totals: TrendTotals | null }) {
   const padB = 24
   const chartW = W - padL - padR
   const chartH = H - padT - padB
-  const max = Math.max(...daily.map((d) => d.total), 1)
+  // [TREND-COMPARE] the y-scale must cover the ghost bars too — otherwise
+  // a bigger previous period would overflow the top of the chart.
+  const max = Math.max(
+    ...daily.map((d) => d.total),
+    ...(prev ? prev.map((d) => d.total) : []),
+    1
+  )
   const barW = chartW / daily.length
   const avg = totals?.avg_per_day ?? 0
   const avgY = padT + chartH - (avg / max) * chartH
   const hoverStat = hovered !== null ? daily[hovered] : null
+  const hoverPrev = prev && hovered !== null ? prev[hovered] : null
 
   return (
     <div className="relative" dir="ltr">
@@ -2376,6 +2515,11 @@ function TrendChart(props: { daily: DailyStat[]; totals: TrendTotals | null }) {
           const isHover = hovered === i
           const isBest =
             totals?.best_day && d.date === totals.best_day.date && d.total > 0
+          // [TREND-COMPARE] ghost bar of the previous period — drawn behind
+          // the current colored bars (same slot, muted slate, slightly
+          // wider) so "this week vs last week" reads at a glance.
+          const prevTotal = prev && prev[i] ? Number(prev[i].total) || 0 : 0
+          const prevH = prev ? (prevTotal / max) * chartH : 0
           return (
             <g
               key={d.date}
@@ -2390,6 +2534,20 @@ function TrendChart(props: { daily: DailyStat[]; totals: TrendTotals | null }) {
                 height={chartH}
                 fill={isHover ? 'rgba(255,255,255,0.05)' : 'transparent'}
               />
+              {/* [TREND-COMPARE] previous-period ghost bar */}
+              {prev && prevTotal > 0 && (
+                <rect
+                  x={padL + i * barW + barW * 0.06}
+                  y={yBase - prevH}
+                  width={barW * 0.88}
+                  height={Math.max(prevH, 2)}
+                  rx="2"
+                  fill="#64748b"
+                  opacity={isHover ? 0.45 : 0.28}
+                  className="transition-opacity"
+                  data-prev={prevTotal}
+                />
+              )}
               {/* telegram (bottom, blue) */}
               <rect
                 x={x}
@@ -2457,6 +2615,29 @@ function TrendChart(props: { daily: DailyStat[]; totals: TrendTotals | null }) {
             الإجمالي:{' '}
             <span className="font-bold text-white">{hoverStat.total.toLocaleString()}</span>
           </p>
+          {hoverPrev && (
+            <p className="text-slate-500">
+              الفترة السابقة: {hoverPrev.total.toLocaleString()}
+              {hoverPrev.total > 0 && hoverStat.total > 0 && (
+                <span
+                  className={
+                    hoverStat.total >= hoverPrev.total
+                      ? 'text-emerald-400 font-bold'
+                      : 'text-rose-400 font-bold'
+                  }
+                >
+                  {' '}
+                  ({hoverStat.total >= hoverPrev.total ? '▲' : '▼'}
+                  {Math.abs(
+                    Math.round(
+                      ((hoverStat.total - hoverPrev.total) / hoverPrev.total) * 100
+                    )
+                  )}
+                  %)
+                </span>
+              )}
+            </p>
+          )}
           <p className="text-emerald-400">
             واتساب: {hoverStat.whatsapp.toLocaleString()}
           </p>
@@ -2675,8 +2856,13 @@ function TopSenderRow(props: { rank: number; sender: TopSender; max: number }) {
   )
 }
 
-function TopGroupRow(props: { rank: number; group: TopGroup; max: number }) {
-  const { rank, group, max } = props
+function TopGroupRow(props: {
+  rank: number
+  group: TopGroup
+  max: number
+  onClick?: () => void
+}) {
+  const { rank, group, max, onClick } = props
   const medals = ['🥇', '🥈', '🥉']
   const rankLabel = medals[rank - 1] || <span className="text-slate-500">#{rank}</span>
   const widthPct = Math.max(2, Math.round((group.total / max) * 100))
@@ -2691,7 +2877,17 @@ function TopGroupRow(props: { rank: number; group: TopGroup; max: number }) {
       initial={{ opacity: 0, x: 24 }}
       animate={{ opacity: 1, x: 0 }}
       transition={{ delay: Math.min(rank * 0.06, 0.4), duration: 0.35 }}
-      className="group"
+      className={onClick ? 'group cursor-pointer' : 'group'}
+      onClick={onClick}
+      role={onClick ? 'button' : undefined}
+      tabIndex={onClick ? 0 : undefined}
+      aria-label={onClick ? `عرض تفاصيل ${group.group}` : undefined}
+      onKeyDown={(e) => {
+        if (onClick && (e.key === 'Enter' || e.key === ' ')) {
+          e.preventDefault()
+          onClick()
+        }
+      }}
     >
       <div className="flex items-center justify-between gap-2 mb-1">
         <div className="flex items-center gap-2 min-w-0">
@@ -2729,12 +2925,23 @@ function TopGroupRow(props: { rank: number; group: TopGroup; max: number }) {
         />
       </div>
       {/* hover detail line */}
-      <div className="text-[10px] text-slate-500 mt-1 h-4 opacity-0 group-hover:opacity-100 transition-opacity">
-        <span className="text-emerald-500">واتساب {group.whatsapp.toLocaleString()}</span>
-        {' · '}
-        <span className="text-blue-400">تيليجرام {group.telegram.toLocaleString()}</span>
-        {group.other > 0 && <span> · أخرى {group.other.toLocaleString()}</span>}
-        <span> · نشاط {group.first_seen} ← {group.last_seen}</span>
+      <div className="text-[10px] text-slate-500 mt-1 h-4 flex items-center justify-between gap-2">
+        <div className="opacity-0 group-hover:opacity-100 transition-opacity truncate">
+          <span className="text-emerald-500">واتساب {group.whatsapp.toLocaleString()}</span>
+          {' · '}
+          <span className="text-blue-400">تيليجرام {group.telegram.toLocaleString()}</span>
+          {group.other > 0 && <span> · أخرى {group.other.toLocaleString()}</span>}
+          <span> · نشاط {group.first_seen} ← {group.last_seen}</span>
+        </div>
+        {onClick && (
+          <span
+            className="flex items-center gap-0.5 text-slate-500 group-hover:text-emerald-400 flex-shrink-0 transition-colors"
+            aria-hidden
+          >
+            <ZoomIn className="w-3 h-3" />
+            تفاصيل
+          </span>
+        )}
       </div>
     </motion.div>
   )
@@ -3047,6 +3254,253 @@ function LinkCard(props: { link: LinkItem; compact?: boolean; isMonitored?: bool
   )
 }
 
+// ===== [GROUP-DRILL] GroupDetailModal — per-group drill-down =====
+// Opened by clicking a top-group or quiet-source row. Self-fetches
+// /api/group_detail?group=X&days=N (the shared trend window) and shows:
+// the group's own daily series (reuses TrendChart — dry days are signal
+// here), its top senders with WA/TG split bars, and the activity range.
+// PII-free: the backend never selects contacts/phones for this view.
+function GroupDetailModal(props: { group: string; days: number; onClose: () => void }) {
+  const { group, days, onClose } = props
+  const [data, setData] = useState<GroupDetailData | null>(null)
+  const [loading, setLoading] = useState<boolean>(true)
+  const [error, setError] = useState<string | null>(null)
+  const [reloadTick, setReloadTick] = useState<number>(0)
+
+  useEffect(() => {
+    let cancelled = false
+    const load = async () => {
+      setLoading(true)
+      setError(null)
+      try {
+        const resp = await fetch(
+          `${API_URL}/api/group_detail?group=${encodeURIComponent(group)}&days=${days}`,
+          { headers: buildHeaders() }
+        )
+        if (!resp.ok) throw new Error(`HTTP ${resp.status}`)
+        const json = await resp.json()
+        if (!cancelled) setData(json as GroupDetailData)
+      } catch {
+        if (!cancelled) setError('تعذّر تحميل تفاصيل المصدر — تحقق من الاتصال وحاول مرة أخرى.')
+      } finally {
+        if (!cancelled) setLoading(false)
+      }
+    }
+    load()
+    return () => {
+      cancelled = true
+    }
+  }, [group, days, reloadTick])
+
+  // Esc closes (same pattern as LinksModal)
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') onClose()
+    }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  }, [onClose])
+
+  const maxSender = data?.senders[0]?.total || 1
+  const waPctOfTotal = data && data.totals.total
+    ? Math.round((data.totals.whatsapp / data.totals.total) * 100)
+    : 0
+
+  return (
+    <AnimatePresence>
+      <motion.div
+        initial={{ opacity: 0 }}
+        animate={{ opacity: 1 }}
+        exit={{ opacity: 0 }}
+        className="fixed inset-0 bg-black/80 backdrop-blur-sm z-50 flex items-center justify-center p-4"
+        onClick={onClose}
+      >
+        <motion.div
+          initial={{ scale: 0.95, opacity: 0 }}
+          animate={{ scale: 1, opacity: 1 }}
+          exit={{ scale: 0.95, opacity: 0 }}
+          className="bg-slate-900 border border-slate-700 rounded-xl max-w-3xl w-full max-h-[95vh] overflow-hidden flex flex-col"
+          onClick={(e: ReactMouseEvent) => e.stopPropagation()}
+          role="dialog"
+          aria-label={`تفاصيل المصدر ${group}`}
+        >
+          {/* Header */}
+          <div className="flex items-center justify-between p-4 border-b border-slate-700 gap-3">
+            <div className="flex items-center gap-2.5 min-w-0">
+              <div className="w-9 h-9 rounded-lg bg-fuchsia-500/15 border border-fuchsia-500/30 flex items-center justify-center flex-shrink-0">
+                <Users2 className="w-4.5 h-4.5 text-fuchsia-400" />
+              </div>
+              <div className="min-w-0">
+                <h2 className="text-lg font-bold text-white truncate" title={group}>
+                  {group}
+                </h2>
+                <p className="text-[11px] text-slate-500">
+                  تفاصيل المصدر · آخر {days} يوم
+                </p>
+              </div>
+            </div>
+            <button
+              onClick={onClose}
+              className="text-slate-400 hover:text-white transition-colors flex-shrink-0"
+              aria-label="إغلاق"
+            >
+              <X className="w-5 h-5" />
+            </button>
+          </div>
+
+          {/* Content */}
+          <div className="p-4 overflow-y-auto flex-1">
+            {loading ? (
+              <div className="flex flex-col items-center justify-center py-14 gap-3">
+                <RefreshCw className="w-8 h-8 text-emerald-400 animate-spin" />
+                <p className="text-sm text-slate-400">جارٍ تحميل تفاصيل المصدر…</p>
+              </div>
+            ) : error ? (
+              <div className="flex flex-col items-center justify-center py-12 gap-3">
+                <AlertTriangle className="w-8 h-8 text-amber-400" />
+                <p className="text-sm text-slate-300">{error}</p>
+                <Button
+                  variant="outline"
+                  size="sm"
+                  onClick={() => setReloadTick((t) => t + 1)}
+                  className="border-slate-600 text-slate-200 hover:bg-slate-800"
+                >
+                  <RefreshCw className="w-3.5 h-3.5 ml-1" />
+                  إعادة المحاولة
+                </Button>
+              </div>
+            ) : data ? (
+              <div className="space-y-5">
+                {/* totals — compact chips grid */}
+                <div className="grid grid-cols-2 sm:grid-cols-4 gap-2.5">
+                  <div className="bg-slate-800/60 border border-slate-700/60 rounded-lg p-3 text-center">
+                    <p className="text-xl font-bold text-white tabular-nums">
+                      {data.totals.total.toLocaleString()}
+                    </p>
+                    <p className="text-[10px] text-slate-400 mt-0.5">إجمالي الروابط</p>
+                  </div>
+                  <div className="bg-emerald-500/10 border border-emerald-500/30 rounded-lg p-3 text-center">
+                    <p className="text-xl font-bold text-emerald-400 tabular-nums">
+                      {data.totals.whatsapp.toLocaleString()}
+                    </p>
+                    <p className="text-[10px] text-slate-400 mt-0.5">واتساب ({waPctOfTotal}%)</p>
+                  </div>
+                  <div className="bg-blue-500/10 border border-blue-500/30 rounded-lg p-3 text-center">
+                    <p className="text-xl font-bold text-blue-400 tabular-nums">
+                      {data.totals.telegram.toLocaleString()}
+                    </p>
+                    <p className="text-[10px] text-slate-400 mt-0.5">تيليجرام ({100 - waPctOfTotal - (data.totals.total ? Math.round((data.totals.other / data.totals.total) * 100) : 0)}%)</p>
+                  </div>
+                  <div className="bg-teal-500/10 border border-teal-500/30 rounded-lg p-3 text-center">
+                    <p className="text-xl font-bold text-teal-400 tabular-nums">
+                      {data.totals.distinct_senders.toLocaleString()}
+                    </p>
+                    <p className="text-[10px] text-slate-400 mt-0.5">مرسل مختلف</p>
+                  </div>
+                </div>
+
+                {/* activity range */}
+                {data.first_seen && (
+                  <div className="flex items-center gap-2 text-[11px] text-slate-400 bg-slate-800/40 border border-slate-700/50 rounded-lg px-3 py-2">
+                    <Clock3 className="w-3.5 h-3.5 text-slate-500 flex-shrink-0" />
+                    <span>
+                      نشاط المصدر داخل النافذة: <span className="text-slate-200 font-medium" dir="ltr">{data.first_seen}</span>
+                      {' ← '}
+                      <span className="text-slate-200 font-medium" dir="ltr">{data.last_seen}</span>
+                    </span>
+                  </div>
+                )}
+
+                {/* the group's own daily series — dry days are the story
+                    for quiet sources (they show as zero bars) */}
+                {data.daily.length > 0 && (
+                  <div>
+                    <h3 className="text-sm font-semibold text-slate-200 mb-2 flex items-center gap-1.5">
+                      <TrendingUp className="w-4 h-4 text-emerald-400" />
+                      الإنتاج اليومي للمصدر
+                    </h3>
+                    <TrendChart daily={data.daily} totals={null} />
+                  </div>
+                )}
+
+                {/* top senders of THIS group */}
+                <div>
+                  <h3 className="text-sm font-semibold text-slate-200 mb-2.5 flex items-center gap-1.5">
+                    <UserCircle2 className="w-4 h-4 text-teal-400" />
+                    أكثر المرسلين في هذا المصدر
+                  </h3>
+                  {data.senders.length === 0 ? (
+                    <p className="text-xs text-slate-500 text-center py-3">
+                      لا روابط لهذا المصدر داخل النافذة المحددة.
+                    </p>
+                  ) : (
+                    <div className="space-y-2">
+                      {data.senders.slice(0, 10).map((s, i) => {
+                        const widthPct = Math.max(3, Math.round((s.total / maxSender) * 100))
+                        const sWaPct = s.total ? Math.round((s.whatsapp / s.total) * widthPct) : 0
+                        const sTgPct = widthPct - sWaPct
+                        return (
+                          <div key={`${s.sender}-${i}`} className="group/s">
+                            <div className="flex items-center justify-between gap-2 mb-1">
+                              <div className="flex items-center gap-2 min-w-0">
+                                <span className="text-[10px] text-slate-500 w-5 text-center flex-shrink-0 tabular-nums">
+                                  {i + 1}.
+                                </span>
+                                <span
+                                  className={`text-xs truncate ${s.sender === 'غير محدد' ? 'text-slate-500 italic' : 'text-slate-200'}`}
+                                  title={s.sender}
+                                >
+                                  {s.sender}
+                                </span>
+                              </div>
+                              <div className="flex items-center gap-2 flex-shrink-0">
+                                <span className="text-[10px] text-slate-500 tabular-nums">
+                                  {s.share.toFixed(1)}%
+                                </span>
+                                <span className="text-xs font-bold text-white tabular-nums">
+                                  {s.total.toLocaleString()}
+                                </span>
+                              </div>
+                            </div>
+                            <div className="flex h-1.5 rounded-full bg-slate-700/40 overflow-hidden">
+                              <div
+                                className="h-full bg-gradient-to-r from-emerald-400 to-emerald-600"
+                                style={{ width: `${sWaPct}%` }}
+                              />
+                              <div
+                                className="h-full bg-gradient-to-r from-blue-400 to-blue-600"
+                                style={{ width: `${sTgPct}%` }}
+                              />
+                            </div>
+                            <div className="text-[9px] text-slate-600 mt-0.5 h-3 opacity-0 group-hover/s:opacity-100 transition-opacity">
+                              واتساب {s.whatsapp.toLocaleString()} · تيليجرام {s.telegram.toLocaleString()}
+                              {s.other > 0 && <span> · أخرى {s.other.toLocaleString()}</span>}
+                              <span> · نشاط {s.first_seen} ← {s.last_seen}</span>
+                            </div>
+                          </div>
+                        )
+                      })}
+                      {data.senders.length > 10 && (
+                        <p className="text-[10px] text-slate-500 text-center">
+                          + {data.senders.length - 10} مرسلين آخرين
+                        </p>
+                      )}
+                    </div>
+                  )}
+                </div>
+
+                <p className="text-[10px] text-slate-600 text-center border-t border-slate-800 pt-3">
+                  🔒 بدون بيانات هواتف أو جهات اتصال (خصوصية) · خلفية الرسم البياني: انقطاع المصدر يظهر كأيام صفرية
+                </p>
+              </div>
+            ) : null}
+          </div>
+        </motion.div>
+      </motion.div>
+    </AnimatePresence>
+  )
+}
+
 // ===== Modal Component =====
 function LinksModal(props: {
   type: ModalType
@@ -3065,8 +3519,9 @@ function LinksModal(props: {
   topSenders: TopSender[]
   topSendersTotals: TopSendersTotals | null
   trendDays: number
+  onOpenGroupDetail?: (group: string) => void
 }) {
-  const { type, onClose, allLinks, joiners, joinersSummary, joinedGroups, monitoredChats, monitoredSummary, bannedGroups, pendingApprovals, pendingSummary, topGroups, topGroupsTotals, topSenders, topSendersTotals, trendDays } = props
+  const { type, onClose, allLinks, joiners, joinersSummary, joinedGroups, monitoredChats, monitoredSummary, bannedGroups, pendingApprovals, pendingSummary, topGroups, topGroupsTotals, topSenders, topSendersTotals, trendDays, onOpenGroupDetail } = props
   const [searchQuery, setSearchQuery] = useState<string>('')
 
   // [UX] Esc closes the modal + / focuses the search box
@@ -3611,7 +4066,17 @@ function LinksModal(props: {
                   {topGroups.map((g, i) => (
                     <div
                       key={g.group}
-                      className="bg-slate-800/50 rounded-lg p-3 border border-slate-700/50"
+                      className={`bg-slate-800/50 rounded-lg p-3 border border-slate-700/50 ${onOpenGroupDetail ? 'cursor-pointer hover:border-emerald-500/40 hover:bg-slate-800/80 transition-colors' : ''}`}
+                      onClick={onOpenGroupDetail ? () => onOpenGroupDetail(g.group) : undefined}
+                      role={onOpenGroupDetail ? 'button' : undefined}
+                      tabIndex={onOpenGroupDetail ? 0 : undefined}
+                      aria-label={onOpenGroupDetail ? `عرض تفاصيل ${g.group}` : undefined}
+                      onKeyDown={(e) => {
+                        if (onOpenGroupDetail && (e.key === 'Enter' || e.key === ' ')) {
+                          e.preventDefault()
+                          onOpenGroupDetail(g.group)
+                        }
+                      }}
                     >
                       <div className="flex items-center justify-between gap-2 mb-2">
                         <div className="flex items-center gap-2 min-w-0">

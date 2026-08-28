@@ -11574,6 +11574,204 @@ async def api_stats_handler(request):
                                  headers={"Access-Control-Allow-Origin": "*"})
 
 
+# [GROUP-DRILL] /api/group_detail — per-group drill-down for the dashboard.
+# Clicking a row in the top-groups card (or a quiet source) opens a detail
+# view: the group's OWN daily series + its top senders. Answers "WHO posts
+# in THIS group" and "when exactly did it dry up" — the drill-down behind
+# the Aug-19 cluster finding (five university groups all went quiet the
+# same day; now the operator can inspect each one's senders + last days).
+# Deliberately PII-free like top_senders: only sender_name is selected —
+# sender_contact and source_phone are NEVER fetched. Same efficiency
+# pattern: narrow select, 1000-row batches, 60s in-process cache keyed by
+# (group, days). Unnamed groups are queryable too (the dashboard passes
+# the raw label; rows store NULL/'' and are aggregated as غير محدد — the
+# filter here matches the raw stored value).
+_GROUP_DETAIL_CACHE = {"key": None, "payload": None, "ts": 0.0}
+
+_UNNAMED_SENDER_LABEL_GD = "غير محدد"
+
+
+async def api_group_detail_handler(request):
+    """API endpoint: per-group drill-down (daily series + top senders).
+
+    Query params:
+      ?group=X   → exact group_name (required, non-empty)
+      ?days=N    → window size in days (default 14, clamped 1..30)
+
+    Returns:
+      {
+        "group": "...", "days": 14, "generated_at": "<ISO>",
+        "totals": {"total": N, "whatsapp": N, "telegram": N, "other": N,
+                   "distinct_senders": N},
+        "first_seen": "YYYY-MM-DD", "last_seen": "YYYY-MM-DD",
+        "daily": [{"date": "...", "whatsapp": N, "telegram": N,
+                   "other": N, "total": N}, ...continuous window],
+        "senders": [{"sender": "...", "total": N, "whatsapp": N,
+                     "telegram": N, "share": 12.3, "first_seen": "...",
+                     "last_seen": "..."}, ... top 20 by total]
+      }
+    """
+    group_name = (request.query.get("group") or "").strip()
+    if not group_name:
+        return web.json_response(
+            {"error": "missing group query param"}, status=400,
+            headers={"Access-Control-Allow-Origin": "*"})
+    db = request.app.get("db")
+    if not db:
+        return web.json_response({"error": "not ready"}, status=503)
+
+    try:
+        days = max(1, min(30, int(request.query.get("days", "14"))))
+        # Cap the key at 80 chars — group names can be long; cache identity
+        # stays unambiguous for realistic names and bounded in memory.
+        cache_key = f"g:{group_name[:80]}:d{days}"
+        now_ts = time.time()
+        cached = _GROUP_DETAIL_CACHE
+        if (cached["key"] == cache_key and cached["payload"] is not None
+                and (now_ts - cached["ts"]) < 60.0):
+            return web.json_response(cached["payload"], status=200,
+                                     headers={"Access-Control-Allow-Origin": "*"})
+
+        daily: dict = {}   # "YYYY-MM-DD" → {"whatsapp", "telegram", "other"}
+        senders: dict = {}  # sender_name → counters
+        first_seen: str | None = None
+        last_seen: str | None = None
+
+        if db.supabase_url and db.supabase_key:
+            try:
+                from urllib.parse import quote as _urlquote
+                session = await db._get_supabase_session()
+                since_dt = datetime.utcnow() - timedelta(days=days)
+                since_iso = since_dt.strftime("%Y-%m-%dT%H:%M:%S")
+                group_eq = _urlquote(group_name, safe="")
+                offset = 0
+                batch_size = 1000
+                fetched = 0
+                while True:
+                    url = (
+                        f"{db.supabase_url}/rest/v1/links"
+                        f"?select=created_at,sender_name,link_type"
+                        f"&group_name=eq.{group_eq}"
+                        f"&created_at=gte.{since_iso}"
+                        f"&order=created_at.asc"
+                        f"&limit={batch_size}&offset={offset}"
+                    )
+                    async with session.get(url) as r:
+                        if r.status == 200:
+                            rows = await r.json()
+                        elif r.status == 416:
+                            break
+                        else:
+                            logging.error(
+                                f"[API] /api/group_detail batch failed: {r.status}")
+                            break
+                    if not rows:
+                        break
+                    for row in rows:
+                        created = str(row.get("created_at") or "")
+                        day_key = created[:10]
+                        if len(day_key) != 10 or not day_key.startswith("20"):
+                            continue
+                        bucket = daily.setdefault(
+                            day_key, {"whatsapp": 0, "telegram": 0, "other": 0})
+                        sname = (row.get("sender_name") or "").strip() \
+                            or _UNNAMED_SENDER_LABEL_GD
+                        s = senders.setdefault(sname, {
+                            "total": 0, "whatsapp": 0, "telegram": 0,
+                            "other": 0, "first": day_key, "last": day_key})
+                        s["total"] += 1
+                        lt = row.get("link_type") or "other"
+                        if lt in ("whatsapp", "telegram"):
+                            bucket[lt] += 1
+                            s[lt] += 1
+                        else:
+                            bucket["other"] = bucket.get("other", 0) + 1
+                            s["other"] += 1
+                        # created_at ordered asc → track window first/last.
+                        if first_seen is None or day_key < first_seen:
+                            first_seen = day_key
+                        if last_seen is None or day_key > last_seen:
+                            last_seen = day_key
+                        if day_key < s["first"]:
+                            s["first"] = day_key
+                        if day_key > s["last"]:
+                            s["last"] = day_key
+                    fetched += len(rows)
+                    if len(rows) < batch_size:
+                        break
+                    offset += batch_size
+                logging.info(
+                    f"[API] /api/group_detail aggregated {fetched} rows for "
+                    f"'{group_name[:40]}' over {days}d → {len(senders)} senders")
+            except Exception as e:
+                logging.warning(f"[API] /api/group_detail supabase fetch failed: {e}")
+
+        # Continuous date series over the window (gaps = zero days — a dry
+        # day inside the window is itself signal for the drill-down chart).
+        today = datetime.utcnow().date()
+        series = []
+        for i in range(days - 1, -1, -1):
+            d = today - timedelta(days=i)
+            key = d.isoformat()
+            b = daily.get(key, {"whatsapp": 0, "telegram": 0, "other": 0})
+            series.append({
+                "date": key,
+                "whatsapp": b["whatsapp"],
+                "telegram": b["telegram"],
+                "other": b.get("other", 0),
+                "total": b["whatsapp"] + b["telegram"] + b.get("other", 0),
+            })
+
+        tot_wa = sum(s["whatsapp"] for s in series)
+        tot_tg = sum(s["telegram"] for s in series)
+        tot_other = sum(s["other"] for s in series)
+        tot_all = tot_wa + tot_tg + tot_other
+
+        ranked = sorted(senders.items(), key=lambda kv: kv[1]["total"],
+                        reverse=True)[:20]
+        top_senders = []
+        for sname, s in ranked:
+            top_senders.append({
+                "sender": sname,
+                "total": s["total"],
+                "whatsapp": s["whatsapp"],
+                "telegram": s["telegram"],
+                "other": s.get("other", 0),
+                "share": round(s["total"] * 100.0 / tot_all, 1)
+                         if tot_all else 0.0,
+                "first_seen": s["first"],
+                "last_seen": s["last"],
+            })
+
+        payload = {
+            "group": group_name,
+            "days": days,
+            "generated_at": datetime.utcnow().isoformat() + "Z",
+            "totals": {
+                "total": tot_all,
+                "whatsapp": tot_wa,
+                "telegram": tot_tg,
+                "other": tot_other,
+                "distinct_senders": len(senders),
+            },
+            "first_seen": first_seen,
+            "last_seen": last_seen,
+            "daily": series,
+            "senders": top_senders,
+        }
+
+        _GROUP_DETAIL_CACHE.update(
+            {"key": cache_key, "payload": payload, "ts": now_ts})
+
+        return web.json_response(payload, status=200,
+                                 headers={"Access-Control-Allow-Origin": "*"})
+    except Exception as e:
+        logging.error(f"[API] /api/group_detail error: {e}")
+        return web.json_response({"error": str(e), "senders": [], "daily": []},
+                                 status=200,
+                                 headers={"Access-Control-Allow-Origin": "*"})
+
+
 async def ready_handler(request):
     """Readiness probe — returns 200 only if DB is reachable AND bot is connected.
 
@@ -12279,6 +12477,7 @@ async def start_http_server(monitor=None, db=None):
     app.router.add_get("/api/links_daily", api_links_daily_handler)  # [TREND-VIEW]
     app.router.add_get("/api/top_groups", api_top_groups_handler)  # [SOURCE-VIEW]
     app.router.add_get("/api/top_senders", api_top_senders_handler)  # [SENDERS-VIEW]
+    app.router.add_get("/api/group_detail", api_group_detail_handler)  # [GROUP-DRILL]
     app.router.add_get("/api/stats", api_stats_handler)
     app.router.add_get("/api/deploy_check", api_deploy_check_handler)  # diagnostic
     app.router.add_get("/api/joiners_status", api_joiners_status_handler)  # joiners + groups

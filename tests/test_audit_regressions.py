@@ -3550,6 +3550,160 @@ async def test_sendersview_top_senders_unnamed_bucket():
 
 
 # =========================================================================
+# [GROUP-DRILL] /api/group_detail — per-group drill-down (daily series +
+# top senders) opened by clicking a top-group / quiet-source row on the
+# dashboard. Guards: route registered, 400 on missing group, 200-shape,
+# 60s cache, clamping, narrow PII-free select, group_name filter,
+# zero-filled continuous series.
+# =========================================================================
+
+async def test_groupdrill_route_registered():
+    """[GROUP-DRILL-1] /api/group_detail MUST be registered in the router —
+    otherwise every drill-down click from the dashboard gets a 404."""
+    try:
+        src = (PROJECT_ROOT / "bot.py").read_text(encoding="utf-8")
+        record("GD-1: /api/group_detail route registered",
+               'add_get("/api/group_detail", api_group_detail_handler)' in src,
+               "route registration missing")
+    except Exception as e:
+        record("GD-1: exception", False, str(e))
+
+
+async def test_groupdrill_handler_shape_and_validation():
+    """[GROUP-DRILL-2] handler returns 400 without ?group=, and 200 with
+    the full shape (daily + senders + totals) even when Supabase is
+    unconfigured (empty but well-formed — the modal shows 'no links')."""
+    try:
+        assert hasattr(bot, "api_group_detail_handler"), "handler missing"
+        db = types.SimpleNamespace(supabase_url=None, supabase_key=None)
+        # missing group → 400
+        req_bad = types.SimpleNamespace(
+            app={"db": db}, query={"days": "7"}, headers={})
+        resp_bad = await bot.api_group_detail_handler(req_bad)
+        record("GD-2a: missing group param → 400",
+               getattr(resp_bad, "status", None) == 400,
+               f"status={getattr(resp_bad, 'status', None)}")
+        # valid group, unconfigured supabase → 200 empty-but-shaped
+        req = types.SimpleNamespace(
+            app={"db": db}, query={"group": "مستجدين المسار الصحي", "days": "3"},
+            headers={})
+        resp = await bot.api_group_detail_handler(req)
+        status = getattr(resp, "status", None)
+        # aiohttp Response.text is a coroutine — read the raw body bytes
+        # and decode, so Arabic group names compare as real UTF-8 text.
+        raw = getattr(resp, "body", None)
+        if isinstance(raw, (bytes, bytearray)):
+            body = bytes(raw).decode("utf-8", "replace")
+        else:
+            body = str(raw)
+        record("GD-2b: valid group → 200",
+               status == 200, f"status={status}")
+        record("GD-2c: response contains daily + senders + totals",
+               '"daily"' in body and '"senders"' in body and '"totals"' in body,
+               f"body head: {body[:120]}")
+        # json_response escapes non-ASCII (\uXXXX) — parse it back instead
+        # of substring-matching the raw serialized form.
+        import json as _json
+        try:
+            payload = _json.loads(body)
+        except Exception:
+            payload = {}
+        record("GD-2d: group echoed back in response",
+               payload.get("group") == "مستجدين المسار الصحي",
+               f"group={payload.get('group')!r} — modal header would lose its title")
+    except Exception as e:
+        record("GD-2: exception", False, str(e))
+    finally:
+        bot._GROUP_DETAIL_CACHE.update({"key": None, "payload": None, "ts": 0.0})
+
+
+async def test_groupdrill_cache():
+    """[GROUP-DRILL-3] _GROUP_DETAIL_CACHE must exist and the handler must
+    seed it and serve the cached payload within 60s (protects Supabase from
+    the dashboard's 15s polling + repeated drill clicks)."""
+    try:
+        record("GD-3a: _GROUP_DETAIL_CACHE present",
+               hasattr(bot, "_GROUP_DETAIL_CACHE")
+               and isinstance(bot._GROUP_DETAIL_CACHE, dict)
+               and set(bot._GROUP_DETAIL_CACHE.keys()) >= {"key", "payload", "ts"},
+               "cache object missing/wrong shape")
+        db = types.SimpleNamespace(supabase_url=None, supabase_key=None)
+        req = types.SimpleNamespace(
+            app={"db": db}, query={"group": "قروب تجريبي", "days": "2"}, headers={})
+        await bot.api_group_detail_handler(req)
+        seeded = dict(bot._GROUP_DETAIL_CACHE)
+        record("GD-3b: first call seeds the cache with g:…:d{days} key",
+               seeded.get("key") == "g:قروب تجريبي:d2"
+               and seeded.get("payload") is not None,
+               f"cache={ {k: type(v).__name__ for k, v in seeded.items()} }")
+        import time as _time
+        bot._GROUP_DETAIL_CACHE["ts"] = _time.time()  # fresh
+        resp2 = await bot.api_group_detail_handler(req)
+        record("GD-3c: second call within 60s served from cache",
+                bot._GROUP_DETAIL_CACHE["payload"] is not None
+                and getattr(resp2, "status", None) == 200,
+                f"status={getattr(resp2, 'status', None)}")
+    except Exception as e:
+        record("GD-3: exception", False, str(e))
+    finally:
+        bot._GROUP_DETAIL_CACHE.update({"key": None, "payload": None, "ts": 0.0})
+
+
+async def test_groupdrill_pii_free_select():
+    """[GROUP-DRILL-4] the Supabase fetch must select ONLY (created_at,
+    sender_name, link_type) and MUST filter by group_name — sender_contact
+    and source_phone are never selected (PII-free by construction, same
+    posture as top_senders)."""
+    try:
+        src = (PROJECT_ROOT / "bot.py").read_text(encoding="utf-8")
+        h_start = src.find("async def api_group_detail_handler")
+        h_end = src.find("\nasync def ", h_start + 50)
+        body = src[h_start:h_end] if h_end > 0 else src[h_start + 9000]
+        record("GD-4a: selects only created_at,sender_name,link_type",
+               "select=created_at,sender_name,link_type" in body,
+               "wide select — PII or over-fetch risk")
+        record("GD-4b: sender_contact never selected in group_detail",
+               "sender_contact" not in body,
+               "sender_contact selected — PII leak risk in drill-down")
+        record("GD-4c: source_phone never selected in group_detail",
+               "source_phone" not in body,
+               "source_phone selected — watcher phone leak risk")
+        record("GD-4d: filters by group_name=eq.",
+               "group_name=eq." in body,
+               "group filter missing — drill-down would aggregate ALL groups")
+        record("GD-4e: group name URL-encoded for the REST filter",
+               "_urlquote(group_name, safe=\"\")" in body,
+               "URL-encoding missing — Arabic/space names would 400")
+        record("GD-4f: paginates in 1000-row batches",
+               "batch_size = 1000" in body and "offset" in body,
+               "pagination missing — >1000-row groups truncated")
+    except Exception as e:
+        record("GD-4: exception", False, str(e))
+
+
+async def test_groupdrill_series_and_clamp():
+    """[GROUP-DRILL-5] the daily series must be continuous over the window
+    (zero-filled gaps — a dry day is signal for a quiet source) and days
+    must clamp to 1..30."""
+    try:
+        src = (PROJECT_ROOT / "bot.py").read_text(encoding="utf-8")
+        h_start = src.find("async def api_group_detail_handler")
+        h_end = src.find("\nasync def ", h_start + 50)
+        body = src[h_start:h_end] if h_end > 0 else src[h_start + 9000]
+        record("GD-5a: continuous zero-filled series over the window",
+               "for i in range(days - 1, -1, -1):" in body,
+               "gap-fill missing — chart x-axis would skip dry days")
+        record("GD-5b: days clamped to 1..30",
+               "max(1, min(30, int(request.query.get(\"days\"" in body,
+               "clamping missing — days=999 would scan/loop unbounded")
+        record("GD-5c: senders ranked by total descending, capped at 20",
+               'key=lambda kv: kv[1]["total"]' in body and "[:20]" in body,
+               "ranking/cap missing — modal list unbounded")
+    except Exception as e:
+        record("GD-5: exception", False, str(e))
+
+
+# =========================================================================
 # [PII-FIX] /api/links PII redaction — source_phone (watcher account phone)
 # and phone-form sender_contact must be masked when the dashboard is open
 # (trusted-origin / fail-open modes). @usernames stay (public handles).
@@ -4586,6 +4740,13 @@ async def main():
     await test_sendersview_top_senders_cache()
     await test_sendersview_top_senders_pii_free_select()
     await test_sendersview_top_senders_unnamed_bucket()
+
+    # === [GROUP-DRILL] /api/group_detail per-group drill-down ===
+    await test_groupdrill_route_registered()
+    await test_groupdrill_handler_shape_and_validation()
+    await test_groupdrill_cache()
+    await test_groupdrill_pii_free_select()
+    await test_groupdrill_series_and_clamp()
     await test_piifix_links_redaction_wired()
     await test_piifix_redact_sender_contact_unit()
 
