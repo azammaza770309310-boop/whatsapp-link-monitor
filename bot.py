@@ -11641,8 +11641,19 @@ async def api_group_detail_handler(request):
             try:
                 from urllib.parse import quote as _urlquote
                 session = await db._get_supabase_session()
-                since_dt = datetime.utcnow() - timedelta(days=days)
-                since_iso = since_dt.strftime("%Y-%m-%dT%H:%M:%S")
+                # Align the fetch window with the SERIES window exactly:
+                # the series is the last N calendar days ending today, so
+                # fetch from start-of-day(today - (N-1)). (A plain
+                # now - N days timestamp would also pull the partial first
+                # day — those rows would land in the sender counters but
+                # outside the series keys, making totals ≠ Σ senders.)
+                today_d = datetime.utcnow().date()
+                window_start = today_d - timedelta(days=days - 1)
+                since_iso = datetime.combine(
+                    window_start, datetime.min.time()
+                ).strftime("%Y-%m-%dT%H:%M:%S")
+                window_start_iso = window_start.isoformat()
+                today_iso = today_d.isoformat()
                 group_eq = _urlquote(group_name, safe="")
                 offset = 0
                 batch_size = 1000
@@ -11671,6 +11682,12 @@ async def api_group_detail_handler(request):
                         created = str(row.get("created_at") or "")
                         day_key = created[:10]
                         if len(day_key) != 10 or not day_key.startswith("20"):
+                            continue
+                        # Consistency guarantee: only count rows whose
+                        # day_key lands inside the series window — the
+                        # series, totals and sender counters then agree
+                        # BY CONSTRUCTION (Σ senders == totals.total).
+                        if day_key < window_start_iso or day_key > today_iso:
                             continue
                         bucket = daily.setdefault(
                             day_key, {"whatsapp": 0, "telegram": 0, "other": 0})

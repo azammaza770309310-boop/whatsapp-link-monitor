@@ -3699,6 +3699,13 @@ async def test_groupdrill_series_and_clamp():
         record("GD-5c: senders ranked by total descending, capped at 20",
                'key=lambda kv: kv[1]["total"]' in body and "[:20]" in body,
                "ranking/cap missing — modal list unbounded")
+        record("GD-6a: fetch window aligned to the calendar series window",
+               "datetime.combine(" in body and "window_start" in body,
+               "fetch uses now-N timestamp — partial first day makes "
+               "Σ senders ≠ totals.total")
+        record("GD-6b: day_key bounds-checked against the window",
+               "day_key < window_start_iso" in body,
+               "bounds check missing — out-of-window rows would skew senders")
     except Exception as e:
         record("GD-5: exception", False, str(e))
 
