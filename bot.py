@@ -11017,6 +11017,25 @@ async def api_links_handler(request):
 _LINKS_DAILY_CACHE = {"key": None, "payload": None, "ts": 0.0}
 
 
+def _calendar_window_bounds(days: int):
+    """[WINDOW-ALIGN] Return (since_iso, window_start_iso, today_iso) for the
+    last ``days`` CALENDAR days ending today (UTC).
+
+    The fetch window is aligned to start-of-day so it matches the daily
+    series keys exactly: a plain ``now - N days`` timestamp would also pull
+    a partial first calendar day whose rows land in counters (or hourly
+    buckets) but outside the series — making totals disagree across
+    endpoints for the same ?days value (see group_detail's consistency
+    guarantee, commit 0802340).
+    """
+    today_d = datetime.utcnow().date()
+    window_start = today_d - timedelta(days=days - 1)
+    since_iso = datetime.combine(
+        window_start, datetime.min.time()
+    ).strftime("%Y-%m-%dT%H:%M:%S")
+    return since_iso, window_start.isoformat(), today_d.isoformat()
+
+
 async def api_links_daily_handler(request):
     """API endpoint: daily link counts for the dashboard trend chart.
 
@@ -11059,8 +11078,10 @@ async def api_links_daily_handler(request):
         if db.supabase_url and db.supabase_key:
             try:
                 session = await db._get_supabase_session()
-                since_dt = datetime.utcnow() - timedelta(days=days)
-                since_iso = since_dt.strftime("%Y-%m-%dT%H:%M:%S")
+                # [WINDOW-ALIGN] fetch from start-of-day(today-(N-1)) so the
+                # fetched rows match the calendar series window exactly.
+                since_iso, window_start_iso, today_iso = \
+                    _calendar_window_bounds(days)
                 offset = 0
                 batch_size = 1000
                 fetched = 0
@@ -11088,6 +11109,11 @@ async def api_links_daily_handler(request):
                         # created_at may be "2026-08-28T05:40:00.123456+00:00"
                         day_key = created[:10]
                         if len(day_key) != 10 or not day_key.startswith("20"):
+                            continue
+                        # [WINDOW-ALIGN] only count rows inside the calendar
+                        # series window — daily series, totals AND hourly
+                        # buckets then agree by construction.
+                        if day_key < window_start_iso or day_key > today_iso:
                             continue
                         bucket = daily.setdefault(
                             day_key, {"whatsapp": 0, "telegram": 0, "other": 0})
@@ -11241,8 +11267,11 @@ async def api_top_groups_handler(request):
         if db.supabase_url and db.supabase_key:
             try:
                 session = await db._get_supabase_session()
-                since_dt = datetime.utcnow() - timedelta(days=days)
-                since_iso = since_dt.strftime("%Y-%m-%dT%H:%M:%S")
+                # [WINDOW-ALIGN] calendar-day window (same as links_daily /
+                # group_detail) so top_groups totals agree with the trend
+                # chart's totals for the same ?days value.
+                since_iso, window_start_iso, today_iso = \
+                    _calendar_window_bounds(days)
                 offset = 0
                 batch_size = 1000
                 fetched = 0
@@ -11269,6 +11298,11 @@ async def api_top_groups_handler(request):
                         created = str(row.get("created_at") or "")
                         day_key = created[:10]
                         if len(day_key) != 10 or not day_key.startswith("20"):
+                            continue
+                        # [WINDOW-ALIGN] defensive bounds check — keeps the
+                        # aggregated window exactly the calendar series
+                        # window even with clock-skewed or future-dated rows.
+                        if day_key < window_start_iso or day_key > today_iso:
                             continue
                         gname = (row.get("group_name") or "").strip() \
                             or _UNNAMED_GROUP_LABEL
@@ -11391,8 +11425,10 @@ async def api_top_senders_handler(request):
         if db.supabase_url and db.supabase_key:
             try:
                 session = await db._get_supabase_session()
-                since_dt = datetime.utcnow() - timedelta(days=days)
-                since_iso = since_dt.strftime("%Y-%m-%dT%H:%M:%S")
+                # [WINDOW-ALIGN] calendar-day window (same as links_daily /
+                # top_groups / group_detail).
+                since_iso, window_start_iso, today_iso = \
+                    _calendar_window_bounds(days)
                 offset = 0
                 batch_size = 1000
                 fetched = 0
@@ -11419,6 +11455,10 @@ async def api_top_senders_handler(request):
                         created = str(row.get("created_at") or "")
                         day_key = created[:10]
                         if len(day_key) != 10 or not day_key.startswith("20"):
+                            continue
+                        # [WINDOW-ALIGN] defensive bounds check (see
+                        # top_groups).
+                        if day_key < window_start_iso or day_key > today_iso:
                             continue
                         sname = (row.get("sender_name") or "").strip() \
                             or _UNNAMED_SENDER_LABEL
@@ -11641,19 +11681,11 @@ async def api_group_detail_handler(request):
             try:
                 from urllib.parse import quote as _urlquote
                 session = await db._get_supabase_session()
-                # Align the fetch window with the SERIES window exactly:
-                # the series is the last N calendar days ending today, so
-                # fetch from start-of-day(today - (N-1)). (A plain
-                # now - N days timestamp would also pull the partial first
-                # day — those rows would land in the sender counters but
-                # outside the series keys, making totals ≠ Σ senders.)
-                today_d = datetime.utcnow().date()
-                window_start = today_d - timedelta(days=days - 1)
-                since_iso = datetime.combine(
-                    window_start, datetime.min.time()
-                ).strftime("%Y-%m-%dT%H:%M:%S")
-                window_start_iso = window_start.isoformat()
-                today_iso = today_d.isoformat()
+                # Align the fetch window with the SERIES window exactly
+                # ([WINDOW-ALIGN] shared helper — see its docstring for why
+                # a plain now - N days timestamp would break consistency).
+                since_iso, window_start_iso, today_iso = \
+                    _calendar_window_bounds(days)
                 group_eq = _urlquote(group_name, safe="")
                 offset = 0
                 batch_size = 1000
@@ -11785,6 +11817,203 @@ async def api_group_detail_handler(request):
     except Exception as e:
         logging.error(f"[API] /api/group_detail error: {e}")
         return web.json_response({"error": str(e), "senders": [], "daily": []},
+                                 status=200,
+                                 headers={"Access-Control-Allow-Origin": "*"})
+
+
+_SENDER_DETAIL_CACHE = {"key": None, "payload": None, "ts": 0.0}
+
+_UNNAMED_GROUP_LABEL_SD = "غير محدد"
+
+
+async def api_sender_detail_handler(request):
+    """API endpoint: per-sender drill-down (daily series + top groups).
+
+    Query params:
+      ?sender=X  → exact sender_name (required, non-empty)
+      ?days=N    → window size in days (default 14, clamped 1..30)
+
+    Returns:
+      {
+        "sender": "...", "days": 14, "generated_at": "<ISO>",
+        "totals": {"total": N, "whatsapp": N, "telegram": N, "other": N,
+                   "distinct_groups": N},
+        "first_seen": "YYYY-MM-DD", "last_seen": "YYYY-MM-DD",
+        "daily": [{"date": "...", "whatsapp": N, "telegram": N,
+                   "other": N, "total": N}, ...continuous window],
+        "groups": [{"group": "...", "total": N, "whatsapp": N,
+                    "telegram": N, "share": 12.3, "first_seen": "...",
+                    "last_seen": "..."}, ... top 20 by total]
+      }
+
+    PII-free by construction: selects ONLY created_at, group_name,
+    link_type — never contacts or phones (TS-4b posture).
+    """
+    sender_name = (request.query.get("sender") or "").strip()
+    if not sender_name:
+        return web.json_response(
+            {"error": "missing sender query param"}, status=400,
+            headers={"Access-Control-Allow-Origin": "*"})
+    db = request.app.get("db")
+    if not db:
+        return web.json_response({"error": "not ready"}, status=503)
+
+    try:
+        days = max(1, min(30, int(request.query.get("days", "14"))))
+        # Cap the key at 80 chars — sender names can be long; cache identity
+        # stays unambiguous for realistic names and bounded in memory.
+        cache_key = f"s:{sender_name[:80]}:d{days}"
+        now_ts = time.time()
+        cached = _SENDER_DETAIL_CACHE
+        if (cached["key"] == cache_key and cached["payload"] is not None
+                and (now_ts - cached["ts"]) < 60.0):
+            return web.json_response(cached["payload"], status=200,
+                                     headers={"Access-Control-Allow-Origin": "*"})
+
+        daily: dict = {}   # "YYYY-MM-DD" → {"whatsapp", "telegram", "other"}
+        groups: dict = {}  # group_name → counters
+        first_seen: str | None = None
+        last_seen: str | None = None
+
+        if db.supabase_url and db.supabase_key:
+            try:
+                from urllib.parse import quote as _urlquote
+                session = await db._get_supabase_session()
+                # [WINDOW-ALIGN] shared helper — fetch window == series
+                # window (last N calendar days ending today).
+                since_iso, window_start_iso, today_iso = \
+                    _calendar_window_bounds(days)
+                sender_eq = _urlquote(sender_name, safe="")
+                offset = 0
+                batch_size = 1000
+                fetched = 0
+                while True:
+                    url = (
+                        f"{db.supabase_url}/rest/v1/links"
+                        f"?select=created_at,group_name,link_type"
+                        f"&sender_name=eq.{sender_eq}"
+                        f"&created_at=gte.{since_iso}"
+                        f"&order=created_at.asc"
+                        f"&limit={batch_size}&offset={offset}"
+                    )
+                    async with session.get(url) as r:
+                        if r.status == 200:
+                            rows = await r.json()
+                        elif r.status == 416:
+                            break
+                        else:
+                            logging.error(
+                                f"[API] /api/sender_detail batch failed: {r.status}")
+                            break
+                    if not rows:
+                        break
+                    for row in rows:
+                        created = str(row.get("created_at") or "")
+                        day_key = created[:10]
+                        if len(day_key) != 10 or not day_key.startswith("20"):
+                            continue
+                        # Consistency guarantee (mirrors group_detail): only
+                        # count rows whose day_key lands inside the series
+                        # window — series, totals and group counters agree
+                        # BY CONSTRUCTION (Σ groups == totals.total).
+                        if day_key < window_start_iso or day_key > today_iso:
+                            continue
+                        bucket = daily.setdefault(
+                            day_key, {"whatsapp": 0, "telegram": 0, "other": 0})
+                        gname = (row.get("group_name") or "").strip() \
+                            or _UNNAMED_GROUP_LABEL_SD
+                        g = groups.setdefault(gname, {
+                            "total": 0, "whatsapp": 0, "telegram": 0,
+                            "other": 0, "first": day_key, "last": day_key})
+                        g["total"] += 1
+                        lt = row.get("link_type") or "other"
+                        if lt in ("whatsapp", "telegram"):
+                            bucket[lt] += 1
+                            g[lt] += 1
+                        else:
+                            bucket["other"] = bucket.get("other", 0) + 1
+                            g["other"] += 1
+                        # created_at ordered asc → track window first/last.
+                        if first_seen is None or day_key < first_seen:
+                            first_seen = day_key
+                        if last_seen is None or day_key > last_seen:
+                            last_seen = day_key
+                        if day_key < g["first"]:
+                            g["first"] = day_key
+                        if day_key > g["last"]:
+                            g["last"] = day_key
+                    fetched += len(rows)
+                    if len(rows) < batch_size:
+                        break
+                    offset += batch_size
+                logging.info(
+                    f"[API] /api/sender_detail aggregated {fetched} rows for "
+                    f"'{sender_name[:40]}' over {days}d → {len(groups)} groups")
+            except Exception as e:
+                logging.warning(f"[API] /api/sender_detail supabase fetch failed: {e}")
+
+        # Continuous date series over the window (gaps = zero days — a dry
+        # day inside the window is itself signal for the drill-down chart).
+        today = datetime.utcnow().date()
+        series = []
+        for i in range(days - 1, -1, -1):
+            d = today - timedelta(days=i)
+            key = d.isoformat()
+            b = daily.get(key, {"whatsapp": 0, "telegram": 0, "other": 0})
+            series.append({
+                "date": key,
+                "whatsapp": b["whatsapp"],
+                "telegram": b["telegram"],
+                "other": b.get("other", 0),
+                "total": b["whatsapp"] + b["telegram"] + b.get("other", 0),
+            })
+
+        tot_wa = sum(s["whatsapp"] for s in series)
+        tot_tg = sum(s["telegram"] for s in series)
+        tot_other = sum(s["other"] for s in series)
+        tot_all = tot_wa + tot_tg + tot_other
+
+        ranked = sorted(groups.items(), key=lambda kv: kv[1]["total"],
+                        reverse=True)[:20]
+        top_groups = []
+        for gname, g in ranked:
+            top_groups.append({
+                "group": gname,
+                "total": g["total"],
+                "whatsapp": g["whatsapp"],
+                "telegram": g["telegram"],
+                "other": g.get("other", 0),
+                "share": round(g["total"] * 100.0 / tot_all, 1)
+                         if tot_all else 0.0,
+                "first_seen": g["first"],
+                "last_seen": g["last"],
+            })
+
+        payload = {
+            "sender": sender_name,
+            "days": days,
+            "generated_at": datetime.utcnow().isoformat() + "Z",
+            "totals": {
+                "total": tot_all,
+                "whatsapp": tot_wa,
+                "telegram": tot_tg,
+                "other": tot_other,
+                "distinct_groups": len(groups),
+            },
+            "first_seen": first_seen,
+            "last_seen": last_seen,
+            "daily": series,
+            "groups": top_groups,
+        }
+
+        _SENDER_DETAIL_CACHE.update(
+            {"key": cache_key, "payload": payload, "ts": now_ts})
+
+        return web.json_response(payload, status=200,
+                                 headers={"Access-Control-Allow-Origin": "*"})
+    except Exception as e:
+        logging.error(f"[API] /api/sender_detail error: {e}")
+        return web.json_response({"error": str(e), "groups": [], "daily": []},
                                  status=200,
                                  headers={"Access-Control-Allow-Origin": "*"})
 
@@ -12495,6 +12724,7 @@ async def start_http_server(monitor=None, db=None):
     app.router.add_get("/api/top_groups", api_top_groups_handler)  # [SOURCE-VIEW]
     app.router.add_get("/api/top_senders", api_top_senders_handler)  # [SENDERS-VIEW]
     app.router.add_get("/api/group_detail", api_group_detail_handler)  # [GROUP-DRILL]
+    app.router.add_get("/api/sender_detail", api_sender_detail_handler)  # [SENDER-DRILL]
     app.router.add_get("/api/stats", api_stats_handler)
     app.router.add_get("/api/deploy_check", api_deploy_check_handler)  # diagnostic
     app.router.add_get("/api/joiners_status", api_joiners_status_handler)  # joiners + groups

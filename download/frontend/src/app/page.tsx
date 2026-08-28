@@ -251,6 +251,34 @@ interface GroupDetailData {
   senders: GroupDetailSender[]
 }
 
+// [SENDER-DRILL] per-sender detail payload from /api/sender_detail.
+interface SenderDetailGroup {
+  group: string
+  total: number
+  whatsapp: number
+  telegram: number
+  other: number
+  share: number
+  first_seen: string
+  last_seen: string
+}
+
+interface SenderDetailData {
+  sender: string
+  days: number
+  totals: {
+    total: number
+    whatsapp: number
+    telegram: number
+    other: number
+    distinct_groups: number
+  }
+  first_seen: string | null
+  last_seen: string | null
+  daily: DailyStat[]
+  groups: SenderDetailGroup[]
+}
+
 // [SOURCE-HEALTH] a producing source whose last_seen is aging — the client
 // computes daysQuiet from the 30-day top-groups snapshot.
 type QuietSource = TopGroup & { daysQuiet: number }
@@ -474,6 +502,9 @@ export default function Home() {
   // [GROUP-DRILL] the group whose detail modal is open (null = closed).
   // The modal self-fetches /api/group_detail with the shared trend window.
   const [groupDetail, setGroupDetail] = useState<string | null>(null)
+  // [SENDER-DRILL] the sender whose detail modal is open (null = closed).
+  // The modal self-fetches /api/sender_detail with the shared trend window.
+  const [senderDetail, setSenderDetail] = useState<string | null>(null)
   // [TREND-COMPARE] overlay the previous period as ghost bars behind the
   // current window (positionally sliced from the 30-day delta series).
   const [compareMode, setCompareMode] = useState<boolean>(false)
@@ -1556,6 +1587,7 @@ export default function Home() {
                       rank={i + 1}
                       sender={s}
                       max={topSenders[0]?.total || 1}
+                      onClick={() => setSenderDetail(s.sender)}
                     />
                   ))}
                 </div>
@@ -1570,6 +1602,10 @@ export default function Home() {
                   </span>
                   <span className="text-slate-600">· بدون بيانات هواتف (خصوصية)</span>
                 </div>
+                <p className="text-[10px] text-slate-600 text-center mt-2 flex items-center justify-center gap-1">
+                  <ZoomIn className="w-3 h-3" aria-hidden />
+                  اضغط على أي مرسل لعرض منشوراته اليومية ومصادره
+                </p>
               </CardContent>
             </Card>
           </motion.div>
@@ -2290,10 +2326,15 @@ export default function Home() {
           setModal(null)
           setGroupDetail(g)
         }}
+        onOpenSenderDetail={(s) => {
+          setModal(null)
+          setSenderDetail(s)
+        }}
       />
 
       {/* [GROUP-DRILL] per-group detail modal — opened by clicking a
-          top-group / quiet-source row */}
+          top-group / quiet-source row. [CROSS-DRILL] its sender rows swap
+          to the sender drill-down (WHO↔WHERE both directions). */}
       <AnimatePresence>
         {groupDetail && (
           <GroupDetailModal
@@ -2301,6 +2342,29 @@ export default function Home() {
             group={groupDetail}
             days={trendDays}
             onClose={() => setGroupDetail(null)}
+            onOpenSender={(s) => {
+              setGroupDetail(null)
+              setSenderDetail(s)
+            }}
+          />
+        )}
+      </AnimatePresence>
+
+      {/* [SENDER-DRILL] per-sender detail modal — opened by clicking a
+          top-sender row (card or view-all modal) or a sender row inside
+          the group drill-down. Its group rows swap back to the group
+          drill-down — the cross-analysis loop. */}
+      <AnimatePresence>
+        {senderDetail && (
+          <SenderDetailModal
+            key={senderDetail}
+            sender={senderDetail}
+            days={trendDays}
+            onClose={() => setSenderDetail(null)}
+            onOpenGroup={(g) => {
+              setSenderDetail(null)
+              setGroupDetail(g)
+            }}
           />
         )}
       </AnimatePresence>
@@ -2777,12 +2841,12 @@ function HourlyStrip(props: { hourly: HourlyStat[] }) {
   )
 }
 
-// ===== TopGroupRow — [SOURCE-VIEW] one ranked source row ================
-// Split bar (green WA / blue TG) scaled to the #1 group; medals for the
-// top 3; hover reveals the full breakdown + first/last activity dates.
 // ===== TopSenderRow — [SENDERS-VIEW] one ranked sender row =====
-function TopSenderRow(props: { rank: number; sender: TopSender; max: number }) {
-  const { rank, sender, max } = props
+// Split bar (green WA / blue TG) scaled to the #1 sender; medals for the
+// top 3; cross-poster chip; hover reveals the breakdown + top group.
+// [SENDER-DRILL] clickable when onClick is provided (keyboard-accessible).
+function TopSenderRow(props: { rank: number; sender: TopSender; max: number; onClick?: () => void }) {
+  const { rank, sender, max, onClick } = props
   const medals = ['🥇', '🥈', '🥉']
   const rankLabel = medals[rank - 1] || <span className="text-slate-500">#{rank}</span>
   const widthPct = Math.max(2, Math.round((sender.total / max) * 100))
@@ -2797,7 +2861,19 @@ function TopSenderRow(props: { rank: number; sender: TopSender; max: number }) {
       initial={{ opacity: 0, x: 24 }}
       animate={{ opacity: 1, x: 0 }}
       transition={{ delay: Math.min(rank * 0.06, 0.4), duration: 0.35 }}
-      className="group"
+      className={onClick
+        ? 'group cursor-pointer rounded-md p-1 -mx-1 hover:bg-slate-800/40 transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-teal-500/50'
+        : 'group'}
+      onClick={onClick}
+      role={onClick ? 'button' : undefined}
+      tabIndex={onClick ? 0 : undefined}
+      aria-label={onClick ? `عرض تفاصيل ${sender.sender}` : undefined}
+      onKeyDown={(e) => {
+        if (onClick && (e.key === 'Enter' || e.key === ' ')) {
+          e.preventDefault()
+          onClick()
+        }
+      }}
     >
       <div className="flex items-center justify-between gap-2 mb-1">
         <div className="flex items-center gap-2 min-w-0">
@@ -2844,18 +2920,33 @@ function TopSenderRow(props: { rank: number; sender: TopSender; max: number }) {
         />
       </div>
       {/* hover detail line — WA/TG split + the group they post in most */}
-      <div className="text-[10px] text-slate-500 mt-1 h-4 opacity-0 group-hover:opacity-100 transition-opacity">
-        <span className="text-emerald-500">واتساب {sender.whatsapp.toLocaleString()}</span>
-        {' · '}
-        <span className="text-blue-400">تيليجرام {sender.telegram.toLocaleString()}</span>
-        {sender.other > 0 && <span> · أخرى {sender.other.toLocaleString()}</span>}
-        <span> · الأكثر في: <span className="text-slate-400">{sender.top_group}</span></span>
-        <span> · نشاط {sender.first_seen} ← {sender.last_seen}</span>
+      <div className="text-[10px] text-slate-500 mt-1 h-4 flex items-center justify-between gap-2">
+        <div className="opacity-0 group-hover:opacity-100 transition-opacity truncate">
+          <span className="text-emerald-500">واتساب {sender.whatsapp.toLocaleString()}</span>
+          {' · '}
+          <span className="text-blue-400">تيليجرام {sender.telegram.toLocaleString()}</span>
+          {sender.other > 0 && <span> · أخرى {sender.other.toLocaleString()}</span>}
+          <span> · الأكثر في: <span className="text-slate-400">{sender.top_group}</span></span>
+          <span> · نشاط {sender.first_seen} ← {sender.last_seen}</span>
+        </div>
+        {onClick && (
+          <span
+            className="flex items-center gap-0.5 text-slate-500 group-hover:text-teal-400 flex-shrink-0 transition-colors"
+            aria-hidden
+          >
+            <ZoomIn className="w-3 h-3" />
+            تفاصيل
+          </span>
+        )}
       </div>
     </motion.div>
   )
 }
 
+// ===== TopGroupRow — [SOURCE-VIEW] one ranked source row =====
+// Split bar (green WA / blue TG) scaled to the #1 group; medals for the
+// top 3; hover reveals the full breakdown + first/last activity dates.
+// [GROUP-DRILL] clickable when onClick is provided (keyboard-accessible).
 function TopGroupRow(props: {
   rank: number
   group: TopGroup
@@ -2877,7 +2968,9 @@ function TopGroupRow(props: {
       initial={{ opacity: 0, x: 24 }}
       animate={{ opacity: 1, x: 0 }}
       transition={{ delay: Math.min(rank * 0.06, 0.4), duration: 0.35 }}
-      className={onClick ? 'group cursor-pointer' : 'group'}
+      className={onClick
+        ? 'group cursor-pointer rounded-md p-1 -mx-1 hover:bg-slate-800/40 transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-emerald-500/50'
+        : 'group'}
       onClick={onClick}
       role={onClick ? 'button' : undefined}
       tabIndex={onClick ? 0 : undefined}
@@ -3260,8 +3353,16 @@ function LinkCard(props: { link: LinkItem; compact?: boolean; isMonitored?: bool
 // the group's own daily series (reuses TrendChart — dry days are signal
 // here), its top senders with WA/TG split bars, and the activity range.
 // PII-free: the backend never selects contacts/phones for this view.
-function GroupDetailModal(props: { group: string; days: number; onClose: () => void }) {
-  const { group, days, onClose } = props
+// [CROSS-DRILL] sender rows open the SENDER drill-down when
+// onOpenSender is provided — the WHO↔WHERE cross-analysis becomes
+// navigable in both directions.
+function GroupDetailModal(props: {
+  group: string
+  days: number
+  onClose: () => void
+  onOpenSender?: (sender: string) => void
+}) {
+  const { group, days, onClose, onOpenSender } = props
   const [data, setData] = useState<GroupDetailData | null>(null)
   const [loading, setLoading] = useState<boolean>(true)
   const [error, setError] = useState<string | null>(null)
@@ -3440,7 +3541,22 @@ function GroupDetailModal(props: { group: string; days: number; onClose: () => v
                         const sWaPct = s.total ? Math.round((s.whatsapp / s.total) * widthPct) : 0
                         const sTgPct = widthPct - sWaPct
                         return (
-                          <div key={`${s.sender}-${i}`} className="group/s">
+                          <div
+                            key={`${s.sender}-${i}`}
+                            className={onOpenSender
+                              ? 'group/s rounded-md p-1 -mx-1 cursor-pointer hover:bg-slate-800/60 transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-teal-500/50'
+                              : 'group/s'}
+                            onClick={onOpenSender ? () => onOpenSender(s.sender) : undefined}
+                            role={onOpenSender ? 'button' : undefined}
+                            tabIndex={onOpenSender ? 0 : undefined}
+                            aria-label={onOpenSender ? `عرض تفاصيل ${s.sender}` : undefined}
+                            onKeyDown={(e) => {
+                              if (onOpenSender && (e.key === 'Enter' || e.key === ' ')) {
+                                e.preventDefault()
+                                onOpenSender(s.sender)
+                              }
+                            }}
+                          >
                             <div className="flex items-center justify-between gap-2 mb-1">
                               <div className="flex items-center gap-2 min-w-0">
                                 <span className="text-[10px] text-slate-500 w-5 text-center flex-shrink-0 tabular-nums">
@@ -3472,10 +3588,21 @@ function GroupDetailModal(props: { group: string; days: number; onClose: () => v
                                 style={{ width: `${sTgPct}%` }}
                               />
                             </div>
-                            <div className="text-[9px] text-slate-600 mt-0.5 h-3 opacity-0 group-hover/s:opacity-100 transition-opacity">
-                              واتساب {s.whatsapp.toLocaleString()} · تيليجرام {s.telegram.toLocaleString()}
-                              {s.other > 0 && <span> · أخرى {s.other.toLocaleString()}</span>}
-                              <span> · نشاط {s.first_seen} ← {s.last_seen}</span>
+                            <div className="text-[9px] text-slate-600 mt-0.5 h-3 opacity-0 group-hover/s:opacity-100 transition-opacity flex items-center justify-between gap-2">
+                              <span className="truncate">
+                                واتساب {s.whatsapp.toLocaleString()} · تيليجرام {s.telegram.toLocaleString()}
+                                {s.other > 0 && <span> · أخرى {s.other.toLocaleString()}</span>}
+                                <span> · نشاط {s.first_seen} ← {s.last_seen}</span>
+                              </span>
+                              {onOpenSender && (
+                                <span
+                                  className="flex items-center gap-0.5 text-slate-500 group-hover/s:text-teal-400 flex-shrink-0 transition-colors"
+                                  aria-hidden
+                                >
+                                  <ZoomIn className="w-2.5 h-2.5" />
+                                  تفاصيل
+                                </span>
+                              )}
                             </div>
                           </div>
                         )
@@ -3491,6 +3618,291 @@ function GroupDetailModal(props: { group: string; days: number; onClose: () => v
 
                 <p className="text-[10px] text-slate-600 text-center border-t border-slate-800 pt-3">
                   🔒 بدون بيانات هواتف أو جهات اتصال (خصوصية) · خلفية الرسم البياني: انقطاع المصدر يظهر كأيام صفرية
+                </p>
+              </div>
+            ) : null}
+          </div>
+        </motion.div>
+      </motion.div>
+    </AnimatePresence>
+  )
+}
+
+// ===== [SENDER-DRILL] SenderDetailModal — per-sender drill-down =====
+// Mirror of GroupDetailModal for senders: self-fetches
+// /api/sender_detail?sender=X&days=N (the shared trend window) and shows
+// the sender's own daily series (TrendChart reuse — a gone-quiet sender
+// shows trailing zeros), the groups they posted in with WA/TG split
+// bars, and the activity range. PII-free by construction (the backend
+// never selects contacts/phones for this view).
+// [CROSS-DRILL] group rows open the GROUP drill-down when onOpenGroup is
+// provided — WHO↔WHERE navigation in both directions.
+function SenderDetailModal(props: {
+  sender: string
+  days: number
+  onClose: () => void
+  onOpenGroup?: (group: string) => void
+}) {
+  const { sender, days, onClose, onOpenGroup } = props
+  const [data, setData] = useState<SenderDetailData | null>(null)
+  const [loading, setLoading] = useState<boolean>(true)
+  const [error, setError] = useState<string | null>(null)
+  const [reloadTick, setReloadTick] = useState<number>(0)
+
+  useEffect(() => {
+    let cancelled = false
+    const load = async () => {
+      setLoading(true)
+      setError(null)
+      try {
+        const resp = await fetch(
+          `${API_URL}/api/sender_detail?sender=${encodeURIComponent(sender)}&days=${days}`,
+          { headers: buildHeaders() }
+        )
+        if (!resp.ok) throw new Error(`HTTP ${resp.status}`)
+        const json = await resp.json()
+        if (!cancelled) setData(json as SenderDetailData)
+      } catch {
+        if (!cancelled) setError('تعذّر تحميل تفاصيل المرسل — تحقق من الاتصال وحاول مرة أخرى.')
+      } finally {
+        if (!cancelled) setLoading(false)
+      }
+    }
+    load()
+    return () => {
+      cancelled = true
+    }
+  }, [sender, days, reloadTick])
+
+  // Esc closes (same pattern as LinksModal / GroupDetailModal)
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') onClose()
+    }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  }, [onClose])
+
+  const maxGroup = data?.groups[0]?.total || 1
+  const waPctOfTotal = data && data.totals.total
+    ? Math.round((data.totals.whatsapp / data.totals.total) * 100)
+    : 0
+  const tgPctOfTotal = data && data.totals.total
+    ? Math.round((data.totals.telegram / data.totals.total) * 100)
+    : 0
+
+  return (
+    <AnimatePresence>
+      <motion.div
+        initial={{ opacity: 0 }}
+        animate={{ opacity: 1 }}
+        exit={{ opacity: 0 }}
+        className="fixed inset-0 bg-black/80 backdrop-blur-sm z-50 flex items-center justify-center p-4"
+        onClick={onClose}
+      >
+        <motion.div
+          initial={{ scale: 0.95, opacity: 0 }}
+          animate={{ scale: 1, opacity: 1 }}
+          exit={{ scale: 0.95, opacity: 0 }}
+          className="bg-slate-900 border border-slate-700 rounded-xl max-w-3xl w-full max-h-[95vh] overflow-hidden flex flex-col"
+          onClick={(e: ReactMouseEvent) => e.stopPropagation()}
+          role="dialog"
+          aria-label={`تفاصيل المرسل ${sender}`}
+        >
+          {/* Header — teal (sender identity), mirrors the senders card */}
+          <div className="flex items-center justify-between p-4 border-b border-slate-700 gap-3">
+            <div className="flex items-center gap-2.5 min-w-0">
+              <div className="w-9 h-9 rounded-lg bg-teal-500/15 border border-teal-500/30 flex items-center justify-center flex-shrink-0">
+                <UserCircle2 className="w-4.5 h-4.5 text-teal-400" />
+              </div>
+              <div className="min-w-0">
+                <h2 className="text-lg font-bold text-white truncate" title={sender}>
+                  {sender}
+                </h2>
+                <p className="text-[11px] text-slate-500">
+                  تفاصيل المرسل · آخر {days} يوم
+                </p>
+              </div>
+            </div>
+            <button
+              onClick={onClose}
+              className="text-slate-400 hover:text-white transition-colors flex-shrink-0"
+              aria-label="إغلاق"
+            >
+              <X className="w-5 h-5" />
+            </button>
+          </div>
+
+          {/* Content */}
+          <div className="p-4 overflow-y-auto flex-1">
+            {loading ? (
+              <div className="flex flex-col items-center justify-center py-14 gap-3">
+                <RefreshCw className="w-8 h-8 text-teal-400 animate-spin" />
+                <p className="text-sm text-slate-400">جارٍ تحميل تفاصيل المرسل…</p>
+              </div>
+            ) : error ? (
+              <div className="flex flex-col items-center justify-center py-12 gap-3">
+                <AlertTriangle className="w-8 h-8 text-amber-400" />
+                <p className="text-sm text-slate-300">{error}</p>
+                <Button
+                  variant="outline"
+                  size="sm"
+                  onClick={() => setReloadTick((t) => t + 1)}
+                  className="border-slate-600 text-slate-200 hover:bg-slate-800"
+                >
+                  <RefreshCw className="w-3.5 h-3.5 ml-1" />
+                  إعادة المحاولة
+                </Button>
+              </div>
+            ) : data ? (
+              <div className="space-y-5">
+                {/* totals — compact chips grid */}
+                <div className="grid grid-cols-2 sm:grid-cols-4 gap-2.5">
+                  <div className="bg-slate-800/60 border border-slate-700/60 rounded-lg p-3 text-center">
+                    <p className="text-xl font-bold text-white tabular-nums">
+                      {data.totals.total.toLocaleString()}
+                    </p>
+                    <p className="text-[10px] text-slate-400 mt-0.5">إجمالي الروابط</p>
+                  </div>
+                  <div className="bg-emerald-500/10 border border-emerald-500/30 rounded-lg p-3 text-center">
+                    <p className="text-xl font-bold text-emerald-400 tabular-nums">
+                      {data.totals.whatsapp.toLocaleString()}
+                    </p>
+                    <p className="text-[10px] text-slate-400 mt-0.5">واتساب ({waPctOfTotal}%)</p>
+                  </div>
+                  <div className="bg-blue-500/10 border border-blue-500/30 rounded-lg p-3 text-center">
+                    <p className="text-xl font-bold text-blue-400 tabular-nums">
+                      {data.totals.telegram.toLocaleString()}
+                    </p>
+                    <p className="text-[10px] text-slate-400 mt-0.5">تيليجرام ({tgPctOfTotal}%)</p>
+                  </div>
+                  <div className="bg-fuchsia-500/10 border border-fuchsia-500/30 rounded-lg p-3 text-center">
+                    <p className="text-xl font-bold text-fuchsia-400 tabular-nums">
+                      {data.totals.distinct_groups.toLocaleString()}
+                    </p>
+                    <p className="text-[10px] text-slate-400 mt-0.5">مجموعة مختلفة</p>
+                  </div>
+                </div>
+
+                {/* activity range */}
+                {data.first_seen && (
+                  <div className="flex items-center gap-2 text-[11px] text-slate-400 bg-slate-800/40 border border-slate-700/50 rounded-lg px-3 py-2">
+                    <Clock3 className="w-3.5 h-3.5 text-slate-500 flex-shrink-0" />
+                    <span>
+                      نشاط المرسل داخل النافذة: <span className="text-slate-200 font-medium" dir="ltr">{data.first_seen}</span>
+                      {' ← '}
+                      <span className="text-slate-200 font-medium" dir="ltr">{data.last_seen}</span>
+                    </span>
+                  </div>
+                )}
+
+                {/* the sender's own daily series — a gone-quiet sender
+                    shows as trailing zero bars (the timeline story) */}
+                {data.daily.length > 0 && (
+                  <div>
+                    <h3 className="text-sm font-semibold text-slate-200 mb-2 flex items-center gap-1.5">
+                      <TrendingUp className="w-4 h-4 text-teal-400" />
+                      النشر اليومي للمرسل
+                    </h3>
+                    <TrendChart daily={data.daily} totals={null} />
+                  </div>
+                )}
+
+                {/* the groups this sender posted in — [CROSS-DRILL] rows
+                    open the group drill-down */}
+                <div>
+                  <h3 className="text-sm font-semibold text-slate-200 mb-2.5 flex items-center gap-1.5">
+                    <Users2 className="w-4 h-4 text-fuchsia-400" />
+                    المجموعات التي نشر فيها
+                  </h3>
+                  {data.groups.length === 0 ? (
+                    <p className="text-xs text-slate-500 text-center py-3">
+                      لا روابط لهذا المرسل داخل النافذة المحددة.
+                    </p>
+                  ) : (
+                    <div className="space-y-2">
+                      {data.groups.slice(0, 10).map((g, i) => {
+                        const widthPct = Math.max(3, Math.round((g.total / maxGroup) * 100))
+                        const gWaPct = g.total ? Math.round((g.whatsapp / g.total) * widthPct) : 0
+                        const gTgPct = widthPct - gWaPct
+                        return (
+                          <div
+                            key={`${g.group}-${i}`}
+                            className={onOpenGroup
+                              ? 'group/g rounded-md p-1 -mx-1 cursor-pointer hover:bg-slate-800/60 transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-fuchsia-500/50'
+                              : 'group/g'}
+                            onClick={onOpenGroup ? () => onOpenGroup(g.group) : undefined}
+                            role={onOpenGroup ? 'button' : undefined}
+                            tabIndex={onOpenGroup ? 0 : undefined}
+                            aria-label={onOpenGroup ? `عرض تفاصيل ${g.group}` : undefined}
+                            onKeyDown={(e) => {
+                              if (onOpenGroup && (e.key === 'Enter' || e.key === ' ')) {
+                                e.preventDefault()
+                                onOpenGroup(g.group)
+                              }
+                            }}
+                          >
+                            <div className="flex items-center justify-between gap-2 mb-1">
+                              <div className="flex items-center gap-2 min-w-0">
+                                <span className="text-[10px] text-slate-500 w-5 text-center flex-shrink-0 tabular-nums">
+                                  {i + 1}.
+                                </span>
+                                <span
+                                  className={`text-xs truncate ${g.group === 'غير محدد' ? 'text-slate-500 italic' : 'text-slate-200'}`}
+                                  title={g.group}
+                                >
+                                  {g.group}
+                                </span>
+                              </div>
+                              <div className="flex items-center gap-2 flex-shrink-0">
+                                <span className="text-[10px] text-slate-500 tabular-nums">
+                                  {g.share.toFixed(1)}%
+                                </span>
+                                <span className="text-xs font-bold text-white tabular-nums">
+                                  {g.total.toLocaleString()}
+                                </span>
+                              </div>
+                            </div>
+                            <div className="flex h-1.5 rounded-full bg-slate-700/40 overflow-hidden">
+                              <div
+                                className="h-full bg-gradient-to-r from-emerald-400 to-emerald-600"
+                                style={{ width: `${gWaPct}%` }}
+                              />
+                              <div
+                                className="h-full bg-gradient-to-r from-blue-400 to-blue-600"
+                                style={{ width: `${gTgPct}%` }}
+                              />
+                            </div>
+                            <div className="text-[9px] text-slate-600 mt-0.5 h-3 opacity-0 group-hover/g:opacity-100 transition-opacity flex items-center justify-between gap-2">
+                              <span className="truncate">
+                                واتساب {g.whatsapp.toLocaleString()} · تيليجرام {g.telegram.toLocaleString()}
+                                {g.other > 0 && <span> · أخرى {g.other.toLocaleString()}</span>}
+                                <span> · نشاط {g.first_seen} ← {g.last_seen}</span>
+                              </span>
+                              {onOpenGroup && (
+                                <span
+                                  className="flex items-center gap-0.5 text-slate-500 group-hover/g:text-fuchsia-400 flex-shrink-0 transition-colors"
+                                  aria-hidden
+                                >
+                                  <ZoomIn className="w-2.5 h-2.5" />
+                                  تفاصيل
+                                </span>
+                              )}
+                            </div>
+                          </div>
+                        )
+                      })}
+                      {data.groups.length > 10 && (
+                        <p className="text-[10px] text-slate-500 text-center">
+                          + {data.groups.length - 10} مجموعات أخرى
+                        </p>
+                      )}
+                    </div>
+                  )}
+                </div>
+
+                <p className="text-[10px] text-slate-600 text-center border-t border-slate-800 pt-3">
+                  🔒 بدون بيانات هواتف أو جهات اتصال (خصوصية) · اضغط على أي مجموعة لعرض تفاصيلها
                 </p>
               </div>
             ) : null}
@@ -3520,8 +3932,11 @@ function LinksModal(props: {
   topSendersTotals: TopSendersTotals | null
   trendDays: number
   onOpenGroupDetail?: (group: string) => void
+  // [SENDER-DRILL] open the per-sender drill-down from the top-senders
+  // view-all modal (same swap pattern as onOpenGroupDetail).
+  onOpenSenderDetail?: (sender: string) => void
 }) {
-  const { type, onClose, allLinks, joiners, joinersSummary, joinedGroups, monitoredChats, monitoredSummary, bannedGroups, pendingApprovals, pendingSummary, topGroups, topGroupsTotals, topSenders, topSendersTotals, trendDays, onOpenGroupDetail } = props
+  const { type, onClose, allLinks, joiners, joinersSummary, joinedGroups, monitoredChats, monitoredSummary, bannedGroups, pendingApprovals, pendingSummary, topGroups, topGroupsTotals, topSenders, topSendersTotals, trendDays, onOpenGroupDetail, onOpenSenderDetail } = props
   const [searchQuery, setSearchQuery] = useState<string>('')
 
   // [UX] Esc closes the modal + / focuses the search box
@@ -4162,7 +4577,17 @@ function LinksModal(props: {
                   {topSenders.map((s, i) => (
                     <div
                       key={s.sender}
-                      className="bg-slate-800/50 rounded-lg p-3 border border-slate-700/50"
+                      className={`bg-slate-800/50 rounded-lg p-3 border border-slate-700/50 ${onOpenSenderDetail ? 'cursor-pointer hover:border-teal-500/40 hover:bg-slate-800/80 transition-colors' : ''}`}
+                      onClick={onOpenSenderDetail ? () => onOpenSenderDetail(s.sender) : undefined}
+                      role={onOpenSenderDetail ? 'button' : undefined}
+                      tabIndex={onOpenSenderDetail ? 0 : undefined}
+                      aria-label={onOpenSenderDetail ? `عرض تفاصيل ${s.sender}` : undefined}
+                      onKeyDown={(e) => {
+                        if (onOpenSenderDetail && (e.key === 'Enter' || e.key === ' ')) {
+                          e.preventDefault()
+                          onOpenSenderDetail(s.sender)
+                        }
+                      }}
                     >
                       <div className="flex items-center justify-between gap-2 mb-2">
                         <div className="flex items-center gap-2 min-w-0">
@@ -4217,8 +4642,16 @@ function LinksModal(props: {
                           {s.first_seen} → {s.last_seen}
                         </span>
                       </div>
-                      <p className="text-[10px] text-slate-500 mt-1 truncate" title={s.top_group}>
-                        الأكثر نشراً في: <span className="text-slate-400">{s.top_group}</span>
+                      <p className="text-[10px] text-slate-500 mt-1 truncate flex items-center justify-between gap-2" title={s.top_group}>
+                        <span className="truncate">
+                          الأكثر نشراً في: <span className="text-slate-400">{s.top_group}</span>
+                        </span>
+                        {onOpenSenderDetail && (
+                          <span className="flex items-center gap-0.5 text-slate-500 flex-shrink-0" aria-hidden>
+                            <ZoomIn className="w-3 h-3" />
+                            تفاصيل
+                          </span>
+                        )}
                       </p>
                     </div>
                   ))}

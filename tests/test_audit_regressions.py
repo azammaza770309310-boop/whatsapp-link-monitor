@@ -3700,7 +3700,7 @@ async def test_groupdrill_series_and_clamp():
                'key=lambda kv: kv[1]["total"]' in body and "[:20]" in body,
                "ranking/cap missing — modal list unbounded")
         record("GD-6a: fetch window aligned to the calendar series window",
-               "datetime.combine(" in body and "window_start" in body,
+               "_calendar_window_bounds(days)" in body and "window_start" in body,
                "fetch uses now-N timestamp — partial first day makes "
                "Σ senders ≠ totals.total")
         record("GD-6b: day_key bounds-checked against the window",
@@ -3766,6 +3766,223 @@ async def test_piifix_redact_sender_contact_unit():
                f"in={bare!r} out={bare_out!r}")
     except Exception as e:
         record("PR-2: exception", False, str(e))
+
+
+# =========================================================================
+# [WINDOW-ALIGN] links_daily / top_groups / top_senders fetch windows
+# aligned to calendar days via _calendar_window_bounds (round-8 candidate
+# d — the same consistency guarantee group_detail got in commit 0802340:
+# series, totals AND counters agree by construction for the same ?days).
+# =========================================================================
+
+async def test_windowalign_calendar_bounds_helper():
+    """[WINDOW-ALIGN-1] _calendar_window_bounds returns a start-of-day
+    since_iso whose date is exactly (today - (days-1)) — the fetch window
+    then matches the daily series keys exactly. Rollover-safe: all three
+    values come from ONE utcnow() call, so their relationship is checked
+    internally rather than against a second clock read."""
+    try:
+        assert hasattr(bot, "_calendar_window_bounds"), "helper missing"
+        from datetime import date as _date
+        ok_all = True
+        detail = ""
+        for days in (1, 7, 14, 30):
+            since_iso, ws_iso, today_iso = bot._calendar_window_bounds(days)
+            d_today = _date.fromisoformat(today_iso)
+            d_ws = _date.fromisoformat(ws_iso)
+            ok = ((d_today - d_ws).days == days - 1
+                  and since_iso == f"{ws_iso}T00:00:00")
+            if not ok:
+                ok_all = False
+                detail = f"days={days} since={since_iso} ws={ws_iso} today={today_iso}"
+                break
+        record("WA-1a: helper returns start-of-day aligned window",
+               ok_all, detail or "days=1/7/14/30 all aligned")
+        # days=1 → since == today at midnight (a single calendar day)
+        since_iso, ws_iso, today_iso = bot._calendar_window_bounds(1)
+        record("WA-1b: days=1 → window is just today",
+               ws_iso == today_iso and since_iso.endswith("T00:00:00"),
+               f"ws={ws_iso} today={today_iso}")
+    except Exception as e:
+        record("WA-1: exception", False, str(e))
+
+
+async def test_windowalign_handlers_use_calendar_window():
+    """[WINDOW-ALIGN-2] links_daily, top_groups and top_senders MUST use
+    the shared calendar-window helper AND bounds-check each row's day_key —
+    otherwise a plain now-N timestamp pulls a partial first calendar day
+    whose rows land in hourly/counter buckets but outside the series
+    (totals disagree across endpoints for the same ?days value)."""
+    try:
+        src = (PROJECT_ROOT / "bot.py").read_text(encoding="utf-8")
+        for name, tag in (
+                ("api_links_daily_handler", "links_daily"),
+                ("api_top_groups_handler", "top_groups"),
+                ("api_top_senders_handler", "top_senders")):
+            h_start = src.find(f"async def {name}")
+            h_end = src.find("\nasync def ", h_start + 50)
+            body = src[h_start:h_end] if h_end > 0 else src[h_start:h_start + 9000]
+            record(f"WA-2: {tag} uses _calendar_window_bounds + bounds check",
+                   "_calendar_window_bounds(days)" in body
+                   and "day_key < window_start_iso" in body,
+                   "rolling now-N fetch — totals can disagree with the series")
+    except Exception as e:
+        record("WA-2: exception", False, str(e))
+
+
+# =========================================================================
+# [SENDER-DRILL] /api/sender_detail — per-sender drill-down (daily series
+# + top groups) opened by clicking a top-sender row. Mirrors group_detail
+# guards: route, 400/200 validation, 60s cache, clamping, narrow PII-free
+# select, sender_name filter, zero-filled continuous series, calendar
+# window alignment.
+# =========================================================================
+
+async def test_senderdrill_route_registered():
+    """[SENDER-DRILL-1] /api/sender_detail MUST be registered in the router —
+    otherwise every sender drill-down click from the dashboard 404s."""
+    try:
+        src = (PROJECT_ROOT / "bot.py").read_text(encoding="utf-8")
+        record("SD-1: /api/sender_detail route registered",
+               'add_get("/api/sender_detail", api_sender_detail_handler)' in src,
+               "route registration missing")
+    except Exception as e:
+        record("SD-1: exception", False, str(e))
+
+
+async def test_senderdrill_handler_shape_and_validation():
+    """[SENDER-DRILL-2] handler returns 400 without ?sender=, and 200 with
+    the full shape (daily + groups + totals) even when Supabase is
+    unconfigured (empty but well-formed — the modal shows 'no links')."""
+    try:
+        assert hasattr(bot, "api_sender_detail_handler"), "handler missing"
+        db = types.SimpleNamespace(supabase_url=None, supabase_key=None)
+        # missing sender → 400
+        req_bad = types.SimpleNamespace(
+            app={"db": db}, query={"days": "7"}, headers={})
+        resp_bad = await bot.api_sender_detail_handler(req_bad)
+        record("SD-2a: missing sender param → 400",
+               getattr(resp_bad, "status", None) == 400,
+               f"status={getattr(resp_bad, 'status', None)}")
+        # valid sender, unconfigured supabase → 200 empty-but-shaped
+        req = types.SimpleNamespace(
+            app={"db": db}, query={"sender": "قناة فسنجون", "days": "3"},
+            headers={})
+        resp = await bot.api_sender_detail_handler(req)
+        status = getattr(resp, "status", None)
+        raw = getattr(resp, "body", None)
+        if isinstance(raw, (bytes, bytearray)):
+            body = bytes(raw).decode("utf-8", "replace")
+        else:
+            body = str(raw)
+        record("SD-2b: valid sender → 200",
+               status == 200, f"status={status}")
+        record("SD-2c: response contains daily + groups + totals",
+               '"daily"' in body and '"groups"' in body and '"totals"' in body,
+               f"body head: {body[:120]}")
+        import json as _json
+        try:
+            payload = _json.loads(body)
+        except Exception:
+            payload = {}
+        record("SD-2d: sender echoed back in response",
+               payload.get("sender") == "قناة فسنجون",
+               f"sender={payload.get('sender')!r} — modal header would lose its title")
+    except Exception as e:
+        record("SD-2: exception", False, str(e))
+    finally:
+        bot._SENDER_DETAIL_CACHE.update({"key": None, "payload": None, "ts": 0.0})
+
+
+async def test_senderdrill_cache():
+    """[SENDER-DRILL-3] _SENDER_DETAIL_CACHE must exist and the handler must
+    seed it and serve the cached payload within 60s (protects Supabase from
+    repeated drill clicks + the dashboard's polling)."""
+    try:
+        record("SD-3a: _SENDER_DETAIL_CACHE present",
+               hasattr(bot, "_SENDER_DETAIL_CACHE")
+               and isinstance(bot._SENDER_DETAIL_CACHE, dict)
+               and set(bot._SENDER_DETAIL_CACHE.keys()) >= {"key", "payload", "ts"},
+               "cache object missing/wrong shape")
+        db = types.SimpleNamespace(supabase_url=None, supabase_key=None)
+        req = types.SimpleNamespace(
+            app={"db": db}, query={"sender": "مرسل تجريبي", "days": "2"}, headers={})
+        await bot.api_sender_detail_handler(req)
+        seeded = dict(bot._SENDER_DETAIL_CACHE)
+        record("SD-3b: first call seeds the cache with s:…:d{days} key",
+               seeded.get("key") == "s:مرسل تجريبي:d2"
+               and seeded.get("payload") is not None,
+               f"cache={ {k: type(v).__name__ for k, v in seeded.items()} }")
+        import time as _time
+        bot._SENDER_DETAIL_CACHE["ts"] = _time.time()  # fresh
+        resp2 = await bot.api_sender_detail_handler(req)
+        record("SD-3c: second call within 60s served from cache",
+                bot._SENDER_DETAIL_CACHE["payload"] is not None
+                and getattr(resp2, "status", None) == 200,
+                f"status={getattr(resp2, 'status', None)}")
+    except Exception as e:
+        record("SD-3: exception", False, str(e))
+    finally:
+        bot._SENDER_DETAIL_CACHE.update({"key": None, "payload": None, "ts": 0.0})
+
+
+async def test_senderdrill_pii_free_select():
+    """[SENDER-DRILL-4] the Supabase fetch must select ONLY (created_at,
+    group_name, link_type) and MUST filter by sender_name — sender_contact
+    and source_phone are never selected (PII-free by construction, same
+    posture as top_senders/group_detail)."""
+    try:
+        src = (PROJECT_ROOT / "bot.py").read_text(encoding="utf-8")
+        h_start = src.find("async def api_sender_detail_handler")
+        h_end = src.find("\nasync def ", h_start + 50)
+        body = src[h_start:h_end] if h_end > 0 else src[h_start + 9000]
+        record("SD-4a: selects only created_at,group_name,link_type",
+               "select=created_at,group_name,link_type" in body,
+               "wide select — PII or over-fetch risk")
+        record("SD-4b: sender_contact never selected in sender_detail",
+               "sender_contact" not in body,
+               "sender_contact selected — PII leak risk in drill-down")
+        record("SD-4c: source_phone never selected in sender_detail",
+               "source_phone" not in body,
+               "source_phone selected — watcher phone leak risk")
+        record("SD-4d: filters by sender_name=eq.",
+               "sender_name=eq." in body,
+               "sender filter missing — drill-down would aggregate ALL senders")
+        record("SD-4e: sender name URL-encoded for the REST filter",
+               "_urlquote(sender_name, safe=\"\")" in body,
+               "URL-encoding missing — Arabic/space names would 400")
+        record("SD-4f: paginates in 1000-row batches",
+               "batch_size = 1000" in body and "offset" in body,
+               "pagination missing — >1000-row senders truncated")
+    except Exception as e:
+        record("SD-4: exception", False, str(e))
+
+
+async def test_senderdrill_series_and_clamp():
+    """[SENDER-DRILL-5] the daily series must be continuous over the window
+    (zero-filled gaps — a dry day is signal for a gone-quiet sender), days
+    must clamp to 1..30, groups ranked/capped, and the fetch window must be
+    calendar-aligned via the shared helper."""
+    try:
+        src = (PROJECT_ROOT / "bot.py").read_text(encoding="utf-8")
+        h_start = src.find("async def api_sender_detail_handler")
+        h_end = src.find("\nasync def ", h_start + 50)
+        body = src[h_start:h_end] if h_end > 0 else src[h_start + 9000]
+        record("SD-5a: continuous zero-filled series over the window",
+               "for i in range(days - 1, -1, -1):" in body,
+               "gap-fill missing — chart x-axis would skip dry days")
+        record("SD-5b: days clamped to 1..30",
+               "max(1, min(30, int(request.query.get(\"days\"" in body,
+               "clamping missing — days=999 would scan/loop unbounded")
+        record("SD-5c: groups ranked by total descending, capped at 20",
+               'key=lambda kv: kv[1]["total"]' in body and "[:20]" in body,
+               "ranking/cap missing — modal list unbounded")
+        record("SD-5d: fetch window aligned to the calendar series window",
+               "_calendar_window_bounds(days)" in body
+               and "day_key < window_start_iso" in body,
+               "rolling now-N fetch — Σ groups ≠ totals.total")
+    except Exception as e:
+        record("SD-5: exception", False, str(e))
 
 
 # =========================================================================
@@ -4756,6 +4973,17 @@ async def main():
     await test_groupdrill_series_and_clamp()
     await test_piifix_links_redaction_wired()
     await test_piifix_redact_sender_contact_unit()
+
+    # === [WINDOW-ALIGN] calendar-day fetch windows (links_daily/top_*) ===
+    await test_windowalign_calendar_bounds_helper()
+    await test_windowalign_handlers_use_calendar_window()
+
+    # === [SENDER-DRILL] /api/sender_detail per-sender drill-down ===
+    await test_senderdrill_route_registered()
+    await test_senderdrill_handler_shape_and_validation()
+    await test_senderdrill_cache()
+    await test_senderdrill_pii_free_select()
+    await test_senderdrill_series_and_clamp()
 
     # === Task 11a — Secrets scan ===
     await test_11a_no_real_secrets_in_source_files()
