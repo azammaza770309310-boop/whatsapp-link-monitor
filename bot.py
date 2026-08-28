@@ -12706,14 +12706,11 @@ async def api_deploy_check_handler(request):
 # -------------------------------------------------------------------
 # [B06 / PR-7] DASHBOARD_API_KEY shared-secret for /api/* routes
 # -------------------------------------------------------------------
-# SECURE-BY-DEFAULT (PR-7): If DASHBOARD_API_KEY env is SET (non-empty),
-# every /api/* request must carry an `X-Api-Key` header matching it
-# (constant-time compare); mismatch → 401 JSON.
-#
-# If DASHBOARD_API_KEY is UNSET, the /api/* routes are REJECTED with 401
-# by default (fail-closed) — the dashboard MUST NOT leak phones/links to
-# the open internet. Set API_FAIL_OPEN=true ONLY during a controlled
-# transition (the frontend then gets masked PII, never raw phones).
+# If DASHBOARD_API_KEY env is SET (non-empty), every /api/* request must
+# carry an `X-Api-Key` header matching it (constant-time compare);
+# mismatch -> 401 JSON. When DASHBOARD_API_KEY is UNSET, /api/* routes
+# are OPEN (no Origin check, no fail-closed) per operator request
+# (pre-PR-7 behavior). To re-secure, set DASHBOARD_API_KEY.
 #
 # Health endpoints (/health, /ready, /metrics) are NEVER gated — probes
 # must stay open for Render/Prometheus.
@@ -12726,128 +12723,30 @@ def _get_dashboard_api_key() -> Optional[str]:
     return os.environ.get("DASHBOARD_API_KEY") or None
 
 
-def _api_fail_open() -> bool:
-    """[PR-7] Escape-hatch flag. Default False = fail-closed when key unset.
-    Operator sets API_FAIL_OPEN=true ONLY during a controlled transition."""
-    return os.environ.get("API_FAIL_OPEN", "false").lower() in ("true", "1", "yes")
-
-
-# -------------------------------------------------------------------
-# [DASHBOARD-RESTORE] Trusted-origin allowlist — keyless access for the
-# official dashboard frontend only. Fixes the break introduced by PR-7
-# (commit b6017b5, 2026-08-26): PR-7 made /api/* fail-closed when
-# DASHBOARD_API_KEY is unset, but the Vercel-hosted dashboard
-# (download/frontend/src/app/page.tsx) sends no X-Api-Key header → every
-# fetch returned 401 → the dashboard showed zero data. Requiring a key
-# in the browser bundle is security theater (the key would be public),
-# so instead we trust the Origin header: the browser sets Origin on
-# cross-origin fetches and it is a forbidden header (JS cannot spoof it).
-# Server-to-server callers can still spoof Origin, so for full protection
-# the operator should ALSO set DASHBOARD_API_KEY — origin-allow is a
-# convenient restore for the public dashboard, not a complete security
-# boundary on its own.
-# -------------------------------------------------------------------
-# [DASHBOARD-RESTORE-2] Code-deployed DEFAULT allowlist. The first fix
-# (12c6c35) put the Vercel URL in render.yaml as a `value:` env var, but
-# Render does NOT auto-apply new render.yaml env vars to EXISTING services
-# (blueprint sync limitation) — verified live: the 12c6c35 code deployed
-# but the env var never landed, leaving the dashboard 401-broken for 2+
-# days while waiting for a manual Render-dashboard entry that never came.
-# The fix: bake the official dashboard origin into the code (deploys via
-# plain git push, which DOES auto-deploy), and keep the env var as an
-# override:
-#   - DASHBOARD_ALLOWED_ORIGINS unset  → default (official Vercel URL).
-#   - DASHBOARD_ALLOWED_ORIGINS="url"  → operator override (comma-list).
-#   - DASHBOARD_ALLOWED_ORIGINS=""     → explicit opt-out (empty allowlist,
-#     fully fail-closed; for operators who want key-only access).
-_DASHBOARD_DEFAULT_ALLOWED_ORIGINS = (
-    "https://whatsapp-monitor-jzp9pilke-azzam10.vercel.app"
-)
-
-
-def _get_dashboard_allowed_origins() -> list:
-    """Return trusted dashboard origins (exact match, trailing slash stripped).
-
-    Priority: DASHBOARD_ALLOWED_ORIGINS env (comma-separated) → if the env
-    var is UNSET, falls back to _DASHBOARD_DEFAULT_ALLOWED_ORIGINS (the
-    official Vercel dashboard — code-deployed because Render doesn't sync
-    new render.yaml env vars to existing services). Setting the env var to
-    an empty string disables keyless access entirely (opt-out).
-    """
-    if "DASHBOARD_ALLOWED_ORIGINS" in os.environ:
-        raw = os.environ.get("DASHBOARD_ALLOWED_ORIGINS") or ""
-    else:
-        raw = _DASHBOARD_DEFAULT_ALLOWED_ORIGINS
-    return [o.strip().rstrip("/") for o in raw.split(",") if o.strip()]
-
-
-def _is_origin_allowed(request) -> bool:
-    """True if the request Origin (or Referer origin) is in the trusted
-    allowlist. Used to grant the official dashboard frontend keyless
-    access to /api/* without exposing a shared secret in the browser.
-    """
-    allowed = _get_dashboard_allowed_origins()
-    if not allowed:
-        return False
-    # 1) Origin header (set by the browser on cross-origin requests;
-    #    forbidden header — JS cannot override it).
-    origin = (request.headers.get("Origin") or "").rstrip("/")
-    if origin and origin in allowed:
-        return True
-    # 2) Referer fallback (Origin is sometimes absent on same-origin GETs
-    #    in older Safari/mobile). Parse out the scheme://host[:port] prefix.
-    referer = request.headers.get("Referer")
-    if referer:
-        try:
-            from urllib.parse import urlparse
-            ref = urlparse(referer)
-            if ref.scheme and ref.netloc:
-                origin2 = f"{ref.scheme}://{ref.netloc}".rstrip("/")
-                if origin2 in allowed:
-                    return True
-        except Exception:
-            pass
-    return False
+# [OPEN-MODE] Per operator request, /api/* is OPEN when DASHBOARD_API_KEY is
+# unset (dashboard_api_key_middleware passes through). The previous
+# trusted-origin allowlist and fail-open escape-hatch were removed. To
+# re-secure, set DASHBOARD_API_KEY (X-Api-Key then required).
 
 
 def _warn_dashboard_api_key_open_once() -> None:
-    """Emit a single WARNING if the dashboard API is running without a key."""
+    """Emit a single WARNING if the dashboard API is running open (no key)."""
     if _DASHBOARD_API_KEY_WARNED["open"]:
         return
     _DASHBOARD_API_KEY_WARNED["open"] = True
     if _get_dashboard_api_key() is None:
-        allowed = _get_dashboard_allowed_origins()
-        if _api_fail_open():
-            logging.warning(
-                "[DASHBOARD] DASHBOARD_API_KEY is UNSET but API_FAIL_OPEN=true "
-                "— /api/* endpoints are OPEN with MASKED PII (transition mode). "
-                "Set DASHBOARD_API_KEY to lock them fully.")
-        elif allowed:
-            logging.warning(
-                "[DASHBOARD] DASHBOARD_API_KEY is UNSET — /api/* endpoints are "
-                "REJECTED with 401 EXCEPT for trusted dashboard origins: %s. "
-                "This restores the Vercel dashboard without exposing a browser-"
-                "key. For full protection, also set DASHBOARD_API_KEY.",
-                ", ".join(allowed))
-        else:
-            logging.warning(
-                "[DASHBOARD] DASHBOARD_API_KEY is UNSET — /api/* endpoints are "
-                "REJECTED with 401 (fail-closed, PR-7 secure-by-default). "
-                "Set DASHBOARD_API_KEY (+ frontend X-Api-Key) to enable the dashboard, "
-                "OR set DASHBOARD_ALLOWED_ORIGINS to the dashboard URL for keyless "
-                "trusted-frontend access, OR set API_FAIL_OPEN=true for a temporary "
-                "open transition.")
+        logging.warning(
+            "[DASHBOARD] DASHBOARD_API_KEY is UNSET - /api/* endpoints are OPEN "
+            "(no auth; dashboard reads data freely). Set DASHBOARD_API_KEY to "
+            "require an X-Api-Key header and lock them down.")
 
 
 def _api_should_show_full_pii() -> bool:
     """[Security / Req-1] Return True only when the dashboard is behind a
-    shared secret AND the request has already passed the middleware check.
-
-    When DASHBOARD_API_KEY is UNSET, the /api/* endpoints are either
-    fail-closed (default) or return masked PII (API_FAIL_OPEN=true). In
-    either case, full phones must NOT be shown without the key. When the
-    key IS set, the dashboard_api_key_middleware already rejected any
-    request lacking a valid X-Api-Key, so the caller is the authenticated
+    shared secret (DASHBOARD_API_KEY set). When the key is UNSET, /api/* is
+    OPEN per operator request, but full phones are still masked (the caller
+    is unauthenticated). When the key IS set, the middleware already rejected
+    any request lacking a valid X-Api-Key, so the caller is the authenticated
     operator and may see full phones.
     """
     return _get_dashboard_api_key() is not None
@@ -12917,34 +12816,21 @@ def _redact_sender_contact(contact) -> str:
 
 @web.middleware
 async def dashboard_api_key_middleware(request, handler):
-    """Gates /api/* routes behind an optional X-Api-Key shared secret OR
-    a trusted-origin allowlist.
+    """Gates /api/* routes behind an optional X-Api-Key shared secret.
 
-    [Task 5a / A1] Comparison uses secrets.compare_digest (constant-time) —
-    was `provided != key` (string inequality, timing-attack vulnerable). The
-    shared secret is short (<=128 chars typical), so the timing side-channel
-    let an attacker recover the key byte-by-byte via response-time
-    measurement. compare_digest short-circuits on length mismatch but is
-    constant-time for equal-length inputs — the practical leak closed.
+    [Task 5a / A1] Comparison uses secrets.compare_digest (constant-time) -
+    was `provided != key` (string inequality, timing-attack vulnerable).
 
-    [DASHBOARD-RESTORE] Three independent access paths, evaluated in order:
-      1. X-Api-Key header matches DASHBOARD_API_KEY (operator secret) → grant.
-      2. DASHBOARD_API_KEY unset AND request Origin is in
-         DASHBOARD_ALLOWED_ORIGINS allowlist → grant (keyless, restores the
-         Vercel dashboard without exposing a secret in the browser bundle).
-      3. DASHBOARD_API_KEY unset AND API_FAIL_OPEN=true → grant with masked
-         PII (controlled transition; for emergencies only).
-    Otherwise → 401 fail-closed.
+    [OPEN-MODE] When DASHBOARD_API_KEY is UNSET, /api/* routes are OPEN (no
+    Origin check, no fail-closed) - the dashboard frontend reads data freely,
+    per operator request (pre-PR-7 behavior). To re-secure, set
+    DASHBOARD_API_KEY (then X-Api-Key is required).
 
     Health endpoints (/health, /ready, /metrics) are NOT under /api/* and
     are NEVER gated (Render's health probe + Prometheus must stay open).
-    /api/deploy_check IS gated (it's a diagnostic, not a deploy probe).
 
-    CORS preflight (OPTIONS) is ALWAYS allowed for /api/* — returns the
-    necessary Access-Control-Allow-* headers so the browser can issue the
-    actual authenticated GET/POST. Without this, adding an X-Api-Key header
-    to the frontend would trigger a preflight that the old middleware
-    rejected with 401 (OPTIONS carries no X-Api-Key).
+    CORS preflight (OPTIONS) is ALWAYS allowed for /api/* so the browser can
+    issue the actual authenticated GET/POST.
     """
     path = request.path
     if path.startswith("/api/"):
@@ -12983,25 +12869,10 @@ async def dashboard_api_key_middleware(request, handler):
                     {"error": "unauthorized: missing or invalid X-Api-Key"},
                     status=401, headers={"Access-Control-Allow-Origin": "*"})
         else:
-            # [PR-7] DASHBOARD_API_KEY UNSET.
-            # Path A: trusted dashboard origin → keyless grant.
-            # Path B: API_FAIL_OPEN=true → masked PII transition mode.
-            # Path C: fail-closed 401.
-            if _is_origin_allowed(request):
-                # Trusted frontend (e.g. the official Vercel dashboard).
-                # PII is masked via _api_should_show_full_pii() because the
-                # key is unset — same posture as API_FAIL_OPEN.
-                pass
-            elif _api_fail_open():
-                pass
-            else:
-                return web.json_response(
-                    {"error": "unauthorized: DASHBOARD_API_KEY not configured. "
-                              "Set it (env) + send X-Api-Key header, OR set "
-                              "DASHBOARD_ALLOWED_ORIGINS to the dashboard URL "
-                              "for keyless trusted-frontend access, OR set "
-                              "API_FAIL_OPEN=true for temporary open transition."},
-                    status=401, headers={"Access-Control-Allow-Origin": "*"})
+            # DASHBOARD_API_KEY UNSET -> OPEN (no Origin check, no fail-closed).
+            # The dashboard frontend reads /api/* freely, per operator request
+            # (pre-PR-7 behavior). To re-secure, set DASHBOARD_API_KEY.
+            pass
     return await handler(request)
 
 
