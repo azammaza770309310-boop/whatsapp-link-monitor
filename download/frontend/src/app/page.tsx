@@ -13,7 +13,7 @@ import {
   RefreshCw, ExternalLink, Phone, MapPin, Clock, ArrowRight,
   X, Activity, CheckCircle2, XCircle, AlertTriangle, Clock3,
   Copy, Check, Download, TrendingUp, BarChart3, Flame,
-  VolumeX, ShieldCheck, UserCircle2, BellRing,
+  VolumeX, ShieldCheck, UserCircle2, BellRing, Target, ArrowUp,
 } from 'lucide-react'
 import type { ReactNode, MouseEvent as ReactMouseEvent, ChangeEvent } from 'react'
 
@@ -251,6 +251,7 @@ interface AttentionItem {
 const NAV_SECTIONS: { id: string; label: string }[] = [
   { id: 'sec-overview', label: 'نظرة عامة' },
   { id: 'sec-trend', label: 'الاتجاه' },
+  { id: 'sec-targets', label: 'الأهداف' },
   { id: 'sec-sources', label: 'المصادر' },
   { id: 'sec-senders', label: 'المرسلون' },
   { id: 'sec-health', label: 'الصحة' },
@@ -290,6 +291,107 @@ function safeUrl(url: string | null | undefined): string | null {
   const trimmed = url.trim()
   if (/^https?:\/\//i.test(trimmed)) return trimmed
   return null
+}
+
+// ===== [TARGET-VIEW] link-target classification =====
+// Live-data validated (3,000-row sample): the capture stream is dominated by
+// t.me public usernames (~68%), WhatsApp invites (~19%) and private Telegram
+// invites (~12%) — and links are ~100% unique (dup ratio 1.0x). So the
+// valuable breakdown is not "which domains" (only 2 hosts exist) but WHAT
+// KIND of target each link points at, and how many are directly joinable
+// (the joiner fleet can act on invite links immediately).
+type TargetKind = 'wa_invite' | 'tg_public' | 'tg_private' | 'tg_other' | 'other'
+
+interface TargetKindMeta {
+  key: TargetKind
+  label: string
+  hint: string
+  dot: string // tailwind bg for the dot
+  bar: string // tailwind gradient for the share bar
+  text: string // tailwind text color for counts
+}
+
+const TARGET_KINDS: TargetKindMeta[] = [
+  {
+    key: 'wa_invite',
+    label: 'دعوات واتساب',
+    hint: 'chat.whatsapp.com — قابلة للانضمام فوراً عبر الأسطول',
+    dot: 'bg-emerald-500',
+    bar: 'from-emerald-400 to-emerald-600',
+    text: 'text-emerald-300',
+  },
+  {
+    key: 'tg_private',
+    label: 'دعوات تيليجرام خاصة',
+    hint: 't.me/+… و t.me/joinchat — قابلة للانضمام فوراً',
+    dot: 'bg-violet-500',
+    bar: 'from-violet-400 to-violet-600',
+    text: 'text-violet-300',
+  },
+  {
+    key: 'tg_public',
+    label: 'معرّفات تيليجرام عامة',
+    hint: 't.me/<username> — قنوات ومجموعات عامة معروفة',
+    dot: 'bg-blue-500',
+    bar: 'from-blue-400 to-blue-600',
+    text: 'text-blue-300',
+  },
+  {
+    key: 'tg_other',
+    label: 'روابط تيليجرام أخرى',
+    hint: 't.me/c/… — رسائل/محتوى داخلي غير قابل للانضمام',
+    dot: 'bg-sky-500',
+    bar: 'from-sky-400 to-sky-600',
+    text: 'text-sky-300',
+  },
+  {
+    key: 'other',
+    label: 'روابط أخرى',
+    hint: 'مواقع ونطاقات خارج المنصتين',
+    dot: 'bg-slate-500',
+    bar: 'from-slate-400 to-slate-600',
+    text: 'text-slate-300',
+  },
+]
+
+// Host + path extraction tolerant of bare-host links ("t.me/foo").
+function targetHostAndPath(url: string): { host: string; path: string } | null {
+  const trimmed = url.trim()
+  if (!trimmed) return null
+  try {
+    const withProto = /^https?:\/\//i.test(trimmed) ? trimmed : `https://${trimmed}`
+    const u = new URL(withProto)
+    return {
+      host: u.hostname.toLowerCase().replace(/^www\./, ''),
+      path: u.pathname || '/',
+    }
+  } catch {
+    return null
+  }
+}
+
+function classifyTargetKind(url: string): TargetKind | null {
+  const hp = targetHostAndPath(url)
+  if (!hp) return null
+  const { host, path } = hp
+  if (host === 'chat.whatsapp.com' || host === 'invite.whatsapp.com' || host === 'whatsapp.com') {
+    return 'wa_invite'
+  }
+  if (host === 't.me' || host === 'telegram.me' || host === 'telegram.dog') {
+    if (path.startsWith('/+') || path.startsWith('/joinchat')) return 'tg_private'
+    if (/^\/c\/\d+/i.test(path)) return 'tg_other'
+    const seg = path.replace(/^\//, '').split('/')[0] ?? ''
+    if (seg && !/^\d+$/.test(seg)) return 'tg_public'
+    return 'tg_other'
+  }
+  return 'other'
+}
+
+// Dedup key: strip query/hash fragments and trailing slashes, lowercase host.
+function normalizeTargetUrl(url: string): string | null {
+  const hp = targetHostAndPath(url)
+  if (!hp) return null
+  return `${hp.host}${hp.path.replace(/\/+$/, '')}`
 }
 
 // ===== Main Component =====
@@ -333,6 +435,16 @@ export default function Home() {
   const [topSendersTotals, setTopSendersTotals] = useState<TopSendersTotals | null>(null)
   // [ALERT-VIEW] dismissed attention-strip ids (session-lifetime).
   const [dismissedAlerts, setDismissedAlerts] = useState<Set<string>>(new Set())
+  // [DELTA-VIEW] independent 30-day daily series for stat-card deltas and
+  // sparklines. NOT tied to trendDays: the delta always compares the last
+  // 7 days against the previous 7, so it needs a fixed wide window (the
+  // server caches per-days key for 60s — the extra poll is cheap).
+  const [deltaDaily, setDeltaDaily] = useState<DailyStat[]>([])
+  // [NAV-SPY] currently visible section (drives the active chip highlight)
+  // and the back-to-top button visibility.
+  const [activeSection, setActiveSection] = useState<string>('sec-overview')
+  const [showBackToTop, setShowBackToTop] = useState<boolean>(false)
+  const navStripRef = useRef<HTMLDivElement | null>(null)
 
   // ===== Fetch Functions =====
   const fetchStats = useCallback(async () => {
@@ -571,6 +683,23 @@ export default function Home() {
     }
   }, [])
 
+  // [DELTA-VIEW] wide (30-day) daily series — feeds the stat-card delta
+  // badges (last-7 vs previous-7 days) and sparklines. Runs on the 60s
+  // trend cycle, not the 15s core cycle, to keep request volume flat.
+  const fetchDeltaSeries = useCallback(async () => {
+    try {
+      const response = await fetch(`${API_URL}/api/links_daily?days=30`, {
+        headers: buildHeaders(),
+      })
+      if (response.ok) {
+        const data = await response.json()
+        if (Array.isArray(data.daily)) setDeltaDaily(data.daily)
+      }
+    } catch (err) {
+      console.error('fetchDeltaSeries error:', err)
+    }
+  }, [])
+
   // Initial load + auto refresh (real-time every 15s)
   useEffect(() => {
     const load = async () => {
@@ -599,18 +728,19 @@ export default function Home() {
   // [TREND-VIEW] initial load + 60s refresh cycle (see fetchTrend rationale).
   // Re-runs when the window selector changes (7/14/30) so the chart, the
   // hourly strip, the top-groups card AND the top-senders card all switch
-  // windows together.
+  // windows together. The [DELTA-VIEW] wide series rides the same cycle.
   useEffect(() => {
     const load = () => {
       fetchTrend(trendDays)
       fetchTopGroups(trendDays)
       fetchTopSenders(trendDays)
       fetchSourceHealth()
+      fetchDeltaSeries()
     }
     load()
     const t = setInterval(load, 60000)
     return () => clearInterval(t)
-  }, [fetchTrend, fetchTopGroups, fetchTopSenders, fetchSourceHealth, trendDays])
+  }, [fetchTrend, fetchTopGroups, fetchTopSenders, fetchSourceHealth, fetchDeltaSeries, trendDays])
 
   const refreshAll = useCallback(() => {
     fetchLinks()
@@ -623,8 +753,9 @@ export default function Home() {
     fetchTopGroups(trendDays)
     fetchTopSenders(trendDays)
     fetchSourceHealth()
+    fetchDeltaSeries()
     setLastUpdated(new Date())
-  }, [fetchLinks, fetchStats, fetchJoiners, fetchMonitoredChats, fetchReadiness, fetchPendingApprovals, fetchTrend, fetchTopGroups, fetchTopSenders, fetchSourceHealth, trendDays])
+  }, [fetchLinks, fetchStats, fetchJoiners, fetchMonitoredChats, fetchReadiness, fetchPendingApprovals, fetchTrend, fetchTopGroups, fetchTopSenders, fetchSourceHealth, fetchDeltaSeries, trendDays])
 
   // [LIVE-STATUS] seconds since last successful refresh
   const secondsAgo = lastUpdated
@@ -693,6 +824,115 @@ export default function Home() {
   }, [quietSources, stats, readiness])
 
   const visibleAlerts = attentionItems.filter((a) => !dismissedAlerts.has(a.id))
+
+  // [TARGET-VIEW] pattern breakdown of the captured links — computed entirely
+  // client-side from the existing /api/links payload (up to 5,000 rows, no
+  // new endpoint). Answers "what KIND of targets flow through": WhatsApp
+  // invites (directly joinable), public Telegram usernames, private TG
+  // invites (directly joinable), internal t.me/c/ links, other hosts.
+  // Also counts UNIQUE targets (live data: ~100% unique — dup ratio ~1.0x,
+  // so the card reports the fact instead of a pointless re-share list).
+  const targetStats = useMemo(() => {
+    const counts: Record<TargetKind, number> = {
+      wa_invite: 0,
+      tg_public: 0,
+      tg_private: 0,
+      tg_other: 0,
+      other: 0,
+    }
+    const seen = new Set<string>()
+    let parsed = 0
+    for (const l of allLinks) {
+      const url = (l?.link ?? '').toString().trim()
+      if (!url) continue
+      const kind = classifyTargetKind(url)
+      if (!kind) continue
+      parsed++
+      counts[kind]++
+      const norm = normalizeTargetUrl(url)
+      if (norm) seen.add(norm)
+    }
+    const joinable = counts.wa_invite + counts.tg_private
+    return {
+      counts,
+      parsed,
+      unique: seen.size,
+      joinable,
+      joinablePct: parsed > 0 ? (joinable / parsed) * 100 : 0,
+    }
+  }, [allLinks])
+
+  // [DELTA-VIEW] stat-card deltas — last 7 days vs the previous 7 days from
+  // the wide 30-day series. Returns null when there is no baseline (series
+  // shorter than 14 days or previous week summed to 0) so the badge simply
+  // doesn't render instead of showing a meaningless ∞%.
+  const statDeltas = useMemo(() => {
+    const series = deltaDaily
+    if (!series || series.length < 14) return null
+    const last7 = series.slice(-7)
+    const prev7 = series.slice(-14, -7)
+    const sum = (arr: DailyStat[], key: 'total' | 'whatsapp' | 'telegram') =>
+      arr.reduce((acc, d) => acc + (Number(d?.[key]) || 0), 0)
+    const pct = (cur: number, prev: number): number | null =>
+      prev > 0 ? ((cur - prev) / prev) * 100 : null
+    return {
+      total: pct(sum(last7, 'total'), sum(prev7, 'total')),
+      whatsapp: pct(sum(last7, 'whatsapp'), sum(prev7, 'whatsapp')),
+      telegram: pct(sum(last7, 'telegram'), sum(prev7, 'telegram')),
+      sparkTotal: last7.concat(prev7).map((d) => Number(d.total) || 0),
+      sparkWhatsapp: last7.concat(prev7).map((d) => Number(d.whatsapp) || 0),
+      sparkTelegram: last7.concat(prev7).map((d) => Number(d.telegram) || 0),
+    }
+  }, [deltaDaily])
+
+  // [NAV-SPY] scroll-spy — highlights the quick-nav chip of the section
+  // currently in view. A top band (rootMargin) decides "active": the section
+  // whose top edge crosses the upper 20–40% of the viewport wins. Sections
+  // missing from the DOM (hidden cards) are skipped silently.
+  useEffect(() => {
+    const els = NAV_SECTIONS.map((s) => document.getElementById(s.id)).filter(
+      (el): el is HTMLElement => el !== null
+    )
+    if (els.length === 0) return
+    const observer = new IntersectionObserver(
+      (entries) => {
+        for (const entry of entries) {
+          if (entry.isIntersecting) setActiveSection(entry.target.id)
+        }
+      },
+      { rootMargin: '-15% 0px -65% 0px', threshold: 0 }
+    )
+    els.forEach((el) => observer.observe(el))
+    return () => observer.disconnect()
+  }, [trendDaily, topGroups, topSenders, allLinks, quietSources.length])
+
+  // [NAV-SPY] keep the active chip visible inside the horizontal strip on
+  // narrow screens (auto-center it). RTL-safe: uses offsetLeft relative to
+  // the strip + scrollTo (no scrollIntoView → no page jump side-effects).
+  useEffect(() => {
+    const strip = navStripRef.current
+    if (!strip) return
+    const idx = NAV_SECTIONS.findIndex((s) => s.id === activeSection)
+    if (idx < 0) return
+    const chip = strip.children[idx] as HTMLElement | undefined
+    if (!chip) return
+    try {
+      const target = chip.offsetLeft - strip.clientWidth / 2 + chip.clientWidth / 2
+      strip.scrollTo({ left: target, behavior: 'smooth' })
+    } catch {
+      /* non-fatal — highlight alone is still correct */
+    }
+  }, [activeSection])
+
+  // [NAV-SPY] back-to-top visibility — appears once the operator scrolls
+  // past ~1.5 viewport heights.
+  useEffect(() => {
+    const onScroll = () => setShowBackToTop(window.scrollY > window.innerHeight * 1.5)
+    onScroll()
+    window.addEventListener('scroll', onScroll, { passive: true })
+    return () => window.removeEventListener('scroll', onScroll)
+  }, [])
+
   return (
     <div className="min-h-screen bg-gradient-to-br from-slate-950 via-slate-900 to-slate-950 text-white">
       <div className="fixed inset-0 overflow-hidden pointer-events-none">
@@ -793,25 +1033,35 @@ export default function Home() {
         {/* [NAV] Sticky quick-jump chips — the dashboard grew to ~10 cards;
             without navigation the operator scrolls blind. Chips anchor-jump
             to sections and stay pinned while scrolling (backdrop blur).
-            Horizontally scrollable on mobile via overflow-x-auto. */}
+            Horizontally scrollable on mobile via overflow-x-auto.
+            [NAV-SPY] the chip of the section currently in view gets the
+            emerald active style (scroll-spy via IntersectionObserver). */}
         <nav
           aria-label="التنقل السريع"
           className="sticky top-0 z-40 -mx-4 px-4 py-2 mb-5 bg-slate-950/80 backdrop-blur-md border-b border-slate-800/60"
         >
-          <div className="flex items-center gap-1.5 overflow-x-auto no-scrollbar">
-            {NAV_SECTIONS.map((s) => (
-              <a
-                key={s.id}
-                href={`#${s.id}`}
-                onClick={(e) => {
-                  e.preventDefault()
-                  document.getElementById(s.id)?.scrollIntoView({ behavior: 'smooth', block: 'start' })
-                }}
-                className="px-2.5 py-1 rounded-full text-[11px] font-medium text-slate-400 hover:text-white hover:bg-slate-800/80 border border-slate-700/50 whitespace-nowrap transition-colors flex-shrink-0"
-              >
-                {s.label}
-              </a>
-            ))}
+          <div ref={navStripRef} className="flex items-center gap-1.5 overflow-x-auto no-scrollbar">
+            {NAV_SECTIONS.map((s) => {
+              const active = activeSection === s.id
+              return (
+                <a
+                  key={s.id}
+                  href={`#${s.id}`}
+                  aria-current={active ? 'location' : undefined}
+                  onClick={(e) => {
+                    e.preventDefault()
+                    document.getElementById(s.id)?.scrollIntoView({ behavior: 'smooth', block: 'start' })
+                  }}
+                  className={`px-2.5 py-1 rounded-full text-[11px] font-medium whitespace-nowrap transition-all flex-shrink-0 border ${
+                    active
+                      ? 'bg-emerald-500/20 text-emerald-300 border-emerald-500/50 shadow-[0_0_12px_-2px_rgba(16,185,129,0.4)]'
+                      : 'text-slate-400 hover:text-white hover:bg-slate-800/80 border-slate-700/50'
+                  }`}
+                >
+                  {s.label}
+                </a>
+              )
+            })}
           </div>
         </nav>
 
@@ -929,6 +1179,9 @@ export default function Home() {
                 gradient="from-emerald-500/20 to-emerald-500/5"
                 iconColor="text-emerald-400"
                 onClick={() => setModal('all_links')}
+                delta={statDeltas?.total ?? null}
+                spark={statDeltas?.sparkTotal}
+                sparkColor="#34d399"
               />
               <StatCard
                 icon={<MessageCircle className="w-5 h-5" />}
@@ -937,6 +1190,9 @@ export default function Home() {
                 gradient="from-green-500/20 to-green-500/5"
                 iconColor="text-green-400"
                 onClick={() => setModal('whatsapp')}
+                delta={statDeltas?.whatsapp ?? null}
+                spark={statDeltas?.sparkWhatsapp}
+                sparkColor="#4ade80"
               />
               <StatCard
                 icon={<Send className="w-5 h-5" />}
@@ -945,6 +1201,9 @@ export default function Home() {
                 gradient="from-blue-500/20 to-blue-500/5"
                 iconColor="text-blue-400"
                 onClick={() => setModal('telegram')}
+                delta={statDeltas?.telegram ?? null}
+                spark={statDeltas?.sparkTelegram}
+                sparkColor="#60a5fa"
               />
               <StatCard
                 icon={<Users className="w-5 h-5" />}
@@ -1027,6 +1286,92 @@ export default function Home() {
               {/* [HEATMAP-VIEW] hour-of-day activity strip — WHEN do links
                   get posted? Peak hour highlighted in amber. */}
               {hourly.length > 0 && <HourlyStrip hourly={hourly} />}
+            </CardContent>
+          </Card>
+        )}
+
+        {/* [TARGET-VIEW] what KIND of targets flow through the capture
+            stream? Client-side classification of the latest /api/links
+            batch (up to 5,000): WhatsApp invites, private Telegram invites
+            (both DIRECTLY JOINABLE — the fleet can act on them), public
+            TG usernames, internal t.me/c/ links and other hosts. Live-data
+            validated: ~68% public usernames, ~19% WA invites, ~12% private
+            invites; links are ~100% unique (the card reports the unique
+            count so the operator knows the real target yield). */}
+        {targetStats.parsed > 0 && (
+          <Card id="sec-targets" className="bg-slate-800/30 border-slate-700/50 backdrop-blur-sm mb-6 scroll-mt-20">
+            <CardHeader className="pb-3">
+              <CardTitle className="flex items-center justify-between text-lg flex-wrap gap-2">
+                <span className="flex items-center gap-2">
+                  <Target className="w-5 h-5 text-teal-400" />
+                  تركيبة الأهداف الملتقطة
+                  <span className="text-xs text-slate-500 font-normal">
+                    (آخر {targetStats.parsed.toLocaleString()} رابط)
+                  </span>
+                </span>
+                <Badge className="bg-slate-700/50 text-slate-300 border-slate-600/40 text-[10px]">
+                  {targetStats.unique.toLocaleString()} هدف فريد
+                </Badge>
+              </CardTitle>
+            </CardHeader>
+            <CardContent>
+              <div className="space-y-3">
+                {TARGET_KINDS.map((meta, i) => {
+                  const count = targetStats.counts[meta.key]
+                  if (count === 0) return null
+                  const share = targetStats.parsed > 0 ? (count / targetStats.parsed) * 100 : 0
+                  const maxCount = Math.max(
+                    ...TARGET_KINDS.map((m) => targetStats.counts[m.key])
+                  )
+                  const width = maxCount > 0 ? Math.max(3, (count / maxCount) * 100) : 0
+                  return (
+                    <motion.div
+                      key={meta.key}
+                      initial={{ opacity: 0, x: 12 }}
+                      animate={{ opacity: 1, x: 0 }}
+                      transition={{ duration: 0.25, delay: i * 0.05 }}
+                      className="group"
+                      title={meta.hint}
+                    >
+                      <div className="flex items-center justify-between mb-1">
+                        <span className="flex items-center gap-2 text-xs text-slate-300">
+                          <span className={`w-2 h-2 rounded-full ${meta.dot}`} />
+                          {meta.label}
+                          <span className="text-slate-500 text-[10px] hidden sm:inline">
+                            {meta.hint}
+                          </span>
+                        </span>
+                        <span className={`text-xs font-bold ${meta.text}`}>
+                          {count.toLocaleString()}
+                          <span className="text-slate-500 font-normal mr-1.5">
+                            {share.toFixed(1)}%
+                          </span>
+                        </span>
+                      </div>
+                      <div className="h-2 rounded-full bg-slate-900/70 overflow-hidden">
+                        <motion.div
+                          initial={{ width: 0 }}
+                          animate={{ width: `${width}%` }}
+                          transition={{ duration: 0.5, delay: 0.1 + i * 0.05 }}
+                          className={`h-full rounded-full bg-gradient-to-l ${meta.bar}`}
+                        />
+                      </div>
+                    </motion.div>
+                  )
+                })}
+              </div>
+              {/* Joinable insight — the actionable yield: invite links the
+                  joiner fleet can act on immediately. */}
+              <div className="mt-4 p-3 rounded-xl border border-teal-500/30 bg-teal-950/20">
+                <p className="text-xs text-teal-200/90 leading-relaxed">
+                  <span className="font-bold">
+                    ⚡ قابلة للانضمام مباشرة: {targetStats.joinable.toLocaleString()} رابط
+                  </span>{' '}
+                  ({targetStats.joinablePct.toFixed(1)}% من الالتقاطات) — دعوات واتساب ودعوات
+                  تيليجرام الخاصة جاهزة لأسطول الانضمام فوراً، بينما تتطلب المعرّفات العامة
+                  تفتيشاً يدوياً.
+                </p>
+              </div>
             </CardContent>
           </Card>
         )}
@@ -1831,6 +2176,26 @@ export default function Home() {
         topSendersTotals={topSendersTotals}
         trendDays={trendDays}
       />
+
+      {/* [NAV-SPY] back-to-top — appears after ~1.5 viewport heights of
+          scrolling (the dashboard is long); smooth-scrolls home. Fixed to
+          the bottom-start corner, above content, below modals. */}
+      <AnimatePresence>
+        {showBackToTop && (
+          <motion.button
+            key="back-to-top"
+            initial={{ opacity: 0, y: 16, scale: 0.9 }}
+            animate={{ opacity: 1, y: 0, scale: 1 }}
+            exit={{ opacity: 0, y: 16, scale: 0.9 }}
+            transition={{ duration: 0.2 }}
+            onClick={() => window.scrollTo({ top: 0, behavior: 'smooth' })}
+            aria-label="العودة إلى الأعلى"
+            className="fixed bottom-6 left-6 z-40 w-11 h-11 rounded-full bg-emerald-600/90 hover:bg-emerald-500 text-white shadow-lg shadow-emerald-900/50 border border-emerald-400/30 flex items-center justify-center transition-colors"
+          >
+            <ArrowUp className="w-5 h-5" />
+          </motion.button>
+        )}
+      </AnimatePresence>
     </div>
   )
 }
@@ -2383,8 +2748,14 @@ function StatCard(props: {
   gradient: string
   iconColor: string
   onClick: () => void
+  // [DELTA-VIEW] period-over-period change (last 7d vs previous 7d, %).
+  // null/undefined → no badge (no baseline yet, e.g. watchers card).
+  delta?: number | null
+  // [DELTA-VIEW] mini sparkline series (14 points: prev-7 + last-7).
+  spark?: number[]
+  sparkColor?: string
 }) {
-  const { icon, label, value, gradient, iconColor, onClick } = props
+  const { icon, label, value, gradient, iconColor, onClick, delta, spark, sparkColor } = props
   // [STYLING] animated count-up — numbers roll smoothly on every refresh
   const animated = useCountUp(value)
   return (
@@ -2399,15 +2770,100 @@ function StatCard(props: {
           {/* subtle hover sheen */}
           <div className="absolute inset-0 bg-gradient-to-t from-white/5 to-transparent opacity-0 group-hover:opacity-100 transition-opacity pointer-events-none" />
           <div className="flex items-center justify-between">
-            <div>
+            <div className="min-w-0">
               <p className="text-slate-400 text-xs mb-1">{label}</p>
               <p className="text-2xl font-bold text-white">{animated.toLocaleString()}</p>
+              {/* [DELTA-VIEW] week-over-week badge — ▲ emerald / ▼ rose /
+                  flat slate. title carries the exact comparison. */}
+              {typeof delta === 'number' && Number.isFinite(delta) && (
+                <span
+                  title={`مقارنةً بـ7 أيام السابقة: ${delta >= 0 ? '+' : ''}${delta.toFixed(1)}%`}
+                  className={`inline-flex items-center gap-0.5 mt-1.5 px-1.5 py-0.5 rounded-md text-[10px] font-bold border ${
+                    Math.abs(delta) < 1
+                      ? 'bg-slate-700/40 text-slate-400 border-slate-600/40'
+                      : delta > 0
+                        ? 'bg-emerald-500/15 text-emerald-400 border-emerald-500/30'
+                        : 'bg-rose-500/15 text-rose-400 border-rose-500/30'
+                  }`}
+                >
+                  {Math.abs(delta) < 1
+                    ? '–'
+                    : delta > 0
+                      ? '▲'
+                      : '▼'}{' '}
+                  {Math.abs(delta) < 1 ? 'ثابت' : `${Math.abs(delta).toFixed(0)}%`}
+                </span>
+              )}
             </div>
-            <div className={`${iconColor} opacity-80 group-hover:opacity-100 group-hover:scale-110 transition-all`}>{icon}</div>
+            <div className="flex flex-col items-end gap-1.5">
+              <div className={`${iconColor} opacity-80 group-hover:opacity-100 group-hover:scale-110 transition-all`}>{icon}</div>
+              {/* [DELTA-VIEW] sparkline — last 14 days of this metric; the
+                  right half (recent week) is emphasized, the left half is
+                  the baseline week at 55% opacity. */}
+              {spark && spark.length >= 2 && (
+                <Sparkline values={spark} color={sparkColor ?? '#34d399'} className="opacity-70 group-hover:opacity-100 transition-opacity" />
+              )}
+            </div>
           </div>
         </CardContent>
       </Card>
     </button>
+  )
+}
+
+// ===== Sparkline — [DELTA-VIEW] tiny inline SVG trend (14 points) =====
+function Sparkline(props: {
+  values: number[]
+  color?: string
+  width?: number
+  height?: number
+  className?: string
+}) {
+  const { values, color = '#34d399', width = 76, height = 26, className } = props
+  const n = values.length
+  if (n < 2) return null
+  const max = Math.max(...values)
+  const min = Math.min(...values)
+  const range = max - min || 1
+  // x grows left→right (works fine in RTL context — time flows naturally)
+  const pts = values.map((v, i) => {
+    const x = (i / (n - 1)) * (width - 2) + 1
+    const y = height - 3 - ((v - min) / range) * (height - 6)
+    return [x, y] as const
+  })
+  const line = pts.map(([x, y]) => `${x.toFixed(1)},${y.toFixed(1)}`).join(' ')
+  const baseline = pts.slice(0, Math.floor(n / 2)) // previous week
+  const baselineLine = baseline.map(([x, y]) => `${x.toFixed(1)},${y.toFixed(1)}`).join(' ')
+  const area = `1,${height - 2} ${line} ${width - 1},${height - 2}`
+  return (
+    <svg
+      width={width}
+      height={height}
+      viewBox={`0 0 ${width} ${height}`}
+      className={className}
+      aria-hidden="true"
+      focusable="false"
+    >
+      <polygon points={area} fill={color} opacity={0.12} />
+      <polyline
+        points={baselineLine}
+        fill="none"
+        stroke={color}
+        strokeWidth={1.4}
+        strokeLinecap="round"
+        strokeLinejoin="round"
+        opacity={0.45}
+      />
+      <polyline
+        points={line}
+        fill="none"
+        stroke={color}
+        strokeWidth={1.8}
+        strokeLinecap="round"
+        strokeLinejoin="round"
+      />
+      <circle cx={pts[n - 1][0]} cy={pts[n - 1][1]} r={1.8} fill={color} />
+    </svg>
   )
 }
 
