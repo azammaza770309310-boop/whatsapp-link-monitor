@@ -3,6 +3,7 @@
 import { useState, useEffect, useCallback, useMemo, useRef } from 'react'
 import { motion, AnimatePresence, MotionConfig } from 'framer-motion'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
+import DeletedLinksPanel from '@/components/deleted-links-panel'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
@@ -326,6 +327,7 @@ const NAV_SECTIONS: { id: string; label: string }[] = [
   { id: 'sec-ai', label: 'الذكاء' },
   { id: 'sec-monitored', label: 'المراقبة' },
   { id: 'sec-joiners', label: 'الفدائيون' },
+  { id: 'sec-deleted', label: 'المحذوفة' },
 ]
 
 // ===== Constants =====
@@ -2418,6 +2420,20 @@ export default function Home() {
             )}
           </CardContent>
         </Card>
+
+        {/* [DELETED-LINKS] admin-moderated deleted-links panel — the star
+            feature: persistent SQLite table on the Render backend +
+            /api/deleted_links CRUD; this panel reads/writes via that
+            endpoint. See src/components/deleted-links-panel.tsx. */}
+        <motion.div
+          initial={{ opacity: 0, y: 12 }}
+          animate={{ opacity: 1, y: 0 }}
+          transition={{ duration: 0.35 }}
+        >
+          <section id="sec-deleted" className="mb-6 scroll-mt-20">
+            <DeletedLinksPanel />
+          </section>
+        </motion.div>
 
         {/* Recent Links Preview */}
         <Card className="bg-slate-800/30 border-slate-700/50 backdrop-blur-sm">

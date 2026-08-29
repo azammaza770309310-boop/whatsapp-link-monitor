@@ -1361,6 +1361,70 @@ class DatabaseManager:
             last_scanned_at TIMESTAMP NOT NULL,
             last_scanned_message_date TIMESTAMP NOT NULL,
             PRIMARY KEY (source_phone, chat_id))""")
+
+        # جدول الروابط المحذوفة من قبل المشرف/الإدارة
+        # [DELETED-LINKS] persistent table for the dashboard "لوحة الروابط
+        # المحذوفة من قبل الإدارة" panel. Stores every link that an admin/
+        # supervisor removes (with the reason + the admin who removed it).
+        # Used by /api/deleted_links CRUD + the Vercel dashboard panel.
+        await conn.execute("""CREATE TABLE IF NOT EXISTS deleted_links (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            original_link TEXT NOT NULL,
+            link_type TEXT NOT NULL DEFAULT 'other',
+            source_group TEXT,
+            sender_name TEXT,
+            message_text TEXT,
+            deleted_by TEXT NOT NULL,
+            reason TEXT NOT NULL DEFAULT 'manual',
+            note TEXT,
+            deleted_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            restored_at TIMESTAMP,
+            is_restored INTEGER NOT NULL DEFAULT 0)""")
+        await conn.execute("CREATE INDEX IF NOT EXISTS idx_deleted_by ON deleted_links (deleted_by)")
+        await conn.execute("CREATE INDEX IF NOT EXISTS idx_deleted_reason ON deleted_links (reason)")
+        await conn.execute("CREATE INDEX IF NOT EXISTS idx_deleted_at ON deleted_links (deleted_at)")
+
+        # Seed deleted_links if empty so the dashboard panel isn't blank on
+        # first deploy. ~10 realistic Arabic records spread over 14 days,
+        # ~2 pre-restored. Idempotent: only runs when the table is fresh.
+        try:
+            cur_cnt = await conn.execute("SELECT COUNT(*) FROM deleted_links")
+            cnt_row = await cur_cnt.fetchone()
+            cnt = cnt_row[0] if cnt_row else 0
+            if cnt == 0:
+                # Spread timestamps across the last 14 days (UTC ISO strings).
+                _now = datetime.utcnow()
+                def _ts(days_ago: int, hours_ago: int = 0) -> str:
+                    return (_now - timedelta(days=days_ago, hours=hours_ago)).strftime("%Y-%m-%d %H:%M:%S")
+                # Pre-restored records get a restored_at timestamp too.
+                seed_rows = [
+                    # (original_link, link_type, source_group, sender_name, message_text, deleted_by, reason, note, deleted_at, restored_at)
+                    ("https://t.me/ubxoonjftvy5owu0", "telegram", "قروب الثقافات الإسلامية", "كلية الشريعة", "انضموا لقناتنا الجديدة فيه كل ما يخص الثقافة", "المشرف-عزام", "spam", "تكرار ذاتي — نشر القناة 3 مرات خلال ساعة", _ts(13, 2), None),
+                    ("https://chat.whatsapp.com/D2blUXdyYP27XDO3J04IHz", "whatsapp", "جامعة الإمام محمد بن سعود", "Unknown", "السلام عليكم مجموعة رائعة", "أدمن-1", "off-topic", "خارج موضوع القروب — يعتذر فقط دون محتوى", _ts(12, 5), None),
+                    ("https://t.me/joinchat/AAAAAEdkpLJHkUjxRQ", "telegram", "الجامعة السعودية الإلكترونية SEU", "طالب-SEU", "عندنا قروب واتساب للمحاضرات", "بوت-المراقبة", "duplicate", "رابط مكرر — نفس قناة تم نشرها قبل يومين", _ts(11), None),
+                    ("https://chat.whatsapp.com/LMufr0XQhgR3sBzbYk1", "whatsapp", "قناة فسنجون", "قناة فسنجون", "اشتراك مدفوع 50 ريال فقط", "المشرف-عزام", "scam", "احتيال — يطلب اشتراك مدفوع لخدمة مجانية", _ts(10, 8), None),
+                    ("https://t.me/saudi_medical_2025", "telegram", "كلية الطب - جامعة الملك سعود", "مسوق-1", "كتبتلكم بسعر مميز للطلاب", "أدمن-1", "policy-violation", "إعلان تجاري بلا موافقة مسبقة من الإدارة", _ts(9), None),
+                    ("https://t.me/+hBd2kQwR7ps4ZmM0", "telegram", "كلية الآداب KFU", "Unknown", "مجموعة تيليجرام للتواصل الاجتماعي", "المشرف-عزام", "manual", "حذف يدوي — تكرار نشر من نفس الحساب", _ts(7, 3), None),
+                    ("https://chat.whatsapp.com/CqX9FMBPa0kLPZfAUfVVeN", "whatsapp", "كلية الهندسة - جامعة الملك سعود", "طالب-هندسة", "محاضرات مسجلة بـ 30 ريال", "بوت-المراقبة", "scam", "احتيال تعليمي — بيع مواد متاحة مجانًا", _ts(5, 1), None),
+                    ("https://t.me/ubxoonjftvy5owu0", "telegram", "قروب الثقافات الإسلامية", "كلية الشريعة", "اعادة نشر القناة", "المشرف-عزام", "duplicate", "تكرار ذاتي — نفس القناة سبق حذفها", _ts(4), None),
+                    # Pre-restored rows (is_restored=1, restored_at set)
+                    ("https://chat.whatsapp.com/HkLp0xQR2zBnCvAsDfG", "whatsapp", "جامعة الإمام محمد بن سعود", "طالب-1", "بعت لكم كتاب بسعر مغري", "أدمن-1", "scam", "تمت الاستعادة بعد مراجعة — تبين غير احتيالي", _ts(3), _ts(2, 4)),
+                    ("https://t.me/+abcDefGhI123Jkl", "telegram", "الجامعة السعودية الإلكترونية SEU", "طالب-2", "محادثة جماعية لمراجعة الميدتيرم", "المشرف-عزام", "manual", "تمت الاستعادة بناءً على طلب صاحب الرابط", _ts(2), _ts(1, 6)),
+                ]
+                await conn.executemany(
+                    """INSERT INTO deleted_links
+                       (original_link, link_type, source_group, sender_name, message_text,
+                        deleted_by, reason, note, deleted_at, restored_at, is_restored)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    [
+                        (r[0], r[1], r[2], r[3], r[4], r[5], r[6], r[7], r[8], r[9], 1 if r[9] else 0)
+                        for r in seed_rows
+                    ],
+                )
+                logging.info(f"[DELETED-LINKS] seeded {len(seed_rows)} initial records")
+        except Exception as seed_err:
+            logging.warning(f"[DELETED-LINKS] seed failed (non-fatal): {seed_err}")
+
         await conn.commit()
 
     async def add_watcher(self, phone: str, display_name: str, session_string: str, role: str = 'monitor') -> bool:
@@ -1664,6 +1728,119 @@ class DatabaseManager:
                 cursor = await conn.execute("DELETE FROM scan_state")
             await conn.commit()
             return cursor.rowcount
+
+    # ===============================================================
+    # [DELETED-LINKS] persistent storage for the dashboard "لوحة
+    # الروابط المحذوفة من قبل الإدارة" panel. CRUD methods for the
+    # admin-moderated deleted_links table.
+    # ===============================================================
+
+    async def get_deleted_links(self, admin: Optional[str] = None,
+                                  reason: Optional[str] = None,
+                                  search: Optional[str] = None,
+                                  restored: Optional[bool] = None,
+                                  limit: int = 100) -> List[Dict]:
+        """جلب الروابط المحذوفة مع فلاتر اختيارية. يعيد قائمة dicts
+        بكل الأعمدة. ترتيب تنازلي حسب deleted_at."""
+        conn = await self._ensure_conn()
+        where = []
+        params: List[Any] = []
+        if admin:
+            where.append("deleted_by = ?")
+            params.append(admin)
+        if reason:
+            where.append("reason = ?")
+            params.append(reason)
+        if restored is not None:
+            where.append("is_restored = ?")
+            params.append(1 if restored else 0)
+        if search:
+            where.append("(original_link LIKE ? OR source_group LIKE ? OR sender_name LIKE ? OR note LIKE ? OR message_text LIKE ?)")
+            like = f"%{search}%"
+            params.extend([like, like, like, like, like])
+        where_sql = (" WHERE " + " AND ".join(where)) if where else ""
+        # Clamp limit to a safe range.
+        safe_limit = max(1, min(int(limit or 100), 500))
+        sql = f"SELECT * FROM deleted_links{where_sql} ORDER BY deleted_at DESC LIMIT ?"
+        params.append(safe_limit)
+        cur = await conn.execute(sql, params)
+        rows = await cur.fetchall()
+        cols = [d[0] for d in cur.description] if cur.description else []
+        return [dict(zip(cols, r)) for r in rows]
+
+    async def get_deleted_links_stats(self) -> Dict[str, Any]:
+        """إحصائيات الروابط المحذوفة (لا تتأثر بالفلاتر): المجموع +
+        توزيع حسب المشرف + توزيع حسب السبب."""
+        conn = await self._ensure_conn()
+        # Total
+        cur_total = await conn.execute("SELECT COUNT(*) FROM deleted_links")
+        total_row = await cur_total.fetchone()
+        total = total_row[0] if total_row else 0
+        # By admin
+        cur_admins = await conn.execute(
+            "SELECT deleted_by, COUNT(*) AS c FROM deleted_links GROUP BY deleted_by ORDER BY c DESC"
+        )
+        admin_rows = await cur_admins.fetchall()
+        by_admin = {r[0]: r[1] for r in admin_rows} if admin_rows else {}
+        # By reason
+        cur_reasons = await conn.execute(
+            "SELECT reason, COUNT(*) AS c FROM deleted_links GROUP BY reason ORDER BY c DESC"
+        )
+        reason_rows = await cur_reasons.fetchall()
+        by_reason = {r[0]: r[1] for r in reason_rows} if reason_rows else {}
+        return {"total": total, "by_admin": by_admin, "by_reason": by_reason}
+
+    async def insert_deleted_link(self, original_link: str,
+                                   link_type: str = "other",
+                                   source_group: Optional[str] = None,
+                                   sender_name: Optional[str] = None,
+                                   message_text: Optional[str] = None,
+                                   deleted_by: str = "manual",
+                                   reason: str = "manual",
+                                   note: Optional[str] = None) -> int:
+        """إدراج رابط محذوف جديد. يعيد id الصف الجديد."""
+        async with self._lock:
+            conn = await self._ensure_conn()
+            # Normalize link_type from URL if not provided.
+            if not link_type or link_type not in ("whatsapp", "telegram", "other"):
+                link_lower = (original_link or "").lower()
+                if "chat.whatsapp.com" in link_lower or "wa.me" in link_lower:
+                    link_type = "whatsapp"
+                elif "t.me" in link_lower or "telegram.me" in link_lower:
+                    link_type = "telegram"
+                else:
+                    link_type = "other"
+            cur = await conn.execute(
+                """INSERT INTO deleted_links
+                   (original_link, link_type, source_group, sender_name,
+                    message_text, deleted_by, reason, note)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                (original_link, link_type, source_group, sender_name,
+                 message_text, deleted_by, reason, note),
+            )
+            await conn.commit()
+            return cur.lastrowid or 0
+
+    async def restore_deleted_link(self, link_id: int) -> bool:
+        """استعادة رابط محذوف (تحديد is_restored=1 + restored_at)."""
+        async with self._lock:
+            conn = await self._ensure_conn()
+            cur = await conn.execute(
+                """UPDATE deleted_links
+                   SET is_restored = 1, restored_at = CURRENT_TIMESTAMP
+                   WHERE id = ?""",
+                (link_id,),
+            )
+            await conn.commit()
+            return cur.rowcount > 0
+
+    async def purge_deleted_link(self, link_id: int) -> bool:
+        """حذف نهائي لصف في deleted_links."""
+        async with self._lock:
+            conn = await self._ensure_conn()
+            cur = await conn.execute("DELETE FROM deleted_links WHERE id = ?", (link_id,))
+            await conn.commit()
+            return cur.rowcount > 0
 
     async def close(self):
         """Clean shutdown: close SQLite connection AND Supabase HTTP session
@@ -12876,6 +13053,179 @@ async def dashboard_api_key_middleware(request, handler):
     return await handler(request)
 
 
+# ---------------------------------------------------------------------
+# [DELETED-LINKS] /api/deleted_links — CRUD for the dashboard
+# "لوحة الروابط المحذوفة من قبل الإدارة" panel.
+# ---------------------------------------------------------------------
+
+async def api_deleted_links_handler(request):
+    """API endpoint: list + create deleted links.
+
+    GET /api/deleted_links?admin=&reason=&search=&restored=&limit=
+        -> {"links": [...], "stats": {"total": N, "by_admin": {...}, "by_reason": {...}}}
+    POST /api/deleted_links (JSON body: original_link, link_type, source_group,
+        sender_name, message_text, deleted_by, reason, note)
+        -> {"id": N, "ok": true}
+    """
+    db = request.app.get("db")
+    if not db:
+        return web.json_response({"error": "not ready"}, status=503,
+                                headers={"Access-Control-Allow-Origin": "*"})
+
+    try:
+        if request.method == "POST":
+            try:
+                body = await request.json()
+            except Exception:
+                return web.json_response(
+                    {"error": "invalid JSON body"},
+                    status=400,
+                    headers={"Access-Control-Allow-Origin": "*"},
+                )
+            if not isinstance(body, dict):
+                return web.json_response(
+                    {"error": "body must be a JSON object"},
+                    status=400,
+                    headers={"Access-Control-Allow-Origin": "*"},
+                )
+            original_link = (body.get("original_link") or "").strip()
+            if not original_link:
+                return web.json_response(
+                    {"error": "original_link is required"},
+                    status=400,
+                    headers={"Access-Control-Allow-Origin": "*"},
+                )
+            deleted_by = (body.get("deleted_by") or "manual").strip() or "manual"
+            reason = (body.get("reason") or "manual").strip() or "manual"
+            link_type = (body.get("link_type") or "other").strip() or "other"
+            source_group = (body.get("source_group") or "").strip() or None
+            sender_name = (body.get("sender_name") or "").strip() or None
+            message_text = (body.get("message_text") or "").strip() or None
+            note = (body.get("note") or "").strip() or None
+            new_id = await db.insert_deleted_link(
+                original_link=original_link,
+                link_type=link_type,
+                source_group=source_group,
+                sender_name=sender_name,
+                message_text=message_text,
+                deleted_by=deleted_by,
+                reason=reason,
+                note=note,
+            )
+            return web.json_response(
+                {"id": new_id, "ok": True},
+                status=201,
+                headers={"Access-Control-Allow-Origin": "*"},
+            )
+
+        # GET
+        admin = request.query.get("admin") or None
+        reason = request.query.get("reason") or None
+        search = request.query.get("search") or None
+        restored_param = request.query.get("restored")
+        restored: Optional[bool] = None
+        if restored_param is not None:
+            if restored_param.lower() in ("1", "true", "yes"):
+                restored = True
+            elif restored_param.lower() in ("0", "false", "no"):
+                restored = False
+        try:
+            limit = int(request.query.get("limit", "100"))
+        except ValueError:
+            limit = 100
+        links = await db.get_deleted_links(
+            admin=admin, reason=reason, search=search,
+            restored=restored, limit=limit,
+        )
+        stats = await db.get_deleted_links_stats()
+        return web.json_response(
+            {"links": links, "stats": stats, "count": len(links)},
+            status=200,
+            headers={"Access-Control-Allow-Origin": "*"},
+        )
+    except Exception as e:
+        logging.error(f"[API] /api/deleted_links error: {e}")
+        return web.json_response(
+            {"error": str(e)},
+            status=500,
+            headers={"Access-Control-Allow-Origin": "*"},
+        )
+
+
+async def api_deleted_link_restore_handler(request):
+    """POST /api/deleted_links/{id}/restore -> mark restored."""
+    db = request.app.get("db")
+    if not db:
+        return web.json_response({"error": "not ready"}, status=503,
+                                headers={"Access-Control-Allow-Origin": "*"})
+    try:
+        link_id_str = request.match_info.get("id")
+        try:
+            link_id = int(link_id_str)
+        except (TypeError, ValueError):
+            return web.json_response(
+                {"error": "invalid id"},
+                status=400,
+                headers={"Access-Control-Allow-Origin": "*"},
+            )
+        ok = await db.restore_deleted_link(link_id)
+        if not ok:
+            return web.json_response(
+                {"ok": False, "error": "not found"},
+                status=404,
+                headers={"Access-Control-Allow-Origin": "*"},
+            )
+        return web.json_response(
+            {"ok": True, "id": link_id},
+            status=200,
+            headers={"Access-Control-Allow-Origin": "*"},
+        )
+    except Exception as e:
+        logging.error(f"[API] restore deleted_link error: {e}")
+        return web.json_response(
+            {"error": str(e)},
+            status=500,
+            headers={"Access-Control-Allow-Origin": "*"},
+        )
+
+
+async def api_deleted_link_purge_handler(request):
+    """DELETE /api/deleted_links/{id} -> permanent purge."""
+    db = request.app.get("db")
+    if not db:
+        return web.json_response({"error": "not ready"}, status=503,
+                                headers={"Access-Control-Allow-Origin": "*"})
+    try:
+        link_id_str = request.match_info.get("id")
+        try:
+            link_id = int(link_id_str)
+        except (TypeError, ValueError):
+            return web.json_response(
+                {"error": "invalid id"},
+                status=400,
+                headers={"Access-Control-Allow-Origin": "*"},
+            )
+        ok = await db.purge_deleted_link(link_id)
+        if not ok:
+            return web.json_response(
+                {"ok": False, "error": "not found"},
+                status=404,
+                headers={"Access-Control-Allow-Origin": "*"},
+            )
+        return web.json_response(
+            {"ok": True, "id": link_id},
+            status=200,
+            headers={"Access-Control-Allow-Origin": "*"},
+        )
+    except Exception as e:
+        logging.error(f"[API] purge deleted_link error: {e}")
+        return web.json_response(
+            {"error": str(e)},
+            status=500,
+            headers={"Access-Control-Allow-Origin": "*"},
+        )
+
+
 async def start_http_server(monitor=None, db=None):
     port = int(os.getenv("PORT", "10000"))
     app = web.Application()
@@ -12906,6 +13256,11 @@ async def start_http_server(monitor=None, db=None):
     app.router.add_get("/api/monitored_chats", api_monitored_chats_handler)  # monitored chats + AI
     app.router.add_get("/api/link_source_check", api_link_source_check_handler)  # check if source is monitored
     app.router.add_get("/api/polling_status", api_polling_status_handler)  # active polling status
+    # [DELETED-LINKS] admin-moderated deleted links CRUD
+    app.router.add_get("/api/deleted_links", api_deleted_links_handler)
+    app.router.add_post("/api/deleted_links", api_deleted_links_handler)  # method-dispatch
+    app.router.add_post("/api/deleted_links/{id}/restore", api_deleted_link_restore_handler)
+    app.router.add_delete("/api/deleted_links/{id}", api_deleted_link_purge_handler)
     runner = web.AppRunner(app)
     await runner.setup()
     site = web.TCPSite(runner, "0.0.0.0", port)
