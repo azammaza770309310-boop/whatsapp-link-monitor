@@ -1019,15 +1019,19 @@ class DatabaseManager:
             logging.error(f"Supabase watcher exception: {e}")
 
     async def _supabase_get_watchers(self):
-        """جلب الحسابات من Supabase — يتضمن role"""
+        """جلب الحسابات من Supabase — يتضمن role + joiner_enabled.
+        [FIX-JOINER-FILTER] joiner_enabled مطلوب الآن في الـselect لكي
+        get_active_watchers/get_watchers_by_role يُرجع القيمة الحقيقية بدلاً
+        من default=1 — بدون هذا، الـpre-filter في _joiner_worker وفleet_health
+        يفشل في استبعاد joiners المعطّلة فيستمر مسار JOINER_DISABLED المهدر."""
         if not self.supabase_url or not self.supabase_key:
             logging.info("[SUPABASE] No SUPABASE_URL/KEY — using local SQLite only")
             return None  # استخدم المحلي
         try:
             session = await self._get_supabase_session()
-            # جرب مع role أولاً
+            # جرب مع role + joiner_enabled أولاً
             async with session.get(
-                f"{self.supabase_url}/rest/v1/watchers?is_active=eq.true&select=phone,display_name,session_string,role"
+                f"{self.supabase_url}/rest/v1/watchers?is_active=eq.true&select=phone,display_name,session_string,role,joiner_enabled"
             ) as resp:
                 if resp.status == 200:
                     data = await resp.json()
@@ -1035,13 +1039,14 @@ class DatabaseManager:
                         for w in data:
                             if 'role' not in w or not w['role']:
                                 w['role'] = 'monitor'
-                        logging.info(f"[SUPABASE] Loaded {len(data)} watchers from Supabase (with role)")
+                            w.setdefault('joiner_enabled', 1)
+                        logging.info(f"[SUPABASE] Loaded {len(data)} watchers from Supabase (with role+joiner_enabled)")
                         return data
                     logging.warning("[SUPABASE] Watchers table empty (is_active=eq.true returned [])")
                     return []
                 elif resp.status == 400:
-                    # role column might not exist — try without it
-                    logging.warning("[SUPABASE] role column missing — trying without role")
+                    # role/joiner_enabled column might not exist — try without them
+                    logging.warning("[SUPABASE] role/joiner_enabled column missing — trying with minimal select")
                     async with session.get(
                         f"{self.supabase_url}/rest/v1/watchers?is_active=eq.true&select=phone,display_name,session_string"
                     ) as resp2:
