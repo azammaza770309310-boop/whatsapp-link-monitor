@@ -2062,3 +2062,144 @@ Stage Summary:
   * مراقبة `link_queue_pending` — لو ظل 61+ يزداد، السبب fleet degradation (1 disconnected account)
   * التحقق من الحساب المُنفصل: متابعة `/ready` fleet_health.disconnected_joiners_count
   * rotate الـGitHub PAT بعد التأكد من استقرار النشر (تم استخدام token مؤقت في session).
+
+---
+Task ID: RACE-CAPTURE-DIAG
+Agent: main (continuation)
+Task: فحص الكود وGit history وتقديم تشخيص دقيق للمسار الحالي قبل تعديل أي شيء، لتحقيق "Capture First → Snapshot Immediately → Filter/Extract → Send" دون انتظار deletion event.
+
+Work Log:
+- فحصت `/home/z/wlm-prod-check/bot.py` (13685 سطر) + `request_filter.py` (259) + `link_system.py` (1707).
+- راجعت Git log: آخر commit `c27867f FIX(FAST-CAPTURE): synchronous LRB pre-write before any await + wider reconcile`.
+- `git status`: تعديلات غير ملتزمة في bot.py + render.yaml + ملفات جديدة request_filter.py + verify_request_filter.py (من session سابق).
+- وضعت التغييرات في stash لإنشاء baseline نظيف، شغّلت الاختبارات: 404/404 تمر (باستثناء test_audit_regressions و test_api_security — فشلات مسبقة غير مرتبطة).
+- أعدت التغييرات (stash pop): ظهرت انكسارات جديدة: test_delete_rescue 3 و 7، test_raw_hook، test_fast_delete_rescue_evidence (25/25 MISSED — كارثة!)، test_link_capture، test_message_journal.
+
+Diagnosis — المسار الحالي في `_on_user_message` (bot.py:5485):
+  T0: event يصل
+  T0+ε: snapshot تزامني (raw_text, chat_id, msg_id, sender_id) من event  ← صحيح
+  T0+ε: فحص الصدى للقناة الرئيسية (chat_id == channel_id)  ← صحيح
+  T0+ε: فحص الصدى لقناة الطلبات `_rtc = self.config.requests_target_channel`  ← **هنا الخلل**: وصول مباشر non-defensive
+  T0+ε: فحص لا-نص
+  T0+ε: STEP 0 — LINK-ONLY FAST CAPTURE: استخراج روابط تزامني + كتابة LRB dict تزامنية  ← snapshot الرابط (سليم)
+  T1: PRE-CACHE: استخراج chat/sender تزامني + كتابة _msg_cache (async lock)
+  T2: await _journal_write  ← SQLite INSERT (قد يكون بطيئًا تحت ضغط)
+  T3: **مسار الطلبات** `await self._handle_request_path(...)`  ← **هنا الخلل #2**: يحدث بعد journal_write
+  T4: LINK PIPELINE (re-extract, claim, enqueue, mark processed)
+
+Root cause #1 (انكسار الاختبارات):
+  السطر `self.config.requests_target_channel` (bot.py:5504) يرمي AttributeError على الـ fake configs
+  في الاختبارات الحالية (test_delete_rescue / test_raw_hook / test_fast_delete_rescue_evidence /
+  test_link_capture / test_message_journal) لأنها أُنشئت قبل إضافة ميزة requests_target_channel.
+  AttributeError يُلتقط بواسطة outer try/except في L5498→L5793، فيُحبط `_on_user_message` قبل
+  الوصول إلى LINK-ONLY FAST CAPTURE → LRB/cache/journal/queue لا تُملأ → فشل متسلسل:
+  - test_fast_delete_rescue_evidence: 25/25 MISSED (LRB فارغ دائمًا)
+  - test_delete_rescue test 3: "got 0" + "metric not called"
+  - test_delete_rescue test 7: crash في set_group_state (لأن enqueue_link يرى الرابط جديدًا
+    بينما كان يجب أن يراه مكررًا لو _on_user_message أكمل مساره)
+  - test_raw_hook / test_link_capture / test_message_journal: فشلات مشابهة
+
+Root cause #2 (طلب المستخدم الجديد):
+  `_handle_request_path` يُستدعى بعد `await self._journal_write` (T3 بعد T2). journal_write عملية
+  SQLite I/O قد تستغرق 10-100ms+ تحت ضغط. لو Bot/Admin حذف الرسالة خلال هذا الـawait،
+  MessageDeleted event يلتقطه event loop، لكن `_handle_request_path` لم يُستدعع بعد → لا تنبيه طلب أُرسل.
+
+Verification statement (التحقق من القنوات):
+  - render.yaml: `REQUESTS_TARGET_CHANNEL = "@dhkskwksjskwk"` (صيغة @username)  ← مؤكدة
+  - render.yaml: `CHANNEL_ID` with `sync: false` (يُدار من Render dashboard)  ← لم تُلمس
+  - كلا المسارين مستقلان: Request Filter → REQUESTS_TARGET_CHANNEL، Link Extractor → CHANNEL_ID.
+
+Minimal fix plan (أقل تعديل ممكن، لا architecture redesign):
+  1. جعل الوصول لـrequests_target_channel دفاعيًا (getattr default=0) في 3 مواضع:
+     - bot.py:5504 (echo check في _on_user_message)
+     - bot.py:5807 (داخل _handle_request_path)
+  2. جعل الوصول لـbot_client دفاعيًا (getattr default=None) في _handle_request_path (bot.py:5904).
+  3. إعادة ترتيب: تقسيم LINK-ONLY FAST CAPTURE إلى:
+     - 0a (تزامني): استخراج روابط + كتابة LRB dict (snapshot الرابط — microseconds)
+     - **مسار الطلبات** (مُستدعى هنا، قبل أي async housekeeping أو journal_write)
+     - 0b (async housekeeping): _link_ring_put (cap enforcement) + metrics
+  4. لا حذف ولا تغيير منطق Link Extractor الأساسي، لا تغيير REQUEST_KEYWORDS/ADVERTISEMENT_KEYWORDS.
+  5. لا sleep، لا retry طويل، FloodWait كما هو.
+
+Stage Summary:
+- **التشخيص اكتمل**. السبب الجذري للانكسارات: سطر واحد non-defensive (`self.config.requests_target_channel`) يُحبط `_on_user_message` قبل التقاط الروابط في الاختبارات.
+- **طلب المستخدم الجديد**: نقل `_handle_request_path` قبل journal_write. الحل: تقسيم LFC + نقل الاستدعاء.
+- **القنوات**: @dhkskwksjskwk ما زالت قناة الطلبات، CHANNEL_ID لم تُلمس.
+- **لا commit بعد** — بانتظار تنفيذ الإصلاح + الاختبارات + AST + git diff.
+
+---
+Task ID: RACE-CAPTURE-IMPL
+Agent: main (continuation)
+Task: تنفيذ "Capture First → Snapshot Immediately → Filter/Extract → Send" بأقل تعديل ممكن + اختبار race/deletion simulation + التحقق من القنوات + AST + git diff + commit/push.
+
+Work Log:
+- **التعديل 1 (getattr دفاعي في فحص الصدى)**: bot.py:5504 — استبدلت
+  `self.config.requests_target_channel` بـ`getattr(self.config, 'requests_target_channel', 0)`.
+  هذا يمنع AttributeError على الـfake configs القديمة ويُبقي `_on_user_message`
+  يُكمّل مساره حتى لو السمة غير موجودة (اختبارات/Mock/TDD).
+- **التعديل 2 (تقسيم LINK-ONLY FAST CAPTURE + نقل مسار الطلبات)**: bot.py:5532-5588
+  - الخطوة 0 (الأصلية) → قُسّمت إلى:
+    - 0a: snapshot تزامني (extract_links + LRB dict assign) — microseconds، قبل أي await.
+    - 0a.5: مسار الطلبات `await self._handle_request_path(...)` — **نُقل هنا من
+      بعد journal_write إلى قبلها** (Capture First).
+    - 0b: async housekeeping (_link_ring_put cap + metrics) — مؤجلة عن snapshot
+      وعن إرسال تنبيه الطلبات.
+- **التعديل 3 (حذف الاستدعاء القديم لمسار الطلبات)**: bot.py:5650-5654 — استُبدل
+  الاستدعاء بعد journal_write بتعليق توثيقي يشرح أن المسار نُقل أعلاه.
+- **التعديل 4 (getattr دفاعي داخل _handle_request_path)**:
+  - `target = getattr(self.config, 'requests_target_channel', 0)` بدل الوصول المباشر.
+  - `_bot_client = getattr(self, 'bot_client', None)` بدل `self.bot_client` المباشر
+    (في الاستدعاء الرئيسي وفي مسار إعادة المحاولة FloodWait).
+  - أضفت docstring يوضح [RACE-CAPTURE]: لا API إضافي، لا get_messages، لا re-fetch،
+    event.chat/event.sender تُقرأ تزامنياً، fallback 'غير متوفر' لكل حقل.
+- **التعديل 5 (اختبار جديد)**: `tests/test_request_filter_race_rescue.py` (28KB) —
+  7 اختبارات / 23 تأكيدًا:
+  1. Request Filter يُرسل حتى لو event.chat/event.sender=None (محاكاة اختفاء الكيانات).
+  2. Request Filter يُرسل BEFORE journal_write (تحقق ترتيب بالـtimestamps).
+  3. snapshot الرابط في LRB قبل أي await.
+  4. مسارا الطلب والرابط مستقلان (scenario A: طلب+رابط=إعلان لا تنبيه لكن الرابط يُرسل؛
+     scenario B: طلب بلا رابط=تنبيه فقط).
+  5. لا sleep قبل send (delta < 50ms).
+  6. dedup الطلبات يمنع التكرار (نفس msg_id مرتين = إرسال واحد).
+  7. مسار الروابط يُكمّل رغم فشل مسار الطلبات (try/except يعزله).
+
+Verification Results:
+- AST parse OK على bot.py + request_filter.py + tests/test_request_filter_race_rescue.py.
+- **جميع الاختبارات الحالية**: 462/462 تمر (باستثناء test_audit_regressions و
+  test_api_security — فشلات مسبقة على baseline النظيف، غير مرتبطة بالتغييرات).
+  - test_delete_rescue: 15/15 ✅
+  - test_raw_hook: 13/13 ✅
+  - test_fast_delete_rescue_evidence: 25/25 RESCUED_ONCE ✅ (تعافت من 25/25 MISSED!)
+  - test_link_capture: 21/21 ✅
+  - test_message_journal: 66/66 ✅
+  - test_extractor_comparison: 3/3 ✅
+  - test_source_registry: 103/103 ✅
+  - test_phase3_contracts: 96/96 ✅
+  - test_account_safety: 10/10 ✅
+  - test_supabase_snapshot: 17/17 ✅
+  - test_deployment_updated: 35/35 ✅
+  - verify_request_filter: 35/35 ✅
+- **الاختبار الجديد**: test_request_filter_race_rescue: 23/23 ✅
+- الفشلات المسبقة (غير مرتبطة): test_audit_regressions (DR-5, DR-5b, DR-8) +
+  test_api_security (4 فشلات) — موجودة على baseline النظيف قبل أي تعديل.
+
+Channel Verification (مطلوب المستخدم):
+- render.yaml: `REQUESTS_TARGET_CHANNEL = "@dhkskwksjskwk"` ← مؤكدة قناة الطلبات.
+- render.yaml: `CHANNEL_ID` مع `sync: false` ← لم تُلمس، تُدار من لوحة Render.
+- كلا المسارين مستقلان: Request Filter → REQUESTS_TARGET_CHANNEL،
+  Link Extractor → CHANNEL_ID.
+
+Files Changed:
+- bot.py (modified): +232 / -9 — تقسيم LFC + نقل _handle_request_path + getattr دفاعي.
+- render.yaml (modified): +6 — إعلان REQUESTS_TARGET_CHANNEL بقيمة @dhkskwksjskwk.
+- worklog.md (modified): إضافة هذا القسم.
+- request_filter.py (new, from previous session): فلتر الطلبات 300/183 كلمات.
+- verify_request_filter.py (new, from previous session): 35/35 اختبار للفلتر.
+- tests/test_request_filter_race_rescue.py (new): 23/23 اختبار race/deletion.
+
+Stage Summary:
+- **اكتمل**: Capture First → Snapshot Immediately → Filter/Extract → Send بدون انتظار deletion event.
+- **أصلح الانكسارات**: 5 اختبارات تعافت من فشل كامل (25/25 MISSED → 25/25 RESCUED_ONCE).
+- **القنوات مؤكدة**: @dhkskwksjskwk للطلبات، CHANNEL_ID للروابط (لم تتغير).
+- **لا architecture redesign**، لا حذف ميزات، لا تغيير REQUEST_KEYWORDS/ADVERTISEMENT_KEYWORDS.
+- **جاهز لـcommit + push** بعد عرض git diff على المستخدم (هذا القسم يوثّق الانتهاء).

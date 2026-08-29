@@ -25,6 +25,12 @@ services:
         sync: false
       - key: CHANNEL_ID
         sync: false
+      # === Request Filter target channel ===
+      # قناة الطلبات — مسار مستقل لاكتشاف طلبات العملاء وإرسالها.
+      # يقبل: معرف رقمي (-100xxx) أو @username. فارغ/0 = معطّل.
+      # لا يُغيّر القناة الرئيسية (CHANNEL_ID) — المساران مستقلان.
+      - key: REQUESTS_TARGET_CHANNEL
+        value: "@dhkskwksjskwk"
       # === Supabase ===
       - key: SUPABASE_URL
         sync: false

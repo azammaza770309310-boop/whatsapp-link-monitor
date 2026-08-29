@@ -53,6 +53,10 @@ from link_system import (
 # Source Registry + Polling Scheduler + Message Claim (unified dedup layer)
 from source_registry import SourceRegistry, PollingScheduler, MessageClaim
 
+# Request filter — مسار مستقل لاكتشاف طلبات العملاء وإرسالها لقناة الطلبات
+# (لا يلمس مسار استخراج الروابط — يعمل بالتوازي)
+from request_filter import is_request_message
+
 # -------------------------------------------------------------------
 # Constants
 # -------------------------------------------------------------------
@@ -772,6 +776,23 @@ class Config:
         self.api_hash = os.getenv("API_HASH", "")
         self.bot_token = os.getenv("BOT_TOKEN", "")
         self.channel_id = int(os.getenv("CHANNEL_ID", "0"))
+        # === Request Filter target channel ===
+        # قناة الطلبات — مسار مستقل لاكتشاف طلبات العملاء وإرسالها.
+        # يقبل صيغتين:
+        #   1) معرف رقمي (مع -100):  -1001234567890
+        #   2) @username:            @dhkskwksjskwk  (أو dhkskwksjskwk بدون @)
+        # 0 / فارغ = المسار معطّل (بصمت).
+        # لا يُغيّر القناة الرئيسية channel_id — المساران مستقلان.
+        _raw_rtc = os.getenv("REQUESTS_TARGET_CHANNEL", "").strip()
+        if _raw_rtc and _raw_rtc != "0":
+            try:
+                # محاولة كرقم أولًا (معرف رقمي)
+                self.requests_target_channel = int(_raw_rtc)
+            except ValueError:
+                # username — نضمن وجود @ في البداية
+                self.requests_target_channel = _raw_rtc if _raw_rtc.startswith("@") else f"@{_raw_rtc}"
+        else:
+            self.requests_target_channel = 0
         self.owner_id = None
         oid = os.getenv("OWNER_ID", "")
         if oid:
@@ -5478,6 +5499,25 @@ class Monitor:
             raw_text = event.raw_text
             chat_id = event.chat_id
             if chat_id == self.config.channel_id: return
+            # لا نعالج رسائل قناة الطلبات نفسها (تجنب التكرار/الصدى)
+            # يدعم الصيغتين: معرف رقمي (-100xxx) أو @username
+            # [RACE-CAPTURE] getattr دفاعي: لو config بدون السمة (اختبارات قديمة)
+            # القيمة None/0 = فحص الصدى معطّل بصمت، _on_user_message يكمل مساره
+            # ولا يُحبط قبل التقاط الروابط في LRB (يمنع الانكسار المتسلسل).
+            _rtc = getattr(self.config, 'requests_target_channel', 0)
+            if _rtc:
+                if isinstance(_rtc, int):
+                    # معرف رقمي — مقارنة مباشرة
+                    if chat_id == _rtc: return
+                elif isinstance(_rtc, str) and _rtc.startswith("@"):
+                    # username — مقارنة غير حساسة لحالة الأحرف
+                    try:
+                        _co = event.chat
+                        if _co and hasattr(_co, "username") and _co.username:
+                            if _co.username.lstrip("@").lower() == _rtc.lstrip("@").lower():
+                                return
+                    except Exception:
+                        pass
 
             sender_id = event.sender_id or 0
             msg_id = event.id
@@ -5489,15 +5529,19 @@ class Monitor:
                 await self._journal_write(chat_id, msg_id, None, source_phone, state='no_text')
                 return
 
-            # === الخطوة 0: LINK-ONLY FAST CAPTURE (pre-write تزامني قبل أي await) ===
-            # نستخرج الروابط فوراً (regex نقي، لا API) ونخزّنها في LRB
-            # **تزامنياً** (dict assign مباشر، لا await/lock) ثم نُكمّل بـasync
-            # _link_ring_put لـcap enforcement. هذا يُغلق نافذة السباق:
-            # سابقًا كان `await _link_ring_put` يُسلّم للـevent loop، فيُطلق
-            # معالج MessageDeleted قبل اكتمال LRB → DELETE-MISS تحت الضغط العالي.
-            # الآن الروابط في الـdict قبل أي yield — أي حذف لاحقًا ينقذها.
-            # مبدأ تصميمي: فشل observability (metrics/logging) لا يكسر مسار
-            # الالتقاط — كل مكالنات الـmetrics مُغلّفة دفاعياً.
+            # === الخطوة 0a: LINK-ONLY FAST CAPTURE — snapshot تزامني (microseconds, no await) ===
+            # نستخرج الروابط فورًا (regex نقي، لا API) ونخزّنها في LRB
+            # **تزامنياً** (dict assign مباشر، لا await/lock). هذا snapshot الرابط:
+            # أي حذف لاحقًا يجد الروابط في الـdict فيُنقذها MessageDeleted handler.
+            #
+            # [RACE-CAPTURE] تم تقسيم كتلة LINK-ONLY FAST CAPTURE الأصلية:
+            #   - 0a (هنا): snapshot تزامني (extract + LRB dict) — microseconds، قبل أي await.
+            #   - 0a.5: مسار الطلبات _handle_request_path — يُرسل قبل أي async housekeeping
+            #           أو journal_write لضمان أسرع إرسال لتنبيه الطلبات (Capture First).
+            #   - 0b: async housekeeping (_link_ring_put cap + metrics) — مؤجلة عن
+            #         snapshot الـLRB وعن إرسال تنبيه الطلبات. snapshot الـLRB أعلاه
+            #         كافٍ لإنقاذ الروابط عند الحذف؛ هذا مجرد cap enforcement.
+            # مبدأ تصميمي: فشل observability (metrics/logging) لا يكسر مسار الالتقاط.
             links = LinkNormalizer.extract_links(raw_text)
             if links:
                 _ln = [l.get('normalized') or l.get('raw') for l in links]
@@ -5509,6 +5553,27 @@ class Monitor:
                         _ts[_k] = time.time()
                 except Exception:
                     pass  # pre-write فشل — لكن async path أسفل قد ينجح
+
+            # === الخطوة 0a.5: مسار الطلبات المستقل — Capture First → Snapshot → Filter → Send ===
+            # [RACE-CAPTURE] يُرسل تنبيه الطلب BEFORE journal_write و BEFORE cache lock
+            # و BEFORE async LRB cap enforcement. اللقطة (raw_text, chat_id, msg_id,
+            # source_phone) أُخذت أعلاه تزامنياً من event. event.chat/event.sender
+            # تُقرأ تزامنياً داخل _handle_request_path بلا API إضافي (Telethon يُرجع
+            # cached attrs). لو الحذف حدث بعد اللقطة، الإرسال ينجح اعتماداً على snapshot.
+            # مسار مستقل تمامًا: dedup خاص (in-memory dict)، قرار is_request_message
+            # مستقل، فشله مُغلّف بـtry/except لا يكسر مسار الروابط أبدًا.
+            # (رسالة قد تكون طلبًا وفيها رابط → تُرسل للقناتين — المساران مستقلان).
+            try:
+                await self._handle_request_path(event, raw_text, chat_id, msg_id, source_phone)
+            except Exception as _req_err:
+                # فشل المسار لا يكسر مسار الروابط أبدًا
+                logging.debug(f"[REQUEST-PATH] non-fatal error (link path continues): {_req_err}")
+
+            # === الخطوة 0b: LINK-ONLY FAST CAPTURE — async housekeeping ===
+            # cap enforcement (_link_ring_put) + metrics — مؤجلة عن snapshot الـLRB
+            # وعن إرسال تنبيه الطلبات. snapshot الـLRB أعلاه (Step 0a) كافٍ لإنقاذ
+            # الروابط عند الحذف؛ هذا مجرد cap enforcement على الحجم + metrics.
+            if links:
                 try:
                     await self._link_ring_put(chat_id, msg_id, _ln)
                 except Exception:
@@ -5581,6 +5646,12 @@ class Monitor:
                                           chat_title=chat_title, chat_username=chat_username,
                                           chat_link_type=chat_link_type, sender_id=sender_id,
                                           sender_name=sender_name, state='pending')
+
+            # === مسار الطلبات المستقل — نُقل أعلاه إلى الخطوة 0a.5 (Capture First) ===
+            # كان هنا (بعد journal_write) — نُقل قبل journal_write لضمان أسرع إرسال.
+            # اللقطة (raw_text, chat_id, msg_id) أُخذت أعلى _on_user_message تزامنياً،
+            # لذا إرسال تنبيه الطلبات يحدث قبل أي SQLite I/O أو async lock.
+            # (لا حذف هنا — فقط تعليق توثيقي للموضع السابق.)
 
             # === الخطوة 2: استخدم links المُستخرَجة في الخطوة 0 ===
             # (defensive re-extract لو الخطوة 0 فشلت بصمت — استرجاع الأمان)
@@ -5744,6 +5815,152 @@ class Monitor:
 
         except Exception as e:
             logging.error(f"Event handler error: {e}", exc_info=True)
+
+    # ============================================================
+    # === مسار الطلبات المستقل (Request Filter Path) ===
+    # يكتشف طلبات العملاء الحقيقية ويُرسلها لقناة الطلبات (REQUESTS_TARGET_CHANNEL).
+    # مستقل تمامًا عن مسار استخراج الروابط:
+    #   - dedup خاص (in-memory dict + TTL) — لا يشارك processed_messages
+    #   - قرار مستقل (is_request_message) — لا يتأثر بوجود/غياب الروابط
+    #   - لا يُرجع — مسار الروابط أسفلها يكمّل عمله بلا تأثير
+    #   - فشله لا يكسر الإطلاق مسار الروابط (مغلّف بـ try/except)
+    # ============================================================
+    async def _handle_request_path(self, event, raw_text: str, chat_id, msg_id, source_phone: str):
+        """يرصد طلبات العملاء ويُرسلها لقناة الطلبات. مسار غير قاتل.
+
+        [RACE-CAPTURE] هذا المسار يُستدعى من _on_user_message في الخطوة 0a.5 —
+        BEFORE journal_write و BEFORE cache lock. اللقطة (raw_text, chat_id,
+        msg_id, source_phone) أُخذت تزامنياً من event في أعلى _on_user_message.
+        داخل هذه الدالة: لا API إضافي، لا get_messages، لا re-fetch. event.chat
+        و event.sender تُقرأ تزامنياً (Telethon يُرجع cached attrs) — لو الحذف
+        حدث بعد اللقطة، الإرسال ينجح اعتماداً على snapshot. fallback 'غير متوفر'
+        لكل حقل قد يفشل. لا sleep، لا retry طويل. FloodWait فقط كما هو.
+        """
+        # getattr دفاعي: لو config بدون السمة (اختبارات قديمة / fake namespace)
+        # → 0 = المسار معطّل بصمت، لا يرمي AttributeError.
+        target = getattr(self.config, 'requests_target_channel', 0)
+        if not target:
+            return  # القناة غير مُهيأة — المسار معطّل بصمت
+
+        if not raw_text or not raw_text.strip():
+            return  # نص فارغ — ليس طلبًا
+
+        # --- dedup سريع (in-memory, TTL 1h, bounded) ---
+        # lazy init (لا نعتمد على ترتيب __init__)
+        if not hasattr(self, '_request_sent'):
+            self._request_sent = {}
+        sent = self._request_sent
+        now = time.time()
+        # prune دوري عند بلوغ حد أقصى (يمنع النمو غير المحدود)
+        if len(sent) > 1000:
+            cutoff = now - 3600  # 1h TTL
+            expired = [k for k, ts in sent.items() if ts < cutoff]
+            for k in expired:
+                del sent[k]
+        key = (int(chat_id), int(msg_id))
+        if key in sent:
+            return  # سبق إرسالها لقناة الطلبات — لا تكرار
+        sent[key] = now
+
+        # --- الفلترة: هل الرسالة طلب حقيقي؟ ---
+        is_req, info = is_request_message(raw_text)
+        if not is_req:
+            # ليس طلبًا (إعلان أو رسالة عادية) — تجاهل بصمت.
+            # مسار الروابط أسفلها يقرر بشكل مستقل.
+            return
+
+        # --- استخراج معلومات المرسل/المجموعة (متزامن، بلا API إضافي) ---
+        chat_title = ''
+        chat_username = ''
+        try:
+            chat_obj = event.chat
+            if chat_obj:
+                if hasattr(chat_obj, 'title') and chat_obj.title:
+                    chat_title = chat_obj.title
+                if hasattr(chat_obj, 'username') and chat_obj.username:
+                    chat_username = chat_obj.username
+        except Exception:
+            pass
+
+        sender_username = ''
+        sender_display = 'غير متوفر'
+        try:
+            sender_obj = event.sender
+            if sender_obj:
+                if hasattr(sender_obj, 'username') and sender_obj.username:
+                    sender_username = f"@{sender_obj.username}"
+                if hasattr(sender_obj, 'first_name') and sender_obj.first_name:
+                    sender_display = sender_obj.first_name
+                    if hasattr(sender_obj, 'last_name') and sender_obj.last_name:
+                        sender_display += f" {sender_obj.last_name}"
+                elif hasattr(sender_obj, 'title') and sender_obj.title:
+                    sender_display = sender_obj.title
+        except Exception:
+            pass
+
+        # --- بناء رابط الرسالة (آمن للمجموعات الخاصة) ---
+        # مجموعة عامة (لها username) → رابط عام
+        # مجموعة خاصة (بلا username) → صيغة المعرف الداخلي (تعمل للأعضاء)
+        if chat_username:
+            message_link = f"https://t.me/{chat_username}/{msg_id}"
+        else:
+            internal_id = str(chat_id).replace('-100', '')
+            message_link = f"https://t.me/c/{internal_id}/{msg_id}"
+
+        # --- تنسيق التنبيه (HTML-escaped لمنع الحقن) ---
+        # النص الأصلي يُرسل دون تشويه، لكن HTML-escaped للسلامة.
+        safe_text = html_module.escape(str(raw_text)[:1500])
+        if len(raw_text) > 1500:
+            safe_text += "…"
+        safe_sender = html_module.escape(str(sender_display))
+        safe_username = html_module.escape(str(sender_username or 'غير متوفر'))
+        safe_chat = html_module.escape(str(chat_title or 'غير معروف'))
+        safe_link = html_module.escape(message_link, quote=True)
+        safe_source = html_module.escape(str(source_phone or ''))
+
+        keywords_found = ', '.join(info.get('request_matches', [])[:5])
+        safe_keywords = html_module.escape(keywords_found)
+
+        alert = (
+            "<blockquote>"
+            "🔔 <b>طلب جديد</b>\n\n"
+            f"📝 <b>نص الطلب:</b>\n<i>{safe_text}</i>\n\n"
+            f"👤 <b>المستخدم:</b> {safe_username}\n"
+            f"👥 <b>المجموعة:</b> {safe_chat}\n"
+            f"📡 <b>المصدر:</b> <code>{safe_source}</code>\n"
+            f"🔑 <b>الكلمات:</b> {safe_keywords}\n"
+            f'🔗 <a href="{safe_link}">رابط الرسالة</a>'
+            "</blockquote>"
+        )
+
+        # --- الإرسال لقناة الطلبات (retry + FloodWait handling) ---
+        # getattr دفاعي لـbot_client: لو fake namespace (اختبارات) بلا bot_client،
+        # getattr يُرجع None → نتخطّى الإرسال بصمت بدل AttributeError.
+        _bot_client = getattr(self, 'bot_client', None)
+        try:
+            if not _bot_client or not _bot_client.is_connected():
+                logging.warning("[REQUEST-PATH] bot_client not connected — skipping send (will not retry this msg)")
+                return
+            await _bot_client.send_message(
+                target, alert, parse_mode='html', link_preview=False
+            )
+            logging.info(
+                f"[REQUEST-PATH] ✅ sent request alert "
+                f"chat_id={chat_id} msg_id={msg_id} "
+                f"keywords={keywords_found} source={source_phone}"
+            )
+        except FloodWaitError as e:
+            # أعد المحاولة بعد الانتظار (محدود لتجنب التعليق)
+            wait_s = min(getattr(e, 'seconds', 30), 60)
+            logging.warning(f"[REQUEST-PATH] FloodWait {wait_s}s — retrying")
+            try:
+                await asyncio.sleep(wait_s)
+                await _bot_client.send_message(target, alert, parse_mode='html', link_preview=False)
+                logging.info(f"[REQUEST-PATH] ✅ sent after FloodWait chat_id={chat_id} msg_id={msg_id}")
+            except Exception as e2:
+                logging.error(f"[REQUEST-PATH] send failed after FloodWait retry: {e2}")
+        except Exception as e:
+            logging.error(f"[REQUEST-PATH] send failed: {e}")
 
     def _normalized_to_link_data(self, normalized: str, source_phone: str,
                                  chat_id, msg_id, group_name: str = '') -> Optional[dict]:
