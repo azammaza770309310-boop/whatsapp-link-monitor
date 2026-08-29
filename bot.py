@@ -10928,6 +10928,7 @@ async def api_joined_groups_handler(request):
                 "connected_joiners": fh.get('connected_joiners', 0),
                 "floodwait_joiners_count": len(fh.get('floodwait_joiners', [])),
                 "disconnected_joiners_count": len(fh.get('disconnected_joiners', [])),
+                "disabled_joiners_count": fh.get('disabled_joiners_count', 0),
                 "safety_guard_blocked_joiners": fh.get('safety_guard_blocked_joiners', 0),
                 "all_joiners_unavailable": (fh.get('connected_joiners', 0) == 0),
             }
@@ -12592,6 +12593,7 @@ async def ready_handler(request):
             "connected_joiners": fh.get('connected_joiners', 0),
             "floodwait_joiners_count": len(fh.get('floodwait_joiners', [])),
             "disconnected_joiners_count": len(fh.get('disconnected_joiners', [])),
+            "disabled_joiners_count": fh.get('disabled_joiners_count', 0),
             "safety_guard_blocked_joiners": fh.get('safety_guard_blocked_joiners', 0),
             "all_joiners_unavailable": (fh.get('connected_joiners', 0) == 0),
         }
