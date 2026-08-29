@@ -31,6 +31,31 @@ services:
       # لا يُغيّر القناة الرئيسية (CHANNEL_ID) — المساران مستقلان.
       - key: REQUESTS_TARGET_CHANNEL
         value: "@dhkskwksjskwk"
+      # === Request Filter v2 — Kill Switch + Rate Limit + Circuit Breaker ===
+      # [BOT-FILTER-v2] الفلتر المحافظ الجديد: Intent + Academic Service.
+      # يحلّ مشكلة الـ15,000 رسالة الكاذبة (الفلتر القديم بـ300 كلمة +
+      # مطابقة substring ساذجة على «مشروع»/«واجب»/«بحث» وحدها).
+      #
+      # KILL SWITCH (default false): لا يُرسل أي طلب إطلاقًا حتى يتأكد
+      # المُشغّل. مرّن بـtrue عند الجاهزية. مسار الروابط يستمر طبيعيًا.
+      - key: REQUEST_FILTER_ENABLED
+        value: "false"
+      # RATE LIMIT (global): ACCEPT/minute. default محافظ 20.
+      - key: REQUEST_FILTER_MAX_PER_MINUTE
+        value: "20"
+      # RATE LIMIT (per-chat): ACCEPT/minute لكل مجموعة. يمنع مجموعة واحدة
+      # من إغراق القناة. default 5.
+      - key: REQUEST_FILTER_MAX_PER_CHAT_PER_MINUTE
+        value: "5"
+      # CIRCUIT BREAKER: لو تجاوز ACCEPT هذا العدد في window → إيقاف طوارئ
+      # تلقائيًا لمسار الطلبات فقط (لا يوقف البوت ولا مسار الروابط).
+      # auto-recover بعد cooldown.
+      - key: REQUEST_FILTER_CIRCUIT_BREAKER_THRESHOLD
+        value: "100"
+      - key: REQUEST_FILTER_CIRCUIT_BREAKER_WINDOW_S
+        value: "600"
+      - key: REQUEST_FILTER_CIRCUIT_BREAKER_COOLDOWN_S
+        value: "600"
       # === Supabase ===
       - key: SUPABASE_URL
         sync: false

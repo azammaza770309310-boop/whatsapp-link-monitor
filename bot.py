@@ -53,9 +53,16 @@ from link_system import (
 # Source Registry + Polling Scheduler + Message Claim (unified dedup layer)
 from source_registry import SourceRegistry, PollingScheduler, MessageClaim
 
-# Request filter — مسار مستقل لاكتشاف طلبات العملاء وإرسالها لقناة الطلبات
-# (لا يلمس مسار استخراج الروابط — يعمل بالتوازي)
-from request_filter import is_request_message
+# Request Filter v2 — مسار مستقل لاكتشاف طلبات العملاء الحقيقية وإرسالها
+# لقناة الطلبات (REQUESTS_TARGET_CHANNEL). مستقل تمامًا عن مسار استخراج
+# الروابط. v2 المحافظ: Intent + Academic Service (لا مطابقة substring ساذجة).
+# طبقات حماية: Kill Switch + RateLimiter + CircuitBreaker + ContentDeduper.
+from request_filter import (
+    analyze_request, RequestAnalysis,
+    FILTER_VERSION as REQUEST_FILTER_VERSION,
+    FILTER_MODE as REQUEST_FILTER_MODE,
+)
+from request_guard import RateLimiter, CircuitBreaker, ContentDeduper
 
 # -------------------------------------------------------------------
 # Constants
@@ -793,6 +800,40 @@ class Config:
                 self.requests_target_channel = _raw_rtc if _raw_rtc.startswith("@") else f"@{_raw_rtc}"
         else:
             self.requests_target_channel = 0
+
+        # === Request Filter v2 controls — Kill Switch + Rate Limit + Circuit Breaker ===
+        # [BOT-FILTER-v2] conservative defaults: disabled until operator confirms.
+        # REQUEST_FILTER_ENABLED=false → لا يُرسل أي طلب إطلاقًا (مسار الروابط يستمر).
+        # default "false" محافظ لمنع تكرار فيضان 15,000 رسالة. مرّن بـtrue عند الجاهزية.
+        self.request_filter_enabled = os.getenv("REQUEST_FILTER_ENABLED", "false").strip().lower() in (
+            "1", "true", "yes", "on")
+        # Rate limits (count ACCEPT only). defaults محافظة.
+        try:
+            self.request_filter_max_per_minute = int(os.getenv(
+                "REQUEST_FILTER_MAX_PER_MINUTE", "20"))
+        except ValueError:
+            self.request_filter_max_per_minute = 20
+        try:
+            self.request_filter_max_per_chat_per_minute = int(os.getenv(
+                "REQUEST_FILTER_MAX_PER_CHAT_PER_MINUTE", "5"))
+        except ValueError:
+            self.request_filter_max_per_chat_per_minute = 5
+        # Circuit breaker — auto emergency-stop on ACCEPT flood.
+        try:
+            self.request_filter_cb_threshold = int(os.getenv(
+                "REQUEST_FILTER_CIRCUIT_BREAKER_THRESHOLD", "100"))
+        except ValueError:
+            self.request_filter_cb_threshold = 100
+        try:
+            self.request_filter_cb_window_s = int(os.getenv(
+                "REQUEST_FILTER_CIRCUIT_BREAKER_WINDOW_S", "600"))
+        except ValueError:
+            self.request_filter_cb_window_s = 600
+        try:
+            self.request_filter_cb_cooldown_s = int(os.getenv(
+                "REQUEST_FILTER_CIRCUIT_BREAKER_COOLDOWN_S", "600"))
+        except ValueError:
+            self.request_filter_cb_cooldown_s = 600
         self.owner_id = None
         oid = os.getenv("OWNER_ID", "")
         if oid:
@@ -3116,7 +3157,7 @@ class Monitor:
         دفاعي: يعيد False لو sender None أو بلا سمة bot (لا يكسر الالتقاط).
         Telethon User entity يضع sender.bot == True للبوتات الحقيقية.
         القنوات/المجموعات المجهولة (sender=Channel) ليست 'bot' هنا — رسائلها
-        لا تُلتقط كطلبات أصلًا (is_request_message يفلترها). نركز على البوتات."""
+        لا تُلتقط كطلبات أصلًا (analyze_request يفلترها). نركز على البوتات."""
         if not sender:
             return False
         try:
@@ -5628,7 +5669,7 @@ class Monitor:
             # source_phone) أُخذت أعلاه تزامنياً من event. event.chat/event.sender
             # تُقرأ تزامنياً داخل _handle_request_path بلا API إضافي (Telethon يُرجع
             # cached attrs). لو الحذف حدث بعد اللقطة، الإرسال ينجح اعتماداً على snapshot.
-            # مسار مستقل تمامًا: dedup خاص (in-memory dict)، قرار is_request_message
+            # مسار مستقل تمامًا: dedup خاص (in-memory dict)، قرار analyze_request
             # مستقل، فشله مُغلّف بـtry/except لا يكسر مسار الروابط أبدًا.
             # (رسالة قد تكون طلبًا وفيها رابط → تُرسل للقناتين — المساران مستقلان).
             try:
@@ -5889,7 +5930,7 @@ class Monitor:
     # يكتشف طلبات العملاء الحقيقية ويُرسلها لقناة الطلبات (REQUESTS_TARGET_CHANNEL).
     # مستقل تمامًا عن مسار استخراج الروابط:
     #   - dedup خاص (in-memory dict + TTL) — لا يشارك processed_messages
-    #   - قرار مستقل (is_request_message) — لا يتأثر بوجود/غياب الروابط
+    #   - قرار مستقل (analyze_request) — لا يتأثر بوجود/غياب الروابط
     #   - لا يُرجع — مسار الروابط أسفلها يكمّل عمله بلا تأثير
     #   - فشله لا يكسر الإطلاق مسار الروابط (مغلّف بـ try/except)
     # ============================================================
@@ -5953,12 +5994,97 @@ class Monitor:
                 return  # سبق إرسالها لقناة الطلبات — لا تكرار (cross-account dedup)
             sent[key] = now
 
-        # --- الفلترة: هل الرسالة طلب حقيقي؟ ---
-        is_req, info = is_request_message(raw_text)
-        if not is_req:
-            # ليس طلبًا (إعلان أو رسالة عادية) — تجاهل بصمت.
-            # مسار الروابط أسفلها يقرر بشكل مستقل.
+        # === [REQUEST-FILTER v2] Kill Switch + Filter + Guards ===
+        # مسار الروابط أسفلها يكمّل عمله بلا أي تأثير من هذا القسم إطلاقًا.
+        #
+        # [KILL SWITCH] REQUEST_FILTER_ENABLED (default false). لو معطّل، لا
+        # يُرسل أي طلب إطلاقًا. هذا يحمي القناة من تكرار فيضان 15,000 رسالة
+        # حتى يتأكد المُشغّل من الفلتر الجديد. مسار الروابط يستمر طبيعيًا.
+        _rf_enabled = getattr(self.config, 'request_filter_enabled', False)
+        if not _rf_enabled:
+            logging.info(
+                "[REQUEST-FILTER] enabled=false — request sending disabled "
+                f"(skipped chat_id={chat_id} msg_id={msg_id}). Link path unaffected."
+            )
             return
+
+        # --- lazy init guards (getattr دفاعي للاختبارات/fake namespaces) ---
+        if not hasattr(self, '_request_rate_limiter'):
+            self._request_rate_limiter = RateLimiter(
+                max_per_minute=getattr(self.config, 'request_filter_max_per_minute', 20),
+                max_per_chat_per_minute=getattr(self.config, 'request_filter_max_per_chat_per_minute', 5),
+            )
+        if not hasattr(self, '_request_circuit_breaker'):
+            self._request_circuit_breaker = CircuitBreaker(
+                threshold=getattr(self.config, 'request_filter_cb_threshold', 100),
+                window_s=getattr(self.config, 'request_filter_cb_window_s', 600),
+                cooldown_s=getattr(self.config, 'request_filter_cb_cooldown_s', 600),
+            )
+        if not hasattr(self, '_request_content_deduper'):
+            self._request_content_deduper = ContentDeduper(ttl_s=600, max_entries=5000)
+
+        # --- الفلترة v2: analyze_request (Intent + Academic Service) ---
+        # لا مطابقة substring ساذجة على كلمات منفردة («مشروع»/«واجب»/«بحث»
+        # وحدها لا تمر). v2 المحافظ يطلب تركيبة واضحة (intent+service أو
+        # action+service+سؤال أو strong pattern) ويستبعد مقدم الخدمة (provider)
+        # صراحةً. هذا يحلّ مشكلة الـ15,000 رسالة الكاذبة جذريًا.
+        analysis = analyze_request(raw_text)
+        if not analysis.is_request:
+            logging.info(
+                f"[REQUEST-FILTER] REJECT reason={analysis.reason} "
+                f"score={analysis.confidence} seeker={analysis.seeker_confidence} "
+                f"provider={analysis.provider_confidence} chat_id={chat_id} "
+                f"msg_id={msg_id}"
+            )
+            return
+
+        # --- [CONTENT DEDUP] dedup ثانوي على hash النص (TTL 10min) ---
+        # مستقل عن (chat_id,msg_id) dedup أعلاه. يمنع نسخ نفس الطلب من مجموعات
+        # متعددة خلال فترة قصيرة. bounded memory. لا يؤثر على مسار الروابط.
+        if self._request_content_deduper.is_duplicate(raw_text):
+            logging.info(
+                f"[REQUEST-FILTER] REJECT reason=content_dedup "
+                f"(seen recently) chat_id={chat_id} msg_id={msg_id}"
+            )
+            return
+
+        # --- [CIRCUIT BREAKER] إيقاف طوارئ لو ACCEPT تجاوز threshold ---
+        # لو مفعّل (cooldown active) → تخطّي الإرسال. لا يوقف البوت ولا مسار
+        # الروابط — مسار الطلبات فقط. auto-recover بعد cooldown.
+        if self._request_circuit_breaker.is_tripped():
+            logging.warning(
+                "🚨 [REQUEST-FILTER] CIRCUIT BREAKER ACTIVE — request skipped "
+                f"(cooldown active) chat_id={chat_id} msg_id={msg_id}. "
+                "Link path unaffected. Will auto-recover after cooldown."
+            )
+            return
+
+        # --- [RATE LIMIT] حدّ عالمي + حدّ لكل مجموعة (ACCEPT فقط) ---
+        # لو تجاوز الحدّ → تخطّي. لا يؤثر على مسار الروابط إطلاقًا.
+        if not self._request_rate_limiter.try_acquire(chat_id):
+            logging.warning(
+                f"[REQUEST-FILTER] RATE_LIMIT reached — request skipped "
+                f"chat_id={chat_id} msg_id={msg_id}. Link path unaffected."
+            )
+            return
+
+        # سجّل ACCEPT في الـcircuit breaker (يفحص threshold ويطلق trip لو لزم)
+        _tripped_now = self._request_circuit_breaker.record_accept()
+        if _tripped_now:
+            logging.error(
+                "🚨 [REQUEST-FILTER] CIRCUIT BREAKER ACTIVATED — "
+                f"{self._request_circuit_breaker.threshold} accepts in "
+                f"{self._request_circuit_breaker.window}s window. Request path "
+                "PAUSED for cooldown. Link path UNAFFECTED. Bot still running."
+            )
+
+        logging.info(
+            f"[REQUEST-FILTER] ACCEPT confidence={analysis.confidence} "
+            f"reason={analysis.reason} intents={len(analysis.matched_intents)} "
+            f"services={len(analysis.matched_services)} "
+            f"patterns={len(analysis.matched_patterns)} "
+            f"chat_id={chat_id} msg_id={msg_id}"
+        )
 
         # --- استخراج معلومات المرسل/المجموعة (متزامن، بلا API إضافي) ---
         chat_title = ''
@@ -6014,7 +6140,10 @@ class Monitor:
         safe_link = html_module.escape(message_link, quote=True)
         safe_source = html_module.escape(str(source_phone or ''))
 
-        keywords_found = ', '.join(info.get('request_matches', [])[:5])
+        keywords_found = ', '.join(
+            (analysis.matched_intents + analysis.matched_services
+             + analysis.matched_patterns)[:5]
+        )
         safe_keywords = html_module.escape(keywords_found)
 
         # [STYLE-MATCH] التاريخ بنفس صيغة قناة الروابط: %Y-%m-%d %H:%M
@@ -13803,6 +13932,27 @@ async def main():
             "(no fallback to link channel). Set REQUESTS_TARGET_CHANNEL=@dhkskwksjskwk "
             "in Render Environment Variables."
         )
+    # === [REQUEST-FILTER v2] startup snapshot — version + mode + kill switch + guards ===
+    # المُشغّل يستطيع grep على هذه الأسطر للتحقق من إعدادات الفلتر الجديد.
+    logging.info(f"REQUEST_FILTER_VERSION={REQUEST_FILTER_VERSION}")
+    logging.info(f"REQUEST_FILTER_MODE={REQUEST_FILTER_MODE}")
+    _rf_en = getattr(config, 'request_filter_enabled', False)
+    logging.info(f"REQUEST_FILTER_ENABLED={'true' if _rf_en else 'false'}")
+    if _rf_en:
+        logging.info("  → request filter ACTIVE — academic-intent requests will be sent")
+    else:
+        logging.info("  → request filter DISABLED — NO request alerts sent (link path unaffected)")
+    logging.info(
+        f"REQUEST_FILTER_MAX_PER_MINUTE={getattr(config,'request_filter_max_per_minute',20)}"
+    )
+    logging.info(
+        f"REQUEST_FILTER_MAX_PER_CHAT_PER_MINUTE={getattr(config,'request_filter_max_per_chat_per_minute',5)}"
+    )
+    logging.info(
+        f"REQUEST_FILTER_CIRCUIT_BREAKER_THRESHOLD={getattr(config,'request_filter_cb_threshold',100)}"
+        f" (window={getattr(config,'request_filter_cb_window_s',600)}s, "
+        f"cooldown={getattr(config,'request_filter_cb_cooldown_s',600)}s)"
+    )
     # RENDER_GIT_COMMIT يُضبط تلقائيًا من Render عند كل deploy — نطبع أول 12
     # حرفًا حتى يستطيع المُشغّل التأكد أن النسخة الحالية هي آخر commit.
     _git_commit = os.getenv("RENDER_GIT_COMMIT", "")

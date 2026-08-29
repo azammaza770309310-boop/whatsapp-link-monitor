@@ -1,259 +1,549 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-request_filter.py — فلتر طلبات العملاء المستقل
+request_filter.py — Request Filter v2 (conservative Intent + Academic Service)
 
-مسار مستقل لاكتشاف رسائل "الطلبات الحقيقية" وإرسالها إلى قناة الطلبات.
-لا يلمس مسار استخراج الروابط الحالي إطلاقاً — يعمل بالتوازي معه.
+FLTER v2 المحافظ — يحلّ مشكلة الـ15,000 رسالة الكاذبة التي سببها الفلتر
+القديم (REQUEST_KEYWORDS بـ300 كلمة + مطابقة substring ساذجة على كلمات
+منفردة مثل «مشروع» / «واجب» / «بحث» / «عرض» / «اختبار» / «مساعدة»).
 
-المنطق (بالترتيب الصارم المطلوب):
-  المرحلة 1 — قراءة الرسالة + normalization للمقارنة فقط
-            (الإرسال يستخدم النص الأصلي دون تشويه).
-  المرحلة 2 — REQUEST_MATCH: واحدة على الأقل من REQUEST_KEYWORDS.
-            إذا false → تجاهل (ليس طلبًا).
-  المرحلة 3 — ADVERTISEMENT_MATCH: أي كلمة من ADVERTISEMENT_KEYWORDS،
-            أو رقم جوال، أو رابط تواصل، أو رسالة >=6 أسطر.
-            إذا true → تجاهل (إعلان).
-  المرحلة 4 — النتيجة: True فقط إذا REQUEST_MATCH && !ADVERTISEMENT_MATCH.
+المبدأ الجوهري: لا يكفي وجود كلمة أكاديمية وحدها، ولا وجود طلب عام وحده.
+يجب أن تبحث الرسالة عن:
+  (REQUEST_INTENT  AND  ACADEMIC_SERVICE)
+  OR
+  (ACTION + ACADEMIC_SERVICE مع صيغة سؤال/طلب)
+  OR
+  (STRONG_PATTERN مركبة كاملة)
 
-قائمتا الكلمات مأخوذتان كاملتين من بوت خارجي (mbot.py) — الكلمات فقط،
-لا بنية ولا حسابات ولا Health Check ولا طريقة تشغيل. لم يُحذف أي إدخال.
+ويُستبعد مقدم الخدمة (PROVIDER) صراحةً: أسوي بحوث / نوفر مشاريع / خدمات
+بأسعار — هذه إعلانات لا طلبات.
+
+التطبيع (normalize_text) للمقارنة فقط — الإرسال يستخدم raw_text الأصلي.
+
+لا يلمس مسار استخراج الروابط إطلاقًا. هذا الفلتر مستقل تمامًا ويُستدعى من
+_handle_request_path في bot.py فقط.
+
+نقاط التصميم:
+  - لا قائمة 300 كلمة منفردة. كل قائمة هنا إما عبارة طلب (multi-word) أو
+    خدمة أكاديمية محددة أو فعل إنجاز أو عبارة مركبة كاملة.
+  - الخدمة الأكاديمية وحدها (+3) لا تكفي أبدًا للقبول.
+  - مؤشر الطلب العام (من/مين/أبي) وحده (+1) لا يكفي أبدًا.
+  - القبول يتطلب تركيبة واضحة (intent+service أو action+service+سؤال أو
+    strong pattern). خلاف ذلك → REJECT.
+  - confidence تشخيصي للـlogging، والقرار rule-based محافظ.
 """
 
 import re
-from typing import Tuple, Dict, List
+from dataclasses import dataclass, field
+from typing import List, Tuple, Dict, Any
 
-# ============================================================
-# قائمة الكلمات المفتاحية للطلبات (request)
-# مأخوذة كاملة من بوت خارجي — لا حذف ولا اختصار، عربية + إنجليزية
-# + المصطلحات الدراسية والتخصصات.
-# ============================================================
-REQUEST_KEYWORDS: List[str] = [
-    "يحل", "من يحل", "من يكتب", "يسوي لي", "تكفون حل", "احتاج احد", "اريد مختص", "من يساعدني", "يسوي تقرير",
-    "بروجكت", "ورقة عمل", "عندي كويز", "عندي ميد", "عندي فاينال", "عندي مشروع", "أحد يفهم", "احد يفهم",
-    "تعرفون خصوصي", "عندي واجب", "تلخيص", "يسوي تلخيص", "بحث علمي", "واجبات", "مطلوب حل", "شرح مفصل",
-    "يشرح مادة", "أريد حل", "دعم واجبات", "حل واجب", "يشرح مقرر", "حل تمرين", "حل اختبار", "أريد تلخيص",
-    "أريد شرح", "مساعدة بالبحث", "يسوي مشاريع جامعية", "واجبات دراسية", "دعم تعليمي", "تدريس خصوصي",
-    "حل مهام", "مين شاطره", "من شاطر", "حل تدريبي", "شرح درس", "مراجعة مادة", "حل مسائل", "استشارة دراسية",
-    "سكليف", "اعذار طبية", "يزين لي", "يجمل", "ينزل في صحتي", "يحل بحث", "يحل مشاريع", "من يعرف مختص شاطر",
-    "من يطلع عذر طبي", "احد يعرف", "احد يسوي", "تعرفون أحد فاهم", "تقرير ميداني", "ابغى عذر طبي",
-    "تقرير تدريب", "سيفي", "cv", "سي في", "سيرة ذاتية", "ملف انجاز", "ابغى احد يساعدني", "ابي واجب",
-    "ابي بحث", "احتاج تقرير", "مين يعرف احد", "احد فاهم", "من فاهم", "تسوي لي واجب", "تسوي لي بحث",
-    "مين يسوي لي واجب", "مين يسوي لي بحث", "حل واجب جامعي", "كتابة سيرة ذاتية", "مساعدة في الواجب",
-    "برزنتيشن", "باوربوينت", "يسوي بوربوينت", "يسوي عرض تقديمي", "بحث بسيط بمقابل", "يفهم ف اكسل",
-    "ابي خصوصي", "يسوي استبيان", "تحليل بيانات", "يسوي تحليل", "برمجة", "يكتب كود", "برنامج", "تطبيق",
-    "موقع", "تصميم", "يسوي تصميم", "جرافيك", "فوتوشوب", "مونتاج", "فيديو", "صوت", "ترجمة", "يترجم",
-    "تدقيق", "يدقق", "بحث", "يكتب بحث", "ورقة بحثية", "مقال", "يكتب مقال", "تعبير", "يكتب تعبير",
-    "خطابة", "يكتب خطاب", "عرض", "يعرض", "شرائح", "شرائح عرض", "عرض تقديمي", "تمارين", "حل تمارين",
-    "مسائل", "حل مسائل", "اختبار", "حل اختبار", "امتحان", "حل امتحان", "كويز", "حل كويز", "فاينال",
-    "حل فاينال", "ميد", "حل ميد", "مشروع", "حل مشروع", "تخرج", "مشروع تخرج", "اطروحة", "رسالة",
-    "ماجستير", "دكتوراه", "بحث تخرج", "مشروع بحثي", "تقرير", "يكتب تقرير", "تقرير ميداني", "تقرير تدريب",
-    "تقرير عملي", "ملخص", "يلخص", "ملخصات", "ملخص كتاب", "ملخص محاضرة", "ملخص درس", "شرح", "يشرح",
-    "شرح درس", "شرح مادة", "شرح كتاب", "شرح مفهوم", "دروس", "دروس خصوصية", "درس خاص", "معلم خصوصي",
-    "مدرس خصوصي", "تدريس", "يدرس", "تعليم", "يعلم", "دراسة", "مساعدة", "يساعد", "دعم", "يدعم",
-    "استشارة", "نصيحة", "رياضيات", "حساب مثلثات", "جبر", "هندسة", "تفاضل وتكامل", "إحصاء", "احتمالات",
-    "فيزياء", "ميكانيكا", "كهرباء", "مغناطيسية", "بصريات", "ديناميكا", "ثرموديناميك", "كيمياء",
-    "كيمياء عضوية", "كيمياء تحليلية", "كيمياء فيزيائية", "كيمياء حيوية", "أحياء", "علم الأحياء", "تشريح",
-    "فيزيولوجيا", "وراثة", "علم الأحياء الدقيقة", "علم النبات", "علم الحيوان", "بيولوجيا خلوية", "جيولوجيا",
-    "علوم الأرض", "جيوفيزياء", "علم المعادن", "علوم البيئة", "علم البيئة", "هندسة كهربائية", "هندسة إلكترونية",
-    "هندسة ميكانيكية", "هندسة مدنية", "هندسة معمارية", "هندسة كيميائية", "هندسة صناعية", "هندسة طبية",
-    "هندسة حاسب", "هندسة برمجيات", "هندسة اتصالات", "هندسة نظم", "خوارزميات", "هياكل بيانات", "قواعد بيانات",
-    "شبكات حاسب", "ذكاء اصطناعي", "تعلم آلي", "تعلم عميق", "أمن سيبراني", "تطوير ويب", "تطوير تطبيقات",
-    "برمجة شيئية", "طب", "طب بشري", "جراحة", "باطنة", "أطفال", "نساء وتوليد", "صيدلة", "صيدلة إكلينيكية",
-    "كيمياء صيدلانية", "تمريض", "صحة عامة", "تغذية", "علاج طبيعي", "تاريخ", "جغرافيا", "علم نفس", "علم اجتماع",
-    "تربية", "فلسفة", "اقتصاد", "إدارة أعمال", "محاسبة", "تسويق", "تمويل", "قانون", "علوم سياسية",
-    "علاقات دولية", "لغة عربية", "نحو", "صرف", "بلاغة", "أدب عربي", "لغة إنجليزية", "قواعد إنجليزية",
-    "أدب إنجليزي", "ترجمة", "لغويات", "إعلام", "صحافة", "اتصال جماهيري", "تصميم", "فنون", "عمارة",
-    "تربية بدنية", "تربية فنية", "شرح رياضيات", "حل واجبات رياضيات", "تمارين فيزياء", "مسائل كيمياء",
-    "مشروع برمجة", "تقرير أحياء", "بحث تاريخ", "تحليل اقتصادي", "ملخص قوانين", "شرح نظريات", "حل اختبار هندسة",
-    "مراجعة طب", "واجبات محاسبة", "تمارين إحصاء", "مشروع تخرج هندسة", "بحث ماجستير", "رسالة دكتوراه",
-    "تحضير كويز", "مراجعة فاينال", "تحضير ميدترم",
-]
-
-# ============================================================
-# قائمة الكلمات المحظورة (advertisement)
-# مأخوذة كاملة من بوت خارجي — لا حذف ولا اختصار.
-# أي منها → الرسالة إعلان → لا تُرسل لقناة الطلبات.
-# تشمل: للتواصل، واتساب، أرقام، روابط، تسويق، خصومات، عروض، إلخ.
-# ============================================================
-ADVERTISEMENT_KEYWORDS: List[str] = [
-    "للتواصل", "عبر حسابنا", "مكتبنا", "خدمات طلابية", "بأسعار مناسبة", "تواصل خاص", "تواصل واتساب",
-    "عرض احتياجك", "سجل طلبك", "https://", "http://", "t.me/", "wa.me/", "+966", "واتساب", "وتساب",
-    "056", "053", "050", "054", "055", "058", "059", "اعذار ولقيت", "اعذار طبية جاهزة", "في صحتي",
-    "يكلمني ويبشر", "سكليف اجازه مرضيه معتمدة بصحتي", "رقم للتواصل", "ارسال رسالة", "عرض خدمات",
-    "طلب خدمة", "حساب شخصي", "قروب", "link", "contact me", "whatsapp", "tel", "رقم جوال", "مراسلة",
-    "سجل طلبك هنا", "خدمة مدرسية", "حل واجبات", "طلب تدريبي", "تواصل معانا", "خدمات تعليمية",
-    "project service", "study help", "حل سريع", "دعم دراسي", "توصيل مشروع", "تسليم واجب", "حل تمارين",
-    "حل كويز", "حل امتحان", "حل فاينال", "مراجعة سريعة", "أرسل طلبك", "طلب خدمة تعليمية", "خدمات اكاديمية",
-    "مراسلة عبر واتساب", "رقم واتساب", "تواصل شخصي", "promotion", "announcement", "اعلان", "اعلانات",
-    "خدمة اونلاين", "حل واجب فوري", "حل بحث سريع", "طلب مشروع", "تسليم مشروع", "خصم", "عرض", "عروض",
-    "تخفيض", "خصومات", "عروض خاصة", "عرض محدود", "عرض لفترة محدودة", "استفد الآن", "احجز الآن", "اطلب الآن",
-    "سارع", "بسرعة", "فرصة", "فرصه", "محدودة", "العدد محدود", "أماكن محدودة", "مقاعد محدودة", "حجز",
-    "احجز", "حجوزات", "حجز مسبق", "حجز الآن", "دفع", "الدفع", "دفع اونلاين", "الدفع اونلاين", "سداد",
-    "السداد", "الدفع المسبق", "دفع مسبق", "الدفع عند الاستلام", "دفع عند الاستلام", "ضمان", "ضمان استرجاع",
-    "ضمان الاسترجاع", "ضمان الاستعادة", "ضمان الجودة", "جودة", "جودة عالية", "عالية الجودة", "مضمون",
-    "نتيجة مضمونة", "نتائج مضمونة", "ضمان النتيجة", "ضمان النتائج", "خبرة", "خبرات", "خبرة طويلة",
-    "خبرة سنوات", "سنوات من الخبرة", "كفاءة", "كفاءة عالية", "كفاءة وجودة", "كفاءة وجودة عالية", "سرعة",
-    "سرعة في التنفيذ", "تنفيذ سريع", "انجاز سريع", "انجاز في وقت قياسي", "سرية", "سرية تامة", "خصوصية",
-    "خصوصية تامة", "سرية المعلومات", "خصوصية المعلومات", "سرية البيانات", "خصوصية البيانات", "توصيل",
-    "توصيل سريع", "توصيل لكل المناطق", "توصيل لجميع المناطق", "شحن", "شحن سريع", "شحن لكل المناطق",
-    "شحن لجميع المناطق", "استلام", "استلام سريع", "استلام فوري", "استلام في نفس اليوم", "تسليم",
-    "تسليم سريع", "تسليم فوري", "تسليم في نفس اليوم", "عملاء", "عملائنا", "عملاء سابقون", "عملاء راضون",
-    "رضا العملاء", "تقييم", "تقييمات", "تقييمات العملاء", "تقييمات العملاء السابقين", "شهادات",
-    "شهادات العملاء", "شهادات العملاء السابقين", "مراجعات", "مراجعات العملاء", "مراجعات العملاء السابقين",
-    "نماذج", "نماذج أعمال", "نماذج أعمال سابقة", "معرض الأعمال", "معرض أعمال", "معرض أعمال سابقة",
-    "معرض أعمالنا", "حافظة", "حافظة أعمال", "حافظة أعمال سابقة", "حافظة أعمالنا",
-]
+FILTER_VERSION = "v2"
+FILTER_MODE = "conservative_intent_service"
 
 # ============================================================
 # تطبيع النص (normalization) — للمقارنة فقط، لا للإرسال
-#   - lowercase للإنجليزية (العربية لا تتأثر)
-#   - توحيد الحروف العربية الشائعة: أإآٱ→ا، ؤ→و، ئ→ي، ة→ه، ى→ي
-#   - إزالة التطويل (ـ/kashida) والتشكيل (harakat)
+#   - lowercase للإنجليزية
+#   - توحيد الحروف العربية: أإآٱ→ا، ؤ→و، ئ→ي، ة→ه، ى→ي
+#   - إزالة التطويل (kashida) والتشكيل (harakat)
 #   - تطبيع المسافات
-#   - لا يُدمّر النص الأصلي — الإرسال يستخدم raw_text الأصلي
 # ============================================================
+_ARABIC_NORMALIZE_MAP = str.maketrans({
+    'أ': 'a', 'إ': 'a', 'آ': 'a', 'ٱ': 'a',  # placeholder, swapped below
+})
+# Use direct mapping (avoid 'a' placeholder confusion)
 _ARABIC_NORMALIZE_MAP = str.maketrans({
     'أ': 'ا', 'إ': 'ا', 'آ': 'ا', 'ٱ': 'ا',
     'ؤ': 'و', 'ئ': 'ي', 'ة': 'ه', 'ى': 'ي',
     'ـ': '',  # tatweel/kashida
 })
-_ARABIC_DIACRITICS = re.compile(r'[\u0610-\u061A\u064B-\u065F\u0670\u06D6-\u06ED]')  # harakat
+_ARABIC_DIACRITICS = re.compile(r'[\u0610-\u061A\u064B-\u065F\u0670\u06D6-\u06ED]')
 
 
 def normalize_text(text: str) -> str:
     """تطبيع النص للمقارنة فقط — لا يُستخدم للإرسال."""
     if not text:
         return ""
-    # 1. lowercase (للإنجليزية — العربية لا تتأثر)
     t = text.lower()
-    # 2. توحيد الحروف العربية
     t = t.translate(_ARABIC_NORMALIZE_MAP)
-    # 3. إزالة التشكيل
     t = _ARABIC_DIACRITICS.sub('', t)
-    # 4. تطبيع المسافات (عدة مسافات/أسطر → مسافة واحدة، وإزالة الأطراف)
     t = re.sub(r'\s+', ' ', t).strip()
     return t
 
 
-# ============================================================
-# نسخ مُطبّعة مسبقًا من قوائم الكلمات (تطبيع متماثل للإدخال والكلمات)
-# بدون هذا، الكلمات التي تحوي ة/ى/أ لا تتطابق مع النص المُطبّع
-# (مثل "سيرة ذاتية" ← النص يصبح "سيره ذاتيه" فلا تطابق).
-# نُخزّن أزواج (أصلي، مُطبّع) لعرض الكلمة الأصلية في التقارير.
-# ============================================================
-_REQUEST_PAIRS = [(kw, normalize_text(kw)) for kw in REQUEST_KEYWORDS]
-_AD_PAIRS = [(kw, normalize_text(kw)) for kw in ADVERTISEMENT_KEYWORDS]
+def _norm_pairs(phrases: List[str]) -> List[Tuple[str, str]]:
+    """يبني أزواج (أصلي، مُطبّع) ويزيل التكرار والفارغ."""
+    seen = set()
+    out = []
+    for p in phrases:
+        n = normalize_text(p)
+        if n and n not in seen:
+            seen.add(n)
+            out.append((p, n))
+    return out
 
 
 # ============================================================
-# كشف أرقام الجوال وروابط التواصل (anti-spam إضافي)
-# مكمل لقائمة advertisement — يمسك ما قد تفوته الكلمات المفتاحية.
-# نُحافظ على منطق الحماية الموجود أصلاً في المشروع (is_advertiser_message).
+# [1] REQUEST_INTENT_PHRASES — عبارات طلب شخص (+3 لكل تطابق، cap 2)
+# عبارات متعددة الكلمات تبحث عن شخص يسوي/يحل/يساعد. ليست كلمات منفردة.
+# (القائمة تجمع طلبات المستخدم في الأقسام 3 و 4 من المواصفة.)
 # ============================================================
-# أرقام جوال دول الخليج + مصر (مثل المشروع الأصلي PHONE_PATTERN)
-_PHONE_RE = re.compile(r'(\+966\d{8,9}|\+967\d{8,9}|\+968\d{8,9}|\+971\d{8,9}|\+20\d{8,9}|\b05\d{8}\b)')
+REQUEST_INTENT_PHRASES: List[str] = [
+    # أبي أحد / أحتاج شخص
+    "ابي احد", "أبي أحد", "ابي شخص", "أبي شخص",
+    "محتاج أحد", "محتاج شخص", "احتاج احد", "احتاج شخص",
+    "أحتاج أحد", "أحتاج شخص", "أحتاج شخص متخصص", "محتاج شخص متخصص",
+    # من/مين يسوي/يحل لي
+    "من يسوي لي", "مين يسوي لي", "من يسوي", "مين يسوي",
+    "من يحل لي", "مين يحل لي", "من يحل", "مين يحل",
+    # من/مين يعرف أحد/شخص (ليست «من يعرف» المجرّدة — تلك سؤال عام، تُترك indicator فقط)
+    "من يعرف أحد", "مين يعرف أحد", "من يعرف شخص", "مين يعرف شخص",
+    "تعرفون أحد", "تعرفون شخص",
+    # أحد يساعدني / من يقدر يساعدني
+    "أحد يساعدني", "احد يساعدني", "من يقدر يساعدني", "مين يقدر يساعدني",
+    "من يقدر", "مين يقدر", "من يساعدني", "مين يساعدني",
+    # طلبات شخص متخصص/فاهم/خبرة
+    "أبي أحد فاهم", "ابي احد فاهم", "أحد عنده خبرة", "احد عنده خبره",
+    "من عنده شخص", "مين عنده شخص", "أحد ينجز لي", "احد ينجز لي",
+    # أدور/أبحث عن شخص
+    "أدور على أحد", "ادور على احد", "ابحث عن شخص", "أبحث عن شخص",
+    "من يدلني", "مين يدلني", "من يرشح لي", "مين يرشح لي", "وين ألقى",
+    # ممكن/ياليت/لو سمحتوا أحد
+    "ممكن أحد", "ياليت أحد", "لو سمحتوا أحد",
+    # --- seeking-person compounds (من قسم 4 — كلمات عامة للبحث عن شخص) ---
+    # المواصفة: هذه القائمة وحدها غير كافية — تُوضع هنا كـintent (+3) وتحتاج
+    # خدمة أكاديمية أو action+سؤال أو strong pattern للقبول. لا auto-accept.
+    "ابي احد يسوي لي", "أبي أحد يساعدني", "من يعرف يسوي", "تعرفون أحد يسوي",
+    "أحد يعرف شخص يسوي", "من عنده شخص يسوي", "أبي شخص ينجز لي",
+    "محتاج أحد يساعدني", "احتاج شخص يسوي لي", "مين يعرف أحد",
+    "من يقدر يسوي لي", "أحد عنده خبرة", "أبي أحد فاهم",
+    "من يعرف شخص متخصص", "أحد ينجز لي", "مين يقدر يساعدني",
+    "أبي شخص يسوي المشروع", "من عنده خبرة بالمشاريع",
+]
+
+# ============================================================
+# [2] SEEKING_INDICATORS — مؤشرات طلب ضعيفة (+1 لكل تطابق، cap 3)
+# كلمات/عبارات قصيرة تدل على بحث عن شخص، لكنها وحدها غير كافية أبدًا.
+# تساهم في has_question_form (صيغة سؤال/طلب).
+# ============================================================
+SEEKING_INDICATORS: List[str] = [
+    "من", "مين", "أبي", "ابي", "أحتاج", "احتاج", "محتاج", "تعرفون",
+    "أحد يعرف", "احد يعرف", "أحد عنده", "احد عنده",
+    "ممكن أحد", "ياليت أحد", "لو سمحتوا أحد",
+    "من يدلني", "مين يدلني", "من يرشح لي", "مين يرشح لي",
+    "أدور على أحد", "ادور على احد", "ابحث عن شخص", "أبحث عن شخص",
+    "وين ألقى", "ابغى احد", "أبغى أحد",
+]
+
+# ============================================================
+# [3] ACADEMIC_SERVICES — خدمات أكاديمية (+3 لكل تطابق، cap 2)
+# وحدها لا تكفي للقبول. يجب أن تُقرن بـintent أو action+سؤال أو strong pattern.
+# (القائمة الموسعة من القسم 5 في المواصفة.)
+# ============================================================
+ACADEMIC_SERVICES: List[str] = [
+    # بحوث
+    "بحث", "البحث", "بحث جامعي", "بحث علمي", "بحث تخرج", "مشروع بحثي",
+    "بحوث",
+    # تقارير
+    "تقرير", "تقرير جامعي", "تقرير تدريب", "تقرير ميداني", "تقرير تعاوني",
+    "تقارير",
+    # واجبات
+    "واجب", "الواجب", "واجب جامعي", "واجبات",
+    # سكليف / تكليف
+    "سكليف", "اسكليف", "assignment", "تكليف", "تكاليف",
+    # مشاريع
+    "مشروع", "المشروع", "مشاريع", "بروجكت", "project", "مشروع جامعي",
+    "مشروع تخرج",
+    # عروض / بوربوينت
+    "عرض", "عرض تقديمي", "برزنتيشن", "presentation", "بوربوينت",
+    "PowerPoint", "powerpoint", "ppt", "PPT",
+    # Excel
+    "Excel", "excel", "إكسل", "اكسل", "جداول", "ملف اكسل",
+    # خرائط
+    "خريطة مفاهيم", "خريطة ذهنية", "mind map", "mindmap", "concept map",
+    "مخطط",
+    # كويز / اختبارات / ميد
+    "كويز", "quiz", "اختبار", "اختبارات", "ميد", "ميدترم", "midterm",
+    # مذاكرة / شرح
+    "مذاكرة", "شرح", "شرح المادة", "أسئلة المقرر", "حل مسائل",
+]
+
+# ============================================================
+# [4] ACTION_VERBS — أفعال إنجاز (+4 عند وجود فعل + خدمة معًا)
+# action+service = فعل إنجاز موجود AND خدمة أكاديمية موجودة.
+# (القسم 3 من المواصفة: يسوي بحث / يكتب بحث / يحل واجب ...)
+# ============================================================
+ACTION_VERBS: List[str] = [
+    "يسوي", "يكتب", "يحل", "ينجز", "يجهز", "يصمم", "يشرح", "يراجع",
+    "يساعد", "يحضّر", "يحضر",
+]
+
+# ============================================================
+# [5] STRONG_PATTERNS — عبارات مركبة قوية كاملة (+5 لكل تطابق)
+# تطابق مباشر = قبول عالي الثقة (HIGH). (القسم 4 من المواصفة.)
+# هذه عبارات تجمع طلب شخص + خدمة أكاديمية صريحة في عبارة واحدة.
+# عبارات البحث عن شخص وحدها (دون خدمة) نُقلت لـREQUEST_INTENT_PHRASES
+# لأن المواصفة تقول: «لا تعتبر هذه القائمة وحدها كافية».
+# ============================================================
+STRONG_PATTERNS: List[str] = [
+    # --- بحوث وتقارير ---
+    "من يسوي لي بحث", "أبي أحد يسوي بحث", "أحد يسوي بحث", "من يعرف يسوي بحث",
+    "تعرفون أحد يسوي بحث", "أبي أحد يكتب بحث", "من يسوي تقرير",
+    "أبي أحد يسوي تقرير", "أحد يسوي تقرير ميداني", "من يعرف يسوي تقرير ميداني",
+    "أبي تقرير جامعي", "من يسوي بحث تخرج", "أحد يسوي مشروع بحثي",
+    "من يجهز لي البحث", "أحد يساعدني في البحث", "من يسوي لي تقرير تدريب",
+    "أحد يسوي تقرير تعاوني", "من يسوي تقرير تدريب ميداني",
+    # --- واجبات وتكليفات ---
+    "من يحل لي واجب", "أبي أحد يحل الواجب", "أحد يحل لي الواجب",
+    "من يعرف يحل واجب", "أحد يساعدني في واجب", "أحد يسوي لي سكليف",
+    "من يسوي سكليف", "من يعرف يسوي سكليف", "أبي أحد يجهز سكليف",
+    "من يحل التكليف", "أحد يسوي التكليف", "من يساعدني في التكليف",
+    "عندي واجب جامعي وأحتاج مساعدة", "أحد ينجز لي واجب جامعي",
+    # --- مشاريع ---
+    "من يسوي لي مشروع", "أحد يسوي لي مشروع", "من يسوي البروجكت",
+    "أحد يسوي بروجكت", "من يعرف يسوي مشروع", "أبي أحد ينجز المشروع",
+    "أحد يساعدني في المشروع", "من يجهز مشروع جامعي",
+    "عندي مشروع تخرج وأحتاج أحد", "من يسوي مشروع تخرج",
+    "أحد يشتغل مشاريع جامعية",
+    # --- عروض وبوربوينت ---
+    "أحد يسوي لي عرض", "من يسوي لي عرض تقديمي", "من يعرف يسوي برزنتيشن",
+    "أحد يسوي برزنتيشن", "أبي أحد يسوي بوربوينت", "من يسوي بوربوينت",
+    "أحد يجهز عرض بوربوينت", "من يصمم عرض تقديمي", "أحد يصمم برزنتيشن",
+    "أبي عرض جامعي وأحتاج أحد", "من يجهز برزنتيشن جامعي",
+    "أحد يسوي PowerPoint", "من يعرف يسوي PowerPoint", "أبي أحد يصمم لي عرض",
+    # --- Excel والبرامج ---
+    "أحد يحل إكسل", "من يحل Excel", "أحد يسوي لي إكسل", "حل واجب Excel",
+    "أحد يحل واجب إكسل", "من يسوي جداول إكسل", "أحد يساعدني في Excel",
+    "من يعرف يحل مسائل Excel", "أحد يسوي مشروع Excel", "من يجهز ملف Excel",
+    "حل واجبات برامج", "أحد يساعدني في البرامج",
+    # --- خرائط ومخططات ---
+    "من يسوي خريطة مفاهيم", "أحد يسوي خريطة مفاهيم",
+    "من يسوي خريطة ذهنية", "أحد يسوي خريطة ذهنية",
+    "أبي خريطة مفاهيم وأحتاج أحد", "أبي خريطة ذهنية وأحتاج أحد",
+    "من يعرف يسوي Mind Map", "أحد يصمم Mind Map", "من يسوي Concept Map",
+    "أحد يجهز خريطة للمادة", "من يسوي مخطط للمقرر",
+    # --- اختبارات وكويزات ومذاكرة ---
+    "أحد يحل لي ميد", "من يحل الميد", "أحد يساعدني في الميد",
+    "من يحل كويز", "أحد يحل كويز", "من يحل اختبار", "أحد يساعدني في الاختبار",
+    "من يساعدني في أسئلة المقرر", "أحد يساعدني في المذاكرة",
+    "من يشرح لي المادة", "أحد يراجع معي",
+]
+
+# ============================================================
+# [6] PROVIDER_INDICATORS — إشارات مقدم خدمة (+4 لكل تطابق)
+# أول شخص مفرد/جمع يعرض خدمة: أسوي / أحل / نوفر / نقدم / لدينا / متخصص.
+# هذه ليست طلبًا — هذه إعلان عرض خدمة.
+# ============================================================
+PROVIDER_INDICATORS: List[str] = [
+    "أسوي", "اسوي", "أحل", "احل", "أكتب", "اكتب", "أنجز", "انجز",
+    "أصمم", "اصمم", "أشرح", "اشرح", "أجهز", "اجهز",
+    "نوفر", "نقدم", "نقدم خدمات", "لدينا خدمات", "لدينا", "خدماتنا",
+    "نخدمكم", "نخدم", "متخصص في", "متخصصون", "متخصصون في",
+    "مختص في", "مختصون", "للتواصل لحل", "للتواصل", "تواصل معنا", "راسلنا",
+    "تواصل خاص", "للطلب", "للحجز",
+]
+
+# ============================================================
+# [7] ADVERTISEMENT_STRONG_SIGNALS — إشارات إعلانية تسويقية (+2 لكل، cap 3)
+# كلمات تسويق: أسعار/خصومات/عروض/ضمان/عملاء. تُغذّي provider_confidence.
+# NOTE: رقم الهاتف/الرابط وحده لا يُسبب الرفض — يجب أن يُقرن بإشارة عرض.
+# ============================================================
+ADVERTISEMENT_STRONG_SIGNALS: List[str] = [
+    "أسعارنا", "بأسعار", "بأسعار مناسبة", "أفضل الأسعار", "أسعار ممتازة",
+    "خصم", "خصومات", "تخفيض", "عروض", "عرض خاص", "عرض محدود",
+    "عرض لفترة محدودة", "استفد الآن", "احجز الآن", "اطلب الآن", "سارع",
+    "فرصة", "فرصه", "محدودة", "العدد محدود", "أماكن محدودة", "مقاعد محدودة",
+    "حجز", "احجز", "حجوزات", "حجز مسبق",
+    "دفع", "الدفع", "دفع اونلاين", "الدفع اونلاين", "سداد", "السداد",
+    "الدفع المسبق", "دفع مسبق",
+    "ضمان", "ضمان استرجاع", "ضمان الجودة", "مضمون", "نتيجة مضمونة",
+    "ضمان النتيجة", "خدمة مضمونة",
+    "خبرة سنوات", "سنوات من الخبرة", "خبرة طويلة", "فريق متخصص",
+    "كفاءة عالية", "جودة عالية", "عالية الجودة",
+    "سرعة في التنفيذ", "تنفيذ سريع", "انجاز سريع", "انجاز في وقت قياسي",
+    "سرية تامة", "خصوصية تامة",
+    "توصيل سريع", "تسليم سريع", "تسليم فوري", "تسليم في نفس اليوم",
+    "عملاء", "عملائنا", "عملاء سابقون", "عملاء راضون", "رضا العملاء",
+    "تقييمات العملاء", "شهادات العملاء", "مراجعات العملاء",
+    "نماذج أعمال", "معرض أعمال", "حافظة أعمال",
+    "واتساب للأعمال", "رقم واتساب", "مراسلة عبر واتساب", "تواصل واتساب",
+    "عرض خدمات", "طلب خدمة", "خدمات طلابية", "خدمات تعليمية",
+    "خدمات اكاديمية", "خدمة اونلاين", "خدمة مدرسية", "خدمات",
+    "project service", "study help", "promotion", "announcement",
+    "اعلان", "اعلانات", "contact me", "whatsapp",
+]
+
+# نسخ مُطبّعة مسبقًا (أزواج أصلي/مُطبّع) للمقارنة السريعة
+_INTENT_PAIRS = _norm_pairs(REQUEST_INTENT_PHRASES)
+_INDICATOR_PAIRS = _norm_pairs(SEEKING_INDICATORS)
+_SERVICE_PAIRS = _norm_pairs(ACADEMIC_SERVICES)
+_ACTION_PAIRS = _norm_pairs(ACTION_VERBS)
+_PATTERN_PAIRS = _norm_pairs(STRONG_PATTERNS)
+_PROVIDER_PAIRS = _norm_pairs(PROVIDER_INDICATORS)
+_AD_PAIRS = _norm_pairs(ADVERTISEMENT_STRONG_SIGNALS)
+
+# ============================================================
+# أرقام الجوال وروابط التواصل — إشارات إضافية (إضافية فقط، ليست حكمًا نهائيًا)
+# رقم/رابط وحده لا يرفض. يُضاف +1 لـprovider_confidence لو وُجد مع إشارة عرض.
+# ============================================================
+_PHONE_RE = re.compile(
+    r'(\+966\d{8,9}|\+967\d{8,9}|\+968\d{8,9}|\+971\d{8,9}|\+20\d{8,9}|\b05\d{8}\b)'
+)
 _CONTACT_URL_RE = re.compile(r'(https?://|t\.me/|wa\.me/|telegram\.me/)', re.IGNORECASE)
 
 
 def _has_phone_number(text: str) -> bool:
-    """كشف أرقام الجوال (السعودية/اليمن/عمان/الإمارات/مصر + 05xxxxxxxx)."""
     return bool(_PHONE_RE.search(text))
 
 
 def _has_contact_url(text: str) -> bool:
-    """كشف روابط التواصل (http(s)://, t.me/, wa.me/, telegram.me/)."""
     return bool(_CONTACT_URL_RE.search(text))
 
 
-def _is_long_ad(text: str) -> bool:
-    """رسالة بـ6 أسطر أو أكثر = غالباً إعلان (منطق موجود أصلاً في المشروع)."""
+# ============================================================
+# [MBOT-PORT] إشارات إعلانية إضافية من مرجع mbot.py القديم
+# ------------------------------------------------------------
+# هاتان الإشارتان وحدهما لا تكفيان للرفض، لكنهما تُضيفان لـprovider_confidence
+# لتعزيز كشف الإعلانات المُتعمّدة التسلل. مأخوذتان من is_advertiser_message
+# في mbot.py القديم الذي رفعه المُشغّل كمرجع.
+# ============================================================
+
+# [1] كلمات عربية مُجزّأة بنقاط متقطعة — تستخدم للالتفاف على الفلاتر
+#     مثل "ت.قرير" / "تـ.قرير" / "و.اجب" — إشارة إعلانية قوية (+2).
+#     regex: حرف عربي + (optional non-word) + literal "." + (optional non-word) + حرف عربي
+_DOTTED_WORD_RE = re.compile(r'[أ-ي]\W?\.\W?[أ-ي]')
+
+
+def _has_dotted_word(text: str) -> bool:
+    """يكشف كلمات عربية مُجزّأة بنقاط (تعمّد التلصص على الفلاتر)."""
+    if not text:
+        return False
+    return bool(_DOTTED_WORD_RE.search(text))
+
+
+# [2] رسالة متعددة الأسطر (≥6 أسطر) — إشارة إعلانية ضعيفة (+1).
+#     ملاحظة: ليست حكمًا نهائيًا — طلب مشروع طويل قد يكون متعدد الأسطر.
+#     لذلك تُضاف كإشارة ضعيفة فقط، لا ترفض وحدها أبدًا.
+_MULTILINE_AD_THRESHOLD = 6
+
+
+def _has_many_lines(text: str, threshold: int = _MULTILINE_AD_THRESHOLD) -> bool:
+    """يكشف رسائل متعددة الأسطر (≥6 افتراضيًا) — إشارة تسويقية ضعيفة."""
+    if not text:
+        return False
     try:
-        return len(text.splitlines()) >= 6
+        return len(text.splitlines()) >= int(threshold)
     except Exception:
         return False
 
 
 # ============================================================
-# الفلتر الرئيسي — is_request_message
-# يعيد (is_request: bool, info: dict) للشفافية والتشخيص.
-#
-# info يحوي:
-#   reason: 'empty' | 'no_request_keyword' | 'advertisement' | 'genuine_request'
-#   request_matches: list[str]   (الكلمات المفتاحية التي تطابقت)
-#   advertisement_matches: list[str]
-#   reasons: list[str]  (تفصيل أسباب الرفض، إن وُجدت)
+# thresholds — محافظة لتقليل false positives
 # ============================================================
-def is_request_message(text: str) -> Tuple[bool, Dict]:
-    """يقرر إن كانت الرسالة طلبًا حقيقيًا يُرسل لقناة الطلبات.
+PROVIDER_THRESHOLD = 6   # provider_confidence >= 6 → REJECT (provider)
+INTENT_CAP = 2           # max intent matches counted (×3)
+SERVICE_CAP = 2          # max service matches counted (×3)
+ACTION_CAP = 2           # max action matches counted (×4)
+INDICATOR_CAP = 3        # max indicator matches counted (×1)
+AD_CAP = 3               # max ad-signal matches counted (×2)
+PATTERN_BONUS = 5        # per strong pattern match
+HIGH_CONFIDENCE = 9
+MEDIUM_CONFIDENCE = 6
 
-    الترتيب الصارم:
-      1. normalization (للمقارنة فقط)
-      2. REQUEST_MATCH: واحدة على الأقل من REQUEST_KEYWORDS
-         → إن false، ارجع False (ليس طلبًا)
-      3. ADVERTISEMENT_MATCH (كلمات + هاتف + رابط + طول >=6 أسطر)
-         → إن true، ارجع False (إعلان)
-      4. النتيجة: True فقط إذا REQUEST_MATCH && !ADVERTISEMENT_MATCH
-    """
-    if not text or not text.strip():
-        return False, {
-            "reason": "empty",
-            "request_matches": [],
-            "advertisement_matches": [],
-            "reasons": ["empty_text"],
+
+@dataclass
+class RequestAnalysis:
+    """نتيجة تحليل رسالة واحدة. تشخيصية للـlogging وقرار is_request."""
+    is_request: bool = False
+    confidence: int = 0
+    reason: str = "low_confidence"
+    matched_intents: List[str] = field(default_factory=list)
+    matched_services: List[str] = field(default_factory=list)
+    matched_actions: List[str] = field(default_factory=list)
+    matched_patterns: List[str] = field(default_factory=list)
+    matched_indicators: List[str] = field(default_factory=list)
+    provider_signals: List[str] = field(default_factory=list)
+    ad_signals: List[str] = field(default_factory=list)
+    seeker_confidence: int = 0
+    provider_confidence: int = 0
+    has_question_form: bool = False
+    has_phone: bool = False
+    has_contact_url: bool = False
+    # [MBOT-PORT] إشارات إعلانية إضافية من mbot.py
+    has_dotted_word: bool = False       # كلمات عربية مُجزّأة بنقاط (obfuscation)
+    has_many_lines: bool = False        # ≥6 أسطر (weak marketing signal)
+
+    def to_dict(self) -> Dict[str, Any]:
+        """Compatibility dict للواجهة القديمة (is_request_message)."""
+        # request_matches للعرض: intents + services + patterns (أبرزها)
+        matches = (self.matched_intents + self.matched_services
+                   + self.matched_patterns)
+        # إشارات إعلانية إضافية تُعرض في advertisement_matches للتشخيص
+        extra_ad = []
+        if self.has_dotted_word:
+            extra_ad.append("(dotted_word_obfuscation)")
+        if self.has_many_lines:
+            extra_ad.append("(multi_line_six_plus)")
+        return {
+            "reason": self.reason,
+            "request_matches": matches,
+            "advertisement_matches": (self.provider_signals + self.ad_signals + extra_ad),
+            "reasons": [self.reason] if self.reason else [],
+            "confidence": self.confidence,
+            "seeker_confidence": self.seeker_confidence,
+            "provider_confidence": self.provider_confidence,
+            "matched_intents": self.matched_intents,
+            "matched_services": self.matched_services,
+            "matched_patterns": self.matched_patterns,
+            "matched_actions": self.matched_actions,
+            "provider_signals": self.provider_signals,
+            "has_question_form": self.has_question_form,
+            "has_dotted_word": self.has_dotted_word,
+            "has_many_lines": self.has_many_lines,
         }
+
+
+def _match_pairs(pairs, normalized: str) -> List[str]:
+    """يرجع قائمة العبارات الأصلية التي تطابقت (substring على المُطبّع)."""
+    return [orig for orig, norm in pairs if norm and norm in normalized]
+
+
+def analyze_request(text: str) -> RequestAnalysis:
+    """يحلل الرسالة ويُرجع RequestAnalysis تشخيصية.
+
+    قرار القبول (is_request=True) يتطلب إحدى:
+      A) matched_intents AND matched_services  (intent + academic service)
+      B) matched_actions AND has_question_form (action+service + سؤال/طلب)
+      C) matched_patterns (strong compound phrase)
+
+    ويُرفض صراحةً لو provider_confidence >= PROVIDER_THRESHOLD (مقدم خدمة).
+    خلاف ذلك → REJECT (confidence منخفض).
+    """
+    res = RequestAnalysis()
+
+    if not text or not text.strip():
+        res.reason = "empty"
+        return res
 
     normalized = normalize_text(text)
     if not normalized:
-        return False, {
-            "reason": "empty_after_normalize",
-            "request_matches": [],
-            "advertisement_matches": [],
-            "reasons": ["empty_after_normalize"],
-        }
+        res.reason = "empty_after_normalize"
+        return res
 
-    # --- المرحلة 2: البحث عن كلمات الطلب (substring على النص المُطبّع) ---
-    # نقارن النص المُطبّع ضد الكلمات المُطبّعة مسبقًا (تطبيع متماثل).
-    request_matches = [orig for orig, norm in _REQUEST_PAIRS if norm and norm in normalized]
-    request_match = len(request_matches) > 0
-    if not request_match:
-        return False, {
-            "reason": "no_request_keyword",
-            "request_matches": [],
-            "advertisement_matches": [],
-            "reasons": ["no_request_keyword"],
-        }
+    # --- مطابقات ---
+    res.matched_intents = _match_pairs(_INTENT_PAIRS, normalized)
+    res.matched_indicators = _match_pairs(_INDICATOR_PAIRS, normalized)
+    res.matched_services = _match_pairs(_SERVICE_PAIRS, normalized)
+    res.matched_patterns = _match_pairs(_PATTERN_PAIRS, normalized)
+    res.provider_signals = _match_pairs(_PROVIDER_PAIRS, normalized)
+    res.ad_signals = _match_pairs(_AD_PAIRS, normalized)
 
-    # --- المرحلة 3: فحص الإعلان (كلمات + هاتف + رابط + طول) ---
-    advertisement_matches = [orig for orig, norm in _AD_PAIRS if norm and norm in normalized]
-    # الهاتف والأرقام تُفحص على النص الأصلي (لا تتأثر بالتطبيع)
-    has_phone = _has_phone_number(text)
-    has_contact_url = _has_contact_url(text)
-    is_long = _is_long_ad(text)
+    # action+service: فعل إنجاز موجود AND خدمة موجودة
+    matched_action_verbs = _match_pairs(_ACTION_PAIRS, normalized)
+    res.matched_actions = []
+    if matched_action_verbs and res.matched_services:
+        for av in matched_action_verbs:
+            res.matched_actions.append(f"{av}+service")
+            if len(res.matched_actions) >= ACTION_CAP:
+                break
 
-    advertisement_match = bool(advertisement_matches) or has_phone or has_contact_url or is_long
+    # إشارات هاتف/رابط
+    res.has_phone = _has_phone_number(text)
+    res.has_contact_url = _has_contact_url(text)
 
-    if advertisement_match:
-        reasons = []
-        if advertisement_matches:
-            reasons.append("ad_keyword:" + ",".join(advertisement_matches[:3]))
-        if has_phone:
-            reasons.append("phone_number")
-        if has_contact_url:
-            reasons.append("contact_url")
-        if is_long:
-            reasons.append("long_message(>=6_lines)")
-        return False, {
-            "reason": "advertisement",
-            "request_matches": request_matches,
-            "advertisement_matches": advertisement_matches,
-            "reasons": reasons,
-        }
+    # [MBOT-PORT] إشارات إعلانية إضافية من mbot.py
+    # (1) كلمات عربية مُجزّأة بنقاط — تعمّد التلصص على الفلاتر
+    # (2) رسالة متعددة الأسطر (≥6) — إشارة تسويقية ضعيفة
+    res.has_dotted_word = _has_dotted_word(text)
+    res.has_many_lines = _has_many_lines(text)
 
-    # --- المرحلة 4: طلب حقيقي — يُرسل لقناة الطلبات ---
-    return True, {
-        "reason": "genuine_request",
-        "request_matches": request_matches,
-        "advertisement_matches": [],
-        "reasons": ["genuine_request"],
-    }
+    # صيغة سؤال/طلب: علامة استفهام OR intent phrase OR seeking indicator
+    res.has_question_form = (
+        '؟' in text or '?' in text
+        or bool(res.matched_intents) or bool(res.matched_indicators)
+    )
+
+    # --- حساب الثقة ---
+    seeker = (
+        min(len(res.matched_intents), INTENT_CAP) * 3
+        + min(len(res.matched_indicators), INDICATOR_CAP) * 1
+        + min(len(res.matched_services), SERVICE_CAP) * 3
+        + min(len(res.matched_actions), ACTION_CAP) * 4
+        + len(res.matched_patterns) * PATTERN_BONUS
+    )
+    res.seeker_confidence = seeker
+
+    provider = (
+        len(res.provider_signals) * 4
+        + min(len(res.ad_signals), AD_CAP) * 2
+    )
+    # هاتف/رابط وحده لا يكفي، لكنه يُضيف +1 لو وُجد مع إشارة عرض (provider>0)
+    if (res.has_phone or res.has_contact_url) and provider > 0:
+        provider += 1
+    # [MBOT-PORT] إشارات إعلانية إضافية: dotted word = +2 (قوية)، multi-line = +1 (ضعيفة)
+    # وحدهما لا يكفيان للرفض (PROVIDER_THRESHOLD=6)، لكنهما يعززان الكشف لو
+    # رافقتا إشارة عرض أخرى. dotted word قوية لأن العربية لا تستخدم النقاط
+    # بين الحروف عادةً — هذا التلصص إعلاني شبه أكيد.
+    if res.has_dotted_word:
+        provider += 2
+    if res.has_many_lines:
+        provider += 1
+    res.provider_confidence = provider
+
+    # --- القرار ---
+    # 1) مقدم خدمة → رفض صريح (حتى لو بدا طلبًا)
+    if res.provider_confidence >= PROVIDER_THRESHOLD:
+        res.is_request = False
+        res.reason = "provider_detected"
+        res.confidence = seeker
+        return res
+
+    # 2) strong pattern → قبول عالي
+    if res.matched_patterns:
+        res.is_request = True
+        res.reason = "strong_pattern"
+        res.confidence = max(HIGH_CONFIDENCE, seeker)
+        return res
+
+    # 3) intent + service → قبول متوسط-عالي
+    if res.matched_intents and res.matched_services:
+        res.is_request = True
+        res.reason = "intent_plus_service"
+        res.confidence = max(MEDIUM_CONFIDENCE, seeker)
+        return res
+
+    # 4) action + service + صيغة سؤال/طلب → قبول متوسط
+    if res.matched_actions and res.has_question_form:
+        res.is_request = True
+        res.reason = "action_plus_service"
+        res.confidence = max(MEDIUM_CONFIDENCE, seeker)
+        return res
+
+    # 5) رفض — تمييز السبب للتشخيص
+    res.is_request = False
+    if not res.matched_services and not res.matched_intents and not res.matched_actions:
+        res.reason = "no_academic_signal"
+    elif res.matched_services and not res.matched_intents and not res.matched_actions:
+        res.reason = "service_without_intent"  # «عندي مشروع» / «بحثي صعب»
+    elif res.matched_intents and not res.matched_services:
+        res.reason = "intent_without_service"  # «ممكن أحد يساعدني»
+    else:
+        res.reason = "low_confidence"
+    res.confidence = seeker
+    return res
+
+
+def is_service_seeker(text: str) -> bool:
+    """هل الرسالة طالب خدمة (seeker)؟ قرار analyze_request المعتمد."""
+    return analyze_request(text).is_request
+
+
+def is_service_provider(text: str) -> bool:
+    """هل الرسالة مقدم خدمة (provider)؟ provider_confidence >= threshold."""
+    return analyze_request(text).provider_confidence >= PROVIDER_THRESHOLD
+
+
+def is_request_message(text: str) -> Tuple[bool, Dict[str, Any]]:
+    """Compatibility wrapper للواجهة القديمة. يُرجع (is_request, info_dict).
+    يستخدم نفس منطق analyze_request — لا فلتر قديم يعمل بالتوازي."""
+    res = analyze_request(text)
+    return res.is_request, res.to_dict()

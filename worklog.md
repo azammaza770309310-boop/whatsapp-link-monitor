@@ -2334,3 +2334,110 @@ Stage Summary:
 - التصميم: لا snapshot، لا LRB، لا cache، لا journal، لا send لأي بوت. الحارس شفاف للمستخدمين الحقيقيين (bot=False) وللرسائل من قنوات/مجموعات مجهولة (sender=Channel بلا bot attr).
 - الـraw hook يبقى ultra-fast (لا entity lookup)؛ يُغطّى purge-Via-NewMessage.
 - جاهز لـcommit + push.
+
+---
+Task ID: REQUEST-FILTER-v2
+Agent: main
+Task: استبدال فلتر الطلبات القديم (REQUEST_KEYWORDS بـ300 كلمة + مطابقة substring ساذجة) بالكامل بـ Request Filter v2 المحافظ (Intent + Academic Service + scoring + seeker/provider + Kill Switch + Rate Limit + Circuit Breaker + Content Dedup)، مع الحفاظ التام على مسار الروابط. لا commit/push حتى تقرير نهائي.
+
+Work Log:
+- استنساخ المستودع من GitHub إلى /home/z/wlm-clone (آخر نسخة origin/main = f436a4e BOT-FILTER).
+- تشخيص: request_filter.py القديم = 259 سطر فيه REQUEST_KEYWORDS (~200 إدخال) + ADVERTISEMENT_KEYWORDS (~130) + مطابقة substring ساذجة على كلمات منفردة («مشروع»/«واجب»/«بحث»/«عرض»/«اختبار»/«مساعدة») → سبب الـ15,000 رسالة الكاذبة.
+- حذف request_filter.py القديم بالكامل (0 سطر من المنطق القديم بقي) واستبداله بـ v2 (632 سطر):
+  * REQUEST_INTENT_PHRASES (72 عبارة طلب شخص، +3، cap 2) — multi-word فقط.
+  * SEEKING_INDICATORS (26 مؤشر ضعيف، +1، cap 3) — وحده غير كافٍ أبدًا.
+  * ACADEMIC_SERVICES (62 خدمة، +3، cap 2) — وحدها لا تكفي.
+  * ACTION_VERBS (11 فعل إنجاز، +4 مع service).
+  * STRONG_PATTERNS (91 عبارة مركبة كاملة، +5، قبول مباشر HIGH).
+  * PROVIDER_INDICATORS (34 إشارة مقدم خدمة، +4).
+  * ADVERTISEMENT_STRONG_SIGNALS (89 إشارة تسويقية، +2، cap 3).
+  * analyze_request(text) → RequestAnalysis dataclass (is_request, confidence, reason, matched_*, seeker/provider confidence, has_question_form).
+  * القرار: A) intent+service OR B) action+service+سؤال OR C) strong_pattern. provider>=6 → REJECT. خلاف ذلك REJECT بـreason تشخيصي (service_without_intent / intent_without_service / no_academic_signal / low_confidence).
+  * is_service_seeker / is_service_provider helpers. is_request_message compat wrapper.
+- بناء request_guard.py جديد (232 سطر): RateLimiter (global+per-chat sliding window) + CircuitBreaker (trip on threshold, cooldown, auto-recover) + ContentDeduper (hash + per-entry TTL + bounded). كلها pure-Python، تزامنية، no Telegram.
+- ربط bot.py _handle_request_path: kill switch (REQUEST_FILTER_ENABLED default false) → lazy-init guards → analyze_request → content dedup → circuit breaker → rate limit → record_accept → logging تشخيصي (REJECT reason=... score=... / ACCEPT confidence=... reason=...) → التنسيق والإرسال (مطابق قناة الروابط، target=@dhkskwksjskwk، لا fallback).
+- Config parsing: REQUEST_FILTER_ENABLED + MAX_PER_MINUTE(20) + MAX_PER_CHAT_PER_MINUTE(5) + CIRCUIT_BREAKER_THRESHOLD(100) + WINDOW_S(600) + COOLDOWN_S(600). كلها getattr دفاعي.
+- Startup logging: REQUEST_FILTER_VERSION=v2 / MODE=conservative_intent_service / ENABLED=true|false / MAX_PER_MINUTE / MAX_PER_CHAT_PER_MINUTE / CIRCUIT_BREAKER_THRESHOLD (window, cooldown).
+- render.yaml: 6 env vars جديدة بقيم محافظة (REQUEST_FILTER_ENABLED=false, MAX_PER_MINUTE=20, MAX_PER_CHAT_PER_MINUTE=5, CB_THRESHOLD=100, CB_WINDOW_S=600, CB_COOLDOWN_S=600).
+- تحديث verify_request_filter.py (rewrite كامل، 40/40 حالة): ACCEPT(10) + REJECT(13) + CRITICAL(5) + REJECT-AD(6) + SEEKER+contact(3) + PROVIDER(4).
+- اختبار جديد tests/test_request_filter_v2.py (49/49 تأكيد): A(analyze_request ACCEPT/REJECT/provider) + B(normalization) + C(RateLimiter) + D(CircuitBreaker) + E(ContentDeduper) + F(_handle_request_path integration: kill switch + channel separation + capture-first + rate limit + circuit breaker + content dedup + cross-account dedup + independence + seeker+phone).
+- تحديث اختبارين قديمين: test_request_channel_separation.py (env+config+raw_text_2 v2-valid) → 52/52. test_request_filter_race_rescue.py (env+config + 4A flipped: genuine request+link يُقبل في v2) → 23/23.
+
+Stage Summary:
+- جميع الاختبارات تمر: test_request_channel_separation 52/52, test_request_filter_race_rescue 23/23, test_delete_rescue 15/15, test_raw_hook 13/13, test_fast_delete_rescue_evidence RESCUED_ONCE=25 MISSED=0, test_link_capture 21/21, test_bot_filter 20/20, test_request_filter_v2 49/49 (جديد), verify_request_filter 40/40.
+- AST OK على كل الملفات السبعة.
+- الفلتر القديم محذوف بالكامل: 0 مرجع لـREQUEST_KEYWORDS/ADVERTISEMENT_KEYWORDS في الكود (بقيت 7 مراجع فقط في git show HEAD = النسخة القديمة، تؤكد الحذف).
+- مسار الروابط لم يُلمس: link extractor → CHANNEL_ID كما هو؛ request filter → @dhkskwksjskwk مستقل. الاختبارات تثبت الاستقلالية.
+- Kill Switch default = false (محافظ): لا يُرسل أي طلب حتى يفعّل المُشغّل REQUEST_FILTER_ENABLED=true في Render.
+- لم يُعمل commit أو push (بانتظار تقرير نهائي وموافقة المُشغّل).
+
+---
+Task ID: REQUEST-FILTER-v2 + MBOT.PY HEURISTICS PORT
+Agent: main
+Task: المُشغّل رفع ملف mbot.py (النسخة القديمة المستقلة للبوت) كمرجع. كان يحتوي على (1) قائمة keywords القديمة بـ127 كلمة منفردة (سبب فيضان 15,000 رسالة كاذبة) + (2) dict مُجزّأ بـ5 فئات لكن بلا اسم متغير (لن يعمل) + (3) advertiser_keywords بـ27 إشارة + (4) دالة is_advertiser_message بثلاث إشارات فريدة لا توجد في v2: dotted-word obfuscation regex و multi-line ad signal. المهمة: استخراج الإشارات الفريدة من mbot.py ودمجها في v2 + اختبارات + تقرير نهائي (بدون commit/push).
+
+Work Log:
+- استرجاع الحالة: HEAD=f436a4e (BOT-FILTER). working tree فيه v2 مكتمل (request_filter.py 487 سطر + request_guard.py 231 سطر + bot.py +174 + render.yaml +25 + tests/test_request_filter_v2.py 49/49 + verify_request_filter.py 40/40). جميع الاختبارات تمر.
+- تحليل mbot.py المرفوع (371 سطر):
+  * keywords = [...] بـ127 كلمة منفردة فريدة (مع تكرارات) — قائمة الـ15,000 false positive.
+  * dict منعوت بـ{...} بلا اسم متغير = bare expression statement = dead code (Python parse OK لكن لا ينفّذ شيء).
+  * advertiser_keywords = 27 إشارة (للتواصل، عبر حسابنا، مكتبنا، خدمات طلابية، +966، 05X، t.me/، wa.me/...).
+  * is_advertiser_message(text) بثلاث heuristics:
+    - len(text.splitlines()) >= 6 → ad
+    - re.search(r'\+966\d{9}', text) → ad (السعودية فقط)
+    - re.search(r'\b05\d{8}\b', text) → ad (السعودية فقط)
+    - re.search(r'[أ-ي]\W?\.\W?[أ-ي]', text) → ad (Arabic dotted obfuscation مثل ت.قرير)
+  * detect_customer event handler: if any(keyword in text) AND not is_advertiser → forward.
+- مقارنة v2 مع mbot.py — ما الذي تغطيه v2 بالفعل؟
+  * phone regex في v2: +966، +967، +968، +971، +20، 05X — أوسع من mbot.py (السعودية فقط).
+  * contact URL regex في v2: https://، t.me/، wa.me/، telegram.me/ — مطابق لـmbot.py.
+  * PROVIDER_INDICATORS (34 إشارة) + ADVERTISEMENT_STRONG_SIGNALS (89 إشارة) — أوسع بكثير من advertiser_keywords (27).
+- الاختبار الذي يُثبت التغطية: 27/27 من advertiser_keywords في mbot.py → REJECT في v2 (تحت أسباب مختلفة: provider_detected / no_academic_signal / service_without_intent). كلها rejected ✅.
+- الاختبار الذي يُثبت التحسّن: 127 كلمة منفردة في keywords القديمة → v2 rejects 121/127 = 95% (false-positive elimination). الـ6 المتبقية عبارات متعددة الكلمات حقيقية مثل «من يحل واجب» و«مين يسويلي بحث».
+- [MBOT-PORT] استخراج الإشارتين الفريدتين اللتين لا توجدان في v2:
+  1. dotted-word obfuscation regex: r'[أ-ي]\W?\.\W?[أ-ي]' — يكشف تعمّد التلصص على الفلاتر مثل «ت.قرير» / «تـ.قرير» / «و.اجب». العربية لا تستخدم نقاط بين الحروف عادةً — هذه الإشارة شبه أكيدة للإعلان.
+  2. multi-line ad signal: len(text.splitlines()) >= 6 — رسالة متعددة الأسطر = إشارة تسويقية ضعيفة.
+- تعديل request_filter.py (المسار: assistant → Edit tool):
+  * إضافة _DOTTED_WORD_RE = re.compile(r'[أ-ي]\W?\.\W?[أ-ي]') + _has_dotted_word(text) helper.
+  * إضافة _MULTILINE_AD_THRESHOLD=6 + _has_many_lines(text, threshold=6) helper.
+  * إضافة حقلين على RequestAnalysis dataclass: has_dotted_word + has_many_lines.
+  * في analyze_request: حساب الإشارتين بعد has_phone/has_contact_url، قبل has_question_form.
+  * في حساب provider_confidence: dotted word = +2 (قوية)، multi-line = +1 (ضعيفة). وحدهما لا يكفيان للرفض (PROVIDER_THRESHOLD=6).
+  * في to_dict: عرض (dotted_word_obfuscation) و (multi_line_six_plus) في advertisement_matches للتشخيص.
+- اختبارات جديدة في tests/test_request_filter_v2.py (section G، 29 assertion):
+  * _has_dotted_word: ت.قرير ✅، و.اجب ✅، تـ.قرير (kashilda+dot) ✅، تـ.ـقرير (both) ✅، تقرير ✗، empty ✗، english ✗، جملة عربية كاملة ✗.
+  * _has_many_lines: 6 أسطر ✅، 5 أسطر ✗، empty ✗، custom threshold=3 ✅، None-safe ✅.
+  * analyze_request: dotted ad REJECT provider_detected ✅ + has_dotted_word=True ✅ + provider>=6 ✅.
+  * ad no-dots: REJECT provider_detected ✅ + has_dotted_word=False ✅ + dotted version أعلى provider_confidence ✅.
+  * multi-line ad (6 أسطر مع provider words): REJECT ✅ + has_many_lines=True ✅ + provider>=6 ✅.
+  * NO false positive: multi-line genuine request (6 أسطر بطلب حقيقي): ACCEPT ✅ + provider<6 ✅ (multi-line = إشارة ضعيفة لا ترفض وحدها).
+  * to_dict: has_dotted_word و has_many_lines في الـdict ✅ + tags في advertisement_matches ✅.
+- اختبارات جديدة في verify_request_filter.py (+3 cases، الآن 43/43):
+  * REJECT-AD case 7: «مكتبنا يقدم خدمات طلابية ت.قرير و.اجب باسعار مناسبة» → REJECT provider=8 ✅.
+  * REJECT-AD case 8: 6-line ad «نوفر بحوث ومشاريع\nأسعارنا مناسبة\n...» → REJECT provider=11 ✅.
+  * SEEKER-multi-line (case جديد): 6-line genuine request → ACCEPT (لا false-reject) ✅.
+- AST OK على request_filter.py + request_guard.py + bot.py + verify_request_filter.py + tests/test_request_filter_v2.py.
+- جميع الاختبارات تمر:
+  * test_request_filter_v2: 78/78 (was 49، +29 section G) ✅
+  * verify_request_filter: 43/43 (was 40، +3) ✅
+  * test_request_channel_separation: 52/52 ✅
+  * test_request_filter_race_rescue: 23/23 ✅
+  * test_delete_rescue: 15/15 ✅
+  * test_raw_hook: 13/13 ✅
+  * test_fast_delete_rescue_evidence: RESCUED_ONCE=25 MISSED=0 ✅
+  * test_link_capture: 21/21 ✅
+  * test_bot_filter: 20/20 ✅
+  * Total: 290 test cases pass.
+- Pre-existing failures unrelated (verified via git stash):
+  * test_api_security: 4/13 failed (origin-allowlist refactoring من commits 12c6c35+5c020ac — خارج نطاق v2).
+  * test_audit_regressions DR-5b/DR-8: origin-allowlist refactoring.
+  * test_phase3_contracts STARTUP-2: READY_FOR_JOIN في joiner fleet — pre-existing.
+  * جميعها تفشل أيضًا على HEAD=f436a4e بدون تغييراتي — خارجة عن نطاق Request Filter v2.
+
+Stage Summary:
+- المسار: request_filter.py (487→530 سطر) + tests/test_request_filter_v2.py (49→78 assertions) + verify_request_filter.py (40→43 cases).
+- MBOT-PORT: إشارتا ad-detection من mbot.py مدمجتان في v2 بطريقة محافظة (weak signals +2/+1 لا ترفض وحدها).
+- توثيق التغطية: 27/27 من mbot.py advertiser_keywords → REJECT في v2. 121/127 من mbot.py keywords → REJECT في v2 (95% false-positive elimination).
+- جميع الاختبارات (290 case) تمر. AST OK. Kill Switch default=false (محافظ).
+- لم يُعمل commit أو push (كما طلب المُشغّل في الجلسة السابقة — بانتظار التقرير النهائي والموافقة).
+- الخطوات التالية المُقترحة: (1) commit + push بعد موافقة المُشغّل. (2) تفعيل REQUEST_FILTER_ENABLED=true في Render env. (3) راقب أول ACCEPT/REJECT في logs للتحقق من السلوك في الإنتاج. (4) اختبار القناة الهدف @dhkskwksjskwk للتأكد من وصول التنبيهات. (5) اختبار live: إرسال رسالة طلب حقيقية في مجموعة مُراقَبة → يجب أن تصل @dhkskwksjskwk. (6) اختبار live: إرسال إعلان مُتعمّد مع dotted obfuscation → يجب ألا يصل.

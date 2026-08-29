@@ -159,6 +159,13 @@ def make_race_monitor(prod_db, channel_id=-1009999999,
         journal_retention_s=86400, journal_no_text_retention_s=21600,
         channel_id=channel_id, journal_recovery_enabled=True,
         requests_target_channel=requests_target_channel,
+        # [REQUEST-FILTER-v2] config attrs (getattr دفاعي في _handle_request_path)
+        request_filter_enabled=True,
+        request_filter_max_per_minute=1000,
+        request_filter_max_per_chat_per_minute=1000,
+        request_filter_cb_threshold=10000,
+        request_filter_cb_window_s=600,
+        request_filter_cb_cooldown_s=600,
     )
 
     # SendMock: async callable يتتبع الاستدعاءات + يحفظ timing وargs
@@ -378,10 +385,13 @@ async def test_4_request_and_link_paths_independent():
         fm_a = make_race_monitor(prod_db)
         await fm_a._on_user_message(ev_a, '+SIM_SOURCE')
         sm_a = fm_a.bot_client.send_message
-        # Request alert NOT sent (advertisement classification due to 't.me/' link)
-        record("4A: request alert NOT sent (link → advertisement classification)",
-               not sm_a.called,
-               f"send called={sm_a.called} (expected NOT called)")
+        # [REQUEST-FILTER-v2] طلب حقيقي (intent+service+action) + رابط → يُقبل.
+        # المواصفة الجديدة: «لو كانت الرسالة طلبًا حقيقيًا لكن تحتوي رابط
+        # تواصل، فلا ترفضها تلقائيًا». الفلتر القديم كان يرفض بسبب t.me/؛
+        # v2 يقبله لأنه ليس إعلان خدمة (لا provider signals).
+        record("4A: request alert SENT (genuine request + link → accepted in v2)",
+               sm_a.called,
+               f"send called={sm_a.called} (expected called)")
         # Link IS in LRB + enqueued (link path independent of request decision)
         key_a = (int(chat_a), int(msg_id_a))
         record("4A: LRB has the link (link path ran despite ad classification)",

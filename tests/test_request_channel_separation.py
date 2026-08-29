@@ -63,6 +63,11 @@ os.environ.setdefault('OWNER_ID', '12345')
 os.environ.setdefault('SUPABASE_URL', '')
 os.environ.setdefault('SUPABASE_KEY', '')
 os.environ.setdefault('REQUESTS_TARGET_CHANNEL', '@dhkskwksjskwk')  # قناة الطلبات
+# [REQUEST-FILTER-v2] مرّن الفلتر في الاختبارات (default false في الإنتاج).
+os.environ.setdefault('REQUEST_FILTER_ENABLED', 'true')
+os.environ.setdefault('REQUEST_FILTER_MAX_PER_MINUTE', '1000')
+os.environ.setdefault('REQUEST_FILTER_MAX_PER_CHAT_PER_MINUTE', '1000')
+os.environ.setdefault('REQUEST_FILTER_CIRCUIT_BREAKER_THRESHOLD', '10000')
 
 logging.disable(logging.CRITICAL)
 
@@ -153,6 +158,13 @@ def make_monitor(prod_db, channel_id=-1001234567890,
         journal_retention_s=86400, journal_no_text_retention_s=21600,
         channel_id=channel_id, journal_recovery_enabled=True,
         requests_target_channel=requests_target_channel,
+        # [REQUEST-FILTER-v2] config attrs (getattr دفاعي في _handle_request_path)
+        request_filter_enabled=True,
+        request_filter_max_per_minute=1000,
+        request_filter_max_per_chat_per_minute=1000,
+        request_filter_cb_threshold=10000,
+        request_filter_cb_window_s=600,
+        request_filter_cb_cooldown_s=600,
     )
 
     class SendMock:
@@ -644,7 +656,7 @@ async def test_12_different_messages_no_false_dedup():
         chat = -1001212003
         # رسالتان مختلفتان في نفس المجموعة (msg_id مختلف)
         raw_text_1 = "مين يحل لي واجب رياضيات؟ محتاج مساعدة"
-        raw_text_2 = "محتاج مساعدة في البرمجة، مين يقدر يساعد؟"
+        raw_text_2 = "أبي أحد يسوي لي تقرير برمجة"
         ev1 = FakeNewMessageEvent(raw_text_1, chat, 120001, chat=None, sender=None)
         ev2 = FakeNewMessageEvent(raw_text_2, chat, 120002, chat=None, sender=None)
 
