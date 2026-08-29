@@ -5840,7 +5840,19 @@ class Monitor:
         # → 0 = المسار معطّل بصمت، لا يرمي AttributeError.
         target = getattr(self.config, 'requests_target_channel', 0)
         if not target:
-            return  # القناة غير مُهيأة — المسار معطّل بصمت
+            # [CHANNEL-SEPARATION] NO FALLBACK to channel_id — explicit error log instead.
+            # لو REQUESTS_TARGET_CHANNEL غير مضبوطة، المسار معطّل لكن يُسجّل خطأً واضحًا
+            # في كل مرة يصل فيها طلب. لا إرسال لأي قناة أخرى (خاصةً قناة الروابط).
+            # هذا يمنع التباس "الطلبات تذهب للقناة القديمة" بشكل قاطع: لو لم تُضبط
+            # قناة الطلبات، الطلب لا يُرسل إطلاقًا (بدلًا من إرساله للقناة الخطأ).
+            logging.error(
+                "[REQUEST-PATH] ❌ REQUESTS_TARGET_CHANNEL not configured — "
+                "request alert SKIPPED (NOT sent to any channel, NOT falling "
+                "back to link channel). Set REQUESTS_TARGET_CHANNEL in Render "
+                "env vars (e.g. @dhkskwksjskwk) to send this request "
+                f"(chat_id={chat_id} msg_id={msg_id})."
+            )
+            return
 
         if not raw_text or not raw_text.strip():
             return  # نص فارغ — ليس طلبًا
@@ -5941,6 +5953,14 @@ class Monitor:
             if not _bot_client or not _bot_client.is_connected():
                 logging.warning("[REQUEST-PATH] bot_client not connected — skipping send (will not retry this msg)")
                 return
+            # [CHANNEL-SEPARATION] الصيغة المطلوبة حرفيًا من المُشغّل:
+            #   [REQUEST-PATH] sending to @dhkskwksjskwk
+            # (بدل {target!r} الذي يضيف علامات اقتباس — نطبع القيمة مباشرة
+            # حتى يستطيع المُشغّل grep على السطر بشكل صريح.)
+            logging.info(f"[REQUEST-PATH] sending to {target}")
+            logging.info(
+                f"  (chat_id={chat_id} msg_id={msg_id} source={source_phone})"
+            )
             await _bot_client.send_message(
                 target, alert, parse_mode='html', link_preview=False
             )
@@ -12845,6 +12865,10 @@ async def ready_handler(request):
             "all_joiners_unavailable": (fh.get('connected_joiners', 0) == 0),
         }
 
+    # [CHANNEL-SEPARATION] عرض القناتين + الـcommit في /ready حتى يستطيع
+    # المُشغّل أو load balancer التأكد من فصلهما قاطعًا ومراقبة الإصدار.
+    requests_target_channel = getattr(monitor.config, 'requests_target_channel', 0) if monitor else 0
+    git_commit = os.getenv("RENDER_GIT_COMMIT", "")
     if db_ok and bot_ok:
         return web.json_response({
             "status": "ready",
@@ -12853,6 +12877,10 @@ async def ready_handler(request):
             "active_watchers": active_watchers,
             "scan_running": monitor.is_scan_running() if monitor else False,
             "fleet_health": fleet,
+            # request alerts → @dhkskwksjskwk, link extractor → channel_id
+            "requests_target_channel": requests_target_channel,
+            "link_channel_id": monitor.config.channel_id if monitor else None,
+            "git_commit": git_commit[:12] if git_commit else "",
         }, status=200)
     else:
         return web.json_response({
@@ -12862,6 +12890,9 @@ async def ready_handler(request):
             "db_error": db_error,
             "active_watchers": active_watchers,
             "fleet_health": fleet,
+            "requests_target_channel": requests_target_channel,
+            "link_channel_id": monitor.config.channel_id if monitor else None,
+            "git_commit": git_commit[:12] if git_commit else "",
         }, status=503)
 
 
@@ -13045,7 +13076,11 @@ async def api_deploy_check_handler(request):
     }
 
     # 1. Environment variables — presence only (mask values for security)
+    # [CHANNEL-SEPARATION] أضف REQUESTS_TARGET_CHANNEL + RENDER_GIT_COMMIT لقائمة
+    # الفحص حتى يستطيع المُشغّل التأكد من القناة الفعلية + الـcommit المُشغّل من
+    # خلال /api/deploy_check (نقطة تشخيص واحدة لو اختلطت القنوات).
     required_envs = ["API_ID", "API_HASH", "BOT_TOKEN", "CHANNEL_ID",
+                     "REQUESTS_TARGET_CHANNEL",
                      "SUPABASE_URL", "SUPABASE_KEY", "OPENAI_API_KEY",
                      "AI_BATCH_MODE", "OWNER_ID", "STARTUP_SCAN_DAYS"]
     for var in required_envs:
@@ -13170,7 +13205,38 @@ async def api_deploy_check_handler(request):
         "providers_count": len(monitor.ai_analyzer.providers) if hasattr(monitor, 'ai_analyzer') and monitor.ai_analyzer else 0,
     }
 
-    # 7. Final verdict
+    # 7. [CHANNEL-SEPARATION] Channel routing snapshot — يعرض القناتين الفعليتين
+    # حتى يستطيع المُشغّل التأكد قاطعًا من فصل المسارين:
+    #   request alerts → requests_target_channel (يجب أن يكون @dhkskwksjskwk)
+    #   link extractor → channel_id (قناة الروابط القديمة، لم تتغير)
+    # + git_commit حتى يستطيع المُشغّل التأكد أن Render يعمل على آخر commit.
+    _rtc_actual = getattr(monitor.config, 'requests_target_channel', 0)
+    _link_channel = monitor.config.channel_id
+    _deployed_commit = os.getenv("RENDER_GIT_COMMIT", "")
+    report["channel_routing"] = {
+        "requests_target_channel_resolved": _rtc_actual,
+        "requests_target_channel_env_raw": os.getenv("REQUESTS_TARGET_CHANNEL", ""),
+        "link_channel_id": _link_channel,
+        "git_commit_short": _deployed_commit[:12] if _deployed_commit else "",
+        "git_commit_full": _deployed_commit,
+        # sanity: القناتان يجب أن تكونا مختلفتين (لو تساوتا = خطأ تكوين حرج).
+        "channels_are_distinct": (
+            bool(_rtc_actual) and str(_rtc_actual) != str(_link_channel)
+        ),
+    }
+    if not _rtc_actual:
+        report["issues"].append(
+            "🚨 REQUESTS_TARGET_CHANNEL is NOT set — request alerts are SKIPPED "
+            "(no fallback to link channel). Set REQUESTS_TARGET_CHANNEL=@dhkskwksjskwk "
+            "in Render Environment Variables."
+        )
+    elif str(_rtc_actual) == str(_link_channel):
+        report["issues"].append(
+            "🚨 REQUESTS_TARGET_CHANNEL == CHANNEL_ID — request path and link path "
+            "are sending to the SAME channel! This breaks channel separation."
+        )
+
+    # 8. Final verdict
     report["verdict"] = "HEALTHY" if not report["issues"] else "ISSUES_FOUND"
     report["issues_count"] = len(report["issues"])
 
@@ -13591,6 +13657,35 @@ async def main():
     else:
         logging.warning("Bot token: NOT SET")
     logging.info(f"Channel ID: {config.channel_id}")
+    # [CHANNEL-SEPARATION] سجّل القناتين بوضوح عند التشغيل حتى يستطيع المُشغّل
+    # التأكد من فصلهما قاطعًا:
+    #   - REQUESTS_TARGET_CHANNEL → مسار الطلبات (يصله @dhkskwksjskwk)
+    #   - CHANNEL_ID              → مسار استخراج الروابط (لم تتغير)
+    # كلا السطرين يظهران في بداية السجل، قبل أي معالجة رسالة. لو لم تُضبط
+    # قناة الطلبات (REQUESTS_TARGET_CHANNEL غير محددة في Render)، سيظهر خطأ
+    # واضحًا ولا يوجد أي fallback لقناة الروابط.
+    _rtc_value = getattr(config, 'requests_target_channel', 0)
+    if _rtc_value:
+        # [CHANNEL-SEPARATION] الصيغة المطلوبة حرفيًا من المُشغّل:
+        #   REQUESTS_TARGET_CHANNEL=@dhkskwksjskwk
+        # (بدل {value!r} الذي يضيف علامات اقتباس — نطبع القيمة مباشرة حتى
+        # يستطيع المُشغّل grep على السطر بشكل صريح.)
+        logging.info(f"REQUESTS_TARGET_CHANNEL={_rtc_value}")
+        logging.info(f"  → request alerts route to this channel ({_rtc_value})")
+        logging.info(f"  → link extractor  routes to CHANNEL_ID={config.channel_id} (unchanged)")
+    else:
+        logging.error(
+            "REQUESTS_TARGET_CHANNEL is NOT SET — request alerts will NOT be sent "
+            "(no fallback to link channel). Set REQUESTS_TARGET_CHANNEL=@dhkskwksjskwk "
+            "in Render Environment Variables."
+        )
+    # RENDER_GIT_COMMIT يُضبط تلقائيًا من Render عند كل deploy — نطبع أول 12
+    # حرفًا حتى يستطيع المُشغّل التأكد أن النسخة الحالية هي آخر commit.
+    _git_commit = os.getenv("RENDER_GIT_COMMIT", "")
+    if _git_commit:
+        logging.info(f"RENDER_GIT_COMMIT={_git_commit[:12]} (deployed commit short-hash)")
+    else:
+        logging.info("RENDER_GIT_COMMIT not set (local dev / non-Render environment)")
     if config.startup_scan_days is not None:
         logging.info(f"Startup scan: {config.startup_scan_days} days for each watcher")
 

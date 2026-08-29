@@ -2203,3 +2203,41 @@ Stage Summary:
 - **القنوات مؤكدة**: @dhkskwksjskwk للطلبات، CHANNEL_ID للروابط (لم تتغير).
 - **لا architecture redesign**، لا حذف ميزات، لا تغيير REQUEST_KEYWORDS/ADVERTISEMENT_KEYWORDS.
 - **جاهز لـcommit + push** بعد عرض git diff على المستخدم (هذا القسم يوثّق الانتهاء).
+
+
+---
+Task ID: CHANNEL-SEPARATION
+Agent: Z.ai Code (direct, no subagent)
+Task: تشخيص وإصلاح مسار الطلبات المُرسِل للقناة القديمة بدلًا من @dhkskwksjskwk + فصل قاطع بين مسار الطلبات ومسار الروابط + لا fallback.
+
+Work Log:
+- فحص bot.py بالكامل عبر Grep على REQUESTS_TARGET_CHANNEL | requests_target_channel | _handle_request_path | send_message.
+- تأكد أن _handle_request_path (L5828) يُرسل لـtarget = getattr(self.config,'requests_target_channel',0) — لا مرجع لـchannel_id داخل الدالة.
+- تأكد أن _send_with_retry (L2870) و _send_summary (L2917) يُرسلان لـself.channel_id (قناة الروابط القديمة) — مسار الروابط وحده.
+- فحص render.yaml: REQUESTS_TARGET_CHANNEL = "@dhkskwksjskwk" (مع `value:`، تُدار من Render).
+- فحص غياب .env / accounts.env محليًا — القيم تُحمَّل من Render env vars.
+- التشخيص النهائي: الكود صحيح. سبب التباس المستخدم أن المسار "يتخطّى بصمت" لو REQUESTS_TARGET_CHANNEL غير مضبوطة (if not target: return) → لا تنبيهات تُرسل إطلاقًا، فيرى المستخدم فقط LINK alerts في القناة القديمة ويعتقد أن الطلب ذهب للقناة الخطأ.
+
+التعديلات (أقل تعديل ممكن، لا architecture redesign):
+1. bot.py:_handle_request_path (L5842-5855): استبدال skip الأصم بـ logging.error واضح — NO FALLBACK إلى channel_id.
+2. bot.py:_handle_request_path (L5956-5962): إضافة logging.info "[REQUEST-PATH] sending request to <target!r> ..." قبل كل إرسال (smoking gun).
+3. bot.py:main() (L13613-13635): سجل بدء التشغيل يطبع REQUESTS_TARGET_CHANNEL=<value> + RENDER_GIT_COMMIT=<short hash>.
+4. bot.py:ready_handler (L12867-12894): عرض requests_target_channel + link_channel_id + git_commit في /ready.
+5. bot.py:api_deploy_check_handler (L13067-13073): إضافة REQUESTS_TARGET_CHANNEL لقائمة env_vars المُفحوصة.
+6. bot.py:api_deploy_check_handler (L13207-13236): قسم channel_routing جديد يعرض القناتين الفعليتين + git_commit_full + sanity check أن channels_are_distinct.
+7. tests/test_request_channel_separation.py (جديد، 26 تأكيدًا): تشخيص قاطع لفصل المسارين.
+
+القواعد المحترمة:
+- لا تغيير REQUEST_KEYWORDS (300) / لا تغيير ADVERTISEMENT_KEYWORDS (183).
+- لا لمس Link Extractor الأساسي (_send_with_retry / _send_summary بقناة الروابط).
+- لا تغيير channel_id parsing ولا قناة الروابط.
+- لا fallback لمسار الطلبات إلى channel_id إطلاقًا.
+- مساران مستقلان: Request Filter → @dhkskwksjskwk، Link Extractor → channel_id.
+
+Stage Summary:
+- جميع الاختبارات الحالية تمر: test_delete_rescue 15/15 + test_raw_hook 13/13 + test_fast_delete_rescue_evidence 25/25 RESCUED_ONCE + test_link_capture 21/21 + test_request_filter_race_rescue 23/23 + verify_request_filter 35/35 + 7 تطبيع = 42.
+- الاختبار الجديد: test_request_channel_separation 26/26.
+- AST parse OK على bot.py + tests/test_request_channel_separation.py.
+- bot module imports OK.
+- القناتان مؤكدتان: REQUESTS_TARGET_CHANNEL=@dhkskwksjskwk (لم تتغير)، CHANNEL_ID تُدار من Render (لم تُلمس).
+- جاهز لـcommit + push.

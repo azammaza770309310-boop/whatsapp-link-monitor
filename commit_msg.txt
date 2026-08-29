@@ -1,22 +1,79 @@
-AUDIT-FIX(8b): 10 new edge-case fixes + journal durability snapshot + AI drainer
+FIX(CHANNEL-SEPARATION): hard separation REQUEST FILTER -> @dhkskwksjskwk, LINK EXTRACTOR -> CHANNEL_ID (no fallback)
 
-Re-audit pass 2 (Task 7) findings:
-- N01: journal_cleanup preserves pending/failed rows (was deleting all >24h)
-- N02: reconcile writes journal BEFORE claim (was after — crash lost msg)
-- N03: LOSER no longer overwrites WINNER's pending state
-- N04: mass-delete per-iteration try/except (one error aborted remaining 49)
-- N05: journal_write consecutive-failure counter + rate-limited ERROR burst
-- N06: enqueue_link re-raises non-IntegrityError (was swallowing SQLITE_BUSY)
-- N07: _ai_drainer_worker processes ai_pending backlog (26475 structural)
-- N08: FloodWait registered with floodwait_mgr in polling+reconcile
-- N09: PollingScheduler gather return_exceptions (one FloodWait no longer blocks batch)
-- N10: _ensure_conn uses self._lock (was check-then-act race leaking connections)
+addresses confusion "request alerts going to old channel": the existing code was
+correct (no fallback), but it silently skipped when REQUESTS_TARGET_CHANNEL was
+not set, so the operator saw only LINK alerts in the old channel and assumed
+requests were being misrouted. Now the skip is replaced with a clear ERROR and
+the actual target value is logged at startup and per-send in the exact format
+the operator requested.
 
-Persistence Option C (survives Render ephemeral-disk restart WITHOUT buying disk):
-- _journal_snapshot_loop (30s): snapshots at-risk journal rows to Supabase message_journal_snapshot
-- _restore_journal_from_supabase on startup: restores pending/no_text/delete_miss
-- ~120 lines + 2 tests. Additive, idempotent, doesn't replace SQLite journal.
+Changes (minimal, no architecture redesign):
 
-Regression tests appended to tests/test_audit_regressions.py (12 new scenarios).
-render.yaml: +AI_DRAIN_ENABLED.
-No secrets. No push (no GH creds).
+1. bot.py:_handle_request_path (L5842-5855): replaced silent skip with
+   logging.error: "[REQUEST-PATH] REQUESTS_TARGET_CHANNEL not configured --
+   request alert SKIPPED (NOT sent to any channel, NOT falling back to link
+   channel)". No fallback to channel_id ever.
+
+2. bot.py:_handle_request_path (L5956-5963): log before each send in the
+   exact operator-requested format:
+     "[REQUEST-PATH] sending to {target}"
+   (no !r quotes -- the operator can grep the literal value).
+
+3. bot.py:main() (L13666-13680): startup log prints in the exact format:
+     "REQUESTS_TARGET_CHANNEL=@dhkskwksjskwk"
+   plus a context line tying the two routes:
+     "  -> request alerts route to this channel (@dhkskwksjskwk)"
+     "  -> link extractor  routes to CHANNEL_ID=-100xxx (unchanged)"
+   plus RENDER_GIT_COMMIT short-hash so the operator can verify the deployed
+   commit matches the latest push.
+
+4. bot.py:ready_handler (L12867-12894): expose requests_target_channel +
+   link_channel_id + git_commit in /ready JSON for monitoring.
+
+5. bot.py:api_deploy_check_handler (L13070): add REQUESTS_TARGET_CHANNEL to
+   the env_vars checklist (presence + masked value).
+
+6. bot.py:api_deploy_check_handler (L13207-13236): new channel_routing section
+   in /api/deploy_check JSON exposing:
+     - requests_target_channel_resolved (actual value)
+     - requests_target_channel_env_raw (raw env var)
+     - link_channel_id
+     - git_commit_short + git_commit_full
+     - channels_are_distinct (sanity check)
+   plus critical issue if REQUESTS_TARGET_CHANNEL is unset OR equals CHANNEL_ID.
+
+7. tests/test_request_channel_separation.py (new, 26 assertions): hard proof
+   of channel separation:
+     - Test 1: request message -> target == '@dhkskwksjskwk' (str), != channel_id (int)
+     - Test 2: _handle_request_path source has NO 'channel_id' ref (static search)
+     - Test 3: REQUESTS_TARGET_CHANNEL=0 -> NO send_message call (no fallback)
+     - Test 4: link-only message -> request path silent, link extractor enqueues
+     - Test 5: request + link message -> both paths independent
+     - Test 6: Config @username parsing -> str
+     - Test 7: Config numeric parsing -> int
+     - Test 8: Empty REQUESTS_TARGET_CHANNEL -> 0 (disabled, no implicit fallback)
+     - Test 9: validate() does NOT require REQUESTS_TARGET_CHANNEL, requires CHANNEL_ID
+
+Channels (verified):
+- REQUESTS_TARGET_CHANNEL = @dhkskwksjskwk (request alerts -> this)
+- CHANNEL_ID (sync: false in render.yaml) -> link extractor (unchanged)
+
+Strict rules respected:
+- NO change to REQUEST_KEYWORDS (300) / ADVERTISEMENT_KEYWORDS (183).
+- NO touch to Link Extractor core (_send_with_retry / _send_summary to channel_id).
+- NO change to channel_id parsing or link channel.
+- NO fallback from request path to channel_id, ever.
+- Two independent paths: Request Filter -> @dhkskwksjskwk, Link Extractor -> CHANNEL_ID.
+
+Results:
+- AST parse OK on bot.py + tests/test_request_channel_separation.py.
+- 26/26 new channel-separation tests + 23/23 race rescue + 15/15 delete_rescue
+  + 13/13 raw_hook + 25/25 fast_delete_rescue_evidence RESCUED_ONCE + 21/21
+  link_capture + verify_request_filter 42 pass markers.
+- bot module imports OK.
+- Smoke test confirms log format matches operator request exactly.
+
+Files changed:
+- bot.py: +99/-2 (logging + /ready + /api/deploy_check + skip-to-error)
+- tests/test_request_channel_separation.py: new (537 lines, 26/26 assertions)
+- worklog.md: +38 lines (CHANNEL-SEPARATION section)
