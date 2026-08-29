@@ -2293,3 +2293,44 @@ Stage Summary:
 - Smoke test للتّنبيه الجديد: مربع منسق مطابق لقناة الروابط + target = @dhkskwksjskwk.
 - القناتان مؤكدتان: REQUESTS_TARGET_CHANNEL=@dhkskwksjskwk (لم تتغير)، CHANNEL_ID تُدار من Render (لم تُلمس).
 - جاهز لـcommit + push.
+
+---
+Task ID: BOT-FILTER
+Agent: main
+Task: المستخدم طلب صراحة: "انضر ما ابيه يسحب اي رابط او اي طلب من اي بوت كان" — لا سحب أي رابط أو طلب من أي بوت كان. (طلب جوهري جديد بعد إنجاز CROSS-ACCOUNT-CAPTURE + STYLE-MATCH في commit 349d550.)
+
+Work Log:
+- تشخيص شامل: فُحصت كل نقاط دخول الرسائل في bot.py. النتيجة: لا توجد أي فلترة للبوتات إطلاقًا قبل هذا العمل. البوت كان يسحب الروابط والطلبات من أي مُرسِل بما فيهم البوتات.
+- نقاط الدخول المُحدّدة (5):
+  1. _on_user_message (NewMessage handler, line 5493) — المسار الرئيسي للطلبات + الروابط real-time.
+  2. _on_raw_new_message (Raw MTProto hook, line 3722) — يكتب LRB فقط (supplementary).
+  3. _poll_one_chat (Polling scanner, line 6585) — يعيد سحب الرسائل ويعالجها.
+  4. _reconcile_chat_after_delete_miss (line 4132) — يسترجع الرسائل الأخوات الفائتة.
+  5. _on_message_deleted get_messages rescue (line ~6234) — إنقاذ عبر get_messages.
+- أُضيف helper جديد _sender_is_bot(sender) كـ@staticmethod بجانب _get_sender_name (line 3113-3125). دفاعي: يعيد False لو sender None أو بلا سمة bot أو يرفع استثناء. Telethon User entity يضع sender.bot=True للبوتات الحقيقية.
+- الحارس #1 (_on_user_message, line 5551): فحص BEFORE أي استخراج روابط أو _handle_request_path. لو بوت:
+  - لا LRB (لا snapshot)، لا _msg_cache، لا _handle_request_path، لا journal.
+  - ينظّف أي LRB entry كتبه الـraw hook (سباق ميكروثواني) حتى لا يُنقذ لاحقًا روابط البوت.
+- الحارس #2 (_poll_one_chat, line 6700): تجاهل رسائل البوت قبل cache/claim/extract.
+- الحارس #3 (_reconcile_chat_after_delete_miss, line 4174): تجاهل رسائل البوت قبل journal/claim/extract.
+- الحارس #4 (get_messages rescue في _on_message_deleted, line 6308): تجاهل رسائل البوت حتى في deletion-rescue.
+- الحارس #5 (raw hook → LRB → deletion-rescue): يُغطّى بشكل غير مباشر بواسطة الحارس #1 (purge LRB entry).
+- [DEFENSIVE] كل الحرساسات تستخدم getattr(self, '_sender_is_bot', None) + callable() بدل self._sender_is_bot المباشر. هذا يمنع AttributeError لو namespace اختبارات لا يربط الميثود (الـstaticmethod) — يضمن استمرار المسار بأمان ولا يكسر الاختبارات الحالية.
+- اختبار جديد tests/test_bot_filter.py (20/20 تأكيد، 9 مجموعات اختبار):
+  - Test 1: helper correctness (None/bot=True/bot=False/no-attr/raises).
+  - Test 2: NewMessage bot → no send/LRB/cache.
+  - Test 3: NewMessage bot → purges pre-existing LRB entry (raw-hook race).
+  - Test 4: NewMessage user → continues (guard transparent).
+  - Test 5: static — guard precedes extract_links + _handle_request_path call.
+  - Test 6: static — _sender_is_bot in _poll_one_chat.
+  - Test 7: static — _sender_is_bot in _reconcile_chat_after_delete_miss.
+  - Test 8: static — _sender_is_bot in _on_message_deleted.
+  - Test 9: polling integration — bot ignored, user processed.
+- [REGRESSION FIX] المرسل الأول للحراس (self._sender_is_bot مباشر) كسر الاختبارات الحالية لأن make_monitor الخاص بها لا يربط الـstaticmethod → AttributeError يُبتلع → _on_user_message يخرج صامتًا. أُصلح بـgetattr دفاعي → استُعيدت كل الاختبارات.
+
+Stage Summary:
+- جميع الاختبارات تمر: test_request_channel_separation 52/52 + test_request_filter_race_rescue 23/23 + test_delete_rescue 15/15 + test_raw_hook 13/13 + test_fast_delete_rescue_evidence RESCUED_ONCE=25 MISSED=0 + test_link_capture 21/21 + test_bot_filter 20/20 (جديد) + verify_request_filter ✅.
+- AST parse OK على bot.py.
+- التصميم: لا snapshot، لا LRB، لا cache، لا journal، لا send لأي بوت. الحارس شفاف للمستخدمين الحقيقيين (bot=False) وللرسائل من قنوات/مجموعات مجهولة (sender=Channel بلا bot attr).
+- الـraw hook يبقى ultra-fast (لا entity lookup)؛ يُغطّى purge-Via-NewMessage.
+- جاهز لـcommit + push.

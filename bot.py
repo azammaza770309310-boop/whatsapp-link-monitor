@@ -3110,6 +3110,20 @@ class Monitor:
             return n.strip() or getattr(sender, "username", "") or "Unknown"
         return getattr(sender, "username", "Unknown") or "Unknown"
 
+    @staticmethod
+    def _sender_is_bot(sender) -> bool:
+        """[BOT-FILTER] هل المُرسِل بوت؟
+        دفاعي: يعيد False لو sender None أو بلا سمة bot (لا يكسر الالتقاط).
+        Telethon User entity يضع sender.bot == True للبوتات الحقيقية.
+        القنوات/المجموعات المجهولة (sender=Channel) ليست 'bot' هنا — رسائلها
+        لا تُلتقط كطلبات أصلًا (is_request_message يفلترها). نركز على البوتات."""
+        if not sender:
+            return False
+        try:
+            return bool(getattr(sender, 'bot', False))
+        except Exception:
+            return False
+
     def _create_bot_client(self):
         sp = os.path.join(SESSIONS_DIR, "bot")
         return TelegramClient(sp, self.config.api_id, self.config.api_hash,
@@ -4156,6 +4170,15 @@ class Monitor:
             recovered = 0
             for msg in messages:
                 if not msg or not msg.raw_text or msg.out:
+                    continue
+                # [BOT-FILTER] تجاهل رسائل البوتات (لا نسحب روابط/طلبات من أي بوت)
+                # [DEFENSIVE] getattr دفاعي: لو namespace اختبارات بلا الميثود → تخطّى بأمان
+                _bot_check = getattr(self, '_sender_is_bot', None)
+                if callable(_bot_check) and _bot_check(getattr(msg, 'sender', None)):
+                    logging.info(
+                        f"[BOT-FILTER] ignored bot message (reconcile) "
+                        f"chat_id={chat_id} msg_id={msg.id} source={reader}"
+                    )
                     continue
                 async with self._msg_cache_lock:
                     if (chat_id, msg.id) in self._msg_cache:
@@ -5527,6 +5550,43 @@ class Monitor:
                     except Exception:
                         pass
 
+            # === [BOT-FILTER] لا نسحب أي رابط أو طلب من أي بوت كان ===
+            # فحص المُرسِل BEFORE أي استخراج روابط أو مسار طلبات. لو بوت:
+            #  - لا نكتب LRB (لا snapshot للروابط)
+            #  - لا نكتب _msg_cache (لا PRE-CACHE)
+            #  - لا نُرسل تنبيه طلب (لا _handle_request_path)
+            #  - ننظّف أي LRB entry قد كتبه الـraw hook (سباق ميكروثواني)
+            #    حتى لا يُنقذ لاحقًا روابط البوت عبر deletion-rescue.
+            # مبدأ: لا snapshot، لا LRB، لا cache، لا journal للبوتات.
+            # [DEFENSIVE] getattr دفاعي: لو namespace اختبارات بلا _sender_is_bot
+            # (static method غير مربوط) → _bot_check=None → الحارس يُتخطى بأمان
+            # ولا يكسر المسار (لا AttributeError يُبطئ _on_user_message).
+            _bot_check = getattr(self, '_sender_is_bot', None)
+            if callable(_bot_check):
+                try:
+                    _bot_sender = event.sender
+                except Exception:
+                    _bot_sender = None
+                if _bot_check(_bot_sender):
+                    try:
+                        _bk = (int(chat_id), int(event.id))
+                        if _bk in self._link_ring:
+                            self._link_ring.pop(_bk, None)
+                            _bts = getattr(self, '_link_ring_ts', None)
+                            if _bts is not None:
+                                _bts.pop(_bk, None)
+                            logging.info(
+                                f"[BOT-FILTER] purged LRB entry for bot message "
+                                f"chat_id={chat_id} msg_id={event.id} source={source_phone}"
+                            )
+                    except Exception:
+                        pass
+                    logging.info(
+                        f"[BOT-FILTER] ignored bot message chat_id={chat_id} "
+                        f"msg_id={event.id} sender_id={event.sender_id or 0} source={source_phone}"
+                    )
+                    return
+
             sender_id = event.sender_id or 0
             msg_id = event.id
 
@@ -6245,6 +6305,16 @@ class Monitor:
                             if gm_client is not None:
                                 msgs = await gm_client.get_messages(chat_id, ids=[deleted_msg_id])
                                 gm = msgs[0] if msgs else None
+                                # [BOT-FILTER] تجاهل رسائل البوتات حتى في deletion-rescue
+                                # [DEFENSIVE] getattr دفاعي: لو namespace اختبارات بلا الميثود → تخطّي بأمان
+                                _bot_check = getattr(self, '_sender_is_bot', None)
+                                if (gm is not None and callable(_bot_check)
+                                        and _bot_check(getattr(gm, 'sender', None))):
+                                    logging.info(
+                                        f"[BOT-FILTER] ignored bot message (get_messages rescue) "
+                                        f"chat_id={chat_id} msg_id={deleted_msg_id} source={source_phone}"
+                                    )
+                                    gm = None
                                 gm_text = getattr(gm, 'message', '') or ''
                                 if gm_text:
                                     cached_msg = {
@@ -6629,6 +6699,15 @@ class Monitor:
                     continue
                 # تجاهل رسائل البوت نفسه
                 if msg.out:
+                    continue
+                # [BOT-FILTER] تجاهل رسائل البوتات (لا نسحب روابط/طلبات من أي بوت)
+                # [DEFENSIVE] getattr دفاعي: لو namespace اختبارات بلا الميثود → تخطّى بأمان
+                _bot_check = getattr(self, '_sender_is_bot', None)
+                if callable(_bot_check) and _bot_check(getattr(msg, 'sender', None)):
+                    logging.info(
+                        f"[BOT-FILTER] ignored bot message (polling) "
+                        f"chat_id={chat_id} msg_id={msg.id} source={phone}"
+                    )
                     continue
                 
                 # تحقق أنها مو مكررة في cache

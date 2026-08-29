@@ -92,3 +92,4 @@ __pycache__/
 *.db
 # Render/blueprint local snapshots
 render.yaml.local
+dash-after-sso-fix.png
