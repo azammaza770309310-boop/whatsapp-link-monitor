@@ -3710,13 +3710,25 @@ class Monitor:
             if chat_id is None:
                 return  # نوع غير مدعوم — تجاهل بهدوء
             # استخراج الروابط (regex نقي) + كتابة LRB
+            # [FIX-FAST-CAPTURE] pre-write تزامني إلى _link_ring dict قبل أي
+            # await — يُغلق نافذة السباق: أي حذف يصل بعد هذه النقطة يجد
+            # الروابط في LRB وينقذها. الـasync _link_ring_put أسفله يُكمّل
+            # cap enforcement + timestamps.
             links = LinkNormalizer.extract_links(text)
             if links:
+                _ln = [l.get('normalized') or l.get('raw') for l in links]
                 try:
-                    await self._link_ring_put(chat_id, int(mid),
-                                              [l.get('normalized') or l.get('raw') for l in links])
+                    _k = (int(chat_id), int(mid))
+                    self._link_ring[_k] = _ln
+                    _ts = getattr(self, '_link_ring_ts', None)
+                    if _ts is not None:
+                        _ts[_k] = time.time()
                 except Exception:
-                    pass  # LRB فشل — لكن NewMessage سيلتقط لاحقاً
+                    pass
+                try:
+                    await self._link_ring_put(chat_id, int(mid), _ln)
+                except Exception:
+                    pass  # LRB فشل — لكن pre-write أعلاه أنقذ الروابط
         except Exception:
             pass  # Raw hook لا يكسر event loop أبداً
 
@@ -4089,9 +4101,11 @@ class Monitor:
         asyncio.create_task(_runner())
 
     async def _reconcile_chat_after_delete_miss(self, chat_id: int, hint_phone: str = None):
-        """بعد DELETE-MISS: اسحب آخر 15 رسالة من الشات لالتقاط أي رسائل أخرى
+        """بعد DELETE-MISS: اسحب آخر 50 رسالة من الشات لالتقاط أي رسائل أخرى
         فاتتنا (فجوة أحداث). الرسالة المحذوفة نفسها لا يمكن استرجاعها
-        (Telegram حذفها نهائيًا) — لكن الرسائل الأخوات الفائتة يمكن التقاطها."""
+        (Telegram حذفها نهائيًا) — لكن الرسائل الأخوات الفائتة يمكن التقاطها.
+        [FIX-FAST-CAPTURE] رُفع الحد من 15 إلى 50 رسالة لالتقاط نطاق أوسع
+        من الرسائل الأخوات الفائتة تحت الضغط العالي (فجوات أحداث أطول)."""
         reader = hint_phone
         client = self.user_clients.get(reader) if reader else None
         used_registry = False
@@ -4109,7 +4123,7 @@ class Monitor:
             logging.debug(f"[RECONCILE] no available reader for chat={chat_id}")
             return
         try:
-            messages = await client.get_messages(chat_id, limit=15)
+            messages = await client.get_messages(chat_id, limit=50)
             recovered = 0
             for msg in messages:
                 if not msg or not msg.raw_text or msg.out:
@@ -5475,19 +5489,30 @@ class Monitor:
                 await self._journal_write(chat_id, msg_id, None, source_phone, state='no_text')
                 return
 
-            # === الخطوة 0: LINK-ONLY FAST CAPTURE (أسرع مسار — قبل أي metadata) ===
-            # نستخرج الروابط فوراً (regex نقي، لا API) ونخزّنها في LRB.
-            # هذا يضمن: لو حُذفت الرسالة قبل اكتمال PRE-CACHE metadata،
-            # الـ MessageDeleted handler يقدر يسحب الروابط من LRB وينقذها.
+            # === الخطوة 0: LINK-ONLY FAST CAPTURE (pre-write تزامني قبل أي await) ===
+            # نستخرج الروابط فوراً (regex نقي، لا API) ونخزّنها في LRB
+            # **تزامنياً** (dict assign مباشر، لا await/lock) ثم نُكمّل بـasync
+            # _link_ring_put لـcap enforcement. هذا يُغلق نافذة السباق:
+            # سابقًا كان `await _link_ring_put` يُسلّم للـevent loop، فيُطلق
+            # معالج MessageDeleted قبل اكتمال LRB → DELETE-MISS تحت الضغط العالي.
+            # الآن الروابط في الـdict قبل أي yield — أي حذف لاحقًا ينقذها.
             # مبدأ تصميمي: فشل observability (metrics/logging) لا يكسر مسار
             # الالتقاط — كل مكالنات الـmetrics مُغلّفة دفاعياً.
             links = LinkNormalizer.extract_links(raw_text)
             if links:
+                _ln = [l.get('normalized') or l.get('raw') for l in links]
                 try:
-                    await self._link_ring_put(chat_id, msg_id,
-                                              [l.get('normalized') or l.get('raw') for l in links])
+                    _k = (int(chat_id), int(msg_id))
+                    self._link_ring[_k] = _ln
+                    _ts = getattr(self, '_link_ring_ts', None)
+                    if _ts is not None:
+                        _ts[_k] = time.time()
                 except Exception:
-                    pass  # LRB فشل — لكن extract ناجح، نكمل
+                    pass  # pre-write فشل — لكن async path أسفل قد ينجح
+                try:
+                    await self._link_ring_put(chat_id, msg_id, _ln)
+                except Exception:
+                    pass  # LRB async فشل — لكن pre-write أعلاه أنقذ الروابط
                 try:
                     await self.metrics.record_link_capture(len(links))
                 except Exception:
