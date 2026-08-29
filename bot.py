@@ -3973,13 +3973,19 @@ class Monitor:
 
     async def _record_delete_miss(self, chat_id, msg_id, source_phone):
         """يسجّل حذف رسالة لم نرَ NewMessage لها أبدًا — دليل على فجوة تسليم أحداث.
-        تحذير WARNING مقيّد (مرة/دقيقة لكل شات) + صف delete_miss في journal."""
+        سجل INFO مقيّد (مرة/دقيقة لكل شات) + صف delete_miss في journal."""
         key = chat_id if chat_id is not None else 0
         now = time.time()
         self._delete_miss_count[key] = self._delete_miss_count.get(key, 0) + 1
         if now - self._delete_miss_log_ts.get(key, 0) > 60:
-            logging.warning(
-                f"[DELETE-HANDLER] ⚠️ DELETE-MISS msg_id={msg_id} chat_id={chat_id} "
+            # [FIX-LOG-NOISE] Downgraded WARNING→INFO: a delete seen without
+            # a prior NewMessage is expected Telegram behavior (bot added to
+            # chat after the message, or a delivery gap during restart). The
+            # forensic data is still written to the journal (state=delete_miss)
+            # and counted in metrics.delete_miss_total — only the log level
+            # changes to stop spamming WARNING on a known-expected condition.
+            logging.info(
+                f"[DELETE-HANDLER] DELETE-MISS msg_id={msg_id} chat_id={chat_id} "
                 f"— NewMessage never received "
                 f"({self._delete_miss_count[key]} miss(es) in window) "
                 f"(delete seen by {source_phone})"
@@ -4465,8 +4471,17 @@ class Monitor:
                     watchers = await self.db.get_active_watchers()
                 except Exception as e:
                     logging.warning(f"[FLEET-HEALTH] get_active_watchers failed: {e}")
+                # [FIX-LOG-NOISE] Only count ENABLED joiners. A disabled
+                # joiner (joiner_enabled=0) is intentionally out-of-fleet —
+                # counting it as "connected" masked true fleet availability
+                # and prevented the _joiner_worker backoff gate from firing,
+                # causing perpetual wasteful cycles every 60s.
                 joiner_phones = [w['phone'] for w in watchers
-                                 if w.get('role', 'monitor') == 'joiner']
+                                 if w.get('role', 'monitor') == 'joiner'
+                                 and w.get('joiner_enabled', 1)]
+                disabled_joiners = [w['phone'] for w in watchers
+                                    if w.get('role', 'monitor') == 'joiner'
+                                    and not w.get('joiner_enabled', 1)]
 
                 connected = []
                 floodwait_list = []
@@ -4509,6 +4524,8 @@ class Monitor:
                     'floodwait_joiners': floodwait_list,
                     'disconnected_joiners': disconnected,
                     'safety_guard_blocked_joiners': safety_guard_blocked,
+                    'disabled_joiners': disabled_joiners,
+                    'disabled_joiners_count': len(disabled_joiners),
                     'all_unavailable_since': prev_all_down_since,
                     'fleet_down_alerted': prev_snapshot.get('fleet_down_alerted', False),
                 }
@@ -8792,6 +8809,29 @@ class Monitor:
                     await asyncio.sleep(30)
                     continue
 
+                # [FIX-LOG-NOISE] Pre-filter disabled joiners ONCE before the
+                # membership check + selection loop. Previously a disabled
+                # joiner passed connection/rate-limiter/safety-guard checks,
+                # got SELECTED, then was rejected inside _join_group_safe
+                # (JOINER_DISABLED) — wasting ~6 Supabase calls, a safety
+                # guard run, a metric increment, and re-queuing the link with
+                # only 1min retry → perpetual wasteful cycle every 60s.
+                _enabled_joiners = [j for j in joiners if j.get('joiner_enabled', 1)]
+                _disabled_count = len(joiners) - len(_enabled_joiners)
+                if _disabled_count:
+                    logging.info(
+                        f"[LINK id={link_id}] [PIPELINE-6] {_disabled_count} joiner(s) disabled — filtered before selection"
+                    )
+                    joiners = _enabled_joiners
+                if not joiners:
+                    logging.warning(
+                        f"[LINK id={link_id}] [JOINER] all joiner accounts disabled (joiner_enabled=0) — retry in 5 min"
+                    )
+                    await self.prod_db.update_queue_status(link_data['id'], 'QUEUED',
+                                                           next_retry=datetime.now() + timedelta(minutes=5))
+                    await asyncio.sleep(30)
+                    continue
+
                 # 5. Membership Check — across ALL joiners BEFORE selecting one.
                 # This prevents a second joiner from re-joining a group that
                 # another joiner already joined.
@@ -8861,9 +8901,14 @@ class Monitor:
                         continue
 
                     # 6c. Connection check — MOVED INSIDE LOOP (root-cause fix)
+                    # [FIX-LOG-NOISE] Downgraded WARNING→INFO: a disconnected
+                    # joiner is an expected per-cycle state, not an incident.
+                    # The fleet-health loop already alerts when ALL joiners are
+                    # down (5min sustained). WARNING here spammed 1 line per
+                    # disconnected joiner every 60s.
                     jclient = self.user_clients.get(jphone)
                     if not jclient or not jclient.is_connected():
-                        logging.warning(
+                        logging.info(
                             f"[LINK id={link_id}] [JOINER] unavailable account={jphone} reason=not_connected"
                         )
                         last_skip_reason = f'not_connected_{jphone}'
@@ -9055,7 +9100,12 @@ class Monitor:
                 elif status in ("MONITOR_NO_JOIN", "JOINER_DISABLED", "PAUSED", "SIMULATION"):
                     final_status = 'QUEUED'
                     next_retry = datetime.now() + timedelta(minutes=1)
-                    logging.warning(f"[LINK id={link_id}] [PIPELINE-6] ⚠️ {phone} {status} — skipping")
+                    # [FIX-LOG-NOISE] Downgraded WARNING→INFO: these are
+                    # configuration states (disabled/paused/sim/monitor-role),
+                    # not runtime incidents. After the pre-filter fix above,
+                    # JOINER_DISABLED rarely reaches here (only if a joiner is
+                    # disabled between the fleet snapshot and selection).
+                    logging.info(f"[LINK id={link_id}] [PIPELINE-6] ⚠️ {phone} {status} — skipping")
 
                 elif status == "INVALID":
                     state_to_set = GroupState.BANNED  # لا إعادة محاولة

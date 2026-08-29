@@ -3372,13 +3372,14 @@ class Monitor:
 
     async def _record_delete_miss(self, chat_id, msg_id, source_phone):
         """يسجّل حذف رسالة لم نرَ NewMessage لها أبدًا — دليل على فجوة تسليم أحداث.
-        تحذير WARNING مقيّد (مرة/دقيقة لكل شات) + صف delete_miss في journal."""
+        سجل INFO مقيّد (مرة/دقيقة لكل شات) + صف delete_miss في journal."""
         key = chat_id if chat_id is not None else 0
         now = time.time()
         self._delete_miss_count[key] = self._delete_miss_count.get(key, 0) + 1
         if now - self._delete_miss_log_ts.get(key, 0) > 60:
-            logging.warning(
-                f"[DELETE-HANDLER] ⚠️ DELETE-MISS msg_id={msg_id} chat_id={chat_id} "
+            # [FIX-LOG-NOISE] Downgraded WARNING→INFO: expected Telegram behavior.
+            logging.info(
+                f"[DELETE-HANDLER] DELETE-MISS msg_id={msg_id} chat_id={chat_id} "
                 f"— NewMessage never received "
                 f"({self._delete_miss_count[key]} miss(es) in window) "
                 f"(delete seen by {source_phone})"
@@ -6641,7 +6642,8 @@ class Monitor:
                 elif status in ("MONITOR_NO_JOIN", "JOINER_DISABLED", "PAUSED", "SIMULATION"):
                     final_status = 'QUEUED'
                     next_retry = datetime.now() + timedelta(minutes=1)
-                    logging.warning(f"[LINK id={link_id}] [PIPELINE-6] ⚠️ {phone} {status} — skipping")
+                    # [FIX-LOG-NOISE] Downgraded WARNING→INFO: configuration states, not incidents.
+                    logging.info(f"[LINK id={link_id}] [PIPELINE-6] ⚠️ {phone} {status} — skipping")
 
                 elif status == "INVALID":
                     state_to_set = GroupState.BANNED  # لا إعادة محاولة
