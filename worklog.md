@@ -2241,3 +2241,55 @@ Stage Summary:
 - bot module imports OK.
 - القناتان مؤكدتان: REQUESTS_TARGET_CHANNEL=@dhkskwksjskwk (لم تتغير)، CHANNEL_ID تُدار من Render (لم تُلمس).
 - جاهز لـcommit + push.
+
+
+---
+Task ID: CROSS-ACCOUNT-CAPTURE + STYLE-MATCH
+Agent: Z.ai Code (direct, no subagent)
+Task: (1) تنسيق مربع رسالة الطلبات ليتطابق مع قناة الروابط، (2) مسار الطلبات يلتقط من كل المجموعات في كل الحسابات (monitor + joiner)، (3) إضافة حساب جديد تُضمّ مجموعاته تلقائيًا بدون تكرار.
+
+Work Log:
+- فحص MessageFormatter.format_link_message (L2396-2468) لاستخراج نمط القناة الروابط: blockquote + ترتيب الحقول (العضوية → الاسم → التواصل → التاريخ → العدد) + رابط "عرض الرسالة الأصلية" + النص في الأسفل.
+- فحص _register_user_handlers (L3649) + _run_user_client (L8606) — اكتشف أن المعالج كان يُسجَّل على monitor فقط (L8678-8691 قديمًا). Joiner لم يكن يلتقط طلبات.
+- فحص MessageClaim.claim() (source_registry.py L59) — race-safe عبر SQLite PRIMARY KEY + INSERT OR IGNORE + CAS UPDATE. مفتاح (chat_id, msg_id) مشترك بين الحسابات → dedup الروابط عبر الحسابات كان يعمل سلفًا.
+- فحص _request_sent dict — check-then-set WITHOUT lock → race condition ممكن حين يستلم حسابان نفس الرسالة.
+
+التعديلات (4 تغييرات مركزة على bot.py):
+1. bot.py:Monitor.__init__ (L3035-3042): إضافة self._request_sent + self._request_sent_lock = asyncio.Lock() لضمان cross-account race-safe dedup.
+2. bot.py:_handle_request_path dedup block (L5868-5894): wrap check-then-set داخل async with self._request_sent_lock: — أول حساب يفوز بالقفل ويُرسل، الثاني يرى key موجود فيتخطّى (logging.debug للشفافية).
+3. bot.py:_handle_request_path alert format (L5941-5978): استبدال التنسيق القديم بـ تنسيق يطابق قناة الروابط:
+   - <blockquote>إطار + 📞 header "طلب مساعدة"
+   - 👥 المجموعة، 👤 المرسل، 📟 الحساب، 🕒 التاريخ (NEW field via event.message.date)، 📡 المصدر <code>، 🔑 الكلمات
+   - "🔗 عرض الرسالة الأصلية" (نفس نص قناة الروابط)
+   - "💬 نص الطلب" في الأسفل (نفس نمط قناة الروابط "النص")
+   - HTML-escaped لكل الحقول (XSS safety)
+4. bot.py:_run_user_client (L8710-8730): إزالة if role == 'monitor' حول _register_user_handlers — الآن كلا النوعين (monitor + joiner) يُسجّلان handlers. وثّق التعليق و docstring ليعكس السلوك الجديد.
+
+كيف يعمل "إضافة حساب جديد → يضم مجموعاته بدون تكرار":
+- /login flow (L7270-7273) يضيف phone إلى _user_tasks فورًا + يبدأ _run_user_client.
+- _run_user_client connect → authorize → register handlers (الآن لكل الأدوار).
+- NewMessage event يُطلق لكل رسالة في كل مجموعة (شاملة المجموعات الجديدة التي يضمها الحساب الجديد فقط).
+- نفس الرسالة في نفس المجموعة: mاkey (chat_id, msg_id) مشترك → _request_sent_lock race-safe يمنع التكرار.
+- روابط: MessageClaim SQLite atomic INSERT OR IGNORE يمنع تكرار معالجة الروابط عبر الحسابات.
+
+القواعد المحترمة:
+- لا تغيير REQUEST_KEYWORDS (300) / ADVERTISEMENT_KEYWORDS (183).
+- لا لمس Link Extractor الأساسي (_send_with_retry / _send_summary يبقيان لـchannel_id).
+- لا تغيير channel_id parsing ولا قناة الروابط.
+- لا fallback لمسار الطلبات إلى channel_id إطلاقًا.
+- المساران مستقلان: Request Filter → @dhkskwksjskwk، Link Extractor → CHANNEL_ID.
+
+اختبارات جديدة (4 اختبارات + 8 تأكيدات):
+- Test 10 (12 تأكيد): alert format يطابق قناة الروابط — blockquote + طلب مساعدة + ترتيب الحقول + التاريخ + "عرض الرسالة الأصلية" + "نص الطلب" + الترتيب (رابط قبل النص).
+- Test 11 (3 تأكيد): cross-account dedup race-safe — استدعاءان متوازيان لنفس (chat_id, msg_id) → إرسال واحد فقط (lock working).
+- Test 12 (2 تأكيد): no false dedup — رسالتان مختلفتان (msg_id مختلف) → إرسالان.
+- Test 13 (6 تأكيد): XSS safety — <script>, <b>, &, <svg>, <img> كلها HTML-escaped.
+- Test 14 (3 تأكيد): date field بصيغة YYYY-MM-DD HH:MM مطابقة لقناة الروابط.
+
+Stage Summary:
+- 52/52 تأكيد في test_request_channel_separation (was 26, +26 جديدة).
+- جميع الاختبارات الحالية تمر: test_delete_rescue 15/15 + test_raw_hook 13/13 + test_fast_delete_rescue_evidence 25/25 RESCUED_ONCE + test_link_capture 21/21 + test_request_filter_race_rescue 23/23 + verify_request_filter 42 ✅.
+- AST parse OK على bot.py + tests/test_request_channel_separation.py.
+- Smoke test للتّنبيه الجديد: مربع منسق مطابق لقناة الروابط + target = @dhkskwksjskwk.
+- القناتان مؤكدتان: REQUESTS_TARGET_CHANNEL=@dhkskwksjskwk (لم تتغير)، CHANNEL_ID تُدار من Render (لم تُلمس).
+- جاهز لـcommit + push.

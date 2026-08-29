@@ -1,0 +1,94 @@
+FEAT(CROSS-ACCOUNT-CAPTURE + STYLE-MATCH): request alerts styled like link channel + capture from ALL accounts (monitor + joiner) + race-safe cross-account dedup
+
+Operator asked for three things:
+1. Make the request alert message box look like the link channel's blockquote
+2. Capture requests from ALL groups across monitor AND joiner (federal) accounts
+3. Adding a new monitor/joiner account should auto-include its groups without duplicates
+
+Changes (4 targeted edits to bot.py):
+
+1. bot.py:Monitor.__init__ (L3035-3042): add self._request_sent dict +
+   self._request_sent_lock = asyncio.Lock(). The lock is necessary because
+   the dedup was previously check-then-set (no lock) -- two concurrent
+   arrivals of the same (chat_id, msg_id) from monitor + joiner would
+   both see the key absent and both send. Now the lock serializes:
+   first account wins + records the key, second sees the key + skips.
+
+2. bot.py:_handle_request_path dedup block (L5868-5894): wrap the
+   check-then-set inside `async with self._request_sent_lock:`. Adds a
+   logging.debug on dedup hit so the operator can see when cross-account
+   dedup prevents a duplicate.
+
+3. bot.py:_handle_request_path alert format (L5941-5978): restyled to
+   match MessageFormatter.format_link_message:
+     - <blockquote> wrapper (same as link channel)
+     - "طلب مساعدة" header (matches link's "🔗 رابط محفوظ")
+     - Field order: 👥 المجموعة, 👤 المرسل, 📟 الحساب, 🕒 التاريخ (NEW),
+       📡 المصدر <code>, 🔑 الكلمات
+     - "🔗 عرض الرسالة الأصلية" link text (matches link channel exactly)
+     - "💬 نص الطلب" at bottom (matches link channel's "💬 النص")
+     - HTML-escaped (XSS safety preserved)
+     - Date field pulled from event.message.date in YYYY-MM-DD HH:MM format
+       (same format as link channel's date_str)
+
+4. bot.py:_run_user_client (L8710-8730): removed `if role == 'monitor':`
+   gate around _register_user_handlers. Now BOTH monitor AND joiner
+   accounts register NewMessage handlers -- request alerts capture from
+   all groups across all accounts. Existing link dedup via MessageClaim
+   (SQLite atomic INSERT OR IGNORE) prevents duplicate link processing
+   across accounts; the new _request_sent_lock prevents duplicate request
+   alerts.
+
+How "new account -> new groups without duplicate" works:
+- /login flow (L7270-7273) adds the phone to _user_tasks immediately +
+  starts _run_user_client.
+- _run_user_client connect -> authorize -> register handlers (now for
+  ALL roles, not just monitor).
+- NewMessage fires for every message in every group the new account is
+  in (including new groups only the new account has).
+- Same message in the same group: same key (chat_id, msg_id) ->
+  _request_sent_lock race-safe prevents duplicate alert.
+- Links: MessageClaim SQLite atomic INSERT OR IGNORE prevents duplicate
+  link processing.
+
+Strict rules respected:
+- NO change to REQUEST_KEYWORDS (300) / ADVERTISEMENT_KEYWORDS (183).
+- NO touch to Link Extractor core (_send_with_retry / _send_summary still
+  send to channel_id -- unchanged).
+- NO change to channel_id parsing or link channel.
+- NO fallback from request path to channel_id, ever.
+- Two independent paths: Request Filter -> @dhkskwksjskwk, Link Extractor
+  -> CHANNEL_ID.
+
+New tests (4 tests, 26 new assertions) added to
+tests/test_request_channel_separation.py:
+- Test 10 (12 assertions): alert format matches link channel style --
+  blockquote wrapper, "طلب مساعدة" header, all field labels, date field
+  NEW, "عرض الرسالة الأصلية" link text, "💬 نص الطلب" at bottom, link
+  before text (order match).
+- Test 11 (3 assertions): cross-account dedup race-safe -- two parallel
+  _on_user_message calls for same (chat_id, msg_id) -> exactly 1 send.
+- Test 12 (2 assertions): no false dedup -- different msg_id -> 2 sends.
+- Test 13 (6 assertions): XSS safety -- <script>, <b>, &, <svg>, <img>
+  all HTML-escaped.
+- Test 14 (3 assertions): date field in YYYY-MM-DD HH:MM format (matches
+  link channel).
+
+Results:
+- 52/52 assertions in test_request_channel_separation (was 26, +26 new).
+- All existing tests still pass: test_delete_rescue 15/15, test_raw_hook
+  13/13, test_fast_delete_rescue_evidence 25/25 RESCUED_ONCE,
+  test_link_capture 21/21, test_request_filter_race_rescue 23/23,
+  verify_request_filter 42 markers.
+- AST parse OK on bot.py + tests/test_request_channel_separation.py.
+- Smoke test of new alert format: blockquote-styled box, target =
+  @dhkskwksjskwk (request channel, not link channel).
+
+Channels verified:
+- REQUESTS_TARGET_CHANNEL = @dhkskwksjskwk (request alerts -> this)
+- CHANNEL_ID (sync: false in render.yaml) -> link extractor (unchanged)
+
+Files changed:
+- bot.py: +101/-13 (lock + alert restyle + handler registration for joiners)
+- tests/test_request_channel_separation.py: +225/-2 (4 new tests)
+- worklog.md: +50 lines (CROSS-ACCOUNT-CAPTURE + STYLE-MATCH section)

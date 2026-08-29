@@ -3032,6 +3032,14 @@ class Monitor:
         self._link_ring: Dict[Tuple[int, int], List[str]] = {}
         self._link_ring_ts: Dict[Tuple[int, int], float] = {}  # received_at per key
         self._link_ring_lock = asyncio.Lock()
+        # [CROSS-ACCOUNT-DEDUP] قفل منفصل لمسار الطلبات. سابقًا كان _request_sent
+        # dict check-then-set بدون lock — مما يعني أن لو حسابان (monitor + joiner)
+        # استلما نفس الرسالة في نفس المجموعة في نفس اللحظة، كلاهما يرى key غير
+        # موجود ويُرسل تنبيهًا مكررًا. الآن القفل يُجبر التسلسل: أول حساب يُرسل،
+        # الثاني يرى key موجود فيتخطّى. ضروري بعد تمكين NewMessage handlers على
+        # حسابات joiner أيضًا (مسار الطلبات يلتقط من كل المجموعات في كل الحسابات).
+        self._request_sent: Dict[Tuple[int, int], float] = {}
+        self._request_sent_lock = asyncio.Lock()
         self._link_ring_ttl = 300   # 5 دقائق (أطول من cache لاحتمال وصول Delete متأخر)
         self._link_ring_cap = 20000 # حد أقصى لمنع نمو الذاكرة بلا حدود
         self._link_ring_evicted = 0 # عدّاد للمراقبة (size-based eviction)
@@ -5857,22 +5865,33 @@ class Monitor:
         if not raw_text or not raw_text.strip():
             return  # نص فارغ — ليس طلبًا
 
-        # --- dedup سريع (in-memory, TTL 1h, bounded) ---
-        # lazy init (لا نعتمد على ترتيب __init__)
+        # --- [CROSS-ACCOUNT-DEDUP] dedup سريع race-safe (in-memory, TTL 1h, bounded) ---
+        # lazy init (لا نعتمد على ترتيب __init__ للاختبارات القديمة) + lock.
+        # القفل ضعري هنا: لو حسابان (monitor X + joiner Y) استلما نفس الرسالة في
+        # نفس المجموعة في نفس اللحظة، القفل يُجبر التسلسل: أول حساب يرى key غير
+        # موجود فيُرسل التنبيه ويُسجّل key، الثاني يرى key موجود فيتخطّى. هذا
+        # يضمن عدم تكرار التنبيهات بعد تمكين handlers على حسابات joiner.
         if not hasattr(self, '_request_sent'):
             self._request_sent = {}
-        sent = self._request_sent
+        if not hasattr(self, '_request_sent_lock'):
+            self._request_sent_lock = asyncio.Lock()
         now = time.time()
-        # prune دوري عند بلوغ حد أقصى (يمنع النمو غير المحدود)
-        if len(sent) > 1000:
-            cutoff = now - 3600  # 1h TTL
-            expired = [k for k, ts in sent.items() if ts < cutoff]
-            for k in expired:
-                del sent[k]
-        key = (int(chat_id), int(msg_id))
-        if key in sent:
-            return  # سبق إرسالها لقناة الطلبات — لا تكرار
-        sent[key] = now
+        async with self._request_sent_lock:
+            sent = self._request_sent
+            # prune دوري عند بلوغ حد أقصى (يمنع النمو غير المحدود)
+            if len(sent) > 1000:
+                cutoff = now - 3600  # 1h TTL
+                expired = [k for k, ts in sent.items() if ts < cutoff]
+                for k in expired:
+                    del sent[k]
+            key = (int(chat_id), int(msg_id))
+            if key in sent:
+                logging.debug(
+                    f"[REQUEST-PATH] dedup hit — skipping (already sent by another "
+                    f"account) chat_id={chat_id} msg_id={msg_id}"
+                )
+                return  # سبق إرسالها لقناة الطلبات — لا تكرار (cross-account dedup)
+            sent[key] = now
 
         # --- الفلترة: هل الرسالة طلب حقيقي؟ ---
         is_req, info = is_request_message(raw_text)
@@ -5921,6 +5940,11 @@ class Monitor:
 
         # --- تنسيق التنبيه (HTML-escaped لمنع الحقن) ---
         # النص الأصلي يُرسل دون تشويه، لكن HTML-escaped للسلامة.
+        # [STYLE-MATCH] التنسيق يطابق قناة الروابط (MessageFormatter.format_link_message):
+        #   - نفس إطار <blockquote>
+        #   - نفس ترتيب الحقول: المجموعة → المرسل → الحساب → التاريخ → المصدر
+        #   - نفس روابط الإجراء: "عرض الرسالة الأصلية" + النص في الأسفل
+        #   - أيقونات emoji متناسقة (👥 👤 📟 🕒 📡 🔑)
         safe_text = html_module.escape(str(raw_text)[:1500])
         if len(raw_text) > 1500:
             safe_text += "…"
@@ -5933,17 +5957,25 @@ class Monitor:
         keywords_found = ', '.join(info.get('request_matches', [])[:5])
         safe_keywords = html_module.escape(keywords_found)
 
-        alert = (
-            "<blockquote>"
-            "🔔 <b>طلب جديد</b>\n\n"
-            f"📝 <b>نص الطلب:</b>\n<i>{safe_text}</i>\n\n"
-            f"👤 <b>المستخدم:</b> {safe_username}\n"
-            f"👥 <b>المجموعة:</b> {safe_chat}\n"
-            f"📡 <b>المصدر:</b> <code>{safe_source}</code>\n"
-            f"🔑 <b>الكلمات:</b> {safe_keywords}\n"
-            f'🔗 <a href="{safe_link}">رابط الرسالة</a>'
-            "</blockquote>"
-        )
+        # [STYLE-MATCH] التاريخ بنفس صيغة قناة الروابط: %Y-%m-%d %H:%M
+        try:
+            _msg_date = getattr(event, 'message', None)
+            _dt = getattr(_msg_date, 'date', None) if _msg_date else None
+            date_str = _dt.strftime("%Y-%m-%d %H:%M") if _dt else "غير معروف"
+        except Exception:
+            date_str = "غير معروف"
+
+        # بناء <blockquote> واحد شامل — مطابق لقناة الروابط
+        content = "🔔 <b>طلب مساعدة</b>\n\n"
+        content += f"👥 <b>المجموعة:</b> {safe_chat}\n"
+        content += f"👤 <b>المرسل:</b> {safe_sender}\n"
+        content += f"📟 <b>الحساب:</b> {safe_username}\n"
+        content += f"🕒 <b>التاريخ:</b> {date_str}\n"
+        content += f"📡 <b>المصدر:</b> <code>{safe_source}</code>\n"
+        content += f"🔑 <b>الكلمات:</b> {safe_keywords}\n\n"
+        content += f'🔗 <a href="{safe_link}">عرض الرسالة الأصلية</a>'
+        content += f"\n\n💬 <b>نص الطلب:</b>\n<i>{safe_text}</i>"
+        alert = f"<blockquote>{content}</blockquote>"
 
         # --- الإرسال لقناة الطلبات (retry + FloodWait handling) ---
         # getattr دفاعي لـbot_client: لو fake namespace (اختبارات) بلا bot_client،
@@ -8604,7 +8636,13 @@ class Monitor:
             logging.warning(f"[ACCOUNT] {phone} alert send failed: {e}")
 
     async def _run_user_client(self, watcher):
-        """تشغيل user_client — المراقبون فقط يستمعون للرسائل، الفدائيون لا
+        """تشغيل user_client — المراقبون والفدائيون كلاهما يستمعان للرسائل الآن
+
+        [CROSS-ACCOUNT-CAPTURE] سابقًا كان المعالج يُسجَّل على monitor فقط. الآن
+        كلا النوعين (monitor + joiner) يُسجّلان handlers — مسار الطلبات ومسار
+        استخراج الروابط يلتقطان من كل المجموعات في كل الحسابات. هذا يضمن أن
+        إضافة حساب فدائي جديد (في مجموعات لا يوجد فيها مراقب) لن يفوت البوت
+        طلباتها. dedup race-safe يمنع التكرار حين يتلقى حسابان نفس الرسالة.
 
         Startup Contract:
             - لا تعتبر الحساب READY حتى: connect → authorize → register handlers
@@ -8675,19 +8713,26 @@ class Monitor:
                         await asyncio.sleep(3600)
                         continue
 
-                    # === REGISTER HANDLERS (monitors only) ===
+                    # === REGISTER HANDLERS (monitors AND joiners) ===
+                    # [CROSS-ACCOUNT-CAPTURE] سابقًا كان المعالج يُسجَّل على monitor فقط،
+                    # مما يعني أن حسابات joiner (الفدائية) لم تكن تلتقط طلبات العملاء
+                    # من مجموعاتها. الآن كلا النوعين يُسجّلان handlers — مسار الطلبات
+                    # + مسار استخراج الروابط يلتقطان من كل المجموعات في كل الحسابات.
+                    # dedup عبر `_request_sent_lock` (race-safe) يمنع تكرار التنبيهات
+                    # حين يستلم حسابان نفس الرسالة في نفس المجموعة. dedup الروابط عبر
+                    # `message_claim` (SQLite atomic) يمنع تكرار معالجة الروابط.
+                    self._register_user_handlers(phone)
                     if role == 'monitor':
-                        self._register_user_handlers(phone)
                         logging.info(
                             f"[ACCOUNT] {phone} STATUS=READY\n"
                             f"[ACCOUNT] role=monitor\n"
-                            f"[ACCOUNT] handlers=registered"
+                            f"[ACCOUNT] handlers=registered (request + link capture)"
                         )
                     else:
                         logging.info(
-                            f"[ACCOUNT] {phone} STATUS=READY_FOR_JOIN\n"
+                            f"[ACCOUNT] {phone} STATUS=READY\n"
                             f"[ACCOUNT] role=joiner\n"
-                            f"[ACCOUNT] handlers=none (joiner only)"
+                            f"[ACCOUNT] handlers=registered (request + link capture — NEW)"
                         )
                     # === Notify SourceRegistry of phone status ===
                     if self.source_registry:

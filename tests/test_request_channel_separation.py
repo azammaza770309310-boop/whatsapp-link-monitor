@@ -505,6 +505,274 @@ async def test_9_validate_does_not_require_rtc():
         os.environ['REQUESTS_TARGET_CHANNEL'] = '@dhkskwksjskwk'
 
 
+# =====================================================================
+# Test 10: [STYLE-MATCH] alert format matches link channel's blockquote
+# Verifies the new alert uses the same style as MessageFormatter.format_link_message:
+#   - <blockquote> wrapper
+#   - "طلب مساعدة" header
+#   - field labels: 👥 المجموعة، 👤 المرسل، 📟 الحساب، 🕒 التاريخ، 📡 المصدر، 🔑 الكلمات
+#   - "عرض الرسالة الأصلية" link text (matches link channel's "عرض الرسالة الأصلية")
+#   - "💬 نص الطلب" at the bottom (matches link channel's "💬 النص" at bottom)
+# =====================================================================
+async def test_10_alert_format_matches_link_channel_style():
+    print("\n--- Test 10: Alert format matches link channel blockquote style ---")
+    prod_db, db_path, conn = await make_test_db()
+    try:
+        fm = make_monitor(prod_db)
+        chat = -1001010001
+        msg_id = 100001
+        raw_text = "مين يحل لي واجب رياضيات؟ محتاج مساعدة عاجلة"
+        ev = FakeNewMessageEvent(raw_text, chat, msg_id, chat=None, sender=None)
+        await fm._on_user_message(ev, '+TEST_SOURCE')
+
+        sm = fm.bot_client.send_message
+        record("10: send_message was called (alert dispatched)",
+               sm.called, "send_message not called")
+        if not sm.called:
+            return
+        alert = sm.calls[0]['alert']
+
+        # [STYLE-MATCH] same blockquote wrapper as link channel
+        record("10: alert wrapped in <blockquote>...</blockquote>",
+               alert.startswith('<blockquote>') and alert.endswith('</blockquote>'),
+               f"alert starts/ends: {alert[:30]!r}...{alert[-30:]!r}")
+
+        # [STYLE-MATCH] header: "طلب مساعدة" (matches link channel's "🔗 رابط محفوظ")
+        record("10: alert has header 'طلب مساعدة'",
+               'طلب مساعدة' in alert,
+               f"alert snippet: {alert[:200]!r}")
+
+        # [STYLE-MATCH] field labels matching link channel
+        record("10: alert has '👥 <b>المجموعة:</b>' (link channel: 👥 العضوية)",
+               '👥 <b>المجموعة:</b>' in alert,
+               "missing group label")
+        record("10: alert has '👤 <b>المرسل:</b>' (link channel: 👤 الاسم)",
+               '👤 <b>المرسل:</b>' in alert,
+               "missing sender label")
+        record("10: alert has '🕒 <b>التاريخ:</b>' (link channel: 🕒 التاريخ — NEW field)",
+               '🕒 <b>التاريخ:</b>' in alert,
+               "missing date label (new field)")
+        record("10: alert has '📡 <b>المصدر:</b>' with <code> wrapping (link channel: 📡 العدد)",
+               '📡 <b>المصدر:</b> <code>' in alert,
+               "missing source label with code tag")
+        record("10: alert has '🔑 <b>الكلمات:</b>' field",
+               '🔑 <b>الكلمات:</b>' in alert,
+               "missing keywords label")
+
+        # [STYLE-MATCH] link text "عرض الرسالة الأصلية" (matches link channel exactly)
+        record("10: alert has link text 'عرض الرسالة الأصلية' (matches link channel)",
+               'عرض الرسالة الأصلية' in alert,
+               "missing link text 'عرض الرسالة الأصلية'")
+
+        # [STYLE-MATCH] text at the bottom: "💬 <b>نص الطلب:</b>" (link channel: "💬 <b>النص:</b>")
+        record("10: alert has '💬 <b>نص الطلب:</b>' at bottom (link channel: 💬 النص at bottom)",
+               '💬 <b>نص الطلب:</b>' in alert,
+               "missing text label")
+
+        # [STYLE-MATCH] text label should come AFTER the link (order: link → text)
+        link_pos = alert.find('عرض الرسالة الأصلية')
+        text_label_pos = alert.find('💬 <b>نص الطلب:</b>')
+        record("10: 'عرض الرسالة الأصلية' comes BEFORE '💬 نص الطلب' (link channel order)",
+               link_pos != -1 and text_label_pos != -1 and link_pos < text_label_pos,
+               f"link_pos={link_pos} text_label_pos={text_label_pos}")
+
+        # [CONTENT] alert contains the original request text (HTML-escaped)
+        record("10: alert contains original request text 'مين يحل لي واجب رياضيات؟'",
+               'مين يحل لي واجب رياضيات' in alert,
+               f"alert snippet: {alert[:300]!r}")
+    finally:
+        await conn.close()
+        try: os.remove(db_path)
+        except: pass
+
+
+# =====================================================================
+# Test 11: [CROSS-ACCOUNT-DEDUP] race-safe dedup — two concurrent
+# arrivals of same (chat_id, msg_id) → exactly 1 send_message call.
+# Simulates monitor + joiner both receiving the same message.
+# =====================================================================
+async def test_11_cross_account_dedup_race_safe():
+    print("\n--- Test 11: Cross-account dedup (race-safe) — 2 concurrent arrivals → 1 send ---")
+    prod_db, db_path, conn = await make_test_db()
+    try:
+        fm = make_monitor(prod_db)
+        chat = -1001111002
+        msg_id = 110002
+        raw_text = "مين يحل لي واجب رياضيات؟ محتاج مساعدة عاجلة"
+        # محاكاة وصول نفس الرسالة على حسابين مختلفين في نفس اللحظة
+        ev1 = FakeNewMessageEvent(raw_text, chat, msg_id, chat=None, sender=None)
+        ev2 = FakeNewMessageEvent(raw_text, chat, msg_id, chat=None, sender=None)
+
+        # تشغيل الاستدعاءين بشكل متوازي (محاكاة سباق)
+        await asyncio.gather(
+            fm._on_user_message(ev1, '+MONITOR_ACCOUNT'),
+            fm._on_user_message(ev2, '+JOINER_ACCOUNT'),
+        )
+
+        sm = fm.bot_client.send_message
+        record("11: exactly 1 send_message call (race-safe dedup prevented duplicate)",
+               sm.call_count == 1,
+               f"got {sm.call_count} calls (expected 1 — duplicate should be suppressed)")
+        if sm.call_count >= 1:
+            target = sm.calls[0]['target']
+            record("11: target == '@dhkskwksjskwk' (request channel)",
+                   target == '@dhkskwksjskwk',
+                   f"got target={target!r}")
+            # one of the two sources should be the winner (race outcome)
+            source_seen = sm.calls[0]['kwargs'].get('source') or sm.calls[0].get('source')
+            # both sources processed the same message; the winner is whichever
+            # acquired the lock first. We don't assert which — only that ONE won.
+            record("11: exactly 1 source won the race (no duplicate alert sent)",
+                   sm.call_count == 1,
+                   f"both sources tried, only 1 should succeed")
+    finally:
+        await conn.close()
+        try: os.remove(db_path)
+        except: pass
+
+
+# =====================================================================
+# Test 12: [CROSS-ACCOUNT-DEDUP] two DIFFERENT messages (different msg_id)
+# from two different accounts → 2 send_message calls (no false dedup).
+# Verifies dedup is keyed on (chat_id, msg_id), not on chat alone.
+# =====================================================================
+async def test_12_different_messages_no_false_dedup():
+    print("\n--- Test 12: Different (chat_id, msg_id) → 2 sends (no false dedup) ---")
+    prod_db, db_path, conn = await make_test_db()
+    try:
+        fm = make_monitor(prod_db)
+        chat = -1001212003
+        # رسالتان مختلفتان في نفس المجموعة (msg_id مختلف)
+        raw_text_1 = "مين يحل لي واجب رياضيات؟ محتاج مساعدة"
+        raw_text_2 = "محتاج مساعدة في البرمجة، مين يقدر يساعد؟"
+        ev1 = FakeNewMessageEvent(raw_text_1, chat, 120001, chat=None, sender=None)
+        ev2 = FakeNewMessageEvent(raw_text_2, chat, 120002, chat=None, sender=None)
+
+        await asyncio.gather(
+            fm._on_user_message(ev1, '+ACCOUNT_A'),
+            fm._on_user_message(ev2, '+ACCOUNT_B'),
+        )
+
+        sm = fm.bot_client.send_message
+        record("12: exactly 2 send_message calls (different msg_id → no false dedup)",
+               sm.call_count == 2,
+               f"got {sm.call_count} calls (expected 2)")
+        if sm.call_count == 2:
+            targets = [c['target'] for c in sm.calls]
+            record("12: both targets == '@dhkskwksjskwk' (request channel)",
+                   all(t == '@dhkskwksjskwk' for t in targets),
+                   f"targets: {targets!r}")
+    finally:
+        await conn.close()
+        try: os.remove(db_path)
+        except: pass
+
+
+# =====================================================================
+# Test 13: [XSS-SAFETY] alert HTML-escapes user-controlled content
+# (sender name, group title, raw text) to prevent injection in the channel.
+# =====================================================================
+async def test_13_alert_html_escapes_user_content():
+    print("\n--- Test 13: Alert HTML-escapes user content (XSS safety) ---")
+    prod_db, db_path, conn = await make_test_db()
+    try:
+        fm = make_monitor(prod_db)
+        chat = -1001313004
+        msg_id = 130004
+        # نص يحوي محاولة حقن HTML
+        raw_text = "مين يحل لي واجب رياضيات؟ <script>alert(1)</script> & <b>bold</b>"
+        # chat وsender يحويان أيضاً محاولة حقن
+        malicious_chat = type('MaliciousChat', (), {
+            'title': '<img src=x onerror=alert(1)>',
+            'username': None,
+        })()
+        malicious_sender = type('MaliciousSender', (), {
+            'username': 'evil<script>',
+            'first_name': '<svg/onload=alert(1)>',
+            'last_name': None,
+            'title': None,
+        })()
+        ev = FakeNewMessageEvent(
+            raw_text, chat, msg_id,
+            chat=malicious_chat, sender=malicious_sender
+        )
+        await fm._on_user_message(ev, '+TEST_SOURCE')
+
+        sm = fm.bot_client.send_message
+        record("13: send_message was called (alert dispatched)",
+               sm.called, "send_message not called")
+        if not sm.called:
+            return
+        alert = sm.calls[0]['alert']
+
+        # raw text must be HTML-escaped (no raw <script>, <b>, &)
+        record("13: raw <script> tag escaped in alert",
+               '<script>' not in alert and '&lt;script&gt;' in alert,
+               f"<script> not escaped! alert snippet: {alert[:400]!r}")
+        record("13: raw <b> tag escaped in alert",
+               '<b>bold</b>' not in alert or '&lt;b&gt;bold&lt;/b&gt;' in alert,
+               f"<b> not escaped")
+        record("13: '&' escaped to '&amp;' in user text",
+               '&amp;' in alert,
+               "& not escaped")
+        # sender name must be escaped (only the < > need to be escaped — the
+        # payload text "onload" is preserved as plain text, which is safe
+        # because it's not inside an HTML tag). The XSS vector is neutralized
+        # when '<svg' is NOT in the alert (escaped to '&lt;svg').
+        record("13: malicious sender tag '<svg' escaped to '&lt;svg' (XSS vector neutralized)",
+               '<svg' not in alert and '&lt;svg' in alert,
+               f"<svg not escaped — alert snippet: {alert[:400]!r}")
+        # chat title must be escaped (same rationale)
+        record("13: malicious chat title '<img' escaped to '&lt;img' (XSS vector neutralized)",
+               '<img' not in alert and '&lt;img' in alert,
+               f"<img not escaped — alert snippet: {alert[:400]!r}")
+    finally:
+        await conn.close()
+        try: os.remove(db_path)
+        except: pass
+
+
+# =====================================================================
+# Test 14: [DATE-FIELD] alert contains a date string in YYYY-MM-DD HH:MM format
+# (matches link channel's date_str format from MessageFormatter.format_link_message)
+# =====================================================================
+async def test_14_alert_has_date_field_in_link_channel_format():
+    print("\n--- Test 14: Alert has date field in YYYY-MM-DD HH:MM (link channel format) ---")
+    prod_db, db_path, conn = await make_test_db()
+    try:
+        fm = make_monitor(prod_db)
+        chat = -1001414005
+        msg_id = 140005
+        raw_text = "مين يحل لي واجب رياضيات؟"
+        # نحقن message.date عبر event.message
+        from datetime import datetime
+        fake_msg = type('FakeMsg', (), {'date': datetime(2025, 8, 29, 14, 30)})()
+        ev = FakeNewMessageEvent(raw_text, chat, msg_id, chat=None, sender=None)
+        ev.message = fake_msg  # نضيف السمة بعد الإنشاء
+        await fm._on_user_message(ev, '+TEST_SOURCE')
+
+        sm = fm.bot_client.send_message
+        record("14: send_message was called (alert dispatched)",
+               sm.called, "send_message not called")
+        if not sm.called:
+            return
+        alert = sm.calls[0]['alert']
+        # التاريخ يجب أن يظهر بالصيغة YYYY-MM-DD HH:MM
+        import re
+        date_match = re.search(r'🕒 <b>التاريخ:</b> (\d{4}-\d{2}-\d{2} \d{2}:\d{2})', alert)
+        record("14: date field present in YYYY-MM-DD HH:MM format",
+               date_match is not None,
+               f"date field not found in alert snippet: {alert[:300]!r}")
+        if date_match:
+            record("14: date value matches injected message.date (2025-08-29 14:30)",
+                   date_match.group(1) == '2025-08-29 14:30',
+                   f"got date={date_match.group(1)}")
+    finally:
+        await conn.close()
+        try: os.remove(db_path)
+        except: pass
+
+
 async def main():
     print("=" * 70)
     print("Request Channel Separation Hardening — Test Suite [CHANNEL-SEPARATION]")
@@ -525,6 +793,11 @@ async def main():
     await test_7_config_parsing_numeric_form()
     await test_8_config_parsing_empty_form()
     await test_9_validate_does_not_require_rtc()
+    await test_10_alert_format_matches_link_channel_style()
+    await test_11_cross_account_dedup_race_safe()
+    await test_12_different_messages_no_false_dedup()
+    await test_13_alert_html_escapes_user_content()
+    await test_14_alert_has_date_field_in_link_channel_format()
     print("\n" + "=" * 70)
     passed = sum(1 for r in RESULTS if r['passed'])
     failed = sum(1 for r in RESULTS if not r['passed'])
