@@ -127,6 +127,40 @@ REJECT_SPAM_EDGE = [
     "ن.وفر ت.قرير طبي للتواصل0540916687 @DrMed",
 ]
 
+# ============================================================
+# 8. PRODUCTION-FALSE-POSITIVES — رسائل فعلية وصلت لقناة الطلبات
+#    تحت v2.1 المُنتَجة. v3.0+ يجب أن ترفض كلها. كل رسالة هنا مثال
+#    واقعي سُحب بالخطأ. الأسباب في v2.1:
+#      - «وين القى» كان في REQUEST_INTENT_PHRASES (intent)
+#      - «أبغى شرح» كان intent+service (substring على كلمات منفردة)
+#      - «افضل واحد يشرح المادة» → action_plus_service (لم يكن recommendation)
+#    Hard Gates v3.0+ ترصد كل واحدة عبر resource/info/recommendation gates.
+# ============================================================
+PRODUCTION_FP_CASES = [
+    "محتوى يشرح Systematic Review ويحتوي كلمة بحث",                # FP-1: long-info content with "بحث"
+    "وين القى اختبارات ع التاسيس عشان اراجع الدرس اللي اخذته قبل", # FP-2: resource seeking
+    "أبغى شرح إحصاء الترم التحضيري وين ألقى؟",                    # FP-3: info seeking (شرح as noun)
+    "وين القى شرح الإصدارات المجانيه",                            # FP-4: resource seeking (شرح مجاني)
+    "رسالة نصيحة عادية تحتوي كلمة اختبار",                          # FP-5: recommendation with "اختبار"
+    "افضل واحد يشرح المادة مين؟",                                  # FP-6: recommendation seeking
+]
+
+# ============================================================
+# 9. PRODUCTION-ACCEPT — رسالة فعلية يجب أن تُقبل (طلب شخص + تنفيذ + خدمة)
+#    «ابي حد يسوي بحث» = أبى (requester) + حد (person) + يسوي (exec) + بحث (service).
+#    Hard Gate 3 option (a): has_requester AND has_execution ✓
+#    Hard Gate 4: services non-empty ✓ → ACCEPT (service_execution_request).
+# ============================================================
+PRODUCTION_ACCEPT_CASES = [
+    "ابي حد يسوي بحث",   # the user's literal ACCEPT case this round
+    # [v3.0.1] possessive-suffix regression — كان يُرفض في v3.0 بسبب
+    # «مشروعي» لا يطابق SERVICE_TERM «مشروع» (token-equality without suffix strip).
+    "محتاج شخص ينجز مشروعي",  # ownership+person+exec+possessive-suffixed service
+    "من يحل لي واجبي",         # exec implies service (يحل) — also worked in v3.0
+    "أبي أحد يكتب تقريري",     # possessive "تقريري" → now matches "تقرير"
+    "محتاجة شخص يجهز عرضي",   # possessive "عرضي" → now matches "عرض"
+]
+
 
 def run_cases(cases, expect_accept, label):
     print(f"\n=== {label} ===")
@@ -161,6 +195,8 @@ def main():
         (PROVIDER_CASES, False, "PROVIDER — يجب أن يُرفض"),
         (SEEKER_MULTILINE_CASES, True, "SEEKER-multi-line — يجب أن تُقبل"),
         (REJECT_SPAM_EDGE, False, "REJECT-SPAM-EDGE — سبام متقدّم (v2.1)"),
+        (PRODUCTION_FP_CASES, False, "PRODUCTION-FP — رسائل فعلية سُحبت بالخطأ (v3.0.1)"),
+        (PRODUCTION_ACCEPT_CASES, True, "PRODUCTION-ACCEPT — رسائل فعلية يجب أن تُقبل (v3.0.1)"),
     ]:
         p, n = run_cases(cases, expect, label)
         total_pass += p

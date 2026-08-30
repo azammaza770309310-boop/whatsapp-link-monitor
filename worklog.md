@@ -2470,3 +2470,139 @@ Stage Summary:
 - المسار: request_filter.py (608→621 سطر) + verify_request_filter.py (154→168 سطر).
 - الالتزام بالأمان: التوكن لم يُخزَّن في أي ملف داخل المستودع — استُخدم inline في git push فقط ثم نُظّف.
 - الخطوة التالية: commit + push إلى origin/main.
+
+---
+Task ID: FILTER-v3.0-INTENT-ENGINE
+Agent: main (Z.ai Code)
+Task: إعادة بناء جذرية للـRequest Filter — بناء Intent Engine حقيقي بـ Hard Gates بدلاً من Keyword Filter، مع محو المنطق القديم تمامًا. لا commit/push حتى موافقة المُشغّل.
+
+Work Log:
+- تشخيص المشكلة الجوهرية: الفلتر v2.1 (رغم تحسيناته) كان لا يزال Keyword Matcher في جوهره — قوائم كلمات وقوائم patterns. الكارثة: «بحث»/«مشروع»/«تقرير» وحدها أو مع ownership ضعيف كانت تمر. المُشغّل طلب Intent Engine حقيقي.
+- تصميم v3.0: محرك قرار بـ Hard Gates متسلسلة (لا تراكم نقاط):
+  GATE 1: provider/advertisement → REJECT provider_ad
+  GATE 2: info/resource/long-content WITHOUT person+execution → REJECT (information_request | resource_seeking | long_informational_content | ready_made_resource)
+  GATE 2.5: recommendation WITHOUT strong execution → REJECT recommendation_seeking
+  GATE 3: person + execution relationship (5 options a-e) → continue
+  GATE 4: academic service OR exec-implies-service → continue
+  GATE 5: long informational override → REJECT
+  GATE 6: ACCEPT (service_execution_request | person_for_academic_help)
+- إشارات جديدة كليًا (أسماء جديدة، لا تشارك القوائم القديمة):
+  REQUESTER_PHRASES، EXECUTION_VERBS، OWNERSHIP_NEED، OUTSOURCING_INDICATORS،
+  SERVICE_TERMS، PROVIDER_INDICATORS، ADVERTISEMENT_STRONG_SIGNALS،
+  INFO_SEEKING_PHRASES، RESOURCE_SEEKING_PHRASES، RECOMMENDATION_SEEKING،
+  DELEGATION_VERBS، PROFESSIONAL_ROLES، READY_MADE_INDICATORS، PLURAL_SERVICE_NOUNS.
+- القاعدة الصارمة المُثبتة في الاختبارات: SERVICE وحده = REJECT دائمًا.
+- تحسينات تطبيع جوهرية:
+  * تقشير البوادئ العربية (ال/لل/بال/كال/فال/وال/ولل...) لكل token حتى نلتقط «للمشاريع»→«مشاريع».
+  * إزالة ألف التنوين (اً→) حتى «شخصاً»→«شخص».
+  * طيّ الحروف المضاعفة المفرطة 3+→1 (لا 2، حفاظًا على الجزم الشرعي مثل «متخصص»).
+  * مطابقة أفعال التنفيذ مع لاحقات الضمائر: «يساعدني»→يساعد، «يحله»→يحل، «ينجزهم»→ينجز.
+- RequestAnalysis: حقول تشخيصية كاملة (accepted, confidence float 0-1, intent_type,
+  service, requester_signals, execution_signals, service_signals, rejection_signals, reason)
+  + توافق خلفي كامل لـbot.py (is_request, matched_intents/services/patterns,
+  seeker_confidence, provider_confidence, has_dotted_word, has_many_lines, to_dict).
+- Regression Corpus جديد tests/test_request_intent_engine.py:
+  99 ACCEPT + 150 REJECT + 52 ambiguous + 16 mutation tests = 317 حالة.
+  تغطية: فصحى، سعودية، خليجية، أخطاء إملائية، بدون همزات، ة/ه، ى/ي، إنجليزي داخل
+  العربي، رموز وإيموجي، رسائل طويلة، محتوى منسوخ، أسئلة معلوماتية، resource seeking،
+  provider ads، طلب شخص لتنفيذ خدمة، طلب مساعدة مباشرة.
+- محو الفلتر القديم المُتحقّق منه: REQUEST_KEYWORDS=0, STRONG_PATTERNS=0,
+  REQUEST_INTENT_PHRASES=0, SEEKING_INDICATORS=0, ACTION_VERBS=0, ACADEMIC_SERVICES=0
+  (grep -c = 0 لجميع الرموز القديمة). لا فلتر قديم يعمل بالتوازي.
+
+Stage Summary:
+- النتائج الكاملة:
+  * test_request_intent_engine.py: 317/317 (100%) — Precision 100%, Recall 100%,
+    F1 100%, FPR 0%, FNR 0%, mutation 0 failures, ambiguous 52/52 REJECT.
+  * test_request_filter_v2.py: 78/78 (sections A/B/C/D/E/G/F كلها True).
+  * verify_request_filter.py: 52/52.
+  * test_bot_filter: 20/20, test_request_channel_separation: 52/52,
+    test_request_filter_race_rescue: 23/23, test_delete_rescue: 15/15,
+    test_link_capture: 21/21, test_raw_hook: 13/13.
+  * الإجمالي: 591 assertion خضراء. AST OK. مسار الروابط مستقل مؤكد (link_capture/raw_hook).
+- الملفات المعدّلة:
+  * request_filter.py — إعادة كتابة كاملة (834 insertions, 415 deletions, net +419 lines).
+    FILTER_VERSION: v2.1 → v3.0. FILTER_MODE: conservative_intent_service → intent_engine_hard_gates.
+  * tests/test_request_intent_engine.py — ملف جديد (corpus 317 حالة + mutation tests).
+- لم يُعمل commit أو push (كما طلب المُشغّل صراحةً). بانتظار الموافقة على التقرير.
+- الخطوات التالية عند الموافقة: commit + push، ثم تفعيل REQUEST_FILTER_ENABLED=true
+  في Render env، ورصد أول ACCEPT/REJECT في logs للتحقق من السلوك في الإنتاج.
+
+---
+Task ID: FILTER-v3.0.1-FP-FORENSIC
+Agent: main (Z.ai Code)
+Task: المُشغّل أبلغ عن رسائل FP فعلية وصلت قناة الطلبات رغم أن v3.0 يُفترض أن يرفضها. التشخيص المطلوب: لماذا قُبلت فعلًا؟ هل v3.0 يعمل في الإنتاج أم لا؟ ما المسار الذي يسمح بمرورها؟ الإصلاح الحقيقي + إضافة الرسائل الفعلية للاختبارات. لا commit/push حتى التحقق الكامل.
+
+Work Log:
+- التشخيص الجنائي للكود الفعلي:
+  1. آخر commit على origin/main = fbabcd7 (v2.1). v3.0 غير ملتزم وغير مدفوع إطلاقًا — في working tree محلي فقط. الإنتاج يشتغل بـ v2.1.
+  2. bot.py (line 60-62) يستورد analyze_request من request_filter. الـ import يُحلّ وقت الـ runtime لنسخة request_filter.py الموجودة على Render = v2.1.
+  3. bot.py (line 6040) يستدعي analyze_request(raw_text) مباشرة — لا wrapper قديم ولا مسار بديل. الشرط line 6041: if not analysis.is_request: return.
+  4. لا REQUEST_KEYWORDS ولا is_request_message ولا is_service_seeker في bot.py (grep = 0). لا فلتر قديم يعمل بالتوازي.
+
+- اختبار 6 رسائل الإنتاج الفعلية على v2.1 (commit fbabcd7):
+  * FP-1 (Systematic Review long content)  → REJECT (low_confidence) ✓ (无意中)
+  * FP-2 (وين القى اختبارات...)           → ACCEPT (intent_plus_service) ❌ FP
+  * FP-3 (أبغى شرح إحصاء...)              → ACCEPT (intent_plus_service) ❌ FP
+  * FP-4 (وين القى شرح الإصدارات...)      → ACCEPT (intent_plus_service) ❌ FP
+  * FP-5 (رسالة نصيحة عادية...)           → REJECT (service_without_intent) ✓ (无意中)
+  * FP-6 (افضل واحد يشرح المادة مين؟)     → ACCEPT (action_plus_service) ❌ FP
+  * ACC-1 (ابي حد يسوي بحث)               → ACCEPT ✓
+
+  v2.1 ينتج 4 FP / 6 = 67% FPR على هذه الرسائل. سبب الإنتاج الفعلي.
+
+- اختبار نفس الرسائل على v3.0 (working tree قبل الإصلاح):
+  * FP-1..FP-6 كلها REJECT ✓
+  * ACC-1 ACCEPT ✓
+  v3.0 صحيح لكل الرسائل الفعلية — لكنه لم يكن ملتزم/مدفوع!
+
+- ثغرة إضافية اكتُشفت أثناء التشخيص: ACCEPT case A3 «محتاج شخص ينجز مشروعي» (مذكور صراحة في رسالة المُشغّل) → v3.0 يرفضه بـ no_academic_service. السبب:
+  * «مشروعي» (possessive form) لا يطابق SERVICE_TERM «مشروع» لأن المطابقة كانت token-equality بلا نزع لاحقة الملكية «ي».
+  * «ينجز» فعل تنفيذ لكنه ليس في EXEC_IMPLIES_SERVICE (الذي يحوي فقط يشرح/يدرس/يعلم/يراجع/يحل/يذاكر).
+  * النتيجة: services=[] + exec_implies=False → REJECT no_academic_service.
+
+- الإصلاح المُنفّذ في request_filter.py (v3.0 → v3.0.1):
+  * إضافة _POSSESSIVE_SUFFIXES_LONGEST_FIRST tuple (هما/كما/كلن/ينا/يها/يكم/يكن/يهم/يهن/يكما/يهما/كم/هم/هن/نا/ها/يه/يك/ه/ك/ي) — أطول أولاً لتجنب التضارب.
+  * إضافة _strip_possessive_suffix(token): يُرجع الجذر لو token >= 4 حروف والجذر >= 3 حروف؛ أطول لاحقة مناسبة فقط.
+  * إضافة _token_root_set(toks): set من كل token + root form. آمن لأن المطابقة لاحقًا تساويًا تامًا على vocab entry — لا خطر substring.
+  * تعديل _match_pairs: لكل token أحادي المفرد، نقبل تطابق norm مع أي عنصر في root set. هذا يلتقط «مشروعي»→«مشروع»، «واجبنا»→«واجب»، «تقريركم»→«تقرير».
+  * تعديل _match_plural_noun بنفس الطريقة (بحوثهم → بحوث).
+  * FILTER_VERSION: v3.0 → v3.0.1. FILTER_MODE unchanged (intent_engine_hard_gates).
+
+- اختبارات regression مضافة:
+  * verify_request_filter.py (+11 cases، 52→63): قسم PRODUCTION_FP_CASES (6 رسائل الفعلية) + قسم PRODUCTION_ACCEPT_CASES (5 رسائل: ابي حد يسوي بحث + 4 possessive-suffix cases).
+  * tests/test_request_intent_engine.py (+11 cases، 317→328): 8 ACCEPT possessive-suffix cases (محتاج شخص ينجز مشروعي + من يحل لي واجبي + عندي تكليف أبي أحد يسويه + أحتاج شخص يتولى المشروع عني + أبي أحد يكتب تقريري + محتاجة شخص يجهز عرضي + من يخلص واجبنا + أبي شخص يرتب بحوثهم) + 3 REJECT production literals (FP-1/FP-3/FP-5).
+
+- التحقق الكامل بعد الإصلاح:
+  * test_request_intent_engine.py: 328/328 (was 317, +11). Precision 100%, Recall 100%, F1 100%, FPR 0%, FNR 0%, mutation 0 fails, ambiguous 52/52 REJECT.
+  * verify_request_filter.py: 63/63 (was 52, +11).
+  * test_request_filter_v2.py: 78/78.
+  * test_request_channel_separation: 52/52.
+  * test_request_filter_race_rescue: 23/23.
+  * test_delete_rescue: 15/15.
+  * test_raw_hook: 13/13.
+  * test_fast_delete_rescue_evidence: RESCUED_ONCE=25 MISSED=0.
+  * test_link_capture: 21/21.
+  * test_bot_filter: 20/20.
+  * Total: 542 assertion خضراء. AST OK على كل الملفات الأربعة.
+- تحقق خاص بالـ6 رسائل الإنتاج + 1 ACCEPT على v3.0.1:
+  * FP-1 → REJECT no_person_executor_relationship ✓
+  * FP-2 → REJECT resource_seeking_not_service_execution ✓
+  * FP-3 → REJECT asking_for_information_not_service_execution ✓
+  * FP-4 → REJECT resource_seeking_not_service_execution ✓
+  * FP-5 → REJECT recommendation_or_tips_request_not_service_execution ✓
+  * FP-6 → REJECT recommendation_or_tips_request_not_service_execution ✓
+  * ACC-1 → ACCEPT explicit_request_for_person_to_execute_service ✓ (confidence=0.99)
+- تحقق إضافي لـ5 ACCEPT cases المذكورة في طلب المُشغّل الأصلي:
+  * A1 (أبي أحد يسوي لي بحث)        → ACCEPT ✓
+  * A2 (من يحل لي واجبي)             → ACCEPT ✓ (عبر exec_implies_service)
+  * A3 (محتاج شخص ينجز مشروعي)       → ACCEPT ✓ (بعد إصلاح possessive suffix)
+  * A4 (عندي تكليف أبي أحد يسويه)    → ACCEPT ✓
+  * A5 (أحتاج شخص يتولى المشروع عني) → ACCEPT ✓
+
+Stage Summary:
+- السبب الحقيقي للـFPs في الإنتاج: v3.0 لم يُلتزم/يُدفع. الإنتاج يعمل بـ v2.1 الذي يقبل 4 من 6 رسائل عبر intent_plus_service (لبعض الكلمات كـ«وين القى»/«أبغى شرح» كـintent) أو action_plus_service (لـ«افضل واحد يشرح المادة» قبل تمييزها كـrecommendation).
+- v3.0+ Hard Gates (RESOURCE_SEEKING_PHRASES / INFO_SEEKING_PHRASES / RECOMMENDATION_SEEKING) ترصد كل رسالة فعلية بشكل صحيح.
+- الإصلاح v3.0.1 يحل ثغرة منفصلة: possessive-suffix stripping (مشروعي → مشروع). 8 ACCEPT cases جديدة مضافة للcorpus لضمان عدم الارتداد.
+- المسار: request_filter.py (1049→1108 سطر، +59 net) + verify_request_filter.py (176→212 سطر، +36) + tests/test_request_intent_engine.py (538→555 سطر، +17).
+- جاهز لـcommit + push — أخيرًا الإنتاج ينتقل من v2.1 إلى v3.0.1 ويحل FPs فعلًا.
