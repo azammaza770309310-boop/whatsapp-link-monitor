@@ -62,7 +62,16 @@ from request_filter import (
     FILTER_VERSION as REQUEST_FILTER_VERSION,
     FILTER_MODE as REQUEST_FILTER_MODE,
 )
-from request_guard import RateLimiter, CircuitBreaker, ContentDeduper
+# NOTE: aliased to RequestRateLimiter to avoid shadowing link_system.RateLimiter.
+# link_system.RateLimiter(db) is instantiated at __init__ as self.rate_limiter
+# and is consumed by MembershipCache (rate_limiter.acquire / record_floodwait)
+# and FloodWaitManager. The request_guard version takes int(max_per_minute) and
+# is only used by the request-filter path (self._request_rate_limiter). A bare
+# `from request_guard import RateLimiter` shadowed the link_system import and
+# crashed the bot at startup with:
+#   TypeError: int() argument must be a string, a bytes-like object or a real
+#   number, not 'ProductionDB'   (request_guard.py:45, bot.py:3033)
+from request_guard import RateLimiter as RequestRateLimiter, CircuitBreaker, ContentDeduper
 
 # -------------------------------------------------------------------
 # Constants
@@ -6010,7 +6019,7 @@ class Monitor:
 
         # --- lazy init guards (getattr دفاعي للاختبارات/fake namespaces) ---
         if not hasattr(self, '_request_rate_limiter'):
-            self._request_rate_limiter = RateLimiter(
+            self._request_rate_limiter = RequestRateLimiter(
                 max_per_minute=getattr(self.config, 'request_filter_max_per_minute', 20),
                 max_per_chat_per_minute=getattr(self.config, 'request_filter_max_per_chat_per_minute', 5),
             )
