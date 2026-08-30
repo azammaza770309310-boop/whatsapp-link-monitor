@@ -310,7 +310,12 @@ def _has_contact_url(text: str) -> bool:
 # [1] كلمات عربية مُجزّأة بنقاط متقطعة — تستخدم للالتفاف على الفلاتر
 #     مثل "ت.قرير" / "تـ.قرير" / "و.اجب" — إشارة إعلانية قوية (+2).
 #     regex: حرف عربي + (optional non-word) + literal "." + (optional non-word) + حرف عربي
-_DOTTED_WORD_RE = re.compile(r'[أ-ي]\W?\.\W?[أ-ي]')
+# [أ-ي] + optional tatweel (ـ U+0640) + literal "." + optional tatweel + [أ-ي].
+# NO \W (no space): a normal sentence period is followed by a space, which must
+# NOT match (it caused false positives like «التأمين. وثيقة» being flagged as a
+# dotted-word obfuscation). Only intra-word dots (ت.قرير / تـ.قرير / تـ.ـقرير)
+# match — which is the actual evasion pattern.
+_DOTTED_WORD_RE = re.compile(r'[أ-ي][ـ]?\.[ـ]?[أ-ي]')
 
 
 def _has_dotted_word(text: str) -> bool:
@@ -318,6 +323,20 @@ def _has_dotted_word(text: str) -> bool:
     if not text:
         return False
     return bool(_DOTTED_WORD_RE.search(text))
+
+
+# [3] Telegram @handle — إشارة مُقدّم خدمة قوية (+3).
+# وجود @handle لاتيني (4+ chars بعد @) في رسالة جماعية إشارة تجارية شبه
+# أكيدة: المساعدة نادرًا ما تترك @handle؛ مُقدّم الخدمة يتركه للتواصل التجاري.
+# (?<!\w) يمنع مطابقة user@domain (email). يبدأ بحرف لاتيني ثم 3+ لاتيني/رقم/_.
+_AT_HANDLE_RE = re.compile(r'(?<!\w)@[A-Za-z][A-Za-z0-9_]{3,}')
+
+
+def _has_at_handle(text: str) -> bool:
+    """يكشف @handle تيليجرام (لاتيني، 4+ chars بعد @) — إشارة تجارية قوية."""
+    if not text:
+        return False
+    return bool(_AT_HANDLE_RE.search(text))
 
 
 # [2] رسالة متعددة الأسطر (≥6 أسطر) — إشارة إعلانية ضعيفة (+1).
@@ -368,6 +387,7 @@ class RequestAnalysis:
     has_question_form: bool = False
     has_phone: bool = False
     has_contact_url: bool = False
+    has_at_handle: bool = False  # Telegram @handle — إشارة مُقدّم خدمة
     # [MBOT-PORT] إشارات إعلانية إضافية من mbot.py
     has_dotted_word: bool = False       # كلمات عربية مُجزّأة بنقاط (obfuscation)
     has_many_lines: bool = False        # ≥6 أسطر (weak marketing signal)
@@ -403,8 +423,38 @@ class RequestAnalysis:
 
 
 def _match_pairs(pairs, normalized: str) -> List[str]:
-    """يرجع قائمة العبارات الأصلية التي تطابقت (substring على المُطبّع)."""
-    return [orig for orig, norm in pairs if norm and norm in normalized]
+    """يرجع قائمة العبارات الأصلية التي تطابقت.
+
+    للعبارات أحادية المُفرَدة (لا مسافة فيها) نستخدم word-boundary (\\b) حتى
+    لا نُطابق كلمة قصيرة داخل كلمة أخرى: «مين» داخل «تأمين»، «من» داخل
+    «المن»/«كلمن»، «أبي» داخل «أبيض». هذا كان سبب false-positive لمحتوى
+    تجاري (تقرير طبي) مرّ كطلب لأن «مين» طُابقت داخل «تأمين» فظُنّ سؤالاً.
+
+    استثناء مهم: نسمح بسبق «ال» التعريف (أي «ال» عند حدّ كلمة) لأن العربية
+    تُلحق الأسماء بـ«ال» عادةً («التقرير» = the report = نفس الكلمة). فبدون
+    هذا الاستثناء، «تقرير» لن يُطابق «التقرير»، ما يُكسر طلبات حقيقية مثل
+    «أحتاج مساعدة في التقرير الجامعي». الـ«ال» نفسها لا تنقذ «مين» داخل
+    «تأمين» لأن «تأمين» لا يحتوي «المين» (لا «ل» بعد الألف).
+
+    للعبارات متعددة المُفرَدات نُبقي substring (محدّدة بما يكفي).
+    """
+    out = []
+    for orig, norm in pairs:
+        if not norm:
+            continue
+        if ' ' in norm:
+            # multi-token phrase — substring is specific enough
+            if norm in normalized:
+                out.append(orig)
+        else:
+            # single token — word boundary, OR prefixed with the «ال» definite
+            # article (itself at a word boundary). \b works for Arabic in
+            # Python 3 re by default (\w includes Unicode letters).
+            pat_bare = r'\b' + re.escape(norm) + r'\b'
+            pat_undef = r'\bال' + re.escape(norm) + r'\b'
+            if re.search(pat_bare, normalized) or re.search(pat_undef, normalized):
+                out.append(orig)
+    return out
 
 
 def analyze_request(text: str) -> RequestAnalysis:
@@ -446,9 +496,10 @@ def analyze_request(text: str) -> RequestAnalysis:
             if len(res.matched_actions) >= ACTION_CAP:
                 break
 
-    # إشارات هاتف/رابط
+    # إشارات هاتف/رابط/@handle
     res.has_phone = _has_phone_number(text)
     res.has_contact_url = _has_contact_url(text)
+    res.has_at_handle = _has_at_handle(text)
 
     # [MBOT-PORT] إشارات إعلانية إضافية من mbot.py
     # (1) كلمات عربية مُجزّأة بنقاط — تعمّد التلصص على الفلاتر
@@ -476,9 +527,6 @@ def analyze_request(text: str) -> RequestAnalysis:
         len(res.provider_signals) * 4
         + min(len(res.ad_signals), AD_CAP) * 2
     )
-    # هاتف/رابط وحده لا يكفي، لكنه يُضيف +1 لو وُجد مع إشارة عرض (provider>0)
-    if (res.has_phone or res.has_contact_url) and provider > 0:
-        provider += 1
     # [MBOT-PORT] إشارات إعلانية إضافية: dotted word = +2 (قوية)، multi-line = +1 (ضعيفة)
     # وحدهما لا يكفيان للرفض (PROVIDER_THRESHOLD=6)، لكنهما يعززان الكشف لو
     # رافقتا إشارة عرض أخرى. dotted word قوية لأن العربية لا تستخدم النقاط
@@ -486,6 +534,17 @@ def analyze_request(text: str) -> RequestAnalysis:
     if res.has_dotted_word:
         provider += 2
     if res.has_many_lines:
+        provider += 1
+    # @handle تيليجرام — إشارة تجارية قوية (+3). المساعد نادرًا ما يترك @handle؛
+    # مُقدّم الخدمة يتركه للتواصل التجاري. وحدها (+3) لا تكفي للرفض (threshold 6)
+    # لكنها تعزّز الكشف بقوة. تركيبة هاتف+@handle شبه أكيدة تجاريًا (+2 إضافية).
+    if res.has_at_handle:
+        provider += 3
+    if res.has_phone and res.has_at_handle:
+        provider += 2
+    # هاتف/رابط/@handle وحدها لا تكفي، لكنها تُضيف +1 لو وُجدت مع إشارة عرض أخرى
+    # (provider>0 بعد الإشارات أعلاه).
+    if (res.has_phone or res.has_contact_url or res.has_at_handle) and provider > 0:
         provider += 1
     res.provider_confidence = provider
 
