@@ -53,7 +53,7 @@ import re
 from dataclasses import dataclass, field
 from typing import List, Tuple, Dict, Any, Optional
 
-FILTER_VERSION = "v3.1.0"
+FILTER_VERSION = "v3.2.0"
 FILTER_MODE = "intent_engine_hard_gates"
 
 
@@ -196,20 +196,35 @@ REQUESTER_PHRASES: List[str] = [
 EXECUTION_VERBS: List[str] = [
     "يسوي", "يعمل", "ينجز", "يخلص", "يحل", "يكتب", "يجهز", "يرتب",
     "يصمم", "ينفذ", "يشتغل", "يستلم", "يتولى", "يكمل", "يراجع",
-    "يساعد", "يضبط", "يشرح", "يدرس", "يعلم", "يذاكر", "ينقح",
+    "يساعد", "يضبط", "يشرح", "يعلم", "ينقح",
     "يرتبه", "يخلصه", "ينجزه", "يسويه", "يحله", "يكتبه", "يجهزه",
 ]
+
+# [v3.2.0] REMOVED "يدرس" and "يذاكر" from EXECUTION_VERBS.
+# «يدرس» in Saudi student dialect = "studies" (a student studying a subject),
+# NOT "teaches". When combined with a person word in existential questions
+# («فيه احد يدرس اداره ماليه؟» / «في احد موظف في ارامكو و يدرس؟») it is a
+# PERSON-STATUS inquiry (finding peers), never a service-execution request.
+# This single entry caused 4 of the 14 new production FPs (#8/#15/#16/#17).
+# «يذاكر» (studies/memorizes) has the same problem — "ابي احد يذاكر معي" is a
+# study-buddy (mutual activity), not a service executed FOR the asker, and per
+# the golden rule defaults to REJECT. Real teaching-execution verbs are kept:
+# «يشرح» (explains), «يعلم/يعلمني» (teaches me), "يدرسني" (teaches me —
+# object-suffix form, still matched via the 'ني' suffix on the verb 'يعلم'-
+# style; bare «يدرس» without object is ambiguous → REJECT per golden rule).
 
 # أفعال تنفيذ هي نفسها خدمة أكاديمية (يشرح=تدريس، يراجع=مراجعة، يحل=حل)
 # لو ظهرت مع requester بلا خدمة صريحة، تُغني عن خدمة (Gate 4).
 EXEC_IMPLIES_SERVICE: Dict[str, str] = {
     "يشرح": "teaching",
-    "يدرس": "teaching",
     "يعلم": "teaching",
     "يراجع": "reviewing",
     "يحل": "solving",
-    "يذاكر": "studying",
 }
+# [v3.2.0] REMOVED "يدرس" (→"teaching") and "يذاكر" (→"studying") — see the
+# EXECUTION_VERBS comment above: both are "studies" (person-status verbs) in
+# Saudi student dialect. With them gone, «الي يدرس ادا 110 يعامني متى الميد»
+# falls to the info-seeking gate (متى) instead of ACCEPTing via exec_implies.
 
 # ============================================================
 # [4] OWNERSHIP_NEED — ملكية/حاجة (المستخدم يملك العمل أو يحتاجه)
@@ -404,6 +419,10 @@ PLURAL_SERVICE_NOUNS: List[str] = [
 # ============================================================
 INFO_SEEKING_PHRASES: List[str] = [
     "ما هو", "ما هي", "وش هو", "وش هي", "ايش هو", "ايش هي",
+    # [v3.2.0] PRODUCTION FP #18: «عندي سؤال اتمنى اللي فاهم او عارف مايبخل
+    # بالاجابه...» — "I have a question, hope whoever understands answers"
+    # = classic info-seeking opener, never a service-execution request.
+    "عندي سؤال", "عندى سؤال", "عندي استفسار", "عندى استفسار",
     "ما معنى", "ما معنى هذا", "وش يعني", "ايش يعني", "وش معنى",
     "ما المقصود", "وش المقصود", "ايش المقصود",
     "كيف اسوي", "كيف أسوي", "كيف أعمل", "كيف اعمل", "كيف احل", "كيف أحل",
@@ -436,6 +455,11 @@ RESOURCE_SEEKING_PHRASES: List[str] = [
     "أين أجد", "أين القى", "أين ألقى", "وين احصل", "وين أحصل",
     "أين احصل", "وين اقدر القى", "وين أقدر القى",
     "وين في", "وين ألاقي", "وين القاه",
+    # [v3.2.0] PRODUCTION FP #5: «ممكن تبعتولى كتب تشريح ١ و٢...» — asking
+    # group members to SEND files (books/slides) = resource-seeking, not
+    # service-execution. Dialect verb forms "send me (pl)".
+    "تبعتولي", "تبعتولى", "تبعثولي", "تبعثولى",
+    "تبعتوني", "تبعثوني", "ابعتولي", "ابعتولى", "ابعتوني",
     "رابط شرح", "قناة تشرح", "قناة تشرح المادة",
     "شرح مجاني", "نماذج اختبار", "نماذج اختبارات", "بنوك أسئلة",
     "بنك أسئلة", "ملخصات المادة", "مذكرات المادة", "ملفات المادة",
@@ -471,6 +495,16 @@ RECOMMENDATION_SEEKING: List[str] = [
     # asking "who teaches/studies" (recommendation of a person)
     "مين يشرح", "من يشرح",
     "مين يدرس", "من يدرس",  # asking "who studies/teaches" (person rec)
+    # [v3.2.0] PRODUCTION FP #1: «في احد يشرح المفكر غير المثنى؟...» —
+    # existential inquiry "is there anyone who explains X?" WITHOUT a
+    # wanting phrase (ابي/ابغى/محتاج/ضروري) or beneficiary marker (لي).
+    # Same classification as «تعرفين احد يشرح البرمجه كويس؟» (v3.1.0 FP-10):
+    # asking about the EXISTENCE of a tutor = recommendation/inquiry, not a
+    # clear request per the golden rule. Messages WITH a beneficiary marker
+    # («في احد يشرح لي المفكر؟») still bypass Gate 2.5 via (beneficiary AND
+    # exec) and stay ACCEPTED.
+    "في احد يشرح", "فيه احد يشرح", "في حد يشرح", "فيه حد يشرح",
+    "في أحد يشرح", "فيه أحد يشرح", "في حد يشرح", "فيه حد يشرح",
 ]
 
 # ============================================================
@@ -535,6 +569,21 @@ DECISION_SEEKING_PHRASES: List[str] = [
     "ما نزل اسم الدكتوره", "ما نزل اسم الدكتور",
     # changing professor questions
     "ابي اغير كم دكتور", "ابي اغير دكتور",
+    # [v3.2.0] PRODUCTION FP #6: «ابي اغير الدكتور لو اروح القسم يغيرونها لي؟»
+    # — changing a section professor via the department = administrative
+    #   decision, not hiring a tutor. «ابي اغير ال» covers الدكتور/المدرس/
+    #   الشعبة/المواد. FP #10: «هل لازم أروح لهم رفع تذكرة» — "must I go to
+    #   them to file a ticket" = decision. FP #12: «فتنصحوني اشترك مع خصوصي
+    #   ولا لا» — "do you advise me to subscribe to private tutoring or not"
+    #   = advice-seeking (the asker explicitly says they already understand
+    #   the material — they only need practice questions, not a tutor).
+    "ابي اغير ال", "ابغى اغير ال", "ابغا اغير ال",
+    "ابغى اغير", "ابغا اغير",
+    "لو اروح", "لو أروح", "لو ارح",
+    "لازم أروح", "لازم اروح", "هل لازم أروح", "هل لازم اروح",
+    "لازم أرح", "لازم ارح",
+    "تنصحوني", "تنصحني", "تنصحني", "تنصحون", "تنصحوني ب",
+    "ولا لا", "ولا لا؟", "او لا", "أو لا",
 ]
 
 # ============================================================
@@ -598,8 +647,17 @@ def _detect_long_informational(text: str, normalized: str) -> bool:
 # ============================================================
 DELEGATION_VERBS: List[str] = [
     "اوكل", "أوكل", "افوض", "أفوض", "فوض", "فوّض", "فوّض",
-    "انيط", "أنيط", "اسند", "أسند", "سند", "وكل", "أكل", "اكل",
+    "انيط", "أنيط", "اسند", "أسند", "سند",
 ]
+# [v3.2.0] REMOVED "وكل" and "أكل"/"اكل" from DELEGATION_VERBS.
+# «وكل» false-matched the extremely common conjunction+quantifier «وكل»
+# (= و+كل "and all") — production FP #14: «...وكل اوراق تمام» ("and all
+# papers are complete") was treated as delegation + person → ACCEPT for a
+# pure informational statement about a military institute. The real
+# delegation forms (اوكل/أوكل) are kept.
+# «أكل»/«اكل» false-matched «اخاف اكل حرمان» ("afraid of failing" — the
+# verb "eat" in the student idiom "اكل حرمان" = get an F). Production FP
+# #11: «احذف مادته؟ اخاف اكل حرمان» was accepted as delegation + person.
 
 # ============================================================
 # [12c] PROFESSIONAL_ROLES — أدوار مهنية (مدرس/دكتور/مختص)
@@ -724,12 +782,30 @@ _ARABIC_PREFIXES = [
     'ال',
 ]
 
+# [v3.2.0] PROTECTED function words — prefix-stripping must NOT touch these.
+# Stripping "ال" from "اللي"/"اللى" (relative pronouns) produced a FALSE
+# outsource signal "لي"/"لى" (to-me) in nearly every message containing
+# "اللي" — one of the most common Arabic function words. Same catastrophe
+# with God-words: "الله"→strip "ال"→"له", "والله"→strip "وال"→"له",
+# "بالله"→strip "بال"→"له" — all produced FALSE "له" (to-him) outsource
+# signals. These words appear in a huge fraction of Saudi chat messages
+# (والله/بالله/ان شاء الله/اللي...) and silently inflated acceptance via
+# Gate 3 (c)/(d) outsource paths and the Gate 2.5 bypass.
+_PROTECTED_WORDS = {
+    'الله', 'بالله', 'والله', 'تالله', 'لله', 'للاله', 'واللهم', 'اللهم',
+    'اللي', 'اللى', 'اللذي', 'اللتي', 'واللي', 'واللى', 'باللي', 'باللى',
+}
+
 
 def _strip_arabic_prefix(word: str) -> str:
     """يُزيل البوادئ العربية الشائعة (ال/لل/بال/كال/فال/وال/ولل...) حتى نُطابق
     الجذر. مثلاً «للمشاريع»→«مشاريع»، «وبالبحث»→«بحث»، «والاستاذ»→«استاذ».
-    لا يُزيل لو كان الباقي قصيرًا (تفادي الإفراط)."""
+    لا يُزيل لو كان الباقي قصيرًا (تفادي الإفراط).
+    [v3.2.0] الكلمات المحمية (الله/والله/بالله/اللي/اللى...) لا تُلمس — تقشيرها
+    كان يُنتج إشارات خاطئة («له»/«لي») من كلمات وظيفية شائعة جدًا."""
     if not word:
+        return word
+    if word in _PROTECTED_WORDS:
         return word
     changed = True
     # try stripping up to 2 prefix layers (e.g. «ولل» → «لل» → root)
@@ -797,9 +873,16 @@ _POSSESSIVE_SUFFIXES_LONGEST_FIRST = (
     'هما', 'كما', 'كلن',     # dual / your-pl-f
     'ينا', 'يها', 'يكم', 'يكن', 'يهم', 'يهن', 'يكما', 'يهما',  # ي+...
     'كم', 'هم', 'هن', 'نا', 'ها',   # your-pl-m / their-m / their-f / our / her
-    'يه', 'يك',               # ي+ه / ي+ك (rare in writing but appears)
+    'يك',               # ي+ك (rare in writing but appears)
     'ك', 'ي',            # your / my (single-letter). REMOVED 'ه' (v3.1.0)
 )
+# [v3.2.0] REMOVED 'يه' — the adjective ending يه/ية ("شخصيه"=personal,
+# "جامعيه"=university-adj) was being stripped as if it were a possessive
+# pronoun: «المقابله الشخصيه» → root «شخص» → FALSE person-word match.
+# Production FP #14 (a pure informational statement about a military
+# institute) was accepted partly because «الشخصيه» produced the person
+# token «شخص». Real possessives never end a service noun with 'يه'
+# ("واجبيه"/"مشروعيه" are not written forms) — safe removal.
 
 
 def _strip_possessive_suffix(token: str) -> Optional[str]:
@@ -820,14 +903,21 @@ def _strip_possessive_suffix(token: str) -> Optional[str]:
 def _token_root_set(toks: List[str]) -> set:
     """يبني مجموعة (set) من كل الجذور الممكنة لكل token:
     الـ token نفسه + الـ root بعد نزع لاحقة الملكية (لو آمن).
-    يُستخدم لمطابقة token-equality آمنة (no substring false-positives)."""
+    يُستخدم لمطابقة token-equality آمنة (no substring false-positives).
+
+    [v3.2.0] الكلمات المحمية (اللي/اللى/الله/والله/بالله...) تُستبعد نهائيًا
+    من الـroots. مجرد حمايتها من تقشير البادئة في _strip_arabic_prefix لم
+    يكن كافيًا: فرع المطابقة ('ال'+norm) in roots في _match_pairs كان يبني
+    «اللي» نصيًا من norm='لي' ويطابقها → إشارة outsource خاطئة رغم الحماية
+    (production FP #9: «المحاضرات اللي عن بعد» أنتجت 'لي'). الاستبعاد الكامل
+    يقطع المسارين معًا: norm مباشر و ('ال'+norm)."""
     out = set()
     for t in toks:
-        if not t:
+        if not t or t in _PROTECTED_WORDS:
             continue
         out.add(t)
         root = _strip_possessive_suffix(t)
-        if root is not None:
+        if root is not None and root not in _PROTECTED_WORDS:
             out.add(root)
     return out
 
@@ -883,18 +973,46 @@ def _match_plural_noun(pairs, normalized: str) -> List[str]:
 # ضمائر المفعول المرفقة بالفعل (يساعدني/يحلّه/ينجزهم/يكتبها/...)
 _EXEC_PRONOUN_SUFFIX = r'(?:ني|نه|كم|كن|هم|هن|هما|كما|نا|ها|ه|ك)?'
 
+# [v3.2.0] نفس الضمائر كـ set — لمطابقة token-start الآمنة (انظر أدناه)
+_EXEC_SUFFIX_SET = {
+    '', 'ني', 'نه', 'كم', 'كن', 'هم', 'هن', 'هما', 'كما', 'نا', 'ها', 'ه', 'ك',
+}
+
 
 def _match_exec_verbs(pairs, normalized: str) -> List[str]:
     """يطابق أفعال التنفيذ مع السماح بضمائر المفعول المرفقة:
     «يساعدني»→يساعد، «يحله»→يحل، «ينجزهم»→ينجز، «يكتبها»→يكتب.
-    نستخدم regex (لا token-equality) لأن الضمائر تُلصق بالفعل بلا مسافة."""
+
+    [v3.2.0] REPLACED regex-anywhere matching with TOKEN-START matching.
+    الـregex القديم (re.search على النص كاملًا) كان يطابق الفعل في وسط أي
+    كلمة: «الدكتور **بيشرح** منها» (صيغة المستقبل ب+يشرح) طابقت «يشرح» →
+    إشارة تنفيذ خاطئة → قبول رسالة طلب كتب/سلايدات (FP #5). الآن: نقسم
+    النص tokens، نزيل «و» العطف من بداية الـtoken فقط («ويعلمني»→«يعلمني» ✓)،
+    ثم نشترط أن يبدأ الـtoken بالفعل وأن يكون الباقي ضمير مفعول صالحًا (أو
+    فارغًا):
+      «يشرح» ✓  «يشرحها» ✓  «ويعلمني» ✓  «يسويه» ✓
+      «بيشرح» ✗ (يبدأ بـ«ب»)  «المشرح» ✗  «تشرح» ✗
+    المطابقة الجديدة subset صارم من القديمة — لا تضيف أي تطابق جديد،
+    فقط تمنع المطابقات داخل الكلمات."""
     out = []
+    toks = _tokens(normalized)
+    # strip the waw-conjunction from token starts (ويعلمني → يعلمني)
+    candidates = set()
+    for t in toks:
+        if not t:
+            continue
+        candidates.add(t)
+        if t.startswith('و') and len(t) > 1:
+            candidates.add(t[1:])
     for orig, norm in pairs:
         if not norm:
             continue
-        pat = re.escape(norm) + _EXEC_PRONOUN_SUFFIX
-        if re.search(pat, normalized):
-            out.append(orig)
+        for cand in candidates:
+            if cand.startswith(norm):
+                rest = cand[len(norm):]
+                if rest in _EXEC_SUFFIX_SET:
+                    out.append(orig)
+                    break
     return out
 
 
@@ -998,7 +1116,30 @@ def analyze_request(text: str) -> RequestAnalysis:
         res.intent_type = "empty"
         return res
 
-    normalized = normalize_text(text)
+    # ===== GATE 0: relay-bot repost detection =====
+    # [v3.2.0] NEW. Production duplicate-posting forensic: the same request
+    # arrived TWICE at the requests channel — once from the original group
+    # and once from a third-party relay bot group that reposts messages in
+    # the wrapper format «المرسل : ...\nالاسم : ...\nID ...\nنص الرساله : ...
+    # رابط الرساله : https://t.me/...». The content-hash dedup can't catch
+    # these (wrapper changes the hash). Since the ORIGINAL message is
+    # already processed from its source group, the relay copy is a duplicate
+    # by definition → hard REJECT before all other gates.
+    _t_norm0 = normalize_text(text)
+    if _t_norm0 and (
+        ("نص الرساله" in _t_norm0 or "نص الرسالة" in _t_norm0)
+        and ("رابط الرساله" in _t_norm0 or "رابط الرسالة" in _t_norm0
+             or "المرسل" in _t_norm0)
+    ):
+        res.accepted = False
+        res.is_request = False
+        res.intent_type = "relay_repost"
+        res.reason = "relay_bot_repost_duplicate"
+        res.confidence = 0.01
+        res.seeker_confidence = 0
+        return res
+
+    normalized = _t_norm0
     if not normalized:
         res.reason = "empty_after_normalize"
         res.intent_type = "empty"
@@ -1199,12 +1340,24 @@ def analyze_request(text: str) -> RequestAnalysis:
     # [v3.1.0] Uses has_ownership (expanded with possessive suffix detection)
     # so that «تعرف أحد يحل واجبي» (no explicit «أبي»/«محتاج» but has «واجبي»
     # = my homework → has_ownership=True) is NOT rejected as recommendation.
-    # Also accepts if (outsource_sigs AND exec_verbs) is present — «من يشرح لي
-    # المادة» has «لي» (to me, outsource) + «يشرح» (exec) without explicit
-    # ownership/service, but is clearly a request to teach the asker.
+    # [v3.2.0] TIGHTENED the second bypass clause: was (outsource_sigs AND
+    # exec_verbs) — production FP #4 «تعرفون احد يشرح كيمياء عضويه او خصوصي؟»
+    # bypassed the recommendation rejection because «خصوصي» (private, an
+    # outsource indicator added in v3.1.0 for the «مدرس خصوصي» role path)
+    # counted as "outsourcing". خصوصي is NOT a beneficiary marker. The bypass
+    # now requires a real BENEFICIARY marker (لي/لى/معي/عني...) — the request
+    # must say the service is FOR THE ASKER: «من يشرح **لي** المادة» ✓,
+    # «من يشرح لي ويحل معي» ✓, «... او خصوصي؟» ✗ (no for-me marker).
+    _beneficiary_markers = (
+        outsource_sigs
+        and bool(set(outsource_sigs) & {
+            "لي", "لى", "ليا", "معي", "معيا", "عني", "ني",
+            "بدلي", "بدالى", "بدليا",
+        })
+    )
     if recommend_sigs and not (
         (has_ownership and services and exec_verbs)
-        or (bool(outsource_sigs) and bool(exec_verbs))
+        or (_beneficiary_markers and bool(exec_verbs))
     ):
         res.accepted = False
         res.is_request = False

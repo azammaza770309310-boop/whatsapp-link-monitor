@@ -3064,3 +3064,116 @@ Stage Summary:
 - Bug جذرية واحدة، تشخيص دقيق (ProductionDB له `_conn()` وليس `_ensure_conn()`)، إصلاح دفاعي مزدوج (alias + rename).
 - صفر تأثير على filter/link-capture/scorer/supabase — كلها كانت تعمل صحيحًا في الـlogs.
 - جاهز لـcommit + push. autoDeploy على Render سيلتقط الإصلاح + v3.1.0 (94fc8e1) معًا في deploy واحد.
+
+---
+Task ID: PROD-FP-V32-REBUILD
+Agent: main (production FP forensic #3 + Intent Engine v3.2.0 radical rebuild)
+Task: تشخيص وإصلاح 18 رسالة إنتاجية جديدة وصلت لقناة الطلبات 06:46-07:24 UTC (بعد نشر v3.1.0=94fc8e1 في 02:46 و crashfix=2c4ef79 في 03:27). 18/18 منها كانت مقبولة على v3.1.0 — إصلاح جذري + 20 regression case.
+
+Work Log:
+- [ENV RESET] البيئة أُعيد تعيينها (sandbox reset) — /home/z/wlm اختفى. أعدت clone من GitHub (repo عام، anonymous clone نجح). تحققت عبر Render API: 2c4ef79 live منذ 03:27:41Z ✓.
+- [PRODUCTION FP DISCOVERY #3] المُشغّل أرسل 20 رسالة وصلت للقناة 06:46-07:24 UTC (توقيت الـbot UTC): 18 فريدة + 2 relay-bot reposts (تكرارات من مجموعة "Bot" بصيغة المرسل/نص الرساله/رابط الرساله). كلها عبرت v3.1.0 → 18/18 ACCEPT محليًا على نفس كود 2c4ef79 (تأكيد قاطع: FPs حقيقية في v3.1.0، ليست deploy lag).
+- [التشخيص] 14 منها FP (يجب رفضها) + 4 طلبات حقيقية صحيحة (#2 يعلمني خاص، #3 ضروري احد يعلمني، #7 ابغى احد يشرح لي، #13 حد يعلمني الطريقة). شُخّصت 12 سببًا جذريًا:
+
+  **RC-1 [الهيكلية الكبرى]: الـtokenizer يدمّر الكلمات الوظيفية**
+  - "الله"→strip"ال"→"له"، "والله"→strip"وال"→"له"، "بالله"→strip"بال"→"له"، "اللي"→strip"ال"→"لي"، "اللى"→"لى"
+  - هذه من أكثر الكلمات العربية شيوعًا (والله/بالله/ان شاء الله/اللي) — كل واحدة تُنتج إشارة outsource خاطئة تُغذي Gate 3(c)/(d) وGate 2.5 bypass
+  - أثر: FP #3 (بالله→له)، FP #9 (اللي→لي)، FP #18 (اللي→لي + صار له→له)
+
+  **RC-2: "يدرس" و"يذاكر" في EXECUTION_VERBS + EXEC_IMPLIES_SERVICE**
+  - "يدرس" بالعامية السعودية = "يذاكر" (فعل حالة شخص)، ليس "يُدرّس"
+  - "فيه احد يدرس X؟" = استعلام عن وجود شخص يدرس = person-status
+  - أثر: FP #8/#15/#16 (person-status) + FP #17 (يدرس يهزم info-gate)
+
+  **RC-3: exec-regex يطابق داخل الكلمات**
+  - re.search('يشرح(?:suffix)?') يطابق "يشرح" داخل "بيشرح" (مستقبل ب+يشرح)
+  - أثر: FP #5 ("الدكتور بيشرح منها" → exec خاطئ → قبول رسالة طلب كتب)
+
+  **RC-4: "وكل" في DELEGATION_VERBS**
+  - "وكل اوراق تمام" = و+كل (and all) وليس فعل التوكيل
+  - أثر: FP #14 (بيان معلوماتي عن معهد القوات الجوية قُبل كطلب!)
+
+  **RC-5: "أكل"/"اكل" في DELEGATION_VERBS**
+  - "اخاف اكل حرمان" (خوف الرسوب) = فعل الأكل وليس التوكيل
+  - أثر: FP #11
+
+  **RC-6: لاحقة 'يه' في _POSSESSIVE_SUFFIXES**
+  - "المقابله الشخصيه" (personal) → strip 'يه' → "شخص" → person word خاطئ
+  - أثر: FP #14
+
+  **RC-7: Gate 2.5 bypass بـ(خصوصي AND exec)**
+  - "تعرفون احد يشرح... او خصوصي؟" — خصوصي (مؤشر outsource لمسار role) كان يُجيز تجاوز رفض التوصية
+  - أثر: FP #4
+
+  **RC-8: DECISION_SEEKING ناقصة** — "ابي اغير ال..."، "لو اروح"، "لازم أروح"، "تنصحوني"، "ولا لا"
+  - أثر: FP #6/#10/#12
+
+  **RC-9: INFO_SEEKING ناقصة** — "عندي سؤال" (opener معلوماتي كلاسيكي)
+  - أثر: FP #18
+
+  **RC-10: RECOMMENDATION_SEEKING ناقصة** — "في احد يشرح" (استعلام وجود بلا wanting/beneficiary)
+  - أثر: FP #1 (نفس تصنيف FP-10 «تعرفين احد يشرح»)
+
+  **RC-11: RESOURCE_SEEKING ناقصة** — "تبعتولى" (ابعتوا لي)
+  - أثر: FP #5
+
+  **RC-12: relay-bot repost (تكرار النشر)**
+  - نفس الرسالة تُنشر مرتين: الأصل + مجموعة "Bot" relay (بصيغة المرسسل/الاسم/ID/نص الرساله/رابط الرساله)
+  - content-hash dedup لا يلتقطها (الـwrapper يغيّر الهاش)
+  - أثر: تكرار ×2 (jazan + IMAMUBusiness)
+
+- [RADICAL FIX v3.1.0 → v3.2.0] (12 إصلاح معماري):
+
+  **FIX-1: _PROTECTED_WORDS + guard في _strip_arabic_prefix + استبعاد كامل من _token_root_set**
+  - حماية الله/بالله/والله/تالله/لله/اللهم/اللي/اللى/اللذي/اللتي/واللي/واللى/باللي/باللى من تقشير البوادئ
+  - اكتشاف إضافي أثناء التنفيذ: حماية البادئة وحدها لم تكفِ — فرع ('ال'+norm) in roots في _match_pairs كان يبني "اللي" من norm='لي' ويطابقها! الاستبعاد الكامل من الـroots قطع المسارين (مباشر + مُركّب). أثر: إصلاح FP #9 التي فشلت في المحاولة الأولى.
+
+  **FIX-2: إزالة "يدرس"/"يذاكر" من EXECUTION_VERBS و EXEC_IMPLIES_SERVICE**
+  - أفعال التدريس الحقيقية تبقى: يشرح/يعلم(+لاحقة ني)/يراجع/يحل
+  - "يدرسني" (يدرس+ني) ما زالت تُطابق عبر لاحقة الضمير إن وُجدت في vocabulary — لكن "يدرس" المجردة = REJECT وفق القاعدة الذهبية
+
+  **FIX-3: _match_exec_verbs token-start matching**
+  - tokenize → strip 'و' العطف من بداية token فقط → startswith(verb) + الباقي ∈ suffix set
+  - "بيشرح" ✗ (يبدأ بـب) / "ويعلمني" ✓ / "يشرحها" ✓ / "يسويه" ✓
+  - مطابقة جديدة = subset صارم من القديمة (لا تضيف تطابقات)
+
+  **FIX-4+5: إزالة "وكل"/"أكل"/"اكل" من DELEGATION_VERBS** (أوكل/أفوض/اسند تبقى)
+
+  **FIX-6: إزالة 'يه' من _POSSESSIVE_SUFFIXES_LONGEST_FIRST** ('يك' يبقى — لا صفة تنتهي به)
+
+  **FIX-7: Gate 2.5 bypass يتطلب beneficiary marker حقيقي**
+  - قبل: (outsource_sigs AND exec) — خصوصي يُجيز التجاوز
+  - بعد: (beneficiary ∈ {لي,لى,ليا,معي,معيا,عني,ني,بدلي,بدالى,بدليا} AND exec)
+  - «من يشرح لي المادة» ✓ تبقى مقبولة / «...او خصوصي؟» ✗ تُرفض
+
+  **FIX-8: DECISION_SEEKING +9 أنماط**: ابي اغير ال/ابغى اغير ال/لو اروح/لازم أروح/هل لازم أروح/تنصحوني/تنصحني/ولا لا/او لا
+
+  **FIX-9: INFO_SEEKING + عندي سؤال/عندي استفسار**
+
+  **FIX-10: RECOMMENDATION_SEEKING + في احد يشرح** (4 متغيرات إملائية)
+  - الرسائل ذات beneficiary (في احد يشرح **لي**) ما زالت تتجاوز عبر Gate 2.5 bypass
+
+  **FIX-11: RESOURCE_SEEKING + تبعتولي/تبعتولى/تبعثولي/تبعثوني/ابعتولي...**
+
+  **FIX-12: GATE 0 (جديد): relay-bot repost detection**
+  - نص يحوي (نص الرساله/نص الرسالة) AND (رابط الرساله/رابط الرسالة/المرسل) → REJECT reason=relay_bot_repost_duplicate
+  - يُطلق قبل كل البوابات — الأصل يُعالج من مجموعته، والنسخة relay مكررة بالتعريف
+
+- [REGRESSION TESTS ADDED]
+  - verify_request_filter.py: 82 → 102 حالة (+16 FP: FP-26..FP-41 بما فيها relay-2 + 4 production-accept)
+  - tests/test_request_intent_engine.py: 347 → 367 حالة (قسم 13d: V32_PRODUCTION_FP_CASES + قسم 18 ACCEPT)
+
+- [VERIFICATION — كل الاختبارات خضراء]
+  - verify_request_filter.py: 102/102 ✓
+  - tests/test_request_intent_engine.py: 367/367 ✓ Precision=100% Recall=100% F1=100%
+  - pytest (v2 + race_rescue + channel_separation + bot_filter): 37 passed ✓
+  - إجمالي: 506 حالات/assersions خضراء
+  - 20/20 رسالة إنتاجية جديدة: التوقع مطابق (14 REJECT + 4 ACCEPT + 2 relay REJECT)
+  - كل حالات القبول الشرعية (spec tests) محفوظة: ابي حد يسوي بحث/محتاج شخص ينجز مشروعي/أبي أوكل أحد بالمهمة/أبي مدرس خصوصي للمادة/من يشرح لي المادة... ✓
+
+- [تصنيف حدّي موثّق] "ابي اطبع جدولي حد يعلمني الطريقة تكفون" (#13) = ACCEPT (أبي+حد+يعلمني = طلب صريح لتعليم). لو رأى المُشغّل أنها noise فالنمط "علمني الطريقة" قابل للإضافة لـINFO لاحقًا — قرار المُشغّل.
+
+Stage Summary:
+- v3.1.0 كانت تقبل 18/18 من رسائل الإنتاج الجديدة (كارثي). v3.2.0: 14 REJECT صحيح + 4 ACCEPT صحيح + 2 relay duplicate مرفوض.
+- 12 سببًا جذريًا، أبرزها RC-1 (tokenizer يدمر الله/والله/اللي → إشارات خاطئة في رسائل لا تحصى) و RC-2 (يدرس كفعل تنفيذ).
+- 20 regression case جديدة. 506 assertions كلها خضراء. جاهز لـcommit + push (autoDeploy سينشر تلقائيًا).
