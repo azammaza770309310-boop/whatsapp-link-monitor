@@ -955,6 +955,16 @@ class ProductionDB:
     async def _conn(self):
         return await self.db._ensure_conn()
 
+    async def _ensure_conn(self):
+        """Backward-compat alias for code that calls `_ensure_conn` directly.
+
+        Historically `bot.py` and other callers used two different names for
+        the same operation (`_conn()` vs `_ensure_conn()`). This alias prevents
+        AttributeError crashes (e.g. PENDING-RECHECK loop at bot.py:4963) when
+        a caller uses the DatabaseManager-style name on the ProductionDB shim.
+        """
+        return await self._conn()
+
     # === Link Queue ===
 
     async def is_link_known(self, raw_link: str, normalized_link: str = None) -> bool:

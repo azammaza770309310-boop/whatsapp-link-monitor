@@ -4960,7 +4960,7 @@ class Monitor:
         logging.info(f"[PENDING-RECHECK] started — {interval}s cycle, max 50 groups/cycle")
         while self._running:
             try:
-                conn = await self.prod_db._ensure_conn()
+                conn = await self.prod_db._conn()
                 cursor = await conn.execute(
                     "SELECT normalized_link, raw_link, joined_by, last_seen "
                     "FROM group_states WHERE state = ? "

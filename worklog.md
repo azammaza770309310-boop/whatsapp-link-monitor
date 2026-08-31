@@ -3015,3 +3015,52 @@ Stage Summary:
 - 602 assertion كلها خضراء، 0 فشل في اختبارات الفلتر.
 - 6 legitimate ACCEPT cases ما زالت تعمل بثقة عالية (5 بـconfidence 0.99، 1 بـ0.75).
 - جاهز لـcommit + push. autoDeploy على Render سينشر تلقائيًا (~75 ثانية).
+
+---
+Task ID: PROD-CRASHFIX-1
+Agent: main (production crash forensic + radical fix)
+Task: تشخيص وإصلاح خطأ تشغيلي حرج رصد في إنتاج: `AttributeError: 'ProductionDB' object has no attribute '_ensure_conn'` في `_pending_approval_recheck_loop` (bot.py:4963). كل دورة (1800s cycle) تنهار.
+
+Work Log:
+- [PROD LOG FORENSIC] حلّلت logs إنتاج حيّة من `2026-08-31 02:46-02:47 UTC`:
+  - ✅ Filter يعمل صحيحًا: 7+ REJECT بـ`no_academic_intent score=0.01` (بما فيها `seeker=1 provider=9` — رفض رسالة بدرجة provider عالية لأنها ليست طلبًا أكاديميًا واضحًا).
+  - ✅ BOT-FILTER, DELETE-HANDLER, RECONCILE, LINK-CAPTURE, PIPELINE-1/2, SCORER, FLEET-HEALTH, SUPABASE كلها تعمل.
+  - ✅ Link-capture pipeline أنجز المطلوب: رابط `https://t.me/un_taif1` من S_boot قُبض وأُدرج في queue.
+  - ✅ RECONCILE أنقذ `https://t.me/testre11` (would have been LOST without journal/cache).
+  - ✅ SCORER: رفض @ksustudents (0 members) و @un_taif1 (0 members)؛ HIGH لـ@jabal_forest (18681) و @testre11 (12815).
+  - 🔴 BUG واحد فقط: `_pending_approval_recheck_loop` crash every 1800s بسبب `_ensure_conn` غير معرّف على ProductionDB.
+
+- [ROOT-CAUSE DIAGNOSIS]
+  - `bot.py:4963` كان يستدعي `self.prod_db._ensure_conn()`.
+  - لكن `ProductionDB` class (في `link_system.py:949`) له method اسمه `_conn()` فقط (line 955)، الذي بدوره يفوّض إلى `self.db._ensure_conn()` (DatabaseManager الأصلي).
+  - أي أن الاسم الصحيح على ProductionDB هو `_conn()`، وليس `_ensure_conn()`.
+  - بقية الكود (bot.py:5401) يستخدم الاسم الصحيح `_conn()`. فقط bot.py:4963 كان خطأ.
+
+- [VERIFICATION: v3.1.0 not yet on Render]
+  - logs تُظهر reasons = `no_academic_intent` فقط (v3.0.1 signature).
+  - لا توجد reasons الجديدة من v3.1.0 (`decision_or_advice_seeking_not_service_execution`، `contact_info_or_person_lookup_not_service_execution`، `person_status_seeking_not_service_execution`).
+  - يعني Render ما زال يعمل بـc0b5f9b (v3.0.1) رغم أن origin/main = 94fc8e1 (v3.1.0) على GitHub. AutoDeploy إما متأخر أو لم يلتقط الـcommit.
+
+- [RADICAL FIX (دفاعي مزدوج)]
+  - FIX-A (الإصلاح المباشر): `bot.py:4963` `self.prod_db._ensure_conn()` → `self.prod_db._conn()` (الاسم الصحيح).
+  - FIX-B (دفاعي معماري): إضافة `async def _ensure_conn(self)` كـalias في ProductionDB class (`link_system.py:958-966`) يفوّض إلى `_conn()`. يمنع AttributeError مستقبلاً لو أي كود آخر استخدم الاسم الخاطئ (نفس فلسفة "defense in depth").
+
+- [VERIFICATION after fix]
+  - `python3 -c "import ast; ast.parse(...)"` → SYNTAX OK لكلا الملفين.
+  - `verify_request_filter.py` → 82/82 ✓ (لم تتأثر v3.1.0 filter behavior — الإصلاح في link_system/bot فقط).
+  - اختبار دقيق للـalias: `ProductionDB(FakeDB())._ensure_conn()` و `_conn()` كلاهما يُرجع FakeConn ✓. الـPENDING-RECHECK loop لن يتعطل بعد النشر.
+
+- [Code stats]
+  - bot.py: تغيير سطر واحد (1 line).
+  - link_system.py: +10 سطور (alias method + docstring).
+  - صفر تأثير على filter behavior أو link-capture pipeline أو tests.
+
+- [PRODUCTION IMPACT متوقع بعد النشر]
+  - دورة `_pending_approval_recheck_loop` (1800s) ستعمل بشكل صحيح لأول مرة منذ نشر c0b5f9b.
+  - ستعيد فحص pending-approval groups (state=PENDING_APPROVAL) كل 30 دقيقة، وتحدّث حالتها إلى JOINED/private/expired عبر CheckChatInviteRequest أو get_entity.
+  - يفتح path لإفراغ pending_links (370+ رابط بانتظار joiner) تدريجيًا (إذا كانت الـjoiner fleet تعمل).
+
+Stage Summary:
+- Bug جذرية واحدة، تشخيص دقيق (ProductionDB له `_conn()` وليس `_ensure_conn()`)، إصلاح دفاعي مزدوج (alias + rename).
+- صفر تأثير على filter/link-capture/scorer/supabase — كلها كانت تعمل صحيحًا في الـlogs.
+- جاهز لـcommit + push. autoDeploy على Render سيلتقط الإصلاح + v3.1.0 (94fc8e1) معًا في deploy واحد.
