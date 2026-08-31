@@ -3177,3 +3177,24 @@ Stage Summary:
 - v3.1.0 كانت تقبل 18/18 من رسائل الإنتاج الجديدة (كارثي). v3.2.0: 14 REJECT صحيح + 4 ACCEPT صحيح + 2 relay duplicate مرفوض.
 - 12 سببًا جذريًا، أبرزها RC-1 (tokenizer يدمر الله/والله/اللي → إشارات خاطئة في رسائل لا تحصى) و RC-2 (يدرس كفعل تنفيذ).
 - 20 regression case جديدة. 506 assertions كلها خضراء. جاهز لـcommit + push (autoDeploy سينشر تلقائيًا).
+
+---
+Task ID: PROD-FP-V32-DEPLOY
+Agent: main (v3.2.0 production deploy + verification)
+Task: دفع v3.2.0 (a683c15) والتحقق من النشر على Render.
+
+Work Log:
+- [PUSH] عبر GitHub token مؤقت (env var، unset فورًا): `2c4ef79..a683c15 main -> main` ✓. تحقق ls-remote: origin/main = a683c151f4bc26fac88ea74493020b717ba82446 ✓ مطابق local HEAD.
+- [RENDER AUTO-DEPLOY] dep-0e5c73bt5570 (المراقبة): build_started 08:01:22Z → build_ended 08:01:53 (succeeded) → deploy_ended 08:02:45Z (succeeded, LIVE). إجمالي ~84 ثانية.
+- [POST-DEPLOY STABILITY] بعد 100 ثانية: صفر أحداث سلبية (crash/restart/failed) في events endpoint. آخر حدث = deploy_ended succeeded.
+- [الحالة النهائية للإنتاج]
+  - LIVE: a683c15 (v3.2.0) منذ 2026-08-31T08:02:45Z
+  - 2c4ef79 (v3.1.0+crashfix): deactivated (استُبدل)
+  - PENDING-RECHECK loop: يعمل منذ 2c4ef79 (crashfix) — أول دورة كاملة 03:58Z+ وما بعدها
+- [SECURITY SCRUB] grep عن الـtokens في /home/z/wlm + /home/z/my-project + /tmp → لا matches. git remote URL نظيف. unset فوري بعد كل استعمال.
+
+Stage Summary:
+- ✅ v3.2.0 (a683c15) منشور على GitHub ومُنشر live على Render (dep-0e5c73bt5570، succeeded، صفر crashes).
+- ✅ الإنتاج الآن يشغّل: v3.2.0 Intent Engine (12 إصلاح جذري) + PENDING-RECHECK crashfix.
+- ⏳ التحقق الكامل من سلوك الإنتاج يحتاج logs جديدة: يجب أن تظهر أسباب REJECT الجديدة (relay_bot_repost_duplicate / decision_or_advice / contact_info / person_status) واختفاء التكرارات (relay). المُشغّل يرسل logs + رسائل القناة القادمة للمقارنة.
+- 🔒 الـtokens (GitHub + Render) ظهرت في المحادثة — يُنصح بإبطالها بعد انتهاء الجلسة.
