@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-request_filter.py — Request Intent Engine v3.0 (Hard-Gated)
+request_filter.py — Request Intent Engine v3.1 (Hard-Gated)
 ============================================================
 إعادة بناء جذرية. ليس Keyword Filter، بل Intent Engine بمراحل قرار
 واضحة (Hard Gates). يحل مشكلة الـ Keyword Filter القديم الذي كان يقبل
@@ -53,7 +53,7 @@ import re
 from dataclasses import dataclass, field
 from typing import List, Tuple, Dict, Any, Optional
 
-FILTER_VERSION = "v3.0.1"
+FILTER_VERSION = "v3.1.0"
 FILTER_MODE = "intent_engine_hard_gates"
 
 
@@ -104,9 +104,14 @@ def _norm_pairs(phrases: List[str]) -> List[Tuple[str, str]]:
 # [1] PERSON_WORDS — كلمات شخص منفردة (تُطابق بـ\b + «ال»)
 # وحدها لا تكفي — يجب أن تُقرن بفعل تنفيذ (Gate 3).
 # ============================================================
+# [v3.1.0] REMOVED "واحد" from PERSON_WORDS — too ambiguous: matches
+# "في يوم واحد" (one as number, religious/figurative context) as well as
+# "أبي واحد" (one as person). The person sense is captured explicitly via
+# multi-token REQUESTER_PHRASES ("أبي واحد"/"محتاج واحد"/"أريد واحد"/"أبغى
+# واحد") so removing the bare word doesn't break legitimate ACCEPTs.
 PERSON_WORDS: List[str] = [
     "أحد", "احد", "حد",                 # someone (formal + Gulf dialect)
-    "شخص", "واحد",                      # person / one
+    "شخص",                              # person ("واحد" removed v3.1.0)
     "مدرس", "دكتور", "استاذ",          # teacher / doctor / professor
     "مختص", "متخصص", "خبير",          # specialist / expert
     "فاهم",                             # someone who understands
@@ -141,8 +146,11 @@ REQUESTER_PHRASES: List[str] = [
     # --- من/مين يعرف/عنده/يقدر (seeking recommendation of a person) ---
     "من يعرف", "مين يعرف", "من عنده", "مين عنده", "من يقدر", "مين يقدر",
     "من يدلني", "مين يدلني", "من يرشح لي", "مين يرشح لي",
-    "تعرفون أحد", "تعرفون احد", "تعرفون شخص", "تعرف أحد", "تعرف احد",
-    "تعرف شخص", "تعرفي أحد", "تعرفي شخص",
+    # [v3.1.0] REMOVED "تعرفون أحد"/"تعرف أحد"/"تعرفي أحد" from here — these
+    # are RECOMMENDATION-SEEKING (asking "do you know someone...") not
+    # explicit service-execution requests. Moved to RECOMMENDATION_SEEKING.
+    # The person+exec variants below ("أحد يحل"/"أحد يشرح") cover real
+    # requests phrased as "do you know someone to do X for me".
     "أدور على أحد", "ادور على احد", "أدور على شخص", "ادور على شخص",
     "أبحث عن شخص", "ابحث عن شخص", "أبحث عن أحد", "ابحث عن احد",
     "أبحث عن مدرس", "ابحث عن مدرس", "أدور على مدرس", "ادور على مدرس",
@@ -157,7 +165,10 @@ REQUESTER_PHRASES: List[str] = [
     "من يسوي لي", "مين يسوي لي", "من يعمل لي", "مين يعمل لي",
     # --- أحد/شخص + فعل (person + execution in one clause) ---
     "أحد يساعدني", "احد يساعدني", "شخص يساعدني",
-    "أحد يعرف", "احد يعرف", "شخص يعرف",
+    # [v3.1.0] REMOVED "أحد يعرف"/"شخص يعرف" from here — these are
+    # CONTACT-INFO-SEEKING (asking the group "does anyone know [specific
+    # person] so they can direct me to him?" — NOT asking the person to
+    # perform a service). Moved to CONTACT_INFO_SEEKING_PHRASES.
     "أحد عنده", "احد عنده", "شخص عنده",
     "أحد يقدر", "احد يقدر", "شخص يقدر",
     "أحد يستلم", "احد يستلم", "شخص يستلم",
@@ -202,9 +213,15 @@ EXEC_IMPLIES_SERVICE: Dict[str, str] = {
 
 # ============================================================
 # [4] OWNERSHIP_NEED — ملكية/حاجة (المستخدم يملك العمل أو يحتاجه)
+# [v3.1.0] REMOVED "علي" / "على" — too common as Arabic preposition
+# ("on"/"over"): matches "على حسب" (depending on), "على غيرك" (other than
+# you), "على ارض الواقع" (in real life). These are NOT ownership markers.
+# The real ownership signals ("عندي"/"محتاج"/"أبي"/"أبغى"/"مطلوب مني") are
+# kept. Possessive suffixes on service nouns ("واجبي"=my homework) are now
+# detected separately via _has_service_with_possessive.
 # ============================================================
 OWNERSHIP_NEED: List[str] = [
-    "عندي", "عندى", "علي", "على", "مطلوب مني", "لازم اسلم", "لازم أسلم",
+    "عندي", "عندى", "مطلوب مني", "لازم اسلم", "لازم أسلم",
     "محتاج", "أحتاج", "احتاج", "أبي", "ابي", "أبغى", "ابغى", "أريد", "اريد",
     "مطلوب", "واجبني", "متطلب",
 ]
@@ -217,6 +234,11 @@ OWNERSHIP_NEED: List[str] = [
 OUTSOURCING_INDICATORS: List[str] = [
     "لي", "له", "لها", "عني", "بدلي", "بدالى", "ني",
     "مضمون", "موثوق", "ياتي", "يقدم", "يوصي",
+    # [v3.1.0] Added "خصوصي" / "خصوصية" — "مدرس خصوصي" / "درس خصوصي" =
+    # private tutor/lesson = strong service-execution indicator. Without this,
+    # "أبي مدرس خصوصي للمادة" would fail Gate 3 (d) tightened check (no exec
+    # verb + no service term). "خصوصي" is rarely used outside tutoring context.
+    "خصوصي", "خصوصية",
 ]
 
 # ============================================================
@@ -426,6 +448,12 @@ RESOURCE_SEEKING_PHRASES: List[str] = [
 # [11] RECOMMENDATION_SEEKING — إشارات طلب توصية (REJECTION)
 # «افضل واحد يشرح» = يطلب توصية بأفضل شخص، لا يطلب شخصًا ينفذ له.
 # ============================================================
+# [v3.1.0] ADDED "تعرف/تعرفين/تعرفون أحد" — asking "do you know someone
+# who teaches..." is recommendation-seeking, NOT explicit service-execution.
+# These were previously in REQUESTER_PHRASES (causing FPs like «تعرفين أحد
+# يشرح البرمجه كويس؟»). Moved here. Gate 2.5 still allows ACCEPT if the
+# message also has ownership + service + exec (e.g., «تعرف أحد يحل واجبي»
+# — has possessive "واجبي" → ownership detected → not pure recommendation).
 RECOMMENDATION_SEEKING: List[str] = [
     "افضل", "أفضل", "الافضل", "الأفضل", "اقوى", "أقوى",
     "مين افضل", "من افضل", "مين أفضل", "من أفضل",
@@ -435,6 +463,99 @@ RECOMMENDATION_SEEKING: List[str] = [
     "ينصح", "نصيحة", "نصح", "استشارة",
     "وش رائيكم", "وش رايكم", "ايش رائيكم", "ايش رايكم",
     "عطوني راي", "اعطوني راي",
+    # [v3.1.0] "do you know someone who..." patterns (recommendation-seeking)
+    "تعرف أحد", "تعرف احد", "تعرف شخص",
+    "تعرفي أحد", "تعرفي احد", "تعرفي شخص",
+    "تعرفين أحد", "تعرفين احد", "تعرفين شخص",
+    "تعرفون أحد", "تعرفون احد", "تعرفون شخص",
+    # asking "who teaches/studies" (recommendation of a person)
+    "مين يشرح", "من يشرح",
+    "مين يدرس", "من يدرس",  # asking "who studies/teaches" (person rec)
+]
+
+# ============================================================
+# [11b] CONTACT_INFO_SEEKING_PHRASES — إشارات طلب معلومات تواصل (REJECTION)
+# [v3.1.0] NEW. «ابي رقم الدكتوره» = يطلب معلومات تواصل (phone/email)،
+# لا يطلب شخصًا ينفذ خدمة. كذلك «أحد يعرفه يدلني عليه» = يطلب توجيهه
+# لشخص معيّن (Not service execution). Gate 1.5.
+# ============================================================
+CONTACT_INFO_SEEKING_PHRASES: List[str] = [
+    # asking for phone number / email
+    "ابي رقم", "أبي رقم", "ابغى رقم", "أبغى رقم", "محتاج رقم",
+    "ابي ايميل", "أبي ايميل", "ابغى ايميل", "أبغى ايميل", "محتاج ايميل",
+    "ابي رقم او ايميل", "أبي رقم أو ايميل",
+    "ابي رقم الاستاذ", "ابي رقم المدرس", "ابي رقم المعيد",
+    # contact info of a specific doctor/professor
+    "رقم الدكتور", "رقم الدكتوره", "ايميل الدكتور", "ايميل الدكتوره",
+    "رقم الاستاذ", "ايميل الاستاذ",
+    "الايميل",  # asking about "the email" of someone
+    # asking "do you know [specific person] to direct me to him"
+    # [v3.1.0] NOTE: removed bare "أحد يعرف" / "شخص يعرف" — these can appear
+    # in legitimate service-execution requests like «أحد يعرف شخص يسوي خريطة
+    # مفاهيم؟» (asking for someone to make a mind map). The contact-info-
+    # seeking signal is the COMBINATION with "يدلني عليه" (direct me to him).
+    # Keep the specific patterns instead.
+    "أحد يعرفه", "احد يعرفه", "شخص يعرفه",
+    "أحد يعرفني", "احد يعرفني", "شخص يعرفني",
+    "يدلني عليه", "يدلوني عليه", "يدلوني عليه",
+    # asking "who has studied with [specific person]"
+    "مين قد درس عند", "من قد درس عند",
+    "مين درس عند", "من درس عند",
+    # asking to be messaged privately for info (not service)
+    "يجيني بالخاص محتاج اعرف", "يجيني بالخاص محتاج",
+    "محتاج اعرف عن طريقة", "ابغى اعرف عن طريقة", "ابي اعرف عن طريقة",
+    "محتاج اعرف عن", "ابغى اعرف عن", "ابي اعرف عن",
+    "وش طريقة الدكتور", "وش طريقة الدكتوره",
+    "وش طريقة المدرس",
+    # how to communicate (not service)
+    "اكلمه على ارض", "اكلمه على ارض الواقع",
+    "ارسله للدكتور", "ارسلها للدكتور",
+]
+
+# ============================================================
+# [11c] DECISION_SEEKING_PHRASES — إشارات طلب قرار/نصيحة قرارية (REJECTION)
+# [v3.1.0] NEW. «اداوم ولا؟» / «يمديني اسويه ولا لازم اخلي احد يسويلي» =
+# المستخدم يسأل المشورة على قرار (لا يلتزم بتنفيذ خدمة). Gate 1.5.
+# ============================================================
+DECISION_SEEKING_PHRASES: List[str] = [
+    # attendance / decision questions
+    "اداوم ولا", "اداوم او", "اداوم الجامعه",
+    "اداوم",  # bare "should I attend" — but only if NO service exec pattern
+    "اقدر ؟", "اقدر?", "اقدر ولا", "اقدر ولا؟",
+    "اقدر اغير", "اقدر اغير كم",
+    # "can I do it myself or outsource?" patterns
+    "يمديني انا اسويه", "يمديني اسويه", "يمديني اسوي",
+    "يمديني انا",  # "can I (myself)..." — decision pattern
+    "انا اسويه ولا لازم", "اسويه ولا لازم اخلي",
+    "ولا لازم اخلي", "لازم اخلي احد",
+    # "should I do X or Y" patterns
+    "ولا اكلمه", "ولا اكلم", "ولا وش العلم",
+    "وش العلم", "وش اسوي", "اش سويت",
+    # asking if professor name/room number is right (administrative question)
+    "ما نزل اسم الدكتوره", "ما نزل اسم الدكتور",
+    # changing professor questions
+    "ابي اغير كم دكتور", "ابي اغير دكتور",
+]
+
+# ============================================================
+# [11d] PERSON_STATUS_SEEKING_PHRASES — إشارات طلب حالة شخص (REJECTION)
+# [v3.1.0] NEW. «طالب يدرس بالتمريض احد يعرفه يدلني عليه» = يسأل عن
+# شخص معيّن (هل هو طالب؟ ما حالته؟) لا يطلب خدمة تنفيذ. كذلك
+# «احد يدرس او تخرج بماجستير طاقة متجددة؟» = يسأل عن خلفية أعضاء
+# المجموعة (من يدرس/تخرج؟) لا يطلب خدمة. Gate 1.5.
+# ============================================================
+PERSON_STATUS_SEEKING_PHRASES: List[str] = [
+    # asking about specific person's status (student/graduate)
+    "طالب يدرس", "طالب يدرس بـ", "طالب يدرس في", "طالب يدرس بال",
+    # asking if anyone in the group is a student/graduate of a program
+    "يدرس او تخرج", "يدرس أو تخرج",
+    "احد يدرس او تخرج", "احد يدرس أو تخرج",
+    "يدرس او تخرج بـ", "يدرس أو تخرج بـ",
+    "يدرس او تخرج بماجستير", "يدرس أو تخرج بماجستير",
+    # "do you know anyone who studies X" patterns
+    "مين يدرس", "من يدرس",  # overlaps with RECOMMENDATION_SEEKING — both fire
+    # asking "how does the doctor work?" (info about person, not service)
+    "طريقة الدكتور", "طريقة الدكتوره", "طريقة المدرس",
 ]
 
 # ============================================================
@@ -554,6 +675,44 @@ _OUTSOURCE_PAIRS = _norm_pairs(OUTSOURCING_INDICATORS)
 _DELEGATION_PAIRS = _norm_pairs(DELEGATION_VERBS)
 _ROLE_PAIRS = _norm_pairs(PROFESSIONAL_ROLES)
 _READY_MADE_PAIRS = _norm_pairs(READY_MADE_INDICATORS)
+# [v3.1.0] New REJECTION gates (Gate 1.5)
+_CONTACT_INFO_PAIRS = _norm_pairs(CONTACT_INFO_SEEKING_PHRASES)
+_DECISION_PAIRS = _norm_pairs(DECISION_SEEKING_PHRASES)
+_PERSON_STATUS_PAIRS = _norm_pairs(PERSON_STATUS_SEEKING_PHRASES)
+
+
+def _has_service_with_possessive(normalized: str) -> bool:
+    """[v3.1.0] NEW. يكتشف إذا كان أي token في النص اسم خدمة + لاحقة ملكية
+    (my/our/his/her/their) — مثل «واجبي»/«مشروعي»/«تقريركم»/«بحوثهم».
+
+    هذه إشارة ملكية قوية: المستخدم يملك الخدمة (الواجب/المشروع/التقرير)
+    ويطلب ضمنيًا شخصًا لينفذها له. تُستخدم لتوسيع ownership signal
+    بحيث يلتقط «تعرف أحد يحل واجبي» (لا يملك «ابي»/«محتاج» لكنه يملك
+    «واجبي» = my homework) كطلب صريح.
+
+    الأمان: نطابق فقط لو root (بعد نزع اللاحقة) ينتمي لـSERVICE_TERMS.
+    لا نُرجع True لمجرد وجود كلمة بـ«ه» — الشروط:
+      - token >= 4 حروف (مطابقة _strip_possessive_suffix)
+      - root >= 3 حروف
+      - root ∈ SERVICE_TERMS (بعد normalize)
+    """
+    if not normalized:
+        return False
+    toks = _tokens(normalized)
+    if not toks:
+        return False
+    # set of normalized service terms for O(1) lookup
+    service_norms = {n for _, n in _SERVICE_PAIRS}
+    plural_norms = {n for _, n in _PLURAL_NOUN_PAIRS}  # بحوث/تقارير/etc
+    for tok in toks:
+        if not tok or len(tok) < 4:
+            continue
+        root = _strip_possessive_suffix(tok)
+        if root is None:
+            continue
+        if root in service_norms or root in plural_norms:
+            return True
+    return False
 
 
 _ARABIC_PREFIXES = [
@@ -624,13 +783,22 @@ def _tokens(normalized: str) -> List[str]:
 # الجذر الناتج >= 3 حروف والـ token >= 4 حروف. لا نُزيل «ي» من كلمة قصيرة
 # (مثل «تقرير» نفسها لا تنتهي بي). هذا آمن لأن المطابقة لاحقًا تتطلب
 # تساويًا تامًا مع vocab entry — أي تطابق خاطئ محدود بقائمة vocab نفسها.
+#
+# [v3.1.0] REMOVED "ه" (his/her possessive) from the suffix list — too
+# ambiguous with taa marbuta (the feminine marker ة which normalize_text
+# converts to ه). "مدرسه" (school) was being stripped to "مدرس" (teacher),
+# causing massive FPs via role detection. Same for "دكتوره" (the female
+# doctor) → "دكتور". Multi-char suffixes (يهم/كم/نا/ها) are kept since they
+# cannot be confused with taa marbuta. The rare legitimate "تقريره" (his
+# report) case is acceptable loss vs the FPs fixed. "ي" (my) and "ك" (your)
+# are kept — they are unambiguous single-letter possessives.
 # ============================================================
 _POSSESSIVE_SUFFIXES_LONGEST_FIRST = (
     'هما', 'كما', 'كلن',     # dual / your-pl-f
     'ينا', 'يها', 'يكم', 'يكن', 'يهم', 'يهن', 'يكما', 'يهما',  # ي+...
     'كم', 'هم', 'هن', 'نا', 'ها',   # your-pl-m / their-m / their-f / our / her
     'يه', 'يك',               # ي+ه / ي+ك (rare in writing but appears)
-    'ه', 'ك', 'ي',            # his / your / my (single-letter — riskiest, hence last)
+    'ك', 'ي',            # your / my (single-letter). REMOVED 'ه' (v3.1.0)
 )
 
 
@@ -859,8 +1027,27 @@ def analyze_request(text: str) -> RequestAnalysis:
         bool(person_tokens) and bool(exec_verbs)
     ) or (bool(person_tokens) and bool(delegation_verbs))
     has_execution = bool(exec_verbs) or bool(delegation_verbs)
-    # professional role + ownership → implies service (teaching/consulting)
-    role_implies_service = bool(role_tokens) and bool(ownership)
+    # [v3.1.0] Expanded ownership: also detect possessive suffix on service nouns
+    # ("واجبي" = my homework) as ownership signal. This catches requests
+    # like «تعرف أحد يحل واجبي» (no explicit «أبي»/«محتاج» but possessive
+    # «واجبي» implies ownership) as legitimate service-execution.
+    has_service_possessive = _has_service_with_possessive(normalized)
+    has_ownership = bool(ownership) or has_service_possessive
+    # [v3.1.0] Tightened role_implies_service: was `role_tokens AND ownership`,
+    # now requires `role_tokens AND ownership AND (services OR exec_verbs)`,
+    # OR `role_tokens AND outsource_sigs` (like «مدرس خصوصي» = private tutor).
+    # This prevents FPs like «ابي رقم الدكتوره» (ownership «ابي» + role «دكتور»
+    # but NO service term/exec) from ACCEPTing as service-execution request.
+    # The outsource variant handles «أبي مدرس خصوصي للمادة» (no exec verb,
+    # no service term, but «خصوصي» = private tutoring indicator).
+    role_implies_service = bool(role_tokens) and (
+        (has_ownership and (bool(services) or bool(exec_verbs)))
+        or bool(outsource_sigs)
+    )
+    # [v3.1.0] New REJECTION signals (Gate 1.5)
+    contact_info_sigs = _match_pairs(_CONTACT_INFO_PAIRS, normalized)
+    decision_sigs = _match_pairs(_DECISION_PAIRS, normalized)
+    person_status_sigs = _match_pairs(_PERSON_STATUS_PAIRS, normalized)
 
     # contact / obfuscation
     res.has_phone = _has_phone_number(text)
@@ -877,6 +1064,7 @@ def analyze_request(text: str) -> RequestAnalysis:
     res.ad_signals = ad_sigs
     res.rejection_signals = (
         info_sigs + resource_sigs + recommend_sigs
+        + contact_info_sigs + decision_sigs + person_status_sigs
     )
     # legacy
     res.matched_intents = res.requester_signals
@@ -946,6 +1134,36 @@ def analyze_request(text: str) -> RequestAnalysis:
         res.service = _classify_service(normalized, exec_verbs)
         return res
 
+    # ===== GATE 1.5: contact-info / decision / person-status seeking =====
+    # [v3.1.0] NEW. These are REJECTION signals that fire BEFORE Gate 2
+    # because they indicate the message is asking for:
+    #   - contact info ("ابي رقم الدكتوره" / "ايميل الاستاذ") — NOT service exec
+    #   - decision advice ("اداوم ولا؟" / "يمديني اسويه ولا لازم اخلي") — NOT service
+    #   - person status info ("طالب يدرس بالتمريض" / "يدرس او تخرج") — NOT service
+    # Even if other gates would ACCEPT, these phrases override → REJECT.
+    # Exception: NONE — these are pure REJECTION signals (no service-execution
+    # interpretation possible). If a request also has these phrases, it's
+    # still asking for info/advice/status, not service execution.
+    if contact_info_sigs or decision_sigs or person_status_sigs:
+        res.accepted = False
+        res.is_request = False
+        # Distinguish the dominant rejection reason for diagnostics
+        if contact_info_sigs:
+            res.intent_type = "contact_info_seeking"
+            res.reason = "contact_info_or_person_lookup_not_service_execution"
+            res.confidence = 0.04
+        elif decision_sigs:
+            res.intent_type = "decision_seeking"
+            res.reason = "decision_or_advice_seeking_not_service_execution"
+            res.confidence = 0.04
+        else:
+            res.intent_type = "person_status_seeking"
+            res.reason = "person_status_inquiry_not_service_execution"
+            res.confidence = 0.04
+        res.seeker_confidence = 1
+        res.service = _classify_service(normalized, exec_verbs)
+        return res
+
     # ===== GATE 2: info / resource / long-content WITHOUT person+execution =====
     # [v3.0] READY_MADE_INDICATORS (جاهز/معد) + service + no exec → resource seeking
     long_info = _detect_long_informational(text, normalized)
@@ -978,7 +1196,16 @@ def analyze_request(text: str) -> RequestAnalysis:
     # ===== GATE 2.5: recommendation WITHOUT strong execution =====
     # «افضل واحد يشرح الماده» = يطلب توصية، لا يطلب شخصًا ينفذ له.
     # نرفض إلا لو وجد ownership + service + exec (طلب تنفيذ قوي).
-    if recommend_sigs and not (ownership and services and exec_verbs):
+    # [v3.1.0] Uses has_ownership (expanded with possessive suffix detection)
+    # so that «تعرف أحد يحل واجبي» (no explicit «أبي»/«محتاج» but has «واجبي»
+    # = my homework → has_ownership=True) is NOT rejected as recommendation.
+    # Also accepts if (outsource_sigs AND exec_verbs) is present — «من يشرح لي
+    # المادة» has «لي» (to me, outsource) + «يشرح» (exec) without explicit
+    # ownership/service, but is clearly a request to teach the asker.
+    if recommend_sigs and not (
+        (has_ownership and services and exec_verbs)
+        or (bool(outsource_sigs) and bool(exec_verbs))
+    ):
         res.accepted = False
         res.is_request = False
         res.intent_type = "recommendation_seeking"
@@ -993,7 +1220,11 @@ def analyze_request(text: str) -> RequestAnalysis:
     # (b) strong requester phrase AND service AND (outsource OR role)
     #     — «من عنده شخص مضمون للمشاريع» (مضمون=outsource) / «أبي مدرس خصوصي» (مدرس=role)
     # (c) requester AND service AND outsourcing indicator (e.g. «له/لي/عني»)
-    # (d) professional role + ownership  (e.g. «أبي مدرس خصوصي» — الدور implies تنفيذ)
+    # (d) [v3.1.0 TIGHTENED] professional role + ownership + (exec OR service OR
+    #     outsource OR delegation). Was: role + ownership alone → caused FPs like
+    #     «ابي رقم الدكتوره» (ownership «ابi» + role «دكتور» but asking for
+    #     contact info). Now requires additional exec/service/outsource/delegation
+    #     to ensure the message actually requests service execution.
     # (e) delegation verb + person + ownership  (e.g. «أبي أوكل أحد بالمهمة»)
     # note: option (b) tightened in v3.0 — «أبي حد بحث» (no outsource/role) → REJECT.
     has_person_exec_relationship = (
@@ -1001,8 +1232,10 @@ def analyze_request(text: str) -> RequestAnalysis:
         or (bool(requester_phrases) and bool(services)
             and (bool(outsource_sigs) or bool(role_tokens)))
         or (has_requester and bool(services) and bool(outsource_sigs))
-        or (bool(role_tokens) and bool(ownership))
-        or (bool(delegation_verbs) and bool(person_tokens) and bool(ownership))
+        or (bool(role_tokens) and has_ownership
+            and (bool(exec_verbs) or bool(services)
+                 or bool(outsource_sigs) or bool(delegation_verbs)))
+        or (bool(delegation_verbs) and bool(person_tokens) and has_ownership)
     )
     if not has_person_exec_relationship:
         res.accepted = False
@@ -1041,7 +1274,8 @@ def analyze_request(text: str) -> RequestAnalysis:
     # ===== GATE 5: long informational override =====
     # حتى لو فحصنا person+exec+service، لو النص طويل معلوماتي وليس
     # طلبًا قصيرًا صريحًا → REJECT.
-    if long_info and not (ownership and services and has_execution):
+    # [v3.1.0] Uses has_ownership (expanded with possessive suffix detection).
+    if long_info and not (has_ownership and services and has_execution):
         res.accepted = False
         res.is_request = False
         res.intent_type = "long_informational_content"
@@ -1054,6 +1288,8 @@ def analyze_request(text: str) -> RequestAnalysis:
     # ===== GATE 6: ACCEPT =====
     res.service = _classify_service(normalized, exec_verbs)
     # confidence scoring (0-1)
+    # [v3.1.0] Uses has_ownership (expanded with possessive suffix detection)
+    # so that «تعرف أحد يحل واجبي» gets the ownership bonus (has «واجبي»=my).
     conf = 0.45
     if has_requester:
         conf += 0.15
@@ -1061,13 +1297,13 @@ def analyze_request(text: str) -> RequestAnalysis:
         conf += 0.15
     if services:
         conf += 0.15
-    if ownership:
+    if has_ownership:
         conf += 0.05
     if len(services) >= 2:
         conf += 0.03
     if exec_implies and services:
         conf += 0.05
-    if has_person_exec and services and ownership:
+    if has_person_exec and services and has_ownership:
         conf += 0.07  # explicit execution request bonus
     conf = min(conf, 0.99)
 

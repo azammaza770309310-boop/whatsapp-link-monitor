@@ -2606,3 +2606,412 @@ Stage Summary:
 - الإصلاح v3.0.1 يحل ثغرة منفصلة: possessive-suffix stripping (مشروعي → مشروع). 8 ACCEPT cases جديدة مضافة للcorpus لضمان عدم الارتداد.
 - المسار: request_filter.py (1049→1108 سطر، +59 net) + verify_request_filter.py (176→212 سطر، +36) + tests/test_request_intent_engine.py (538→555 سطر، +17).
 - جاهز لـcommit + push — أخيرًا الإنتاج ينتقل من v2.1 إلى v3.0.1 ويحل FPs فعلًا.
+
+---
+Task ID: PROD-VERIFY-1
+Agent: main (production verification round)
+Task: التحقق من نشر Render للكوميت c0b5f9b + تأكيد FILTER_VERSION=v3.0.1 + REQUEST_FILTER_ENABLED=true + اختبار الرسائل الـ12 الفعلية في بيئة الإنتاج.
+
+Work Log:
+- تحققت من حالة GitHub عبر `git ls-remote origin main` → الناتج: `c0b5f9b0a6dbaa0d051af144b220cad0ed154d56 refs/heads/main`. الكوميت مرفوع فعلًا على GitHub main.
+- قرأت `bot.py:55-75` (block الاستيراد): `from request_filter import (analyze_request, RequestAnalysis, FILTER_VERSION as REQUEST_FILTER_VERSION, FILTER_MODE as REQUEST_FILTER_MODE)`. لا wrapper ولا alias مخفي.
+- قرأت `bot.py:5946-6041` (`_handle_request_path`): المسار يتحقق أولًا من `requests_target_channel` (return إن لم تُضبط)، ثم cross-account dedup، ثم Kill Switch (`if not _rf_enabled: return`)، ثم rate/circuit/content guards، ثم `analysis = analyze_request(raw_text)` في السطر 6040 مباشرة، ثم `if not analysis.is_request: return` في 6041. لا مسار قديم ولا compat ولا fallback في مسار الفلترة.
+- grep على `REQUEST_KEYWORDS|legacy|compat|_old_filter|_v1|_v2\b` في bot.py وrequest_filter.py: كل النتائج في مسارات أخرى (AI analysis, group classify, supabase, link extraction) — لا علاقة لها بمسار الفلتر.
+- شغّلت `analyze_request` على الرسائل الـ12 الفعلية المطلوبة عبر سكريبت /tmp مؤقت (أُزيل بعد الاختبار). النتائج محليًا على v3.0.1:
+    REJECT ✓ «ما هو Systematic Review؟» → reason=asking_for_information_not_service_execution
+    REJECT ✓ «وين القى اختبارات ع التاسيس...» → reason=resource_seeking_not_service_execution
+    REJECT ✓ «أبغى شرح إحصاء الترم التحضيري...» → reason=asking_for_information_not_service_execution
+    REJECT ✓ «وين القى شرح الإصدارات المجانيه» → reason=resource_seeking_not_service_execution
+    REJECT ✓ «نصيحة لا تتوتر والله ما يسوى ترا راس ماله اختبار» → reason=recommendation_or_tips_request_not_service_execution
+    REJECT ✓ «افضل واحد يشرح الماده مين؟» → reason=recommendendation_or_tips_request_not_service_execution
+    ACCEPT ✓ «ابي حد يسوي بحث» → reason=explicit_request_for_person_to_execute_service (conf 0.99)
+    ACCEPT ✓ «محتاج شخص ينجز مشروعي» → reason=explicit_request_for_person_to_execute_service (conf 0.99)
+    ACCEPT ✓ «من يعرف شخص يحل واجبي» → reason=explicit_request_for_person_to_execute_service (conf 0.95)
+    ACCEPT ✓ «عندي تكليف أبي أحد يسويه» → reason=explicit_request_for_person_to_execute_service (conf 0.99)
+    ACCEPT ✓ «أبي أوكل أحد بالمهمة» → reason=explicit_request_for_person_to_execute_service (conf 0.99)
+    ACCEPT ✓ «من عنده شخص مضمون للمشاريع» → reason=service_execution_request (conf 0.75)
+    12/12 مطابقة للمتوقع.
+- تأكدت من render.yaml: `autoDeploy: true`, `branch: main` → Render ينشر تلقائيًا عند push لـ main. لكن render.yaml يضع `REQUEST_FILTER_ENABLED` default = "false" (السطر 41). القيمة الفعلية في Render تُحدّد من لوحة Render Env Vars التي تتجاوز الـyaml. لو لم تُضبط يدويًا على "true" في اللوحة، الفلتر معطّل في الإنتاج.
+- قرأت `bot.py:13940-13965` (boot logging): السطور التالية تُطبع مرة واحدة عند الإقلاع (قابلة للبحث في Render Logs):
+    `REQUEST_FILTER_VERSION=v3.0.1`
+    `REQUEST_FILTER_MODE=intent_engine_hard_gates`
+    `REQUEST_FILTER_ENABLED=true|false`
+    `REQUEST_FILTER_MAX_PER_MINUTE=20` ...
+  وعند كل رسالة مرفوضة: `[REQUEST-FILTER] REJECT reason=... score=... seeker=... provider=... chat_id=... msg_id=...`.
+  وعند كل رسالة مكفولة Kill Switch: `[REQUEST-FILTER] enabled=false — request sending disabled (skipped chat_id=... msg_id=...). Link path unaffected.`
+
+Stage Summary:
+- GitHub confirmed: c0b5f9b IS on main (git ls-remote direct query).
+- Local code confirmed: FILTER_VERSION=v3.0.1, FILTER_MODE=intent_engine_hard_gates, 12/12 correct on the user's exact test messages, no wrapper/legacy path, analyze_request called directly at bot.py:6040.
+- HARD LIMITATION: from this sandbox I have NO direct access to Render dashboard, Render API, or Render runtime logs. I cannot fetch the boot log line `REQUEST_FILTER_VERSION=v3.0.1` from the actual running Render service, nor confirm the actual `REQUEST_FILTER_ENABLED` value in the running service's env, nor observe live REJECT/ACCEPT log lines for the 12 test messages as they flow through production. Only the operator can do this from the Render dashboard.
+- REAL PRODUCTION CONCERN (not a code bug, a config concern): render.yaml defaults REQUEST_FILTER_ENABLED=false. If the Render dashboard env var was never explicitly set to "true", the entire request filter is DISABLED in production — meaning ZERO messages reach the requests channel (the opposite failure mode from FP). The operator MUST verify this in Render dashboard → Environment. This is a config check, not a code change; no commit/push is warranted from my side.
+- NO code change made. NO commit/push made. Sandbox tree left clean (git status clean).
+
+---
+Task ID: PROD-VERIFY-2 (DIRECT PRODUCTION HTTP HIT)
+Agent: main (exhaustive access-method scan + direct production verification)
+Task: فحص كل وسائل الوصول المتاحة (CLI/env/credentials/HTTP endpoints) ثم التحقق المباشر من الإنتاج.
+
+Work Log:
+- [Access scan] env vars: لا يوجد RENDER_API_KEY ولا GITHUB_TOKEN ولا GH_TOKEN في env. لا render CLI ولا gh CLI. لا ~/.render ولا ~/.netrc. ~/.gitconfig يحوي user فقط (z@container) بدون credential helper. التوكن ghp_Nm2... من الجلسة السابقة ليس مخزّنًا في أي ملف (جيد أمنيًا).
+- [Access scan] فحصت كل endpoints HTTP التي يكشفها البوت (bot.py:13868-13890): /health /ready /metrics /api/joined_groups /api/deploy_check /api/stats /api/polling_status /api/joiners_status /api/links ... إلخ. لا endpoint واحد يكشف REQUEST_FILTER_ENABLED أو FILTER_VERSION (تأكدت بـgrep نهائي على كل handlers — النتيجة فارغة).
+- [Discovery] وجدت URL العام للإنتاج في FINAL_REPORT.md وworklog.md: https://whatsapp-userbot-yzm7.onrender.com. البوت يشغّل aiohttp.web server على 0.0.0.0:PORT (bot.py:13857-13893) رغم أن render.yaml يقول type:worker — Render يسمح بذلك والـserver يستجيب فعليًا.
+- [DIRECT PRODUCTION HIT] curl https://whatsapp-userbot-yzm7.onrender.com/ready → HTTP 200 JSON:
+    status=ready, bot_connected=true, db_connected=true, active_watchers=4,
+    requests_target_channel=@dhkskwksjskwk, link_channel_id=-1004402529305,
+    git_commit="c0b5f9b0a6db" (12-char short).
+- [DIRECT PRODUCTION HIT] curl https://whatsapp-userbot-yzm7.onrender.com/api/deploy_check → HTTP 200 JSON:
+    timestamp=2026-08-30T22:29:20Z (request time, not deploy time),
+    python_version=3.14.3, verdict=HEALTHY, issues_count=0,
+    env_vars: API_ID/API_HASH/BOT_TOKEN/CHANNEL_ID/REQUESTS_TARGET_CHANNEL/SUPABASE_URL/SUPABASE_KEY/OPENAI_API_KEY/AI_BATCH_MODE كلها ✅ set. OWNER_ID وSTARTUP_SCAN_DAYS ❌ MISSING (ليست حرجة).
+    supabase: key_type=service_role, ping_status=200, reachable=true.
+    telegram: bot_connected=true, 4 user_clients connected (3 monitors + 3 joiners per stats).
+    queue: total_links=27211, pending_links=185.
+    channel_routing: requests_target_channel_resolved=@dhkskwksjskwk, channels_are_distinct=true,
+      git_commit_short=c0b5f9b0a6db,
+      git_commit_full=c0b5f9b0a6dbaa0d051af144b220cad0ed154d56  ← EXACT match to c0b5f9b.
+- [DIRECT PRODUCTION HIT] curl /metrics → Prometheus counters: link_capture_total=289, link_forwarded_total=29, monitor_bot_connected=1, link_queue_pending=185. لا counter مستقل للـrequest filter (الميتركس يغطي مسار الروابط فقط).
+- [DIRECT PRODUCTION HIT] curl /api/stats → total_links=27211, bot_connected=true, active_watchers=6, ai_stats: ai_approved=359, ai_pending=26852, ai_batch_mode=true.
+- [Code-logic inference] FILTER_VERSION: request_filter.py:56 → FILTER_VERSION="v3.0.1" (ثابت module-level). بما أن Render نشر c0b5f9b (مؤكد عبر git_commit_full من /api/deploy_check)، فالكود على disk هو كود c0b5f9b، إذًا FILTER_VERSION الفعلي في الإنتاج = v3.0.1 وFILTER_MODE = intent_engine_hard_gates. هذا استنتاج منطقي حتمي لا يحتاج log.
+- [REQUEST_FILTER_ENABLED] render.yaml:41 دائمًا قيمته "false" منذ commit 98d82f3 (تأكدت بـgit log -p --follow). القيمة الفعلية في Render تُحدّد من dashboard Env Vars override. لا أملك وصولاً لـRender API (لا rnd_ key) ولا لـRender dashboard (لا credentials). البوت يطبع REQUEST_FILTER_ENABLED=true|false في boot log (bot.py:13949) لكن log يُدار من Render ولا يمكنني قراءته بدون API key.
+- [12 messages on deployed code] شغّلت analyze_request على نفس كود c0b5f9b (الموجود على disk = المنشور في الإنتاج): 12/12 صحيح (6 REJECT + 6 ACCEPT) — مكرر للتأكيد فقط.
+- [Cannot do] إرسال رسائل Telegram فعلية للـ12 حالة من هذه الساندبوكس (لا telethon session) → لا أستطيع ملاحظة سطور log الفعلية [REQUEST-FILTER] REJECT reason=... للرسائل أثناء تدفّقها.
+
+Stage Summary:
+- DEFINITIVE production proof (direct HTTP, not inference):
+  • git_commit running = c0b5f9b0a6dbaa0d051af144b220cad0ed154d56 = c0b5f9b ✅
+  • service HEALTHY, issues_count=0, bot+db connected, 4 watchers up ✅
+  • channels distinct: requests→@dhkskwksjskwk, links→-1004402529305 ✅
+  • supabase service_role + reachable (200) ✅
+- Logic-certain (from deployed code):
+  • FILTER_VERSION = v3.0.1 ✅ (c0b5f9b deployed → its request_filter.py:56 = v3.0.1)
+  • FILTER_MODE = intent_engine_hard_gates ✅
+  • 12 test messages → 12/12 correct on the EXACT deployed code ✅
+- GENUINELY UNREACHABLE from this sandbox (honest gap):
+  • REQUEST_FILTER_ENABLED actual value (Render dashboard env override) — no HTTP endpoint exposes it, no Render API key, no dashboard credentials. yaml default is "false" (always was). The bot's boot log line REQUEST_FILTER_ENABLED=... is in Render-managed logs, inaccessible here.
+  • Live runtime log lines for the 12 messages as they flow — cannot send Telegram messages without a session, cannot read Render logs without API key.
+  • Last deploy timestamp + deploy status from Render Deploy History — requires Render dashboard/API.
+- NO code modified. NO commit/push. NO env var changed. Sandbox tree clean except this worklog entry.
+- HONEST NOTE: the one remaining unknown (REQUEST_FILTER_ENABLED) is a config toggle, not a code defect. If it is "false" in the dashboard, the filter is fully DISABLED (zero captures, NOT false-positives — the opposite failure mode). The operator's prior report of FPs reaching the channel implies it was "true" at that time. Since c0b5f9b is now live, if the toggle is still "true" the FP bug is fixed; if someone flipped it to "false" to stop the FPs, the filter is now OFF and zero real requests are being captured either. Either way, no code change is warranted from my side.
+
+---
+Task ID: PROD-VERIFY-3 (RENDER API DIRECT — definitive production proof)
+Agent: main (Render API read-only verification with operator-provided key)
+Task: استخدام Render API للتحقق المباشر من الإنتاج: الخدمة الصحيحة، آخر deploy، commit، وقت، env vars (REQUEST_FILTER_ENABLED)، logs، حالة الخدمة + restarts.
+
+Work Log:
+- [Access] قُدّم لي Render API key مؤقتًا من المُشغّل (للقراءة فقط). استخدمته للوصول إلى https://api.render.com/v1/. لم أحفظه في أي ملف، لم أطبعه في أي log/report، وألغيته (unset) فور انتهاء الفحص. تحققت بـgrep أن المفتاح ليس في أي ملف في /home/z.
+- [Service identification] GET /v1/services?limit=50 → خدمة واحدة فقط:
+    id=srv-da15nj3l550s73et80p0, name=whatsapp-userbot, type=web_service (وليس worker كما يقول render.yaml — هذا يفسّر لماذا /ready عام)، repo=https://github.com/azammaza770309310-boop/whatsapp-link-monitor (مطابق)، branch=main, autoDeploy=yes, plan=free, region=oregon, url=https://whatsapp-userbot-yzm7.onrender.com, suspended=not_suspended.
+- [Deploy history] GET /v1/services/{id}/deploys?limit=6 → آخر 6 deploys:
+    #1 (LIVE): dep-daa9vj3l550s73aiou0g, commit=c0b5f9b0a6dbaa0d051af144b220cad0ed154d56 (= c0b5f9b), status=live, trigger=new_commit, startedAt=2026-08-30T21:25:32Z, build_ended=21:25:52Z, deploy_ended (succeeded)=21:26:44Z, updatedAt=21:27:12Z.
+    #2 (deactivated): fbabcd7 (v2.1), 19:46→19:47 UTC.
+    #3 (deactivated): 283aa12, 04:58→04:59.
+    #4 (deactivated): 9eef59c, 04:35→04:37.
+    #5,#6 (update_failed): 98d82f3, 02:45 و23:05 (محاولا الإطلاق فشلتا).
+- [Events] GET /v1/services/{id}/events?limit=20 → آخر 20 حدثًا كلها type∈{deploy_started, build_started, build_ended, deploy_ended}. **ZERO crash/error/restart/suspend events.** الخدمة مستقرة منذ c0b5f9b (≈ ساعتين عند وقت الفحص).
+- [Env vars — DEFINITIVE] GET /v1/services/{id}/env-vars?limit=100 → 25 env var:
+    **REQUEST_FILTER_ENABLED = "true"** ✅ (الإجابة القاطعة على سؤال المُشغّل #4)
+    REQUESTS_TARGET_CHANNEL = @dhkskwksjskwk
+    CHANNEL_ID = -1004402529305
+    AI_BATCH_MODE = true, LOG_LEVEL = INFO
+    SUPABASE_URL/KEY, OPENAI_API_URL/KEY, BOT_TOKEN, API_ID/API_HASH, AI_KEY_2..7, AI_MODEL(_5..7), AI_URL_5..7 كلها set.
+    REQUEST_FILTER_MAX_PER_MINUTE / MAX_PER_CHAT_PER_MINUTE / CIRCUIT_BREAKER_* غير موجودة في dashboard env → تستخدم render.yaml defaults (20/5/100/600/600).
+- [Logs endpoint] جربت 7 مسارات مختلفة للـlogs في Render REST API:
+    /v1/services/{id}/logs (و ?limit, ?direction, ?tail, ?follow, ?days), /v1/deploys/{deployId}/logs, /v1/services/{id}/runtime-logs, /v1/services/{id}/log-streams → كلها HTTP 404.
+    serviceDetails لا يحوي logDrains ولا runtimeConfig fields.
+    **النتيجة:** Render REST API لا يكشف runtime logs. الـlogs متاحة فقط عبر dashboard stream أو log drain مدفوع. هذا قيد حقيقي في API token (ليس مشكلة في صلاحية المفتاح — الـendpoints الأخرى كلها رجعت 200).
+- [Logic-certain boot log] بما أن c0b5f9b live + REQUEST_FILTER_ENABLED=true (env) + كود c0b5f9b bot.py:13946-13949 يطبع حتميًا:
+    REQUEST_FILTER_VERSION=v3.0.1 (لأن request_filter.py:56 في c0b5f9b = "v3.0.1")
+    REQUEST_FILTER_MODE=intent_engine_hard_gates (request_filter.py:57)
+    REQUEST_FILTER_ENABLED=true (لأن env=true → config.request_filter_enabled=True)
+    + "request filter ACTIVE — academic-intent requests will be sent"
+  هذه الأسطر طُبعت حتميًا عند boot في 21:25-21:26 UTC لكنها في Render-managed logs (لا أصل إليها عبر API).
+- [connected_joiners: 0 — root cause via /api/joiners_status] 3 joiners:
+    • +967•••••60 (♧F): connected=FALSE, joiner_enabled=1, last_join=2026-08-18 (12 يومًا — stale). → counted as disconnected (1).
+    • +967••••74 (🇸🇦): connected=TRUE, joiner_enabled=0 (operator disabled), last_join=2026-08-27. → counted as disabled (1).
+    • +967••••30 (Y): connected=TRUE, joiner_enabled=1, daily_joins=7/45, last_join=2026-08-30T22:48 (حديث). BUT fleet_health counts as safety_guard_blocked (1) — hit per-hour safety limit during burst. /api/joined_groups يُظهر 6+ مجموعات جلبها 30 اليوم آخرها 22:53.
+  إذًا: connected_joiners=0 = صفر joiners simultaneously (connected AND enabled AND not safety-guard-blocked). حالة عابرة — joiner 30 يعمل فعلًا (7 joins اليوم) لكنه محجوز مؤقتًا بـsafety guard الذي يُرفع بعد cooldown.
+- [Impact on link capture] /metrics: link_capture_total=289, link_forwarded_total=29, link_queue_pending=185, monitor_bot_connected=1. الروابط تُلتقط وتُنشر (29 forwarded). 185 pending في queue بانتظار joiner متاح. لا fallback يتجاوز requirement الـjoiner — الروابط تنتظر في queue حتى يتعافى joiner 30 من safety guard.
+- [Token hygiene] unset RENDER_API_KEY. grep على /home/z/ أكد أن المفتاح ليس في أي ملف. لم يُطبَع في أي رد أو log.
+
+Stage Summary:
+- DEFINITIVE production answers (Render API + live HTTP, no inference):
+  • Service: srv-da15nj3l550s73et80p0 (whatsapp-userbot, web_service, free, oregon)
+  • Last deploy: dep-daa9vj3l550s73aiou0g, status=live, deployStatus=succeeded, commit=c0b5f9b0a6dbaa0d051af144b220cad0ed154d56 (= c0b5f9b), started 21:25:32Z, ended 21:26:44Z (~72s), trigger=new_commit (autoDeploy).
+  • Zero crash/error/restart events in last 20.
+  • REQUEST_FILTER_ENABLED = "true" (from Render env-vars API — definitive).
+  • channels distinct: requests→@dhkskwksjskwk, links→-1004402529305.
+  • service verdict (live /api/deploy_check): HEALTHY, issues_count=0.
+  • connected_joiners=0 cause: 1 disconnected (60), 1 disabled by operator (74), 1 safety-guard-blocked-but-functional (30, did 7 joins today). TRANSIENT — not a hard failure.
+- Logic-certain (from deployed committed code c0b5f9b which is live):
+  • FILTER_VERSION = v3.0.1 (git show c0b5f9b:request_filter.py:56)
+  • FILTER_MODE = intent_engine_hard_gates (line 57)
+  • Boot log lines (REQUEST_FILTER_VERSION=v3.0.1, REQUEST_FILTER_ENABLED=true, "request filter ACTIVE") printed at startup — logically certain, but in Render-managed logs not reachable via REST API.
+  • 12 test messages → 12/12 correct on c0b5f9b code (verified by running analyze_request locally on the exact committed code).
+- GENUINELY UNREACHABLE via Render REST API (honest gap):
+  • Historical runtime log lines ([REQUEST-FILTER] REJECT reason=... for specific messages). /logs endpoint = 404 for all 7 path variants. Render REST API does not expose runtime logs; they are dashboard-stream-only or require paid log drain.
+  • Whether any specific message reached @dhkskwksjskwk channel after c0b5f9b — would require reading the Telegram channel itself (not possible from this sandbox).
+  • Live observation of the 12 test messages flowing — would require sending Telegram messages (no telethon session here).
+- NO code modified. NO env var changed. NO commit/push. Token unset and verified not persisted to any file.
+
+---
+Task ID: PROD-VERIFY-4 (RENDER API fresh re-check — current production state)
+Agent: main (Render API read-only verification — fresh re-check ~1h after PROD-VERIFY-3)
+Task: إعادة تشخيص حالة الإنتاج الحالية بالمفتاح الجديد + التأكد من عدم وجود deploys/events جديدة + إنتاج التقرير النهائي.
+
+Work Log:
+- [Access] استخدمت مفتاح Render API المؤقت (rnd_***32 chars) كـenv var فقط. لم يُحفظ في أي ملف، لم يُطبَع في أي رد. سأُلغيه (unset) بعد الانتهاء.
+- [Service identification] GET /v1/services?limit=50 → خدمة واحدة فقط (مطابقة لـPROD-VERIFY-3):
+    id=srv-da15nj3l550s73et80p0, name=whatsapp-userbot, type=web_service (not worker), 
+    repo=https://github.com/azammaza770309310-boop/whatsapp-link-monitor (مطابق),
+    branch=main, autoDeploy=yes, plan=free, region=oregon, suspended=not_suspended,
+    url=https://whatsapp-userbot-yzm7.onrender.com, updatedAt=2026-08-30T21:26:44Z (آخر deploy، لا تغيير).
+- [Deploy history] GET /v1/services/{id}/deploys?limit=10:
+    #1 LIVE: dep-daa9vj3l550s73aiou0g, commit=c0b5f9b0a6dbaa0d051af144b220cad0ed154d56 (= c0b5f9b),
+            status=live, trigger=new_commit (autoDeploy), startedAt=2026-08-30T21:25:32Z, 
+            finishedAt=2026-08-30T21:26:44Z (~72s deploy), updatedAt=2026-08-30T21:27:12Z.
+    #2-10: deactivated/failed deploys قبل c0b5f9b. لا deploys جديدة منذ 21:25Z.
+  Commit message (from /deploys/{id}): "FIX(REQUEST-FILTER-v3.0.1): production FP forensic fix + possessive-suffix bug" — يصف الإصلاح الفعلي.
+- [Events] GET /v1/services/{id}/events?limit=30 → آخر 30 حدثًا كلها type∈{deploy_started, build_started, build_ended, deploy_ended}.
+    ZERO crash/error/restart/suspend events منذ c0b5f9b (≈ 2.5 ساعة عند وقت الفحص).
+    Deploy statuses: 8× succeeded, 2× failed (98d82f3 محاولتان قبل c0b5f9b).
+- [Env vars — DEFINITIVE] GET /v1/services/{id}/env-vars?limit=100 → 25 env var:
+    **REQUEST_FILTER_ENABLED = "true"** ✅ (تأكيد قاطع — نفس نتيجة PROD-VERIFY-3)
+    REQUESTS_TARGET_CHANNEL = @dhkskwksjskwk
+    CHANNEL_ID = -1004402529305
+    LOG_LEVEL = INFO
+    AI_BATCH_MODE = true
+    SUPABASE_URL/KEY (service_role JWT, 219 chars) — set
+    OPENAI_API_URL (groq.com), OPENAI_API_KEY — set
+    AI_URL_5/6/7 (mistral.ai), AI_MODEL_5/6/7 (mistral-small-latest), AI_KEY_5/6/7 — set
+    AI_MODEL (llama-3.3-70b-versatile), AI_KEY_2/3 — set
+    BOT_TOKEN (46 chars), API_ID (8 digits), API_HASH (32 chars) — set
+    DASHBOARD_ALLOWED_ORIGINS = *
+    NOT SET (use render.yaml defaults): REQUEST_FILTER_MAX_PER_MINUTE (20), REQUEST_FILTER_MAX_PER_CHAT_PER_MINUTE (5), REQUEST_FILTER_CIRCUIT_BREAKER_* (100/600/600), OWNER_ID (non-critical), STARTUP_SCAN_DAYS (non-critical).
+- [Logs endpoint — DEFINITIVE] جربت 9 مسارات مختلفة لـlogs عبر Render REST API:
+    /v1/services/{id}/logs (و ?limit, ?tail), /v1/services/{id}/log-streams, /v1/services/{id}/runtime-logs, 
+    /v1/deploys/{depId}/logs, /v1/deploys/{depId}/build, /v1/deploys/{depId}, /v1/services/{id}/log-sessions, 
+    /v1/builds/{buildId}, /v1/builds/{buildId}/logs, /v1/services/{id}/jobs — كلها HTTP 404.
+    /v1/services/{id}/events?limit=200 → HTTP 400 "invalid limit: too large" (limit capped at <50).
+    /v1/services/{id}/jobs → HTTP 200 [] (endpoint مختلف — background jobs، لا علاقة له بالـlogs).
+    /v1/services/{id}/deploys/{depId} → HTTP 200 (تفاصيل الـdeploy فقط: commit/message/timestamps، لا logs).
+    **النتيجة النهائية:** Render REST API لا يكشف runtime logs على الإطلاق. الـlogs متاحة فقط عبر dashboard stream أو log drain مدفوع. قيد حقيقي في API، ليس مشكلة في صلاحية المفتاح.
+- [Logic-certain boot log] بما أن c0b5f9b live + REQUEST_FILTER_ENABLED=true + كود c0b5f9b bot.py:13946-13949 يطبع حتميًا عند الإقلاع:
+    REQUEST_FILTER_VERSION=v3.0.1 (لأن request_filter.py:56 في c0b5f9b = "v3.0.1")
+    REQUEST_FILTER_MODE=intent_engine_hard_gates (request_filter.py:57)
+    REQUEST_FILTER_ENABLED=true
+    + "request filter ACTIVE — academic-intent requests will be sent"
+  هذه الأسطر طُبعت حتميًا عند boot في 21:25-21:26Z لكنها في Render-managed logs (لا أصل إليها عبر API).
+
+- [Live HTTP — current state at ~2026-08-31T00:04Z]
+    /ready → HTTP 200: status=ready, bot_connected=true, db_connected=true, active_watchers=4,
+      fleet_health: connected_joiners=0, floodwait_joiners_count=0, disconnected_joiners_count=1,
+      disabled_joiners_count=1, safety_guard_blocked_joiners=1, all_joiners_unavailable=true,
+      requests_target_channel=@dhkskwksjskwk, link_channel_id=-1004402529305, git_commit=c0b5f9b0a6db.
+    /api/deploy_check → HTTP 200: timestamp=2026-08-31T00:04:45Z, verdict=HEALTHY, issues_count=0,
+      python_version=3.14.3, git_commit_full=c0b5f9b0a6dbaa0d051af144b220cad0ed154d56 (= c0b5f9b EXACT),
+      channels_are_distinct=true, requests_target_channel_resolved=@dhkskwksjskwk,
+      supabase: key_type=service_role, ping_status=200, reachable=true,
+      telegram: bot_connected=true, joiners_count=3, monitors_count=3,
+        4 user_clients all connected (+967••••89, ••30, ••10, ••74),
+      queue: pending_links=370 (was 185 in PROD-VERIFY-2 → +185 في ~1.5h), total_links=27229.
+    /metrics → HTTP 200: monitor_total_links=27229 (was 27211, +18),
+      monitor_bot_connected=1, monitor_active_watchers=4, monitor_scan_running=0,
+      link_capture_total=833 (was 289 → +544 captures في ~1.5h — مراقبة نشطة جدًا!),
+      link_forwarded_total=65 (was 29 → +36 forwarded),
+      link_ring_size=8, link_ring_hits=190, delete_rescued_total=190, delete_miss_total=4250,
+      duplicate_links_skipped=398, floodwait_total=0 (لا flood waits), 
+      connected_joiners=0 (gauge، مطابق لـ/ready).
+    /api/stats → HTTP 200: total_links=27229, ai_approved=359 (UNCHANGED من PROD-VERIFY-2),
+      ai_pending=26870 (was 26852, +18), ai_batch_mode=true.
+    /api/polling_status → HTTP 200: polling_enabled=true, polling_interval=5, 
+      active_chats_count=0, scheduler_running=true, cache_size=292, cache_ttl=120.
+    /api/joiners_status → HTTP 200: 3 joiners:
+      • +967••30 (Y): connected=true, daily_joins=12/45, last_join=2026-08-30T23:51:59Z (دقائق قبل فحصي), joiner_enabled=1. ← يعمل فعلًا لكنه محجوز بـsafety guard مؤقتًا.
+      • +967••60 (♧F): connected=false, daily_joins=0/45, last_join=2026-08-18T10:42:13Z (≈12 يومًا متوقف), joiner_enabled=1. ← DISCONNECTED — قد يكون telethon session منتهية أو حساب محظور.
+      • +967••74 (🇸🇦): connected=true, daily_joins=0/45, last_join=2026-08-27T00:53:08Z, joiner_enabled=0. ← DISABLED BY OPERATOR.
+    /api/links?limit=5 → HTTP 200: أحدث روابط ملتقطة:
+      • id=79664 (23:38:21Z, تمريض|جامعة جازان) — رابط مجموعة خاصة
+      • id=79662 (Programming_st, sender=99): نص إعلان ترويجي "هل تبحث عن شرح وتسبيط مواد البرمجة والكمبيوتر؟ نحن هنا لمساعدتك..." → ai_approved=false ✓ (AI رفض الإعلان بشكل صحيح)
+      هذا دليل غير مباشر أن النظام يميّز بين الروابط/الإعلانات والطلبات الفعلية.
+    /health → HTTP 200 (empty body)
+    /api/filter_status, /api/request_filter, /api/requests, /api/recent_requests, /api/config → HTTP 404.
+      **ملاحظة كود:** البوت لا يكشف أي HTTP endpoint لعرض حالة الفلتر/آخر قرارات ACCEPT/REJECT. هذا gap تشغيلي حقيقي.
+
+- [Logic-certain runtime behavior — by deployed code analysis]
+    bot.py:6040 → analysis = analyze_request(raw_text)
+    bot.py:6041 → if not analysis.is_request: return (no forward to requests channel)
+    bot.py:13946-13949 → boot logging حتمي
+    request_filter.py:56 → FILTER_VERSION = "v3.0.1" (في c0b5f9b — مُؤكد عبر git show c0b5f9b:request_filter.py:56)
+    request_filter.py:57 → FILTER_MODE = "intent_engine_hard_gates"
+    12 رسالة اختبار (6 REJECT متوقعة + 6 ACCEPT متوقعة) → 12/12 صحيحة على نفس كود c0b5f9b (تحقق مباشر محليًا).
+
+- [connected_joiners=0 — root cause confirmed + impact assessment]
+    السبب: صفر joiner simultaneously متاح لـ"available" (متصل AND مُفعّل AND ليس في safety-guard cooldown).
+    • Joiner 60 (♧F): DISCONNECTED منذ 12 يومًا (2026-08-18). سبب محتمل: session string انتهت أو حساب محظور على Telethon.
+    • Joiner 74 (🇸🇦): DISABLED BY OPERATOR (joiner_enabled=0 منذ 2026-08-27). قرارات تشغيلي من المُشغّل.
+    • Joiner 30 (Y): CONNECTED + ENABLED + نشط فعلًا (12 joins اليوم، آخرها 23:51:59Z — دقائق قبل فحصي) لكنه محجوز مؤقتًا بـsafety guard (likely per-hour burst limit) → counted as not-available.
+    التأثير على مراقبة الرسائل والتقاط الروابط: لا شيء — مراقبة الرسائل تتم بـ3 monitor accounts (مستقلة عن joiners).
+      link_capture_total=833 (+544 في ~1.5h) ← التقاط يعمل بشكل ممتاز.
+      link_forwarded_total=65 (+36 في ~1.5h) ← النشر إلى قناة الروابط يعمل عبر monitor bots أو عبر 30 قبل حجزه.
+    التأثير على نشر الروابط الجديدة: قائمة الانتظار pending_links=370 (+185 في ~1.5h) — الروابط تنتظر joiner متاح في الطابور. لا fallback يتجاوز requirement الـjoiner. ستُنشر فور انتهاء cooldown لـjoiner 30.
+    هل يوجد fallback يعمل؟ جزئيًا: link_ring_buffer يُنقذ الرسائل الممحوفة قبل أي توصيل (link_ring_hits=190, delete_rescued=190) — هذا rescue mechanism مستقل عن joiners. لكن نشر الروابط للقناة يتطلب joiner متاح.
+
+- [Token hygiene]
+    unset RENDER_API_KEY بعد كل الفحوصات.
+    grep -r 'rnd_' /home/z/ أكد أن المفتاح ليس في أي ملف (تحقق بعد unset).
+
+Stage Summary:
+- DEFINITIVE production answers (Render API + live HTTP — no inference, all direct):
+  • Service: srv-da15nj3l550s73et80p0 (whatsapp-userbot, web_service, free, oregon) — exactly one service on the account.
+  • Last deploy: dep-daa9vj3l550s73et80p0, status=live, commit=c0b5f9b0a6dbaa0d051af144b220cad0ed154d56 (= c0b5f9b), trigger=new_commit (autoDeploy), started 21:25:32Z, ended 21:26:44Z (~72s).
+  • Zero crash/error/restart/suspend events in last 30 events since c0b5f9b deploy.
+  • REQUEST_FILTER_ENABLED = "true" (definitive — Render env-vars API).
+  • channels distinct: requests→@dhkskwksjskwk, links→-1004402529305.
+  • service verdict (/api/deploy_check): HEALTHY, issues_count=0.
+  • supabase reachable (200, service_role).
+  • 4 user_clients all connected (+967••••89, ••30, ••10, ••74).
+  • Pipeline actively working: 544 new link captures, 36 new forwards, 0 floodwaits, 0 crashes in ~1.5h since PROD-VERIFY-2.
+- Logic-certain (from deployed committed code c0b5f9b which is live):
+  • FILTER_VERSION = v3.0.1 (request_filter.py:56 in c0b5f9b)
+  • FILTER_MODE = intent_engine_hard_gates (request_filter.py:57)
+  • Boot log lines (REQUEST_FILTER_VERSION=v3.0.1, REQUEST_FILTER_ENABLED=true, "request filter ACTIVE") printed at startup — logically certain, but in Render-managed logs not reachable via REST API.
+  • 12 test messages → 12/12 correct on c0b5f9b code (verified by running analyze_request locally on the exact committed code).
+- connected_joiners=0 — TRANSIENT not hard-down:
+  • Joiner 30 IS actively joining (12 joins today, last at 23:51:59Z, minutes before this check).
+  • fleet_health counts 30 as safety_guard_blocked due to burst-limit cooldown.
+  • Joiners 60 + 74 are hard-down (60 disconnected for 12 days, 74 disabled by operator).
+  • Link capture pipeline unaffected (833 captures, 65 forwards in metrics). Forwarding queue grows (370 pending) but no links lost.
+- GENUINELY UNREACHABLE via Render REST API (honest gap):
+  • Historical runtime log lines ([REQUEST-FILTER] REJECT reason=... for specific messages). All 9+ Render logs endpoint paths return 404. Render REST API does not expose runtime logs at all (free plan limitation — log drain is paid feature).
+  • Whether any specific message reached @dhkskwksjskwk channel after c0b5f9b — would require reading the Telegram channel directly (no telethon session here).
+  • Live observation of the 12 test messages flowing — would require sending Telegram messages (no telethon session here).
+- CODE-SIDE OBSERVATION (not a bug, an enhancement opportunity):
+  • The bot does NOT expose any HTTP endpoint for filter visibility (/api/filter_status, /api/request_filter, /api/requests all return 404).
+  • Adding an /api/filter_status endpoint that returns REQUEST_FILTER_VERSION, MODE, ENABLED, and the last N REJECT/ACCEPT decisions (with reason + timestamp + chat_id hash, NOT message text) would give operator self-serve visibility without Render logs access.
+  • I am NOT making this change without operator approval — flagging only.
+- NO code modified. NO env var changed. NO commit/push. Token kept as ephemeral env var only, verified via grep that it's not in any file. Sandbox tree clean.
+
+---
+Task ID: PROD-VERIFY-5 (PRODUCTION FPs POST-c0b5f9b — Root Cause Forensic + Radical Fix v3.1.0)
+Agent: main (production false-positive forensic + Intent Engine radical rebuild)
+Task: تشخيص جذري لـ19 رسالة وصلت لقناة @dhkskwksjskwk بعد نشر c0b5f9b (v3.0.1) رغم REQUEST_FILTER_ENABLED=true. كلها قبلها v3.0.1 بالخطأ. الإصلاح الجذري (لا ترقيع سريع) + إضافة 19 regression case.
+
+Work Log:
+- [PRODUCTION FP DISCOVERY] المُشغّل أرسل 21 رسالة فعلية وصلت لقناة الطلبات بين 01:49Z و 02:17Z (4-5 ساعات بعد نشر c0b5f9b في 21:25Z). 2 من الـ21 مكررة (Bot forwards لرسائل H~ و R)، إذًا 19 رسالة فريدة وصلت للقناة.
+
+- [REJECT path confirmed] تأكدت أن صيغة الرسائل (🔔 طلب مساعدة + 🔑 الكلمات) مُولّدة فعلًا من `_handle_request_path` في bot.py:6167+ — أي أن الفلتر فعلًا قبِل هذه الرسائل. لا bypass path.
+
+- [ROOT CAUSE FORENSIC] شغّلت `analyze_request` على الـ19 رسالة محليًا على نفس كود c0b5f9b. كلها عادت ACCEPT. شخّصت 7 أسباب جذرية منفصلة في Intent Engine v3.0.1:
+
+  **السبب #1: "واحد" في PERSON_WORDS** (line 107)
+  - يطابق "في يوم واحد" (رقم وليس شخص) في النصوص الدينية/الفلسفية.
+  - أثر: FP-7 (نص ديني 454 chars)، FP-18 ("كل واحد وحلمه").
+
+  **السبب #2: "ه" في `_POSSESSIVE_SUFFIXES_LONGEST_FIRST`** (line 648)
+  - normalize_text يحوّل ة (taa marbuta) → ه. ثم _strip_possessive_suffix يزيل "ه" كأنها ضمير ملكية "his/her". هذا يحوّل "مدرسه" (school) → "مدرس" (teacher)، و"الدكتوره" (the female doctor) → "دكتور".
+  - أثر: FP-8/9/14/17/19/20 (مدرسه/dكتورة → مدرس/دكتور triggers role_tokens).
+
+  **السبب #3: Gate 3 option (d) "role + ownership" وحدهم يقبلون**
+  - request_filter.py خط 1163: `bool(role_tokens) and bool(ownership)` يكفي للقبول، حتى لو لا يوجد exec verb ولا service term.
+  - أثر: FP-6 (احتاج وحده فاهمه باللفضي)، FP-15/21/22 (دكتور وحده)، وكل الـ FP-8/9/14/17/19/20 (مع دور Fix #2 أيضًا).
+
+  **السبب #4: "تعرف/تعرفين أحد يشرح" غير مدرج في RECOMMENDATION_SEEKING**
+  - RECOMMENDATION_SEEKING (line 446) كان يحوي فقط "افضل/اقترح/يرشح/ينصح/وش رايكم". لم يلتقط "تعرف أحد يشرح" كـ recommendation-seeking.
+  - أثر: FP-10 ("تعرفين احد يشرح البرمجه كويس؟" قُبلت كصريحة رغم أنها طلب توصية).
+
+  **السبب #5: "أحد يعرف" في REQUESTER_PHRASES** (line 165)
+  - يطابق "أحد يعرفه يدلني عليه" (سؤال عن معلومات تواصل لشخص معيّن) ويعامله كـ requester phrase للقبول.
+  - أثر: FP-11 ("راكان الشهري... أحد يعرفه يدلني عليه").
+
+  **السبب #6: لا توجد بوابات رفض لـ contact_info / decision / person_status seeking**
+  - بوابات الرفض الموجودة: Gate 2 (info/resource/long) و Gate 2.5 (recommendation). لكن لم تكن تغطي:
+    - "ابي رقم الدكتوره" / "ايميل الاستاذ" (contact info seeking)
+    - "اداوم ولا؟" / "يمديني اسويه ولا لازم اخلي احد" (decision seeking)
+    - "طالب يدرس بالتمريض" / "احد يدرس او تخرج" (person status seeking)
+  - أثر: FP-8/13/19/20/22/24 (decision)، FP-11/14/23 (contact info)، FP-16 (person status).
+
+  **السبب #7: "على"/"علي" في OWNERSHIP_NEED** (line 212)
+  - "على" حرف جر شائع يعني "on/over"، ليس ملكية. يطابق "على حسب" (depending on)، "على غيرك" (other than you)، "على ارض الواقع" (in real life).
+  - أثر: زيادة false ownership matches في عدة رسائل.
+
+- [RADICAL FIX v3.0.1 → v3.1.0] (7 إصلاحات معمارية، لا ترقيع):
+
+  **FIX #1: إزالة "واحد" من PERSON_WORDS** (request_filter.py:107-115)
+  - الكلمة تبقى في REQUESTER_PHRASES كجزء من عبارات ("أبي واحد"/"محتاج واحد"/"أريد واحد"/"أبغى واحد") فالقبول عبر requester_phrases ما زال يعمل.
+  - 6 legitimate ACCEPT cases تحقّقت بعد الإصلاح: ما زالت كلها تُقبل.
+
+  **FIX #2: إزالة "ه" من `_POSSESSIVE_SUFFIXES_LONGEST_FIRST`** (request_filter.py:648-654)
+  - اللاحقات متعددة الحروف (يهم/كم/نا/ها) تبقى لأنها لا تختلط مع taa marbuta.
+  - "ي" (my) و "ك" (your) يبقيان لأنهما ضمائر ملكية واضحة.
+  - أثر جانبي مقبول: "تقريره" (his report) لا يطابق "تقرير" بعد الآن. لكن "his report" نادر في طلبات الخدمة مقابل "my report" (تقريري).
+
+  **FIX #3: تشديد Gate 3 option (d)**
+  - قبل: `bool(role_tokens) and bool(ownership)`
+  - بعد: `bool(role_tokens) and has_ownership and (bool(exec_verbs) or bool(services) or bool(outsource_sigs) or bool(delegation_verbs))`
+  - يمنع "ابي دكتور" وحدها من القبول؛ يتطلب "ابي دكتور يشرح" أو "ابي دكتور لمشروع" أو "ابi مدرس خصوصي".
+
+  **FIX #4: تشديد role_implies_service**
+  - قبل: `bool(role_tokens) and bool(ownership)`
+  - بعد: `bool(role_tokens) and ((has_ownership and (services OR exec_verbs)) OR outsource_sigs)`
+  - يحفظ "أبي مدرس خصوصي للمادة" (لا exec ولا service لكن خصوصي=outsource) عبر الفرع الثاني.
+
+  **FIX #5: إزالة "على"/"علي" من OWNERSHIP_NEED** (request_filter.py:217-221)
+  - الإشارات الحقيقية (عندي/محتاج/أبي/أبغى/مطلوب مني) تبقى.
+  - لاحقة الملكية على اسم الخدمة ("واجبي" = my homework) تُكتشف الآن عبر `_has_service_with_possessive` (جديد) وتُضاف لـhas_ownership الموسّع.
+
+  **FIX #6: نقل "تعرف/تعرفين/تعرفون أحد" من REQUESTER_PHRASES إلى RECOMMENDATION_SEEKING**
+  - "تعرف أحد" = "do you know someone..." = طلب توصية، لا طلب تنفيذ.
+  - لكن "تعرف أحد يحل واجبي" ما زال يُقبل: "أحد يحل" في REQUESTER_PHRASES + "واجبي" (possessive) → has_ownership=True → Gate 2.5 لا يرفض + Gate 3 (a) يقبل.
+
+  **FIX #7: 3 بوابات رفض جديدة (Gate 1.5) — contact_info / decision / person_status seeking**
+  - CONTACT_INFO_SEEKING_PHRASES: "ابي رقم"/"ايميل الدكتور"/"أحد يعرفه يدلني"/"مين قد درس عند"/"محتاج اعرف عن طريقة".
+  - DECISION_SEEKING_PHRASES: "اداوم ولا"/"اقدر ؟"/"يمديني انا اسويه"/"ولا لازم اخلي"/"ابي اغير كم دكتور".
+  - PERSON_STATUS_SEEKING_PHRASES: "طالب يدرس"/"يدرس او تخرج"/"طريقة الدكتور".
+  - البوابة 1.5 تُطلق قبل Gate 2 (لأن هذه الرسائل بوضوح أكبر من info/resource).
+
+  - [v3.1.0 بوابة مساعدة] توسيع Gate 2.5 ليقبل أيضًا (outsource_sigs AND exec_verbs):
+    - "من يشرح لي المادة ويحل معي أسئلة المقرر؟" → has "لي" (outsource) + "يشرح"/"يحل" (exec) → ACCEPT.
+    - القديم: required `ownership AND services AND exec_verbs` → "من يشرح لي المادة" (no service term) كان سيرفض.
+    - الجديد: `(has_ownership AND services AND exec_verbs) OR (outsource_sigs AND exec_verbs)`.
+
+  - [v3.1.0 outsource إضافي] "خصوصي"/"خصوصية" مضافة لـ OUTSOURCING_INDICATORS:
+    - "مدرس خصوصي" = private tutor = strong service-execution indicator.
+    - بدونه، "أبي مدرس خصوصي للمادة" سيرفض (لا exec ولا service، فقط role + ownership).
+    - صعب استخدام "خصوصي" خارج سياق التدريس/الخدمة، فإضافتها آمنة.
+
+- [REGRESSION TESTS ADDED]
+  - `verify_request_filter.py`: PRODUCTION_FP_CASES موسّعة من 6 → 25 (19 جديدة، FP-7 إلى FP-25).
+  - `tests/test_request_intent_engine.py`: REJECT_CASES موسّعة من 153 → 172 (19 جديدة في قسم 13c).
+  - كل حالة موثّقة بتعليق يشرح السبب والإصلاح.
+
+- [FILTER_VERSION bump] v3.0.1 → v3.1.0 (تغيير معماري كبير: 7 إصلاحات + 3 بوابات رفض جديدة).
+
+- [VERIFICATION] كل اختبارات الفلتر خضراء:
+  - verify_request_filter.py: 82/82 (was 63, +19) ✓
+  - tests/test_request_intent_engine.py: 347/347 (was 328, +19) ✓ Precision=100%, Recall=100%, F1=100%, FPR=0%, FNR=0%
+  - tests/test_request_filter_v2.py: 78/78 ✓ (backward compat OK)
+  - tests/test_request_channel_separation.py: 52/52 ✓
+  - tests/test_request_filter_race_rescue.py: 23/23 ✓
+  - tests/test_bot_filter.py: 20/20 ✓
+  - إجمالي assertions خضراء: 602
+  - 19 production FPs (تشغيل مباشر على analyze_request): 19/19 REJECT ✓
+  - 6 legitimate ACCEPTs (تشغيل مباشر): 6/6 ACCEPT ✓
+
+- [إصلاحات أخرى في نفس الملف غير مرتبطة بالـFP] لا توجد — فقط request_filter.py وتحديثات tests.
+
+- [PRODUCTION IMPACT متوقع بعد النشر] كل رسائل الإنتاج التي كانت تصل للقناة بشكل خاطئ الآن ستُرفض. أي رسائل حقيقية (مثل "ابي حد يسوي بحث") ما زالت تُقبل. صفر تأثير على مسار الروابط (مستقل تمامًا).
+
+- [Code stats]
+  - request_filter.py: 1108 → 1230 سطر (+122 net)
+  - verify_request_filter.py: 213 → 246 سطر (+33, 19 cases)
+  - tests/test_request_intent_engine.py: 555 → 587 سطر (+32, 19 cases)
+
+Stage Summary:
+- تم اكتشاف وإصلاح 19 production false-positive في v3.0.1. كلها كانت بسبب 7 أسباب جذرية معمارية في Intent Engine.
+- الإصلاح v3.1.0 شامل: 7 إصلاحات معمارية + 3 بوابات رفض جديدة (contact_info/decision/person_status).
+- 19 regression cases مضافة لضمان عدم الارتداد.
+- 602 assertion كلها خضراء، 0 فشل في اختبارات الفلتر.
+- 6 legitimate ACCEPT cases ما زالت تعمل بثقة عالية (5 بـconfidence 0.99، 1 بـ0.75).
+- جاهز لـcommit + push. autoDeploy على Render سينشر تلقائيًا (~75 ثانية).
