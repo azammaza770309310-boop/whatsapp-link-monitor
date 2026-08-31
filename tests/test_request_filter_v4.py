@@ -1,0 +1,794 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+test_request_filter_v4.py — Request Intent Engine v4.0 (AI-First) Test Suite
+================================================================================
+يختبر إعادة البناء الجذرية v4.0 المرحلة-بمرحلة:
+
+  A. [STAGE 1] text_normalizer  — إيموجي/روابط/توقيعات/تكرار + canonical
+  B. [STAGE 4] semantic_dedup   — exact + semantic-hash + Jaccard near-dup + TTL
+  C. [STAGE 2/3] intent_classifier — JSON parse (fences/noise) + validation +
+                                    rotation + timeout + parse-failure → REJECT
+  D. Prompt Contract            — العقد الدلالي مقفول في الكود (taxonomy + عتبة)
+  E. Orchestrator v4            — الحالات الإلزامية التسع (طلب المُشغّل) +
+                                   عتبة 0.85 + لا-keyword-fallback + dedup +
+                                   relay + empty + malformed + decision logging
+  F. [STAGE 5] filter_store     — filter_decisions: كتابة + قراءة + إحصاءات
+  G. [STAGE 6] /api/filter_stats — endpoint مع fake monitor
+  H. Regression Corpus          — corpus v3.0 كامل (مئات الحالات) عبر mock AI:
+                                   كل ACCEPT-case مقبول وكل REJECT-case مرفوض
+                                   (يثبت سلامة السباكة على نطاق واسع)
+  I. Integration _handle_request_path — إرسال حقيقي عبر Monitor method مُربوطة
+                                   مع SQLite حقيقي + mock classifier + SendMock
+
+مبدأ الاختبار الصريح: الـAI في الإنتاج يقرر. في الاختبار نُحقن transport
+مُبرمج (scripted) يُعيد تصنيفًا صحيحًا لكل حالة — نثبت أن السباكة كاملة:
+normalize → signals hints → classify → threshold → dedup → filter_decisions →
+send. ونثبت المستحيل: لا يوجد أي مسار يقرر بالكلمات المفتاحية (AI down =
+REJECT دائمًا حتى لرسالة مليئة بكلمات الطلب).
+
+NO Telegram credentials — SIMULATION ONLY (transport injection + in-memory SQLite).
+
+شغّل:  python3 tests/test_request_filter_v4.py
+"""
+import asyncio
+import json
+import os
+import sys
+import tempfile
+import time
+import types
+from pathlib import Path
+
+PROJECT_ROOT = Path(__file__).parent.parent
+sys.path.insert(0, str(PROJECT_ROOT))
+
+os.environ.setdefault('BOT_TOKEN', '123:test')
+os.environ.setdefault('CHANNEL_ID', '-1001234567890')
+os.environ.setdefault('REQUESTS_TARGET_CHANNEL', '@dhkskwksjskwk')
+
+from text_normalizer import normalize as tn_normalize                       # noqa: E402
+from semantic_dedup import SemanticDeduper, content_tokens                  # noqa: E402
+from intent_classifier import (                                             # noqa: E402
+    IntentClassifier, IntentDecision, extract_json_text, validate_ai_output,
+    SYSTEM_PROMPT, ACCEPT_CATEGORIES, REJECT_CATEGORIES, load_providers_from_env,
+)
+from request_filter import (                                                # noqa: E402
+    analyze_request_v4, analyze_request, extract_signals,
+    FILTER_VERSION, FILTER_MODE,
+)
+from filter_store import DecisionLogger, text_hash_of, FILTER_DECISIONS_SCHEMA  # noqa: E402
+
+# test counters
+_TOTAL = {"pass": 0, "fail": 0}
+_FAILURES = []
+
+
+def check(name: str, cond: bool, detail: str = "") -> None:
+    if cond:
+        _TOTAL["pass"] += 1
+        print(f"  ✓ {name}")
+    else:
+        _TOTAL["fail"] += 1
+        _FAILURES.append((name, detail))
+        print(f"  ✗ {name}  {detail}")
+
+
+# ============================================================
+# Mock AI infrastructure (scripted transport)
+# ============================================================
+def _ai_json(decision, confidence, category, reason):
+    return json.dumps({"decision": decision, "confidence": confidence,
+                       "category": category, "reason": reason}, ensure_ascii=False)
+
+
+def make_scripted_classifier(scripts, default=None, model="mock-70b"):
+    """IntentClassifier بحقن transport — scripts: {substring_in_user_msg: (decision, conf, cat, reason)}.
+    default: قرار غير المتطابق (REJECT other افتراضيًا)."""
+    if default is None:
+        default = ("REJECT", 0.90, "other", "غير مطابق")
+
+    async def transport(provider, payload):
+        user_msg = payload["messages"][1]["content"]
+        for key, resp in scripts.items():
+            if key in user_msg:
+                body = {"choices": [{"message": {"content": resp}}]}
+                return 200, json.dumps(body)
+        d, c, cat, r = default
+        body = {"choices": [{"message": {"content": _ai_json(d, c, cat, r)}}]}
+        return 200, json.dumps(body)
+
+    return IntentClassifier(
+        providers=[{"key": "k", "url": "u", "model": model, "name": "Mock"}],
+        transport=transport,
+    )
+
+
+# التصنيف المرجعي الصحيح للحالات الإلزامية التسع (كما يجب أن يقرر LLM مُدرَّب)
+MANDATORY_SCRIPTS = {
+    # ❌ REJECT (طلب المُشغّل)
+    "حين يحبك الله": _ai_json("REJECT", 0.97, "religious_general_content", "محتوى ديني عام"),
+    "عندي دكتور يساعد": _ai_json("REJECT", 0.95, "service_offer", "عرض خدمة من مقدّم"),
+    "التداول": _ai_json("REJECT", 0.98, "advertisement", "إعلان تداول"),
+    "اكتمال جبت": _ai_json("REJECT", 0.96, "praise_testimonial", "مدح منصة بعد تجربة"),
+    "افضل مدرس": _ai_json("REJECT", 0.88, "recommendation_or_opinion", "استطلاع رأي عام"),
+    # ✅ ACCEPT (طلب المُشغّل)
+    "تفاضل 1": _ai_json("ACCEPT", 0.93, "homework_execution_request", "طلب شخص يشرح له"),
+    "يحل معي السؤال": _ai_json("ACCEPT", 0.91, "homework_execution_request", "طلب شخص يحل معه"),
+    "يعرف دكتور يشرح": _ai_json("ACCEPT", 0.90, "tutoring_request", "يبحث عن مدرس رياضيات"),
+    "مدرس خصوصي للمادة": _ai_json("ACCEPT", 0.92, "tutoring_request", "يريد مدرس خصوصي"),
+}
+
+
+# ============================================================
+# A. [STAGE 1] text_normalizer
+# ============================================================
+def section_a():
+    print("\n=== A. [STAGE 1] text_normalizer — تنظيف أولي ===")
+
+    nt = tn_normalize("أحد يشرح لي التفاضل 1؟ 😊✅ https://t.me/xyz")
+    check("A1: إيموجي مُزال", "😊" not in nt.clean and "✅" not in nt.clean, repr(nt.clean))
+    check("A2: الرابط مُزال", "t.me" not in nt.clean, repr(nt.clean))
+    check("A3: السياق محفوظ (السؤال واللهجة)", "؟" in nt.clean and "يشرح" in nt.clean, repr(nt.clean))
+    check("A4: عدّادات الإزالة", nt.removed.get("emojis", 0) >= 2 and nt.removed.get("links", 0) >= 1, str(nt.removed))
+
+    nt2 = tn_normalize("صررررراحة محتاج محتاج محتاج مساعدة")
+    check("A5: تكرار الحروف مضغوط", "صررراحة" not in nt2.clean and "صرراحة" in nt2.clean, repr(nt2.clean))
+    check("A6: تكرار الكلمات مضغوط", nt2.clean.count("محتاج") == 1, repr(nt2.clean))
+
+    nt3 = tn_normalize("مين يعرف مدرس رياضيات؟\nSent from my iPhone")
+    check("A7: توقيع الجهاز مُزال", "iphone" not in nt3.clean.lower(), repr(nt3.clean))
+    check("A8: النص الأصلي باقٍ", "مين يعرف مدرس" in nt3.clean, repr(nt3.clean))
+
+    nt4 = tn_normalize("شلون أحل الواجب؟ وين الأستاذ؟")
+    check("A9: canonical يوحّد اللهجات", "كيف" in nt4.canonical and "اين" in nt4.canonical, repr(nt4.canonical))
+    check("A10: clean يحافظ على اللهجة (السياق)", "شلون" in nt4.clean and "وين" in nt4.clean, repr(nt4.clean))
+
+    nt5 = tn_normalize("أحتاج مساعدة في واجبي")
+    check("A11: canonical يطبّع الحروف العربية", "احتاج" in nt5.canonical and "واجبي" in nt5.canonical, repr(nt5.canonical))
+
+    nt6 = tn_normalize("")
+    check("A12: نص فارغ → bool False", not nt6, str(nt6))
+    nt7 = tn_normalize("😀😀😀")
+    check("A13: إيموجي فقط → canonical فارغ", nt7.canonical == "", repr(nt7.canonical))
+
+
+# ============================================================
+# B. [STAGE 4] semantic_dedup
+# ============================================================
+def section_b():
+    print("\n=== B. [STAGE 4] semantic_dedup — منع التكرار الدلالي ===")
+
+    d = SemanticDeduper(ttl_s=900, jaccard_threshold=0.80)
+
+    c1 = tn_normalize("أحد يشرح لي التفاضل").canonical
+    check("B1: أول ظهور ليس مكررًا", d.check(c1).is_dup is False)
+    d.register(c1)
+    check("B2: نفس النص → exact dup", d.check(c1).is_dup and d.check(c1).kind == "exact")
+
+    c2 = tn_normalize("التفاضل لي يشرح أحد").canonical  # reorder
+    r = d.check(c2)
+    check("B3: إعادة ترتيب الكلمات → semantic dup", r.is_dup and r.kind in ("semantic", "exact"), f"{r.kind}")
+
+    c3 = tn_normalize("أحد يشرح لي التفاضل الليلة").canonical  # +1 word
+    r3 = d.check(c3)
+    check("B4: إضافة كلمة واحدة → near-dup (Jaccard)", r3.is_dup and r3.kind == "near", f"{r3.kind} sim={r3.similarity}")
+
+    c4 = tn_normalize("أريد مدرس خصوصي للرياضيات").canonical
+    check("B5: نص مختلف تمامًا → ليس مكررًا", d.check(c4).is_dup is False)
+
+    # TTL expiry
+    d2 = SemanticDeduper(ttl_s=0.2)
+    c = tn_normalize("محتاج أحد يحل واجبي").canonical
+    d2.register(c, now=time.time())
+    check("B6: داخل TTL → dup", d2.check(c, now=time.time() + 0.05).is_dup)
+    check("B7: بعد TTL → ليس dup", d2.check(c, now=time.time() + 1.0).is_dup is False)
+
+    # word-level stemming: «بحوثي» vs «بحوث»
+    d3 = SemanticDeduper()
+    d3.register(tn_normalize("محتاج أحد يكتب بحوثي الجامعية").canonical)
+    r8 = d3.check(tn_normalize("محتاج أحد يكتب بحوثك الجامعية").canonical)
+    check("B8: تبديل ضمير الملكية → near-dup", r8.is_dup, f"{r8.kind}")
+
+    # is_duplicate compat API
+    d4 = SemanticDeduper()
+    check("B9: is_duplicate API — أول مرة False", d4.is_duplicate("مين يحل واجب الرياضيات؟").is_dup is False)
+    check("B10: is_duplicate API — ثاني مرة True", d4.is_duplicate("مين يحل واجب الرياضيات؟").is_dup is True)
+
+    # stats bounded
+    st = d.stats()
+    check("B11: stats تُرجع الحقول", all(k in st for k in ("ttl_s", "exact_entries", "total_seen")), str(st))
+
+
+# ============================================================
+# C. [STAGE 2/3] intent_classifier — parse + validate + rotation
+# ============================================================
+def section_c():
+    print("\n=== C. [STAGE 2/3] intent_classifier — عقد JSON + فشل آمن ===")
+
+    # JSON extraction
+    check("C1: extract_json — نظيف",
+          extract_json_text('{"decision":"REJECT"}') == '{"decision":"REJECT"}')
+    check("C2: extract_json — ```json fence",
+          '"ACCEPT"' in extract_json_text('```json\n{"decision":"ACCEPT"}\n```'))
+    check("C3: extract_json — noise قبل/بعد",
+          extract_json_text('القرار هو: {"decision":"REJECT"} شكرًا') == '{"decision":"REJECT"}')
+
+    # validation
+    v = validate_ai_output({"decision": "ACCEPT", "confidence": 0.93, "category": "tutoring_request", "reason": "ok"})
+    check("C4: ACCEPT صالح مع فئة ACCEPT", v is not None and v["decision"] == "ACCEPT")
+    v = validate_ai_output({"decision": "ACCEPT", "confidence": 1.7, "category": "tutoring_request", "reason": "ok"})
+    check("C5: confidence يُقصّ إلى [0,1]", v is not None and v["confidence"] == 1.0)
+    v = validate_ai_output({"decision": "ACCEPT", "confidence": -5, "category": "tutoring_request", "reason": "ok"})
+    check("C6: confidence سالب → 0.0", v is not None and v["confidence"] == 0.0)
+    v = validate_ai_output({"decision": "MAYBE", "confidence": 0.9, "category": "x", "reason": "y"})
+    check("C7: قرار غير معروف → invalid (None)", v is None)
+    v = validate_ai_output({"decision": "ACCEPT", "confidence": 0.9, "category": "advertisement", "reason": "y"})
+    check("C8: ACCEPT مع فئة REJECT → رفض تناقض (None)", v is None)
+    v = validate_ai_output({"decision": "REJECT", "confidence": 0.9, "category": "tutoring_request", "reason": "y"})
+    check("C9: REJECT مع فئة ACCEPT → رفض تناقض (None)", v is None)
+    v = validate_ai_output({"decision": "REJECT", "confidence": "nan", "category": "other", "reason": "y"})
+    check("C10: confidence NaN → 0.0", v is not None and v["confidence"] == 0.0)
+    v = validate_ai_output("not a dict")
+    check("C11: ليس dict → None", v is None)
+
+    # classify through scripted transport
+    async def run_c():
+        cl = make_scripted_classifier({"تداول": _ai_json("REJECT", 0.97, "advertisement", "اعلان")})
+        dec = await cl.classify("تعلم التداول واربح")
+        check("C12: classify عبر transport — قرار REJECT advertisement",
+              dec.ok and dec.decision == "REJECT" and dec.category == "advertisement", str(dec))
+
+        # malformed output → not ok → orchestrator rejects
+        async def bad_transport(provider, payload):
+            return 200, json.dumps({"choices": [{"message": {"content": "أعتقد أنها ليست طلبًا"}}]})
+        cl2 = IntentClassifier(providers=[{"key": "k", "url": "u", "model": "m", "name": "Mock"}], transport=bad_transport)
+        dec2 = await cl2.classify("أي رسالة")
+        check("C13: مخرجات غير JSON → ok=False (رفض آمن)", dec2.ok is False, str(dec2))
+
+        # rotation: أول مزوّد فاشل (HTTP 500) → الثاني يعمل
+        state = {"n": 0}
+
+        async def rotating_transport(provider, payload):
+            state["n"] += 1
+            if state["n"] == 1:
+                return 500, "server error"
+            return 200, json.dumps({"choices": [{"message": {"content": _ai_json("REJECT", 0.9, "other", "x")}}]})
+        cl3 = IntentClassifier(
+            providers=[{"key": "k1", "url": "u", "model": "m", "name": "P1"},
+                       {"key": "k2", "url": "u", "model": "m", "name": "P2"}],
+            transport=rotating_transport, max_attempts=2)
+        dec3 = await cl3.classify("رسالة")
+        check("C14: تدوير المزوّدين عند فشل HTTP 500", dec3.ok and dec3.provider_name == "P2", str(dec3))
+
+        # timeout transport → ai_error
+        async def slow_transport(provider, payload):
+            await asyncio.sleep(5)
+            return 200, "{}"
+        cl4 = IntentClassifier(providers=[{"key": "k", "url": "u", "model": "m", "name": "P"}],
+                               transport=slow_transport, timeout_s=0.2, max_attempts=1)
+        dec4 = await cl4.classify("رسالة")
+        check("C15: timeout → ok=False + error يشير للـtimeout", dec4.ok is False and "timeout" in dec4.error, str(dec4.error))
+
+        # no providers → enabled False → classify returns ai_unavailable
+        cl5 = IntentClassifier(providers=[])
+        dec5 = await cl5.classify("أي شيء")
+        check("C16: لا مزوّدين → ai_unavailable REJECT", dec5.ok is False and dec5.decision == "REJECT", str(dec5))
+
+        # counters
+        st = cl.stats()
+        check("C17: stats — counters مسجّلة", st["calls"] > 0 and "avg_latency_ms" in st, str(st))
+
+    asyncio.run(run_c())
+
+
+# ============================================================
+# D. Prompt Contract — العقد الدلالي مقفول
+# ============================================================
+def section_d():
+    print("\n=== D. Prompt Contract — القاعدة الذهبية + الفئات مقفولة ===")
+    check("D1: القاعدة الذهبية موجودة", "ACCEPT فقط إذا وُجد دليل واضح" in SYSTEM_PROMPT)
+    check("D2: عقد JSON موجود", '"decision":"ACCEPT أو REJECT"' in SYSTEM_PROMPT or '"decision"' in SYSTEM_PROMPT)
+    for cat in ACCEPT_CATEGORIES:
+        check(f"D3: فئة ACCEPT مقفولة: {cat}", f'"{cat}"' in SYSTEM_PROMPT)
+    for cat in ("advertisement", "service_offer", "praise_testimonial",
+                "religious_general_content", "non_request_question",
+                "recommendation_or_opinion", "general_discussion"):
+        check(f"D4: فئة REJECT مقفولة: {cat}", f'"{cat}"' in SYSTEM_PROMPT)
+    check("D5: الأمثلة الإلزامية للمُشغّل في الـprompt (مين يعرف دكتور)",
+          "مين يعرف دكتور يشرح رياضيات" in SYSTEM_PROMPT)
+    check("D6: التمييز الحرج (مين أفضل مدرس = REJECT توصية)",
+          "مين أفضل مدرس" in SYSTEM_PROMPT and "recommendation_or_opinion" in SYSTEM_PROMPT)
+    check("D7: الإشارات keyword معلنة كاستدلال مساعد ضعيف",
+          "استدلالًا مساعدًا ضعيفًا" in SYSTEM_PROMPT or "استدلالا مساعدا ضعيفا" in SYSTEM_PROMPT)
+
+
+# ============================================================
+# E. Orchestrator v4.0 — الحالات الإلزامية + الأمان
+# ============================================================
+def section_e():
+    print("\n=== E. Orchestrator v4.0 — الحالات الإلزامية التسع (طلب المُشغّل) ===")
+
+    MANDATORY_REJECT = [
+        "حين يحبك الله يبدل وجه الحياة...",
+        "عندي دكتور يساعد في الرسائل والتكاليف",
+        "تعلم التداول واربح",
+        "شكراً اكتمال جبت درجة عالية",
+        "مين افضل مدرس؟",
+    ]
+    MANDATORY_ACCEPT = [
+        "أحد يشرح لي تفاضل 1",
+        "احتاج شخص يحل معي السؤال",
+        "مين يعرف دكتور يشرح رياضيات؟",
+        "أبي مدرس خصوصي للمادة",
+    ]
+
+    async def run_e():
+        cl = make_scripted_classifier(MANDATORY_SCRIPTS)
+
+        print("  — الإلزامي REJECT (5):")
+        for t in MANDATORY_REJECT:
+            r = await analyze_request_v4(t, cl, threshold=0.85)
+            check(f"E: REJECT «{t[:30]}…»",
+                  r.is_request is False and r.decision_path == "ai",
+                  f"path={r.decision_path} reason={r.reason} cat={r.intent_type}")
+
+        print("  — الإلزامي ACCEPT (4):")
+        for t in MANDATORY_ACCEPT:
+            r = await analyze_request_v4(t, cl, threshold=0.85)
+            check(f"E: ACCEPT «{t[:30]}…»",
+                  r.is_request is True and r.confidence >= 0.85 and r.ai_ok,
+                  f"path={r.decision_path} conf={r.confidence} reason={r.reason}")
+
+        # العتبة الصارمة
+        print("  — العتبة والفشل الآمن:")
+        cl_low = make_scripted_classifier({"تفاضل": _ai_json("ACCEPT", 0.7, "homework_execution_request", "شك")})
+        r = await analyze_request_v4("أحد يشرح لي تفاضل 1", cl_low, threshold=0.85)
+        check("E: ACCEPT بثقة 0.7 < 0.85 → REJECT low_confidence",
+              r.is_request is False and r.reason == "low_confidence", f"reason={r.reason}")
+
+        r = await analyze_request_v4("أحد يشرح لي تفاضل 1", cl_low, threshold=0.65)
+        check("E: عتبة 0.65 → نفس الرسالة مقبولة (العتبة فاعلة)",
+              r.is_request is True, f"conf={r.confidence}")
+
+        # لا keyword fallback — رسالة مليئة بكلمات الطلب لكن AI معطّل
+        r = await analyze_request_v4("محتاج أحد يشرح لي واجبي ويحل معي البحث", None)
+        check("E: AI معطّل → REJECT (لا keyword fallback) — رسالة keyword-heavy",
+              r.is_request is False and r.reason == "ai_classifier_not_configured", f"reason={r.reason}")
+        sig = extract_signals("محتاج أحد يشرح لي واجبي ويحل معي البحث")
+        check("E: الإشارات موجودة لكن لم تقرر (hint فقط)",
+              bool(sig.requester_signals) and bool(sig.execution_signals), "signals empty?!")
+
+        # timeout/error AI → REJECT صارم
+        async def failing(provider, payload):
+            raise RuntimeError("network down")
+        cl_fail = IntentClassifier(providers=[{"key": "k", "url": "u", "model": "m", "name": "P"}],
+                                   transport=failing, max_attempts=1)
+        r = await analyze_request_v4("أحد يشرح لي تفاضل 1", cl_fail)
+        check("E: AI يرمي استثناء → REJECT ai_error",
+              r.is_request is False and r.reason in ("ai_error", "REJECT"), f"reason={r.reason}")
+
+        # malformed AI output → REJECT
+        async def garbage(provider, payload):
+            return 200, json.dumps({"choices": [{"message": {"content": "لا أستطيع التصنيف"}}]})
+        cl_g = IntentClassifier(providers=[{"key": "k", "url": "u", "model": "m", "name": "P"}], transport=garbage)
+        r = await analyze_request_v4("أحد يشرح لي تفاضل 1", cl_g)
+        check("E: مخرجات AI غير JSON → REJECT ai_error (parse failure)",
+              r.is_request is False and r.reason == "ai_error", f"reason={r.reason}")
+
+        # empty
+        r = await analyze_request_v4("", cl)
+        check("E: نص فارغ → REJECT empty", r.is_request is False and r.reason == "empty", f"reason={r.reason}")
+        r = await analyze_request_v4("   ", cl)
+        check("E: فراغات فقط → REJECT empty", r.is_request is False and r.reason == "empty", f"reason={r.reason}")
+
+        # relay wrapper (structural dup)
+        relay_text = "المرسل : أحمد\nالاسم : أبو محمد\nID : 12345\nنص الرساله : أحد يشرح لي تفاضل 1\nرابط الرساله : https://t.me/x/999"
+        r = await analyze_request_v4(relay_text, cl)
+        check("E: غلاف بوت ناقل → REJECT relay_bot_repost_duplicate (قبل AI)",
+              r.is_request is False and r.reason == "relay_bot_repost_duplicate", f"reason={r.reason}")
+
+        # semantic dedup عبر المنسِّق
+        dd = SemanticDeduper(ttl_s=900)
+        r1 = await analyze_request_v4("أحد يشرح لي تفاضل 1", cl, deduper=dd)
+        r2 = await analyze_request_v4("التفاضل لي يشرح أحد", cl, deduper=dd)  # reorder → dup
+        check("E: تكرار دلالي عبر المنسِّق — الثانية REJECT semantic_duplicate",
+              r1.is_request is True and r2.is_request is False
+              and r2.reason == "semantic_duplicate" and r2.dedup_kind in ("semantic", "exact"),
+              f"r2.reason={r2.reason} kind={r2.dedup_kind}")
+
+        # decision logging (in-memory sqlite)
+        logger, conn = await make_logger()
+        r = await analyze_request_v4("أحد يشرح لي تفاضل 1", cl, decision_logger=logger,
+                                     chat_id=-100123, msg_id=555, source_phone="+9665xx")
+        rows = await logger.recent_decisions(10)
+        check("E: القرار مكتوب في filter_decisions",
+              len(rows) == 1 and rows[0]["decision"] == "ACCEPT"
+              and rows[0]["category"] == "homework_execution_request"
+              and rows[0]["chat_id"] == -100123 and rows[0]["message_id"] == 555,
+              str(rows[:1]))
+        check("E: text_hash + preview + model مسجّلة",
+              rows[0]["text_hash"] and rows[0]["text_preview"] and rows[0]["model"] == "mock-70b",
+              str(rows[:1]))
+        await conn.close()
+
+        # to_dict compat (bot.py يقرأها)
+        d = r.to_dict()
+        check("E: to_dict يُرجع حقول v4 + legacy",
+              d["ai_category"] and d["is_request"] is True and "matched_intents" in d and d["version"] == FILTER_VERSION,
+              str(list(d.keys())[:8]))
+
+    asyncio.run(run_e())
+
+
+# ============================================================
+# F. [STAGE 5] filter_store — قاعدة بيانات حقيقية (in-memory)
+# ============================================================
+async def make_logger():
+    import aiosqlite
+    conn = await aiosqlite.connect(":memory:")
+    await conn.execute(FILTER_DECISIONS_SCHEMA)
+    await conn.commit()
+    fake_prod_db = types.SimpleNamespace(_conn=lambda: _return_conn(conn))
+
+    async def _return_conn(c):
+        return c
+    # rebuild with proper async closure
+    async def _conn():
+        return conn
+    fake_prod_db = types.SimpleNamespace(_conn=_conn)
+    logger = DecisionLogger(fake_prod_db)
+    logger._ensured = True  # الجدول أُنشئ يدويًا أعلاه
+    return logger, conn
+
+
+def section_f():
+    print("\n=== F. [STAGE 5] filter_store — filter_decisions ===")
+
+    async def run_f():
+        logger, conn = await make_logger()
+        ok1 = await logger.log_decision(chat_id=-1, message_id=1, raw_text="أحد يشرح لي تفاضل",
+                                        decision="ACCEPT", confidence=0.93,
+                                        category="homework_execution_request",
+                                        reason="طلب شرح", model="m1", latency_ms=120)
+        ok2 = await logger.log_decision(chat_id=-2, message_id=2, raw_text="تعلم التداول",
+                                        decision="REJECT", confidence=0.97,
+                                        category="advertisement", reason="إعلان",
+                                        model="m1", latency_ms=95, dedup_kind="near")
+        ok3 = await logger.log_decision(chat_id=-3, message_id=3, raw_text="مكرر",
+                                        decision="REJECT", confidence=0.0,
+                                        category="duplicate", reason="semantic_duplicate",
+                                        dedup_kind="semantic")
+        check("F1: log_decision يكتب 3 قرارات", ok1 and ok2 and ok3)
+
+        rows = await logger.recent_decisions(2)
+        check("F2: recent_decisions(2) — newest first", len(rows) == 2 and rows[0]["message_id"] == 3, str([r['message_id'] for r in rows]))
+
+        rows_all = await logger.recent_decisions(100)
+        check("F3: كل الحقول محفوظة",
+              all(k in rows_all[0] for k in ("id", "chat_id", "message_id", "text_hash",
+                                             "text_preview", "decision", "confidence",
+                                             "category", "reason", "model", "latency_ms",
+                                             "dedup_kind", "source_phone", "created_at")),
+              str(list(rows_all[0].keys())))
+
+        st = await logger.stats()
+        check("F4: stats — total/accepts/rejects", st["total"] == 3 and st["accepts"] == 1 and st["rejects"] == 2, str(st))
+        check("F5: stats — by_category", st["by_category"].get("advertisement") == 1, str(st["by_category"]))
+        check("F6: stats — by_dedup_kind", st["by_dedup_kind"].get("near") == 1, str(st["by_dedup_kind"]))
+
+        # text_hash consistency مع semantic_dedup fingerprint
+        h1 = text_hash_of("أحد يشرح لي التفاضل")
+        h2 = text_hash_of("أحد يشرح لي التفاضل")  # نفس النص
+        check("F7: text_hash حتمي (نفس النص → نفس الـhash)", h1 == h2 and len(h1) == 32)
+
+        # non-fatal: logger مكسور لا يرمي
+        class BrokenDB:
+            async def _conn(self):
+                raise RuntimeError("db down")
+        broken = DecisionLogger(BrokenDB())
+        ok = await broken.log_decision(raw_text="x", decision="REJECT")
+        check("F8: فشل DB → non-fatal (False، بلا استثناء)", ok is False)
+        rows = await broken.recent_decisions(10)
+        check("F9: فشل DB → قراءة فارغة بلا استثناء", rows == [])
+
+        await conn.close()
+
+    asyncio.run(run_f())
+
+
+# ============================================================
+# G. [STAGE 6] /api/filter_stats endpoint
+# ============================================================
+def section_g():
+    print("\n=== G. [STAGE 6] /api/filter_stats ===")
+
+    async def run_g():
+        import bot as bot_mod
+        from aiohttp import web
+
+        logger, conn = await make_logger()
+        await logger.log_decision(chat_id=-100123, message_id=42, raw_text="أحد يشرح لي تفاضل 1",
+                                  decision="ACCEPT", confidence=0.93,
+                                  category="homework_execution_request", reason="طلب شرح",
+                                  model="mock-70b", latency_ms=110, source_phone="+9665xx")
+
+        cl = make_scripted_classifier(MANDATORY_SCRIPTS)
+        dd = SemanticDeduper()
+        dd.register(tn_normalize("طلب سابق").canonical)
+
+        cfg = types.SimpleNamespace(
+            request_filter_enabled=True,
+            request_filter_ai_threshold=0.85,
+        )
+        monitor = types.SimpleNamespace(
+            config=cfg,
+            request_classifier=cl,
+            _request_semantic_deduper=dd,
+            _request_decision_logger=logger,
+        )
+
+        class FakeRequest:
+            def __init__(self, query=None, app=None):
+                self.query = query or {}
+                self.app = app if app is not None else {"monitor": monitor}
+
+        handler = bot_mod.api_filter_stats_handler
+        resp = await handler(FakeRequest())
+        check("G1: 200 OK", resp.status == 200, f"status={resp.status}")
+        data = json.loads(resp.text)
+        check("G2: filter_version + mode", data.get("filter_version") == "v4.0.0"
+              and data.get("filter_mode") == "ai_intent_classifier", str(data.get("filter_version")))
+        check("G3: آخر القرارات مُعادة", data.get("count") == 1
+              and data["decisions"][0]["decision"] == "ACCEPT", str(data.get("count")))
+        check("G4: حالة الـclassifier الحية", data["ai_classifier"]["enabled"] is True
+              and data["ai_classifier"]["providers"] == 1, str(data.get("ai_classifier")))
+        check("G5: العتبة معروضة", data.get("ai_threshold") == 0.85, str(data.get("ai_threshold")))
+        check("G6: db_stats مجمّعة", data["db_stats"]["accepts"] == 1, str(data.get("db_stats")))
+        check("G7: semantic_dedup stats", "total_seen" in data.get("semantic_dedup", {}), str(data.get("semantic_dedup")))
+
+        # limit param
+        resp2 = await handler(FakeRequest(query={"limit": "1"}))
+        data2 = json.loads(resp2.text)
+        check("G8: ?limit=1 محترم", data2["limit"] == 1 and len(data2["decisions"]) == 1)
+        resp3 = await handler(FakeRequest(query={"limit": "99999"}))
+        data3 = json.loads(resp3.text)
+        check("G9: limit يُقصّ إلى 500", data3["limit"] == 500)
+
+        # no monitor → 503
+        resp4 = await handler(FakeRequest(app={}))
+        check("G10: بلا monitor → 503", resp4.status == 503, f"status={resp4.status}")
+
+        await conn.close()
+
+    asyncio.run(run_g())
+
+
+# ============================================================
+# H. Regression Corpus — corpus v3.0 كامل عبر mock AI
+# ============================================================
+def section_h():
+    print("\n=== H. Regression Corpus (corpus v3.0 عبر mock AI) ===")
+    try:
+        sys.path.insert(0, str(PROJECT_ROOT / "tests"))
+        import test_request_intent_engine as corpus_mod
+    except Exception as e:
+        print(f"  (skipped — corpus غير متاح: {e})")
+        return
+
+    accept_cases = getattr(corpus_mod, "ACCEPT_CASES", [])
+    reject_cases = getattr(corpus_mod, "REJECT_CASES", [])
+    ambiguous = getattr(corpus_mod, "AMBIGUOUS_CASES", [])
+
+    async def run_h():
+        # mock يقرر: corpus ACCEPT → ACCEPT بثقة عالية؛ غير ذلك → REJECT
+        # المفاتيح تُقارن على clean النص (بعد إزالة إيموجي/روابط/التطويل) لأن
+        # المنسّق يمرّر clean للـAI وليس النص الخام.
+        accept_clean = {}
+        for t in accept_cases:
+            accept_clean[tn_normalize(t).clean.strip()] = t
+            accept_clean[t.strip()] = t
+
+        async def corpus_transport(provider, payload):
+            user_msg = payload["messages"][1]["content"]
+            inner = user_msg.split('"""')[-2].strip() if '"""' in user_msg else user_msg.strip()
+            if inner in accept_clean:
+                content = _ai_json("ACCEPT", 0.95, "homework_execution_request", "corpus accept")
+            else:
+                content = _ai_json("REJECT", 0.95, "other", "corpus reject")
+            return 200, json.dumps({"choices": [{"message": {"content": content}}]})
+
+        cl = IntentClassifier(providers=[{"key": "k", "url": "u", "model": "corpus-mock", "name": "Mock"}],
+                              transport=corpus_transport)
+
+        acc_ok = rej_ok = 0
+        for t in accept_cases:
+            r = await analyze_request_v4(t, cl)
+            acc_ok += 1 if r.is_request else 0
+        for t in reject_cases:
+            r = await analyze_request_v4(t, cl)
+            rej_ok += 0 if r.is_request else 1
+        for t in ambiguous:
+            r = await analyze_request_v4(t, cl)
+            rej_ok += 0 if r.is_request else 1
+
+        total = len(accept_cases) + len(reject_cases) + len(ambiguous)
+        check(f"H1: corpus ACCEPT ({len(accept_cases)}) كلها مقبولة عبر السباكة",
+              acc_ok == len(accept_cases), f"{acc_ok}/{len(accept_cases)}")
+        check(f"H2: corpus REJECT+AMBIGUOUS ({len(reject_cases)+len(ambiguous)}) كلها مرفوضة",
+              rej_ok == len(reject_cases) + len(ambiguous),
+              f"{rej_ok}/{len(reject_cases)+len(ambiguous)}")
+        check("H3: corpus كامل عبر v4.0", acc_ok + rej_ok == total, f"{acc_ok+rej_ok}/{total}")
+
+    asyncio.run(run_h())
+
+
+# ============================================================
+# I. Integration — _handle_request_path (Monitor method حقيقية)
+# ============================================================
+def section_i():
+    print("\n=== I. Integration _handle_request_path (Monitor حقيقية + SQLite حقيقية) ===")
+
+    async def run_i():
+        import aiosqlite
+        import bot as bot_mod
+        from request_guard import ContentDeduper, CircuitBreaker
+        from request_guard import RateLimiter as RequestRateLimiter
+
+        # --- in-memory SQLite + ProductionDB ---
+        conn = await aiosqlite.connect(":memory:")
+        await conn.execute(FILTER_DECISIONS_SCHEMA)
+        await conn.commit()
+
+        async def _ensure_conn():
+            return conn
+        db_ns = types.SimpleNamespace(_ensure_conn=_ensure_conn)
+        prod_db = bot_mod.ProductionDB(db_ns)
+
+        # --- config ---
+        cfg = types.SimpleNamespace(
+            journal_enabled=False,
+            requests_target_channel="@dhkskwksjskwk",
+            request_filter_enabled=True,
+            request_filter_max_per_minute=1000,
+            request_filter_max_per_chat_per_minute=1000,
+            request_filter_cb_threshold=10000,
+            request_filter_cb_window_s=600,
+            request_filter_cb_cooldown_s=600,
+            request_filter_ai_threshold=0.85,
+            request_filter_dedup_ttl_s=900,
+        )
+
+        # --- SendMock ---
+        class SendMock:
+            def __init__(self):
+                self.calls = []
+            async def __call__(self, *args, **kwargs):
+                self.calls.append({"target": args[0] if args else None,
+                                   "alert": args[1] if len(args) > 1 else ""})
+            @property
+            def called(self):
+                return len(self.calls) > 0
+        send_mock = SendMock()
+        bot_client = types.SimpleNamespace(is_connected=lambda: True, send_message=send_mock)
+
+        # --- classifier: يقبل طلب الرياضيات ويرفض الإعلان ---
+        cl = make_scripted_classifier(MANDATORY_SCRIPTS)
+
+        fm = types.SimpleNamespace(
+            config=cfg, prod_db=prod_db, bot_client=bot_client,
+            request_classifier=cl,
+            _request_rate_limiter=RequestRateLimiter(max_per_minute=1000, max_per_chat_per_minute=1000),
+            _request_circuit_breaker=CircuitBreaker(threshold=10000),
+            _request_content_deduper=ContentDeduper(ttl_s=600),
+        )
+        fm._handle_request_path = types.MethodType(bot_mod.Monitor._handle_request_path, fm)
+
+        class FakeEvent:
+            def __init__(self, chat_id, msg_id):
+                self.chat_id = chat_id
+                self.id = msg_id
+                self.chat = types.SimpleNamespace(title="مجموعة تجريبية", username=None)
+                self.sender = types.SimpleNamespace(first_name="طالب", last_name="", username=None)
+                self.message = types.SimpleNamespace(date=None)
+
+        # 1) ACCEPT — يُرسل
+        await fm._handle_request_path(FakeEvent(-1009990001, 9001), "أحد يشرح لي تفاضل 1",
+                                      -1009990001, 9001, "+SIM")
+        check("I1: طلب حقيقي (AI ACCEPT) → أُرسل لقناة الطلبات",
+              send_mock.called and send_mock.calls[-1]["target"] == "@dhkskwksjskwk",
+              f"calls={len(send_mock.calls)}")
+        check("I2: نص الطلب موجود في التنبيه", "تفاضل" in (send_mock.calls[-1]["alert"] if send_mock.calls else ""),
+              "")
+
+        # 2) REJECT — لا يُرسل
+        n_before = len(send_mock.calls)
+        await fm._handle_request_path(FakeEvent(-1009990002, 9002), "تعلم التداول واربح",
+                                      -1009990002, 9002, "+SIM")
+        check("I3: إعلان (AI REJECT) → لم يُرسل", len(send_mock.calls) == n_before,
+              f"calls={len(send_mock.calls)}")
+
+        # 3) AI down → لا يرسل أبدًا (لا keyword fallback)
+        fm2_classifier_down = types.SimpleNamespace()  # request_classifier = None below
+        fm.request_classifier = None
+        await fm._handle_request_path(FakeEvent(-1009990003, 9003), "محتاج أحد يحل واجبي",
+                                      -1009990003, 9003, "+SIM")
+        check("I4: AI معطّل → طلب keyword-heavy لم يُرسل (لا fallback)",
+              len(send_mock.calls) == n_before, f"calls={len(send_mock.calls)}")
+        fm.request_classifier = cl
+
+        # 4) duplicate — لا يُرسل مرتين
+        await fm._handle_request_path(FakeEvent(-1009990004, 9004), "مين يعرف دكتور يشرح رياضيات؟",
+                                      -1009990004, 9004, "+SIM")
+        n2 = len(send_mock.calls)
+        await fm._handle_request_path(FakeEvent(-1009990005, 9005), "مين يعرف دكتور يشرح رياضيات؟",
+                                      -1009990005, 9005, "+SIM")
+        check("I5: نفس الطلب بصياغة معاد ترتيبها → semantic dedup منع الإرسال",
+              len(send_mock.calls) == n2, f"calls={len(send_mock.calls)} vs {n2}")
+
+        # 5) filter_decisions كُتبت فعليًا عبر المسار الحقيقي
+        logger = DecisionLogger(prod_db)
+        rows = await logger.recent_decisions(10)
+        check("I6: filter_decisions كُتبت عبر المسار الحقيقي (≥4 قرارات)",
+              len(rows) >= 4, f"rows={len(rows)}")
+        if rows:
+            cats = {r["category"] for r in rows}
+            check("I7: الأسباب كاملة (category + reason + confidence)",
+                  all(r["reason"] for r in rows) and all(isinstance(r["confidence"], float) for r in rows),
+                  str(cats))
+
+        await conn.close()
+
+    asyncio.run(run_i())
+
+
+# ============================================================
+# J. back-compat — sync API أصبح signals-only
+# ============================================================
+def section_j():
+    print("\n=== J. back-compat — sync analyze_request signals-only ===")
+    r = analyze_request("أحد يشرح لي التفاضل")
+    check("J1: sync analyze_request → لا قرار (is_request=False دائمًا)",
+          r.is_request is False and r.reason == "v4_ai_required", f"reason={r.reason}")
+    check("J2: لكن الإشارات مُستخرجة (hints)", len(r.requester_signals) > 0 or len(r.execution_signals) > 0,
+          str(r.requester_signals[:3]))
+    r2 = analyze_request("شكراً اكتمال جبت درجة عالية")
+    check("J3: sync على إعلان → لا قرار + إشارات", r2.is_request is False)
+    from request_filter import is_service_provider, is_request_message
+    check("J4: is_service_provider = إشارة مقدّم (ليست قرارًا)",
+          isinstance(is_service_provider("عندي دكتور يساعد في الرسائل والتكاليف"), bool))
+    ok, d = is_request_message("أحد يشرح لي التفاضل")
+    check("J5: is_request_message → دائمًا (False, dict)", ok is False and isinstance(d, dict))
+
+
+# ============================================================
+# main
+# ============================================================
+def main():
+    print("=" * 70)
+    print(f"Request Intent Engine {FILTER_VERSION} ({FILTER_MODE}) — v4.0 Test Suite")
+    print("=" * 70)
+
+    section_a()
+    section_b()
+    section_c()
+    section_d()
+    section_e()
+    section_f()
+    section_g()
+    section_h()
+    section_i()
+    section_j()
+
+    print("\n" + "=" * 70)
+    print(f"RESULT: {_TOTAL['pass']} pass / {_TOTAL['fail']} fail")
+    if _FAILURES:
+        print("FAILURES:")
+        for name, detail in _FAILURES:
+            print(f"  ✗ {name}  {detail}")
+    print("=" * 70)
+    sys.exit(1 if _TOTAL["fail"] else 0)
+
+
+if __name__ == "__main__":
+    main()

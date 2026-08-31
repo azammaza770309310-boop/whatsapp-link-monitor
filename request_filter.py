@@ -1,60 +1,50 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-request_filter.py — Request Intent Engine v3.1 (Hard-Gated)
+request_filter.py — Request Intent Engine v4.0 (AI-First)
 ============================================================
-إعادة بناء جذرية. ليس Keyword Filter، بل Intent Engine بمراحل قرار
-واضحة (Hard Gates). يحل مشكلة الـ Keyword Filter القديم الذي كان يقبل
-الرسائل لمجرد احتوائها على كلمات مثل «بحث»/«مشروع»/«تقرير»/«شرح»،
-مما سبب آلاف الرسائل الخاطئة.
+إعادة بناء جذرية وفق طلب المُشغّل (v4.0 rebuild): القرار الأساسي من
+مصنّف AI (LLM) — وليس من الكلمات المفتاحية أو Hard Gates.
 
-الهدف الحقيقي: التقاط الأشخاص الذين يطلبون من شخص آخر تنفيذ خدمة
-أكاديمية لهم أو مساعدتهم مباشرة في إنجاز عمل أكاديمي.
-لا يكفي وجود كلمة أكاديمية. كلمة خدمة منفردة = REJECT دائمًا.
+المعمارية (المراحل):
+  المرحلة 1  text_normalizer.normalize — تنظيف أولي (إيموجي/روابط/توقيعات/
+             تكرار) مع الاحتفاظ بالسياق + canonical للـhashing.
+  المرحلة 2  تصنيف النية: فئات ACCEPT (tutoring_request,
+             homework_execution_request) مقابل 8 فئات REJECT (إعلانات،
+             عروض خدمات، مدح، ديني/عام، أسئلة غير طلب، توصيات، نقاش، أخرى).
+  المرحلة 3  intent_classifier.IntentClassifier — نداء LLM (نفس مزوّدي
+             AIAnalyzer: Groq/OpenAI-compat/Gemini-compat) بعقد JSON صارم:
+             {decision, confidence, category, reason}.
+             ACCEPT فقط إذا confidence >= 0.85 (REQUEST_FILTER_AI_THRESHOLD).
+             فشل AI (لا مفاتيح/timeout/parse) = REJECT صارم — لا keyword
+             fallback أبدًا.
+  المرحلة 4  semantic_dedup.SemanticDeduper — منع التكرار الدلالي
+             (exact + semantic-hash + Jaccard near-dup) خلال TTL قصير.
+  المرحلة 5  filter_store.DecisionLogger — جدول filter_decisions يحفظ كل
+             قرار (id, message_id, text_hash, decision, confidence,
+             category, reason, timestamp + تشخيصات) — لماذا قُبل/رُفض.
+  المرحلة 6  /api/filter_stats (bot.py) — آخر 100 قرار + إحصاءات.
 
-Hard Gates (بالتسلسل — لا تراكم نقاط للوصول للقبول):
-  GATE 1  provider/advertisement؟                  → REJECT provider_ad
-  GATE 2  info/resource/long-content WITHOUT
-          person+execution؟                          → REJECT (information_request
-                                                       | resource_seeking
-                                                       | long_informational_content)
-  GATE 3  شخص مطلوب + علاقة تنفيذ؟                  → continue (else REJECT no_person_executor)
-  GATE 4  خدمة أكاديمية (أو فعل implies خدمة)؟      → continue (else REJECT no_academic_service)
-  GATE 5  long informational override                → REJECT long_informational_content
-  GATE 6                                          → ACCEPT (service_execution_request
-                                                       | person_for_academic_help)
+دور الكلمات المفتاحية في v4.0: demoted إلى extract_signals() — تُنتج
+إشارات (hints) تُمرَّر للـAI كاستدلال مساعد ضعيف فقط + تشخيصات تُسجَّل.
+لا يوجد أي مسار يحوّل الكلمات إلى قرار قبول/رفض.
 
-النتيجة التشخيصية RequestAnalysis.to_dict():
-  {
-    "accepted": bool,
-    "confidence": float 0-1,
-    "intent_type": str,
-    "service": str|None,
-    "requester_signals": [...],
-    "service_signals": [...],
-    "execution_signals": [...],
-    "rejection_signals": [...],
-    "reason": str,
-    # legacy compat (bot.py)
-    "is_request": bool,
-    "matched_intents": [...], "matched_services": [...], "matched_patterns": [...],
-    "seeker_confidence": int, "provider_confidence": int,
-  }
+بوابات هيكلية (ليست تصنيفًا لغويًا): empty / relay-bot wrapper (نسخة
+مكررة من بوت ناقل). dedup دلالي قبل نداء AI (توفير تكلفة).
 
-مبادئ صارمة:
-  - SERVICE وحده = REJECT دائمًا («بحث»، «عندي بحث»، «البحث صعب»).
-  - لا تراكم كلمات للقبول (لا «شرح+اختبار+بحث = 9 نقاط»). Hard Gates أولاً.
-  - default = REJECT عند الغموض.
-  - info/resource/recommendation = REJECTION signals (إلا مع person+execution).
-  - المسار مستقل: Link Extractor → CHANNEL_ID لا يُلمس. Capture-First محفوظ.
+الواجهة الأساسية: async analyze_request_v4(text, classifier, ...) →
+RequestAnalysis (is_request = AI-ACCEPT + confidence ≥ threshold).
+
+توافق خلفي: analyze_request (sync) أصبح signals-only بلا قرار — أي
+استخدام له كقرار نهائي هو خطأ معماري (reason=v4_ai_required).
 """
 
 import re
 from dataclasses import dataclass, field
 from typing import List, Tuple, Dict, Any, Optional
 
-FILTER_VERSION = "v3.2.0"
-FILTER_MODE = "intent_engine_hard_gates"
+FILTER_VERSION = "v4.0.0"
+FILTER_MODE = "ai_intent_classifier"
 
 
 # ============================================================
@@ -1019,18 +1009,36 @@ def _match_exec_verbs(pairs, normalized: str) -> List[str]:
 # ============================================================
 # RequestAnalysis — نتيجة تشخيصية كاملة + توافق خلفي مع bot.py
 # ============================================================
+# RequestAnalysis — نتيجة v4.0 (AI-first) + توافق خلفي مع bot.py
+# ============================================================
 @dataclass
 class RequestAnalysis:
-    """نتيجة تحليل Intent Engine. تشخيصية كاملة + متوافقة خلفيًا."""
+    """نتيجة تحليل v4.0. القرار من الـAI (أو رفض صارم عند فشله).
 
-    # --- Core decision (new) ---
+    v4 core:
+      accepted/is_request = (AI decision == ACCEPT) AND (confidence >= threshold)
+      أي فشل/غموض/غياب AI = REJECT. لا قرار من الكلمات المفتاحية أبدًا.
+    legacy fields (matched_*, seeker/provider_confidence) تبقى كتشخيص
+    إشارات فقط (تُستخدم في alert التنسيق والسجلات).
+    """
+
+    # --- v4 core decision ---
     accepted: bool = False
-    confidence: float = 0.0
-    intent_type: str = "low_confidence"
-    service: Optional[str] = None
-    reason: str = "low_confidence"
+    confidence: float = 0.0          # ثقة الـAI (0..1)
+    threshold: float = 0.85          # عتبة القبول المطبَّقة
+    decision_path: str = ""          # ai | semantic_dedup | relay_wrapper | empty | no_classifier
+    ai_ok: bool = False              # هل اكتمل نداء AI بنجاح
+    ai_decision: str = ""            # ACCEPT | REJECT (خام من النموذج)
+    ai_category: str = ""
+    ai_reason: str = ""
+    ai_model: str = ""
+    ai_provider: str = ""
+    ai_latency_ms: int = 0
+    ai_error: str = ""
+    dedup_kind: str = ""             # exact | semantic | near
+    text_hash: str = ""
 
-    # --- Diagnostic signal lists ---
+    # --- diagnostic signal lists (hints — ليست قرارًا) ---
     requester_signals: List[str] = field(default_factory=list)
     execution_signals: List[str] = field(default_factory=list)
     service_signals: List[str] = field(default_factory=list)
@@ -1038,15 +1046,18 @@ class RequestAnalysis:
     ad_signals: List[str] = field(default_factory=list)
     rejection_signals: List[str] = field(default_factory=list)
 
-    # --- Contact / obfuscation diagnostics ---
+    # --- contact / obfuscation diagnostics ---
     has_phone: bool = False
     has_contact_url: bool = False
     has_at_handle: bool = False
     has_dotted_word: bool = False
     has_many_lines: bool = False
 
-    # --- Legacy compat (populated for bot.py logs) ---
+    # --- legacy compat (bot.py logs + alert formatting) ---
     is_request: bool = False
+    intent_type: str = "unclassified"
+    service: Optional[str] = None
+    reason: str = "unclassified"
     matched_intents: List[str] = field(default_factory=list)
     matched_services: List[str] = field(default_factory=list)
     matched_patterns: List[str] = field(default_factory=list)
@@ -1056,25 +1067,36 @@ class RequestAnalysis:
     has_question_form: bool = False
 
     def to_dict(self) -> Dict[str, Any]:
-        """Compatibility + diagnostic dict."""
-        # backward-compat: advertisement_matches includes ad_signals + tags
+        """v4 + legacy diagnostic dict (logs + /api/filter_stats)."""
         extra_ad = []
         if self.has_dotted_word:
             extra_ad.append("(dotted_word_obfuscation)")
         if self.has_many_lines:
             extra_ad.append("(multi_line_six_plus)")
-        ad_matches = self.ad_signals + extra_ad
         return {
-            # new diagnostic
+            # v4 core
+            "version": FILTER_VERSION,
             "accepted": self.accepted,
             "confidence": self.confidence,
+            "threshold": self.threshold,
+            "decision_path": self.decision_path,
+            "ai_ok": self.ai_ok,
+            "ai_decision": self.ai_decision,
+            "ai_category": self.ai_category,
+            "ai_reason": self.ai_reason,
+            "ai_model": self.ai_model,
+            "ai_latency_ms": self.ai_latency_ms,
+            "ai_error": self.ai_error,
+            "dedup_kind": self.dedup_kind,
+            "text_hash": self.text_hash,
+            "reason": self.reason,
             "intent_type": self.intent_type,
-            "service": self.service,
+            # signal diagnostics
             "requester_signals": self.requester_signals,
             "service_signals": self.service_signals,
             "execution_signals": self.execution_signals,
+            "provider_signals": self.provider_signals,
             "rejection_signals": self.rejection_signals,
-            "reason": self.reason,
             # legacy (bot.py reads these)
             "is_request": self.is_request,
             "matched_intents": self.matched_intents,
@@ -1083,8 +1105,7 @@ class RequestAnalysis:
             "matched_indicators": self.matched_indicators,
             "seeker_confidence": self.seeker_confidence,
             "provider_confidence": self.provider_confidence,
-            "provider_signals": self.provider_signals,
-            "advertisement_matches": ad_matches,
+            "advertisement_matches": self.ad_signals + extra_ad,
             "has_question_form": self.has_question_form,
             "has_phone": self.has_phone,
             "has_contact_url": self.has_contact_url,
@@ -1095,403 +1116,412 @@ class RequestAnalysis:
 
 
 # ============================================================
-# Hard-Gated Intent Engine
+# SignalReport — استخراج الإشارات (الكلمات المفتاحية «demoted»)
 # ============================================================
-def analyze_request(text: str) -> RequestAnalysis:
-    """يحلل الرسالة عبر Hard Gates ويرجع RequestAnalysis تشخيصية كاملة.
+@dataclass
+class SignalReport:
+    """إشارات لغوية مستخرجة آليًا — تُمرَّر للـAI كـhints مساعدة فقط.
 
-    قرار القبول (accepted=True) يتطلب:
-      - NOT provider/ad (Gate 1)
-      - NOT info/resource/long-content WITHOUT person+execution (Gate 2)
-      - NOT recommendation WITHOUT strong execution (Gate 2.5)
-      - person + execution relationship (Gate 3)
-      - academic service OR exec-implies-service (Gate 4)
-      - NOT long informational override (Gate 5)
-    أي فشل في Gate = REJECT. default = REJECT عند الغموض.
+    القاعدة الصريحة (طلب المُشغّل): الكلمات إشارة، ليست حكمًا. لا يوجد أي
+    مسار في v4.0 يحوّل هذه الإشارات إلى قرار قبول/رفض.
     """
-    res = RequestAnalysis()
 
+    person_signals: List[str] = field(default_factory=list)
+    requester_signals: List[str] = field(default_factory=list)
+    execution_signals: List[str] = field(default_factory=list)
+    ownership_signals: List[str] = field(default_factory=list)
+    service_signals: List[str] = field(default_factory=list)
+    provider_signals: List[str] = field(default_factory=list)
+    ad_signals: List[str] = field(default_factory=list)
+    info_signals: List[str] = field(default_factory=list)
+    resource_signals: List[str] = field(default_factory=list)
+    recommend_signals: List[str] = field(default_factory=list)
+    outsource_signals: List[str] = field(default_factory=list)
+    delegation_signals: List[str] = field(default_factory=list)
+    role_signals: List[str] = field(default_factory=list)
+    ready_made_signals: List[str] = field(default_factory=list)
+    contact_info_signals: List[str] = field(default_factory=list)
+    decision_signals: List[str] = field(default_factory=list)
+    person_status_signals: List[str] = field(default_factory=list)
+    plural_noun_signals: List[str] = field(default_factory=list)
+
+    has_phone: bool = False
+    has_contact_url: bool = False
+    has_at_handle: bool = False
+    has_dotted_word: bool = False
+    has_many_lines: bool = False
+    has_question_form: bool = False
+
+    normalized: str = ""
+
+    def to_hints(self, max_per_list: int = 5) -> Dict[str, Any]:
+        """hints مضغوطة للـAI prompt (bounded — لا نرسل قوائم ضخمة)."""
+        def _b(lst: List[str]) -> List[str]:
+            return lst[:max_per_list]
+        return {
+            "person_words": _b(self.person_signals),
+            "requester_phrases": _b(self.requester_signals),
+            "execution_verbs": _b(self.execution_signals),
+            "academic_services": _b(self.service_signals),
+            "provider_phrases": _b(self.provider_signals),
+            "ad_phrases": _b(self.ad_signals),
+            "rejection_hints": _b(
+                self.info_signals + self.resource_signals
+                + self.recommend_signals + self.contact_info_signals
+                + self.decision_signals + self.person_status_signals),
+            "contact": {
+                "has_phone": self.has_phone,
+                "has_contact_url": self.has_contact_url,
+                "has_at_handle": self.has_at_handle,
+                "many_lines": self.has_many_lines,
+            },
+        }
+
+
+def extract_signals(text: str) -> SignalReport:
+    """[v4.0] يستخرج كل الإشارات اللغوية من النص — بلا أي قرار.
+
+    هذا هو محرّك الكلمات المفتاحية القديم (v3.2.0) بعد خفض رتبته:
+    كان يقرر القبول/الرفض عبر Hard Gates؛ الآن يُنتج hints فقط
+    تُمرَّر للـAI (المرحلة 2/3) وتُسجَّل للتشخيص (المرحلة 5).
+    """
+    rep = SignalReport()
+    if not text or not text.strip():
+        return rep
+
+    normalized = normalize_text(text)
+    rep.normalized = normalized
+
+    rep.person_signals = _match_pairs(_PERSON_PAIRS, normalized)
+    rep.requester_signals = _match_pairs(_REQUESTER_PAIRS, normalized)
+    rep.execution_signals = _match_exec_verbs(_EXEC_PAIRS, normalized)
+    rep.ownership_signals = _match_pairs(_OWNERSHIP_PAIRS, normalized)
+    rep.service_signals = _match_pairs(_SERVICE_PAIRS, normalized)
+    rep.provider_signals = _match_pairs(_PROVIDER_PAIRS, normalized)
+    rep.ad_signals = _match_pairs(_AD_PAIRS, normalized)
+    rep.info_signals = _match_pairs(_INFO_PAIRS, normalized)
+    rep.resource_signals = _match_pairs(_RESOURCE_PAIRS, normalized)
+    rep.recommend_signals = _match_pairs(_RECOMMEND_PAIRS, normalized)
+    rep.outsource_signals = _match_pairs(_OUTSOURCE_PAIRS, normalized)
+    rep.delegation_signals = _match_pairs(_DELEGATION_PAIRS, normalized)
+    rep.role_signals = _match_pairs(_ROLE_PAIRS, normalized)
+    rep.ready_made_signals = _match_pairs(_READY_MADE_PAIRS, normalized)
+    rep.contact_info_signals = _match_pairs(_CONTACT_INFO_PAIRS, normalized)
+    rep.decision_signals = _match_pairs(_DECISION_PAIRS, normalized)
+    rep.person_status_signals = _match_pairs(_PERSON_STATUS_PAIRS, normalized)
+    rep.plural_noun_signals = _match_plural_noun(_PLURAL_NOUN_PAIRS, normalized)
+
+    rep.has_phone = _has_phone_number(text)
+    rep.has_contact_url = _has_contact_url(text)
+    rep.has_at_handle = _has_at_handle(text)
+    rep.has_dotted_word = _has_dotted_word(text)
+    rep.has_many_lines = _has_many_lines(text)
+    rep.has_question_form = (
+        '؟' in text or '?' in text
+        or bool(rep.requester_signals) or bool(rep.person_signals)
+    )
+    return rep
+
+
+# ============================================================
+# [v4.0] Structural duplicate gates (ليست تصنيفًا دلاليًا)
+# ============================================================
+_RELAY_WRAPPER_KEYS = ("نص الرساله", "نص الرسالة")
+_RELAY_WRAPPER_KEYS2 = ("رابط الرساله", "رابط الرسالة", "المرسل")
+
+
+def _is_relay_wrapper(canonical: str, raw_text: str) -> bool:
+    """[منقول من v3.2.0 Gate 0] كشف نسخ البوتات الناقلة (relay reposts).
+
+    البوت الناقل يُعيد نشر الرسائل بصيغة غلاف ثابتة:
+    «المرسل : ...\nالاسم : ...\nID ...\nنص الرساله : ...\nرابط الرساله : https://t.me/...»
+    هذه نسخة مكررة من الأصل (الذي عُوِّل من مصدره) → REJECT هيكلي قبل
+    نداء AI (يوفر التكلفة). هذا كشف بنية، ليس تصنيف نية بكلمات مفتاحية.
+    """
+    t = canonical or normalize_text(raw_text or "")
+    if not t:
+        return False
+    has_body = any(k in t for k in _RELAY_WRAPPER_KEYS)
+    has_meta = any(k in t for k in _RELAY_WRAPPER_KEYS2)
+    return bool(has_body and has_meta)
+
+
+def _provider_confidence_int(sig: SignalReport) -> int:
+    """[legacy diagnostic] نقاط provider كتشخيص فقط (لا يقرر شيئًا في v4).
+    نفس معادلة v3.2.0 (بما فيها bonus التشويش بالنقاط) — للتوافق التشخيصي."""
+    prov = len(sig.provider_signals) * 4 + min(len(sig.ad_signals), 3) * 2
+    if sig.has_at_handle:
+        prov += 3
+    if sig.has_phone and sig.has_at_handle:
+        prov += 4
+    if (sig.has_phone or sig.has_contact_url or sig.has_at_handle) and prov > 0:
+        prov += 1
+    if sig.has_dotted_word:
+        prov += 2
+    if sig.has_many_lines:
+        prov += 1
+    return prov
+
+
+def _seeker_confidence_int(sig: SignalReport, accepted: bool, ai_conf: float) -> int:
+    """[legacy diagnostic] نسبة طلب 0-100 للتشخيص فقط."""
+    if accepted:
+        return int(round(min(0.99, ai_conf) * 100))
+    base = 0
+    if sig.requester_signals:
+        base += 40
+    if sig.person_signals and sig.execution_signals:
+        base += 20
+    if sig.service_signals:
+        base += 10
+    return min(base, 70)
+
+
+# ============================================================
+# v4.0 Orchestrator — المراحل 1→2/3→4→5
+# ============================================================
+async def analyze_request_v4(
+    text: str,
+    classifier=None,
+    *,
+    chat_id: int = 0,
+    msg_id: int = 0,
+    source_phone: str = "",
+    decision_logger=None,
+    deduper=None,
+    threshold: float = 0.85,
+) -> RequestAnalysis:
+    """يحلل الرسالة عبر Intent Classification Engine v4.0.
+
+    المسار:
+      المرحلة 1  text_normalizer.normalize → clean (للـAI) + canonical (للـhash)
+      بوابات هيكلية: empty / relay-wrapper (نسخة بوت ناقل مكررة)
+      المرحلة 4  semantic dedup pre-check → REJECT duplicate (يوفر نداء AI)
+      المرحلة 2/3 AI classify (clean + hints من extract_signals) → JSON قرار
+      العتبة      ACCEPT فقط إذا confidence >= threshold (default 0.85)
+      المرحلة 4  register البصمة (كل رسالة صُنِّفت)
+      المرحلة 5  log_decision (non-fatal)
+
+    الفشل دائمًا REJECT: لا AI / timeout / parse error / low confidence =
+    REJECT بأسباب صريحة (ai_unavailable / ai_error / low_confidence).
+    لا يوجد أي مسار قرار بالكلمات المفتاحية.
+    """
+    from text_normalizer import normalize as _normalize_stage1
+    from filter_store import text_hash_of
+
+    res = RequestAnalysis(threshold=threshold)
+
+    # ---- بوابة 0: نص فارغ ----
     if not text or not text.strip():
         res.reason = "empty"
         res.intent_type = "empty"
+        res.decision_path = "empty"
+        await _log_decision_safe(decision_logger, text or "", res, chat_id, msg_id, source_phone)
         return res
 
-    # ===== GATE 0: relay-bot repost detection =====
-    # [v3.2.0] NEW. Production duplicate-posting forensic: the same request
-    # arrived TWICE at the requests channel — once from the original group
-    # and once from a third-party relay bot group that reposts messages in
-    # the wrapper format «المرسل : ...\nالاسم : ...\nID ...\nنص الرساله : ...
-    # رابط الرساله : https://t.me/...». The content-hash dedup can't catch
-    # these (wrapper changes the hash). Since the ORIGINAL message is
-    # already processed from its source group, the relay copy is a duplicate
-    # by definition → hard REJECT before all other gates.
-    _t_norm0 = normalize_text(text)
-    if _t_norm0 and (
-        ("نص الرساله" in _t_norm0 or "نص الرسالة" in _t_norm0)
-        and ("رابط الرساله" in _t_norm0 or "رابط الرسالة" in _t_norm0
-             or "المرسل" in _t_norm0)
-    ):
-        res.accepted = False
-        res.is_request = False
-        res.intent_type = "relay_repost"
-        res.reason = "relay_bot_repost_duplicate"
-        res.confidence = 0.01
-        res.seeker_confidence = 0
-        return res
-
-    normalized = _t_norm0
-    if not normalized:
+    # ---- المرحلة 1: تنظيف أولي ----
+    nt = _normalize_stage1(text)
+    if not nt.clean or not nt.clean.strip():
         res.reason = "empty_after_normalize"
         res.intent_type = "empty"
+        res.decision_path = "empty"
+        res.text_hash = text_hash_of(text)
+        await _log_decision_safe(decision_logger, text, res, chat_id, msg_id, source_phone)
+        return res
+    res.text_hash = text_hash_of(text)
+
+    # ---- بوابات هيكلية: relay-wrapper (نسخة بوت ناقل) ----
+    if _is_relay_wrapper(nt.canonical, text):
+        res.reason = "relay_bot_repost_duplicate"
+        res.intent_type = "relay_repost"
+        res.decision_path = "relay_wrapper"
+        res.confidence = 0.01
+        await _log_decision_safe(decision_logger, text, res, chat_id, msg_id, source_phone)
         return res
 
-    # ===== Signal detection =====
-    person_tokens = _match_pairs(_PERSON_PAIRS, normalized)
-    requester_phrases = _match_pairs(_REQUESTER_PAIRS, normalized)
-    exec_verbs = _match_exec_verbs(_EXEC_PAIRS, normalized)
-    ownership = _match_pairs(_OWNERSHIP_PAIRS, normalized)
-    services = _match_pairs(_SERVICE_PAIRS, normalized)
-    provider_sigs = _match_pairs(_PROVIDER_PAIRS, normalized)
-    ad_sigs = _match_pairs(_AD_PAIRS, normalized)
-    plural_nouns = _match_plural_noun(_PLURAL_NOUN_PAIRS, normalized)
-    info_sigs = _match_pairs(_INFO_PAIRS, normalized)
-    resource_sigs = _match_pairs(_RESOURCE_PAIRS, normalized)
-    recommend_sigs = _match_pairs(_RECOMMEND_PAIRS, normalized)
-    outsource_sigs = _match_pairs(_OUTSOURCE_PAIRS, normalized)
-    delegation_verbs = _match_pairs(_DELEGATION_PAIRS, normalized)
-    role_tokens = _match_pairs(_ROLE_PAIRS, normalized)
-    ready_made = _match_pairs(_READY_MADE_PAIRS, normalized)
+    # ---- المرحلة 4 (pre): semantic dedup ----
+    if deduper is not None and nt.canonical:
+        dup = deduper.check(nt.canonical)
+        if dup.is_dup:
+            res.reason = "semantic_duplicate"
+            res.intent_type = "duplicate"
+            res.decision_path = "semantic_dedup"
+            res.dedup_kind = dup.kind
+            res.confidence = 0.0
+            await _log_decision_safe(
+                decision_logger, text, res, chat_id, msg_id, source_phone,
+                dedup_kind=dup.kind)
+            return res
 
-    # requester = explicit person phrase OR (person word + execution in same msg)
-    # OR (person word + delegation verb — «أبي أوكل أحد»)
-    has_requester = bool(requester_phrases) or (
-        bool(person_tokens) and bool(exec_verbs)
-    ) or (bool(person_tokens) and bool(delegation_verbs))
-    has_execution = bool(exec_verbs) or bool(delegation_verbs)
-    # [v3.1.0] Expanded ownership: also detect possessive suffix on service nouns
-    # ("واجبي" = my homework) as ownership signal. This catches requests
-    # like «تعرف أحد يحل واجبي» (no explicit «أبي»/«محتاج» but possessive
-    # «واجبي» implies ownership) as legitimate service-execution.
-    has_service_possessive = _has_service_with_possessive(normalized)
-    has_ownership = bool(ownership) or has_service_possessive
-    # [v3.1.0] Tightened role_implies_service: was `role_tokens AND ownership`,
-    # now requires `role_tokens AND ownership AND (services OR exec_verbs)`,
-    # OR `role_tokens AND outsource_sigs` (like «مدرس خصوصي» = private tutor).
-    # This prevents FPs like «ابي رقم الدكتوره» (ownership «ابي» + role «دكتور»
-    # but NO service term/exec) from ACCEPTing as service-execution request.
-    # The outsource variant handles «أبي مدرس خصوصي للمادة» (no exec verb,
-    # no service term, but «خصوصي» = private tutoring indicator).
-    role_implies_service = bool(role_tokens) and (
-        (has_ownership and (bool(services) or bool(exec_verbs)))
-        or bool(outsource_sigs)
-    )
-    # [v3.1.0] New REJECTION signals (Gate 1.5)
-    contact_info_sigs = _match_pairs(_CONTACT_INFO_PAIRS, normalized)
-    decision_sigs = _match_pairs(_DECISION_PAIRS, normalized)
-    person_status_sigs = _match_pairs(_PERSON_STATUS_PAIRS, normalized)
+    # ---- استخراج الإشارات (hints — demoted keyword engine) ----
+    sig = extract_signals(text)
 
-    # contact / obfuscation
-    res.has_phone = _has_phone_number(text)
-    res.has_contact_url = _has_contact_url(text)
-    res.has_at_handle = _has_at_handle(text)
-    res.has_dotted_word = _has_dotted_word(text)
-    res.has_many_lines = _has_many_lines(text)
-
-    # populate diagnostic lists
-    res.requester_signals = requester_phrases + person_tokens
-    res.execution_signals = exec_verbs
-    res.service_signals = services
-    res.provider_signals = provider_sigs
-    res.ad_signals = ad_sigs
+    # ---- بوابات تشخيصية على الإشارات (fill legacy fields للتنبيهات) ----
+    res.requester_signals = sig.requester_signals + sig.person_signals
+    res.execution_signals = sig.execution_signals
+    res.service_signals = sig.service_signals
+    res.provider_signals = sig.provider_signals
+    res.ad_signals = sig.ad_signals
     res.rejection_signals = (
-        info_sigs + resource_sigs + recommend_sigs
-        + contact_info_sigs + decision_sigs + person_status_sigs
+        sig.info_signals + sig.resource_signals + sig.recommend_signals
+        + sig.contact_info_signals + sig.decision_signals + sig.person_status_signals
     )
-    # legacy
     res.matched_intents = res.requester_signals
-    res.matched_services = services
-    res.matched_patterns = exec_verbs
-    res.matched_indicators = ownership
+    res.matched_services = sig.service_signals
+    res.matched_patterns = sig.execution_signals
+    res.matched_indicators = sig.ownership_signals
+    res.has_phone = sig.has_phone
+    res.has_contact_url = sig.has_contact_url
+    res.has_at_handle = sig.has_at_handle
+    res.has_dotted_word = sig.has_dotted_word
+    res.has_many_lines = sig.has_many_lines
+    res.has_question_form = sig.has_question_form
+    res.provider_confidence = _provider_confidence_int(sig)
+    res.service = _classify_service(sig.normalized, sig.execution_signals)
 
-    # has_question_form (legacy)
-    res.has_question_form = (
-        '؟' in text or '?' in text
-        or has_requester
-    )
-
-    # provider_confidence (legacy int scale)
-    prov_int = len(provider_sigs) * 4 + min(len(ad_sigs), 3) * 2
-    if res.has_at_handle:
-        prov_int += 3
-    if res.has_phone and res.has_at_handle:
-        prov_int += 4
-    if (res.has_phone or res.has_contact_url or res.has_at_handle) and prov_int > 0:
-        prov_int += 1
-    if res.has_dotted_word:
-        prov_int += 2
-    if res.has_many_lines:
-        prov_int += 1
-    res.provider_confidence = prov_int
-
-    # ===== GATE 1: provider / advertisement =====
-    # Strong provider = first-person plural OR provider phrase OR ad signal
-    # Weak provider plural = first-person singular verb + plural service noun
-    #   (أسوي بحوث / أحل واجبات = commercial offering)
-    has_strong_provider = bool(
-        [p for p in provider_sigs if normalize_text(p) in {
-            normalize_text(x) for x in (
-                "نوفر", "نقدم", "نقدم خدمات", "لدينا خدمات", "لدينا",
-                "خدماتنا", "نخدمكم", "نخدم", "نسوي", "نعمل", "ننجز",
-                "نساعدكم", "نساعدكم في", "نشتغل", "نرتب", "نصمم", "نحل",
-                "نكتب", "نجهز", "نشرح", "نراجع", "مكتبنا", "فريقنا",
-                "ننجز لك", "متخصص في", "متخصصون", "متخصصون في",
-                "مختص في", "مختصون", "للتواصل لحل", "للتواصل",
-                "تواصل معنا", "راسلنا", "تواصل خاص", "للطلب", "للحجز",
-                "للاستفسار", "للاستفسارات", "للحجز والاستفسار",
-                "مكتب", "مؤسسة", "منشة",
-            )
-        }]
-    )
-    has_ad = bool(ad_sigs)
-    has_provider_weak_plural = bool(plural_nouns) and any(
-        normalize_text(p) in {
-            normalize_text(x) for x in (
-                "أسوي", "اسوي", "أعمل", "اعمل", "أنجز", "انجز",
-                "أحل", "احل", "أكتب", "اكتب", "أصمم", "اصمم",
-                "أشرح", "اشرح", "أجهز", "اجهز", "أرتب", "ارتب",
-                "أكمل", "اكمل", "أنفذ", "انفذ",
-            )
-        }
-        for p in provider_sigs
-    )
-
-    if has_strong_provider or has_ad or has_provider_weak_plural:
-        res.accepted = False
-        res.is_request = False
-        res.intent_type = "provider_ad"
-        res.reason = "provider_detected"
-        res.confidence = 0.02
-        res.seeker_confidence = 0
-        res.service = _classify_service(normalized, exec_verbs)
+    # ---- المرحلة 2/3: AI Intent Classification (القرار الأساسي) ----
+    if classifier is None:
+        # لا مصنِّف (لا مفاتيح AI) → REJECT صارم. لا keyword fallback.
+        res.reason = "ai_classifier_not_configured"
+        res.intent_type = "ai_unavailable"
+        res.decision_path = "no_classifier"
+        res.ai_category = "ai_unavailable"
+        res.ai_reason = "no AI providers configured (REQUEST_FILTER cannot accept without AI)"
+        res.seeker_confidence = _seeker_confidence_int(sig, False, 0.0)
+        await _log_decision_safe(decision_logger, text, res, chat_id, msg_id, source_phone)
         return res
 
-    # ===== GATE 1.5: contact-info / decision / person-status seeking =====
-    # [v3.1.0] NEW. These are REJECTION signals that fire BEFORE Gate 2
-    # because they indicate the message is asking for:
-    #   - contact info ("ابي رقم الدكتوره" / "ايميل الاستاذ") — NOT service exec
-    #   - decision advice ("اداوم ولا؟" / "يمديني اسويه ولا لازم اخلي") — NOT service
-    #   - person status info ("طالب يدرس بالتمريض" / "يدرس او تخرج") — NOT service
-    # Even if other gates would ACCEPT, these phrases override → REJECT.
-    # Exception: NONE — these are pure REJECTION signals (no service-execution
-    # interpretation possible). If a request also has these phrases, it's
-    # still asking for info/advice/status, not service execution.
-    if contact_info_sigs or decision_sigs or person_status_sigs:
-        res.accepted = False
-        res.is_request = False
-        # Distinguish the dominant rejection reason for diagnostics
-        if contact_info_sigs:
-            res.intent_type = "contact_info_seeking"
-            res.reason = "contact_info_or_person_lookup_not_service_execution"
-            res.confidence = 0.04
-        elif decision_sigs:
-            res.intent_type = "decision_seeking"
-            res.reason = "decision_or_advice_seeking_not_service_execution"
-            res.confidence = 0.04
-        else:
-            res.intent_type = "person_status_seeking"
-            res.reason = "person_status_inquiry_not_service_execution"
-            res.confidence = 0.04
-        res.seeker_confidence = 1
-        res.service = _classify_service(normalized, exec_verbs)
+    decision = await classifier.classify(nt.clean, hints=sig.to_hints())
+    res.ai_ok = decision.ok
+    res.ai_decision = decision.decision
+    res.confidence = decision.confidence
+    res.ai_category = decision.category
+    res.ai_reason = decision.reason
+    res.ai_model = decision.model
+    res.ai_provider = decision.provider_name
+    res.ai_latency_ms = decision.latency_ms
+    res.ai_error = decision.error
+
+    # ---- المرحلة 4 (register): كل رسالة صُنِّفت تُسجَّل بصمتها ----
+    if deduper is not None and nt.canonical:
+        deduper.register(nt.canonical)
+
+    # ---- القرار + العتبة ----
+    if not decision.ok:
+        # فشل AI (timeout/error/parse) → REJECT صارم بأسباب صريحة
+        res.reason = decision.category or "ai_error"
+        res.intent_type = decision.category or "ai_error"
+        res.decision_path = "ai"
+        res.seeker_confidence = _seeker_confidence_int(sig, False, 0.0)
+        await _log_decision_safe(decision_logger, text, res, chat_id, msg_id, source_phone)
         return res
 
-    # ===== GATE 2: info / resource / long-content WITHOUT person+execution =====
-    # [v3.0] READY_MADE_INDICATORS (جاهز/معد) + service + no exec → resource seeking
-    long_info = _detect_long_informational(text, normalized)
-    has_person_exec = has_requester and has_execution
-    ready_made_resource = bool(ready_made) and bool(services) and not has_execution
+    accepted = (decision.decision == "ACCEPT") and (decision.confidence >= threshold)
 
-    if (info_sigs or resource_sigs or long_info or ready_made_resource) and not has_person_exec:
-        res.accepted = False
-        res.is_request = False
-        if long_info:
-            res.intent_type = "long_informational_content"
-            res.reason = "long_informational_content_no_person_executor"
-            res.confidence = 0.04
-        elif ready_made_resource:
-            res.intent_type = "resource_seeking"
-            res.reason = "ready_made_resource_not_service_execution"
-            res.confidence = 0.05
-        elif info_sigs:
-            res.intent_type = "information_request"
-            res.reason = "asking_for_information_not_service_execution"
-            res.confidence = 0.06
-        else:
-            res.intent_type = "resource_seeking"
-            res.reason = "resource_seeking_not_service_execution"
-            res.confidence = 0.05
-        res.seeker_confidence = 0
-        res.service = _classify_service(normalized, exec_verbs)
-        return res
-
-    # ===== GATE 2.5: recommendation WITHOUT strong execution =====
-    # «افضل واحد يشرح الماده» = يطلب توصية، لا يطلب شخصًا ينفذ له.
-    # نرفض إلا لو وجد ownership + service + exec (طلب تنفيذ قوي).
-    # [v3.1.0] Uses has_ownership (expanded with possessive suffix detection)
-    # so that «تعرف أحد يحل واجبي» (no explicit «أبي»/«محتاج» but has «واجبي»
-    # = my homework → has_ownership=True) is NOT rejected as recommendation.
-    # [v3.2.0] TIGHTENED the second bypass clause: was (outsource_sigs AND
-    # exec_verbs) — production FP #4 «تعرفون احد يشرح كيمياء عضويه او خصوصي؟»
-    # bypassed the recommendation rejection because «خصوصي» (private, an
-    # outsource indicator added in v3.1.0 for the «مدرس خصوصي» role path)
-    # counted as "outsourcing". خصوصي is NOT a beneficiary marker. The bypass
-    # now requires a real BENEFICIARY marker (لي/لى/معي/عني...) — the request
-    # must say the service is FOR THE ASKER: «من يشرح **لي** المادة» ✓,
-    # «من يشرح لي ويحل معي» ✓, «... او خصوصي؟» ✗ (no for-me marker).
-    _beneficiary_markers = (
-        outsource_sigs
-        and bool(set(outsource_sigs) & {
-            "لي", "لى", "ليا", "معي", "معيا", "عني", "ني",
-            "بدلي", "بدالى", "بدليا",
-        })
-    )
-    if recommend_sigs and not (
-        (has_ownership and services and exec_verbs)
-        or (_beneficiary_markers and bool(exec_verbs))
-    ):
-        res.accepted = False
-        res.is_request = False
-        res.intent_type = "recommendation_seeking"
-        res.reason = "recommendation_or_tips_request_not_service_execution"
-        res.confidence = 0.08
-        res.seeker_confidence = 1
-        res.service = _classify_service(normalized, exec_verbs)
-        return res
-
-    # ===== GATE 3: person + execution relationship =====
-    # (a) requester AND exec verb
-    # (b) strong requester phrase AND service AND (outsource OR role)
-    #     — «من عنده شخص مضمون للمشاريع» (مضمون=outsource) / «أبي مدرس خصوصي» (مدرس=role)
-    # (c) requester AND service AND outsourcing indicator (e.g. «له/لي/عني»)
-    # (d) [v3.1.0 TIGHTENED] professional role + ownership + (exec OR service OR
-    #     outsource OR delegation). Was: role + ownership alone → caused FPs like
-    #     «ابي رقم الدكتوره» (ownership «ابi» + role «دكتور» but asking for
-    #     contact info). Now requires additional exec/service/outsource/delegation
-    #     to ensure the message actually requests service execution.
-    # (e) delegation verb + person + ownership  (e.g. «أبي أوكل أحد بالمهمة»)
-    # note: option (b) tightened in v3.0 — «أبي حد بحث» (no outsource/role) → REJECT.
-    has_person_exec_relationship = (
-        (has_requester and has_execution)
-        or (bool(requester_phrases) and bool(services)
-            and (bool(outsource_sigs) or bool(role_tokens)))
-        or (has_requester and bool(services) and bool(outsource_sigs))
-        or (bool(role_tokens) and has_ownership
-            and (bool(exec_verbs) or bool(services)
-                 or bool(outsource_sigs) or bool(delegation_verbs)))
-        or (bool(delegation_verbs) and bool(person_tokens) and has_ownership)
-    )
-    if not has_person_exec_relationship:
-        res.accepted = False
-        res.is_request = False
-        # distinguish reason
-        if not services and not has_requester and not has_execution:
-            res.intent_type = "casual_talk"
-            res.reason = "no_academic_intent"
-            res.confidence = 0.01
-        elif services and not has_requester and not has_execution:
-            res.intent_type = "service_mention_only"
-            res.reason = "service_word_without_person_or_executor"
-            res.confidence = 0.03
-        else:
-            res.intent_type = "low_confidence"
-            res.reason = "no_person_executor_relationship"
-            res.confidence = 0.05
-        res.seeker_confidence = 1
-        res.service = _classify_service(normalized, exec_verbs)
-        return res
-
-    # ===== GATE 4: academic service (or exec/delegation/role implies service) =====
-    exec_implies = any(
-        normalize_text(ev) in EXEC_IMPLIES_SERVICE for ev in exec_verbs
-    ) or bool(delegation_verbs) or role_implies_service
-    if not services and not exec_implies:
-        res.accepted = False
-        res.is_request = False
-        res.intent_type = "low_confidence"
-        res.reason = "no_academic_service"
-        res.confidence = 0.10
-        res.seeker_confidence = 2
-        res.service = None
-        return res
-
-    # ===== GATE 5: long informational override =====
-    # حتى لو فحصنا person+exec+service، لو النص طويل معلوماتي وليس
-    # طلبًا قصيرًا صريحًا → REJECT.
-    # [v3.1.0] Uses has_ownership (expanded with possessive suffix detection).
-    if long_info and not (has_ownership and services and has_execution):
-        res.accepted = False
-        res.is_request = False
-        res.intent_type = "long_informational_content"
-        res.reason = "long_informational_content_override"
-        res.confidence = 0.07
-        res.seeker_confidence = 2
-        res.service = _classify_service(normalized, exec_verbs)
-        return res
-
-    # ===== GATE 6: ACCEPT =====
-    res.service = _classify_service(normalized, exec_verbs)
-    # confidence scoring (0-1)
-    # [v3.1.0] Uses has_ownership (expanded with possessive suffix detection)
-    # so that «تعرف أحد يحل واجبي» gets the ownership bonus (has «واجبي»=my).
-    conf = 0.45
-    if has_requester:
-        conf += 0.15
-    if has_execution:
-        conf += 0.15
-    if services:
-        conf += 0.15
-    if has_ownership:
-        conf += 0.05
-    if len(services) >= 2:
-        conf += 0.03
-    if exec_implies and services:
-        conf += 0.05
-    if has_person_exec and services and has_ownership:
-        conf += 0.07  # explicit execution request bonus
-    conf = min(conf, 0.99)
-
-    # intent_type
-    if services and has_execution and has_requester:
-        res.intent_type = "service_execution_request"
-        res.reason = "explicit_request_for_person_to_execute_service"
-    elif exec_implies and has_requester:
-        res.intent_type = "person_for_academic_help"
-        res.reason = "request_for_person_to_provide_academic_help"
+    if accepted:
+        res.accepted = True
+        res.is_request = True
+        res.decision_path = "ai"
+        res.intent_type = decision.category
+        res.reason = decision.reason
+        res.seeker_confidence = _seeker_confidence_int(sig, True, decision.confidence)
     else:
-        res.intent_type = "service_execution_request"
-        res.reason = "service_execution_request"
+        res.accepted = False
+        res.is_request = False
+        res.decision_path = "ai"
+        res.intent_type = decision.category
+        if decision.decision == "ACCEPT" and decision.confidence < threshold:
+            res.reason = "low_confidence"
+        else:
+            res.reason = decision.reason
+        res.seeker_confidence = _seeker_confidence_int(sig, False, decision.confidence)
 
-    res.accepted = True
-    res.is_request = True
-    res.confidence = round(conf, 2)
-    res.seeker_confidence = int(round(conf * 100))
+    await _log_decision_safe(decision_logger, text, res, chat_id, msg_id, source_phone)
     return res
 
 
+async def _log_decision_safe(decision_logger, text: str, res: "RequestAnalysis",
+                             chat_id: int, msg_id: int, source_phone: str,
+                             dedup_kind: str = "") -> None:
+    """المرحلة 5: كتابة القرار في filter_decisions — non-fatal دائمًا."""
+    if decision_logger is None:
+        return
+    try:
+        await decision_logger.log_decision(
+            chat_id=chat_id,
+            message_id=msg_id,
+            raw_text=text or "",
+            decision="ACCEPT" if res.accepted else "REJECT",
+            confidence=res.confidence,
+            category=(res.intent_type or res.reason or "")[:64],
+            reason=(res.reason or "")[:200],
+            model=(res.ai_model or "")[:64],
+            latency_ms=res.ai_latency_ms,
+            dedup_kind=dedup_kind or res.dedup_kind,
+            source_phone=source_phone,
+        )
+    except Exception:
+        # فشل التشخيص لا يكسر المسار أبدًا
+        pass
+
+
 # ============================================================
-# Legacy wrappers (backward compat — bot.py & tests)
+# Backward-compat sync wrappers — إشارات فقط، ليست قرارًا
 # ============================================================
+def analyze_request(text: str) -> RequestAnalysis:
+    """[DEPRECATED in v4.0] الواجهة القديمة (تزامنية بلا AI).
+
+    في v4.0 القرار الأساسي يصدر عن الـAI فقط (analyze_request_v4 async).
+    هذه الدالة تُعيد تقرير الإشارات بلا قرار: is_request=False دائمًا
+    وreason=v4_ai_required. محفوظة لتوافق الاستيرادات القديمة —
+    أي استخدام لها كقرار نهائي هو خطأ معماري.
+    """
+    res = RequestAnalysis()
+    if not text or not text.strip():
+        res.reason = "v4_ai_required"
+        res.intent_type = "empty"
+        return res
+    sig = extract_signals(text)
+    res.requester_signals = sig.requester_signals + sig.person_signals
+    res.execution_signals = sig.execution_signals
+    res.service_signals = sig.service_signals
+    res.provider_signals = sig.provider_signals
+    res.ad_signals = sig.ad_signals
+    res.rejection_signals = (
+        sig.info_signals + sig.resource_signals + sig.recommend_signals
+        + sig.contact_info_signals + sig.decision_signals + sig.person_status_signals
+    )
+    res.matched_intents = res.requester_signals
+    res.matched_services = sig.service_signals
+    res.matched_patterns = sig.execution_signals
+    res.matched_indicators = sig.ownership_signals
+    res.has_phone = sig.has_phone
+    res.has_contact_url = sig.has_contact_url
+    res.has_at_handle = sig.has_at_handle
+    res.has_dotted_word = sig.has_dotted_word
+    res.has_many_lines = sig.has_many_lines
+    res.has_question_form = sig.has_question_form
+    res.provider_confidence = _provider_confidence_int(sig)
+    res.reason = "v4_ai_required"
+    res.intent_type = "signals_only_no_decision"
+    return res
+
+
 def is_service_seeker(text: str) -> bool:
-    """هل الرسالة طالب خدمة؟ قرار analyze_request."""
-    return analyze_request(text).is_request
+    """[v4.0 — signal helper] هل توجد إشارات طالب خدمة؟ (ليست قرارًا)."""
+    return bool(analyze_request(text).requester_signals)
 
 
 def is_service_provider(text: str) -> bool:
-    """هل الرسالة مقدم خدمة؟ (provider/ad detected)."""
-    return analyze_request(text).intent_type == "provider_ad"
+    """[v4.0 — signal helper] هل توجد إشارات مقدّم خدمة/إعلان؟ (ليست قرارًا)."""
+    rep = analyze_request(text)
+    return bool(rep.provider_signals or rep.ad_signals)
 
 
 def is_request_message(text: str) -> Tuple[bool, Dict[str, Any]]:
-    """Compatibility wrapper للواجهة القديمة. يُرجع (is_request, info_dict)."""
+    """[DEPRECATED in v4.0] compatibility wrapper — يُرجع دائمًا (False, dict).
+
+    القرار الفعلي: await analyze_request_v4(text, classifier, ...).
+    """
     res = analyze_request(text)
-    return res.is_request, res.to_dict()
+    return False, res.to_dict()

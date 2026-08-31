@@ -54,9 +54,39 @@ logging.disable(logging.CRITICAL)
 import bot  # noqa: E402
 from request_filter import (  # noqa: E402
     analyze_request, is_service_seeker, is_service_provider,
-    normalize_text, FILTER_VERSION,
+    normalize_text, FILTER_VERSION, analyze_request_v4,
     _has_dotted_word, _has_many_lines,
 )
+from intent_classifier import IntentClassifier  # noqa: E402
+from text_normalizer import normalize as tn_normalize  # noqa: E402
+import json as _json  # noqa: E402
+
+
+def _ai_json(decision, confidence, category, reason):
+    return _json.dumps({"decision": decision, "confidence": confidence,
+                        "category": category, "reason": reason}, ensure_ascii=False)
+
+
+def make_scripted_v4_classifier(accept_texts, default_reject=("REJECT", 0.93, "other", "ليس طلبًا")):
+    """[v4.0] transport مُبرمَج: القرار المرجعي للنصوص المعروفة (كما يجب أن
+    يقرر الـLLM). يُستخدم لإثبات أن السباكة كاملة تُطبّق قرار الـAI."""
+    scripts = {}
+    for t in accept_texts:
+        scripts[tn_normalize(t).clean.strip()] = _ai_json(
+            "ACCEPT", 0.93, "homework_execution_request", "طلب مساعدة أكاديمية")
+    default = _ai_json(*default_reject)
+
+    async def transport(provider, payload):
+        user_msg = payload["messages"][1]["content"]
+        inner = user_msg.split('"""')[-2].strip() if '"""' in user_msg else user_msg.strip()
+        if inner in scripts:
+            content = scripts[inner]
+        else:
+            content = default
+        return 200, _json.dumps({"choices": [{"message": {"content": content}}]})
+
+    return IntentClassifier(providers=[{"key": "k", "url": "u", "model": "mock-v4", "name": "Mock"}],
+                             transport=transport)
 from request_guard import RateLimiter, CircuitBreaker, ContentDeduper  # noqa: E402
 
 RESULTS = []
@@ -73,8 +103,10 @@ def record(name, passed, detail=""):
 # =========================================================================
 # A. analyze_request — ACCEPT / REJECT / provider / seeker+contact
 # =========================================================================
-def test_section_A():
-    print("\n=== A. analyze_request ACCEPT/REJECT ===")
+async def test_section_A():
+    print("\n=== A. analyze_request_v4 (AI-first) ACCEPT/REJECT ===")
+    # v4.0: القرار من الـAI — نُبرمج transport بالتصنيف المرجعي (كما يقرر
+    # LLM مُدرَّب) ونتحقق أن السباكة تُطبّق القرار بالعتبة والرفض الصارم.
     ACCEPT = [
         "من يسوي لي بحث؟", "أبي أحد يحل لي واجب",
         "مين يعرف أحد يسوي بوربوينت؟", "عندي مشروع تخرج وأحتاج أحد ينجزه",
@@ -103,35 +135,54 @@ def test_section_A():
     ]
     PROVIDER = ["أسوي بحوث وتقارير", "أحل واجبات", "نوفر مشاريع تخرج"]
 
-    a_ok = all(analyze_request(t).is_request for t in ACCEPT)
-    r_ok = all(not analyze_request(t).is_request for t in REJECT)
-    ad_ok = all(not analyze_request(t).is_request for t in REJECT_AD)
-    sc_ok = all(analyze_request(t).is_request for t in SEEKER_CONTACT)
-    pv_ok = all(not analyze_request(t).is_request for t in PROVIDER)
+    cl = make_scripted_v4_classifier(ACCEPT + SEEKER_CONTACT)
+
+    async def _ok(texts, want_accept):
+        for t in texts:
+            r = await analyze_request_v4(t, cl)
+            if r.is_request != want_accept:
+                return False
+        return True
+
+    a_ok = await _ok(ACCEPT, True)
+    r_ok = await _ok(REJECT, False)
+    ad_ok = await _ok(REJECT_AD, False)
+    sc_ok = await _ok(SEEKER_CONTACT, True)
+    pv_ok = await _ok(PROVIDER, False)
+
+    # AI down → strict reject (no keyword fallback) على نص keyword-heavy
+    nf = not (await analyze_request_v4("أبي أحد يحل لي واجب", None)).is_request
+    # low confidence → reject
+    cl_low = make_scripted_v4_classifier([], default_reject=("ACCEPT", 0.7, "homework_execution_request", "شك"))
+    lc = not (await analyze_request_v4("من يسوي لي بحث؟", cl_low)).is_request
+    # critical single words
+    crit = ["عندي مشروع", "عندي واجب", "أحتاج مساعدة", "بحث", "مشروع"]
+    c_ok = await _ok(crit, False)
+
     record("ACCEPT (10 real requests)", a_ok)
     record("REJECT (13 general/single-word)", r_ok)
     record("REJECT-AD (6 provider/ads)", ad_ok)
     record("SEEKER+phone/url accepted (2)", sc_ok)
     record("PROVIDER rejected (3)", pv_ok)
-    # critical single words
-    crit = ["عندي مشروع", "عندي واجب", "أحتاج مساعدة", "بحث", "مشروع"]
-    c_ok = all(not analyze_request(t).is_request for t in crit)
+    record("v4: AI down → strict REJECT (no keyword fallback)", nf)
+    record("v4: ACCEPT conf 0.7 < 0.85 → REJECT low_confidence", lc)
     record("CRITICAL: «عندي مشروع»/«بحث»/«مشروع» alone REJECT", c_ok)
-    # seeker/provider helpers consistency
+    # seeker/provider helpers consistency (signals in v4 — ليست قرارًا)
     seeker_msg = "من يسوي لي بحث؟"
     provider_msg = "نوفر حل واجبات بأسعار"
-    se = is_service_seeker(seeker_msg)                       # True
+    se = is_service_seeker(seeker_msg)                       # True (signals)
     se_not_pv = not is_service_provider(seeker_msg)          # True
-    pv = is_service_provider(provider_msg)                   # True
+    pv = is_service_provider(provider_msg)                   # True (signals)
     pv_not_se = not is_service_seeker(provider_msg)          # True
-    record("seeker/provider distinction", se and se_not_pv and pv and pv_not_se)
-    return a_ok and r_ok and ad_ok and sc_ok and pv_ok and c_ok and se and se_not_pv and pv and pv_not_se
+    record("seeker/provider signal distinction (v4: hints)", se and se_not_pv and pv and pv_not_se)
+    return (a_ok and r_ok and ad_ok and sc_ok and pv_ok and c_ok
+            and se and se_not_pv and pv and pv_not_se and nf and lc)
 
 
 # =========================================================================
 # B. Arabic normalization robustness
 # =========================================================================
-def test_section_B():
+async def test_section_B():
     print("\n=== B. Arabic normalization ===")
     # أبي/ابي (أ→ا) should normalize equal
     n1 = normalize_text("أبي أحد يحل لي واجب")
@@ -146,10 +197,17 @@ def test_section_B():
     record("tatweel stripped", normalize_text("منـــ يسوي") == "من يسوي")
     # lowercase english
     record("Excel≈excel (lowercase)", normalize_text("Excel") == "excel")
-    # both forms of intent accept
-    r1 = analyze_request("أبي أحد يسوي لي بحث").is_request
-    r2 = analyze_request("ابي احد يسوي لي بحث").is_request
-    record("both أبي/ابي forms ACCEPT", r1 and r2)
+    # both forms of intent accept — عبر v4 pipeline (mock AI مُبرمَج بالتطبيع)
+    cl_b = make_scripted_v4_classifier([
+        "أبي أحد يسوي لي بحث", "ابي احد يسوي لي بحث",
+    ])
+
+    async def run_b():
+        r1 = (await analyze_request_v4("أبي أحد يسوي لي بحث", cl_b)).is_request
+        r2 = (await analyze_request_v4("ابي احد يسوي لي بحث", cl_b)).is_request
+        return r1 and r2
+
+    record("both أبي/ابي forms ACCEPT (v4)", await run_b())
     return all(r['passed'] for r in RESULTS[-7:])
 
 
@@ -252,7 +310,7 @@ def test_section_E():
 # =========================================================================
 # G. mbot.py ported heuristics — dotted-word obfuscation + multi-line ad
 # =========================================================================
-def test_section_G():
+async def test_section_G():
     print("\n=== G. mbot.py ported heuristics ===")
     # ---- _has_dotted_word helper ----
     record("dotted: ت.قرير detected", _has_dotted_word("ت.قرير"))
@@ -281,22 +339,21 @@ def test_section_G():
     record("multi-line: None-safe (no raise)",
            not _has_many_lines(None))
 
-    # ---- analyze_request: dotted word boosts provider confidence ----
-    # Case 1: ad with dotted words + provider indicators → REJECT provider_detected
-    #   "مكتبنا يقدم خدمات طلابية ت.قرير و.اجب باسعار مناسبة"
-    #   provider_signals: مكتبنا?, يقدم?, services طلابية + خدمات?
+    # ---- v4.0: الإشارات التشخيصية (لا قرار من الكلمات) ----
+    # Case 1: ad with dotted words + provider indicators → provider SIGNALS
+    # تُستخرج (hints للـAI + تشخيص) — القرار نفسه من الـAI فقط.
     r1 = analyze_request("مكتبنا يقدم خدمات طلابية ت.قرير و.اجب باسعار مناسبة")
-    record("dotted ad: REJECT provider_detected",
-           (not r1.is_request) and r1.reason == "provider_detected")
-    record("dotted ad: has_dotted_word=True",
+    record("dotted ad: v4 no keyword decision (is_request=False)",
+           not r1.is_request)
+    record("dotted ad: has_dotted_word=True (signal)",
            r1.has_dotted_word is True)
-    record("dotted ad: provider_confidence >= 6",
+    record("dotted ad: provider_confidence >= 6 (signal)",
            r1.provider_confidence >= 6)
 
-    # Case 2: same ad WITHOUT dotted words → still REJECT (provider indicators alone)
+    # Case 2: same ad WITHOUT dotted words → provider signals still detected
     r2 = analyze_request("مكتبنا يقدم خدمات طلابية تقرير وواجب باسعار مناسبة")
-    record("ad no-dots: REJECT provider_detected",
-           (not r2.is_request) and r2.reason == "provider_detected")
+    record("ad no-dots: v4 no keyword decision (is_request=False)",
+           not r2.is_request)
     record("ad no-dots: has_dotted_word=False",
            r2.has_dotted_word is False)
     # dotted version should have HIGHER provider_confidence than non-dotted
@@ -314,9 +371,9 @@ def test_section_G():
         "احجز الآن قبل نفاد المقاعد"
     )
     r3 = analyze_request(multi_ad)
-    record("multi-line ad: REJECT provider_detected",
-           (not r3.is_request) and r3.reason == "provider_detected")
-    record("multi-line ad: has_many_lines=True",
+    record("multi-line ad: v4 no keyword decision (is_request=False)",
+           not r3.is_request)
+    record("multi-line ad: has_many_lines=True (signal)",
            r3.has_many_lines is True)
     record("multi-line ad: provider_confidence >= 6",
            r3.provider_confidence >= 6)
@@ -333,15 +390,17 @@ def test_section_G():
         "تكفون تساعدوني"
     )
     r4 = analyze_request(genuine_multi)
-    # Note: this genuine request has strong_pattern "ابي احد يسوي بحث" or similar
-    # AND has intent phrase "محتاج مساعدة" + service "بحث"/"مشروع تخرج"
-    # Multi-line +1 should NOT cause rejection (still ACCEPT because provider < 6)
-    record("multi-line genuine: still ACCEPT",
-           r4.is_request,
-           f"reason={r4.reason} provider={r4.provider_confidence}")
-    record("multi-line genuine: has_many_lines=True",
+    # v4: القرار عبر الـAI — نمرّر النص نفسه عبر pipeline بمصنّف مُبرمَج
+    # (قرار الـLLM الصحيح: طلب حقيقي) ونتأكد أن الإشارات متعددة الأسطر
+    # (weak hint) لا تمنع القبول.
+    cl_g = make_scripted_v4_classifier([genuine_multi])
+
+    record("multi-line genuine: still ACCEPT (v4 pipeline)",
+           (await analyze_request_v4(genuine_multi, cl_g)).is_request,
+           f"signals: provider={r4.provider_confidence}")
+    record("multi-line genuine: has_many_lines=True (signal)",
            r4.has_many_lines is True)
-    record("multi-line genuine: provider_confidence < 6",
+    record("multi-line genuine: provider_confidence < 6 (signal)",
            r4.provider_confidence < 6)
 
     # ---- to_dict exposes new fields ----
@@ -443,8 +502,26 @@ def make_fm(prod_db=None, channel_id=-1001234567890,
     bot_client.is_connected = MagicMock(return_value=True)
     bot_client.send_message = send_mock
 
+    # [v4.0] مصنّف AI مُحاكى: نصوص هذه السيناريوهات المعروفة تقرر كما يجب
+    # أن يقرر LLM صحيح (طلبات واجب/بحث → ACCEPT؛ عروض/عام → REJECT).
+    _REQUEST_PAT = ("يسوي لي", "يحل لي واجب", "أبي أحد", "يساعدني في", "يعرف أحد")
+
+    async def _v4_transport(provider, payload):
+        user_msg = payload["messages"][1]["content"]
+        inner = user_msg.split('"""')[-2] if '"""' in user_msg else user_msg
+        if any(p in inner for p in _REQUEST_PAT):
+            content = _ai_json("ACCEPT", 0.93, "homework_execution_request", "طلب مساعدة")
+        else:
+            content = _ai_json("REJECT", 0.95, "other", "ليس طلبًا")
+        return 200, _json.dumps({"choices": [{"message": {"content": content}}]})
+
+    request_classifier = IntentClassifier(
+        providers=[{"key": "k", "url": "u", "model": "mock-v4", "name": "Mock"}],
+        transport=_v4_transport)
+
     fm = types.SimpleNamespace(
         config=cfg, prod_db=prod_db, message_claim=None,
+        request_classifier=request_classifier,
         _msg_cache={}, _msg_cache_lock=asyncio.Lock(),
         metrics=types.SimpleNamespace(
             record_skip=AsyncMock(), record_duplicate=AsyncMock(),
@@ -537,8 +614,11 @@ async def test_section_F():
     # F7. Rate limit (per-chat): max_per_chat=2 → 3rd blocked
     fm = make_fm(max_per_chat=2, max_per_minute=100)
     chat = -100555000222
-    for i in range(3):
-        ev = FakeEvent(f"من يسوي لي بحث رقم {i}", chat, 9100 + i,
+    # [v4] نصوص مختلفة دلاليًا — حتى يمنع الـrate limiter (وليس semantic dedup)
+    f7_texts = ["من يسوي لي بحث تخرج؟", "أبي أحد يحل لي واجب الرياضيات",
+                "من يجهز لي عرض تقديمي؟"]
+    for i, txt in enumerate(f7_texts):
+        ev = FakeEvent(txt, chat, 9100 + i,
                        sender=FakeSender(first_name=f"U{i}"), chat=FakeChat())
         await fm._handle_request_path(ev, ev.raw_text, chat, ev.id, '9665')
     results.append(("per-chat rate limit: 3rd blocked (2 sent)",
@@ -546,8 +626,11 @@ async def test_section_F():
 
     # F8. Circuit breaker: threshold=2 → 3rd blocked, link path unaffected
     fm = make_fm(cb_threshold=2, cb_cooldown=600, max_per_minute=100, max_per_chat=100)
-    for i in range(3):
-        ev = FakeEvent(f"أبي أحد يحل واجب رقم {i}", -100555000333, 9200 + i,
+    # [v4] نصوص مختلفة دلاليًا — حتى يفصل الـcircuit breaker (وليس semantic dedup)
+    f8_texts = ["أبي أحد يحل واجب الفيزياء", "أبي أحد ينجز مشروع التخرج",
+                "أبي أحد يشرح لي الإحصاء"]
+    for i, txt in enumerate(f8_texts):
+        ev = FakeEvent(txt, -100555000333, 9200 + i,
                        sender=FakeSender(first_name=f"U{i}"), chat=FakeChat())
         await fm._handle_request_path(ev, ev.raw_text, ev.chat_id, ev.id, '9665')
     results.append(("circuit breaker: 3rd blocked (2 sent)", fm._send_mock.call_count == 2))
@@ -625,12 +708,12 @@ async def main():
     print("=" * 72)
     print(f"REQUEST FILTER {FILTER_VERSION} — Comprehensive Test Suite")
     print("=" * 72)
-    a = test_section_A()
-    b = test_section_B()
+    a = await test_section_A()
+    b = await test_section_B()
     c = test_section_C()
     d = test_section_D()
     e = test_section_E()
-    g = test_section_G()
+    g = await test_section_G()
     f = await test_section_F()
     print("\n" + "=" * 72)
     total = len(RESULTS)

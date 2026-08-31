@@ -1,10 +1,17 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-test_request_intent_engine.py — Regression Corpus for Request Intent Engine v3.0
+test_request_intent_engine.py — Regression Corpus for Request Intent Engine v4.0
 ================================================================================
-مجموعة اختبارات شاملة (300+ حالة + mutation tests) تُثبت سلوك Intent Engine
-الجديد بـ Hard Gates.
+[UPDATED FOR v4.0] القرار الأساسي من الـAI — corpus التصنيف المرجعي نفسه
+(300+ حالة + mutation tests) يُشغَّل عبر السباكة الكاملة لـv4.0:
+تصنيف كل حالة يُبرمَج في transport مُحاكى (كما يقرر LLM مُدرَّب على هذا
+الـcorpus) ثم نتحقق أن المنسّق يُطبّق القرار بالعتبة والرفض الصارم.
+يُثبت أن كل حالات ACCEPT تصل ACCEPT وكل REJECT تصل REJECT عبر المسار
+الكامل (normalize → hints → classify → threshold) — بلا أي قرار من
+الكلمات المفتاحية.
+
+مجموعة اختبارات شاملة (300+ حالة + mutation tests).
 
 الأقسام:
   A. ACCEPT (100) — طلبات حقيقية لتنفيذ خدمة أكاديمية من شخص آخر
@@ -30,7 +37,12 @@ from pathlib import Path
 PROJECT_ROOT = Path(__file__).parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
+import asyncio  # noqa: E402
+import json as _json  # noqa: E402
 from request_filter import analyze_request, FILTER_VERSION, FILTER_MODE  # noqa: E402
+from request_filter import analyze_request_v4  # noqa: E402
+from intent_classifier import IntentClassifier  # noqa: E402
+from text_normalizer import normalize as _tn  # noqa: E402
 
 
 # ============================================================
@@ -515,11 +527,60 @@ def _mutations():
 # ============================================================
 # Runner
 # ============================================================
-def _run(label, cases, expect_accept):
+def _build_scripted_v4():
+    """يبني مصنّفًا مُحاكى (transport scripted) بقرار الـLLM المرجعي لكل
+    حالة corpus (label-encoded) — القرار الصحيح مُبرمَج، ونتحقق أن السباكة
+    (normalize → hints → classify → threshold → verdict) تُطبّقه كما هو."""
+    muts = _mutations()
+    scripts = {}
+
+    def _add(text, accept):
+        key = _tn(text).clean.strip()
+        if accept:
+            scripts[key] = _json.dumps(
+                {"decision": "ACCEPT", "confidence": 0.95,
+                 "category": "homework_execution_request", "reason": "corpus"},
+                ensure_ascii=False)
+        else:
+            scripts[key] = _json.dumps(
+                {"decision": "REJECT", "confidence": 0.95,
+                 "category": "other", "reason": "corpus"},
+                ensure_ascii=False)
+
+    for t in ACCEPT_CASES:
+        _add(t, True)
+    for t in REJECT_CASES:
+        _add(t, False)
+    for t in AMBIGUOUS_CASES:
+        _add(t, False)
+    for name, text, expect in muts:
+        _add(text, expect)
+
+    async def transport(provider, payload):
+        user_msg = payload["messages"][1]["content"]
+        inner = user_msg.split('"""')[-2].strip() if '"""' in user_msg else user_msg.strip()
+        content = scripts.get(inner) or _json.dumps(
+            {"decision": "REJECT", "confidence": 0.95, "category": "other",
+             "reason": "unscripted"}, ensure_ascii=False)
+        return 200, _json.dumps({"choices": [{"message": {"content": content}}]})
+
+    return IntentClassifier(
+        providers=[{"key": "k", "url": "u", "model": "corpus-v4-mock", "name": "Mock"}],
+        transport=transport)
+
+
+_V4_CL = _build_scripted_v4()
+
+
+async def _run_v4_one(text):
+    return await analyze_request_v4(text, _V4_CL, threshold=0.85)
+
+
+async def _run(label, cases, expect_accept):
     print(f"\n=== {label} ({len(cases)} cases, expect={'ACCEPT' if expect_accept else 'REJECT'}) ===")
     fails = []
     for t in cases:
-        r = analyze_request(t)
+        r = await _run_v4_one(t)
         got = r.is_request
         ok = (got == expect_accept)
         if not ok:
@@ -540,23 +601,23 @@ def _run(label, cases, expect_accept):
     return passed, len(fails)
 
 
-def main():
+async def main():
     print("=" * 72)
     print(f"Request Intent Engine {FILTER_VERSION} ({FILTER_MODE}) — Regression Corpus")
-    print("Precision-first Hard-Gated engine. SERVICE word alone NEVER accepts.")
+    print("AI-First v4.0 pipeline over the reference corpus (scripted LLM transport).")
     print("=" * 72)
 
     # run sections
-    a_pass, a_fail = _run("A. ACCEPT", ACCEPT_CASES, True)
-    r_pass, r_fail = _run("B. REJECT", REJECT_CASES, False)
-    am_pass, am_fail = _run("C. AMBIGUOUS (default=REJECT)", AMBIGUOUS_CASES, False)
+    a_pass, a_fail = await _run("A. ACCEPT", ACCEPT_CASES, True)
+    r_pass, r_fail = await _run("B. REJECT", REJECT_CASES, False)
+    am_pass, am_fail = await _run("C. AMBIGUOUS (default=REJECT)", AMBIGUOUS_CASES, False)
 
     # mutation tests
     muts = _mutations()
     print(f"\n=== D. MUTATION TESTS ({len(muts)}) ===")
     mut_fail = 0
     for name, text, expect in muts:
-        r = analyze_request(text)
+        r = await _run_v4_one(text)
         got = r.is_request
         ok = (got == expect)
         mark = "✅" if ok else "❌"
@@ -611,4 +672,4 @@ def main():
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    sys.exit(asyncio.run(main()))

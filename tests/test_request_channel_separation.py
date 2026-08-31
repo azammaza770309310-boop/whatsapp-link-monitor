@@ -71,6 +71,40 @@ os.environ.setdefault('REQUEST_FILTER_CIRCUIT_BREAKER_THRESHOLD', '10000')
 
 logging.disable(logging.CRITICAL)
 
+
+# [v4.0] Mock AI Intent Classifier — القرار من الـAI (mock scripted)،
+# لأن كلمات المفاتيح لم تعد تقرر شيئًا (rebuild v4.0). النصوص التي
+# تختبرها هذه السيناريوهات (طلبات واجبات/رياضيات/برمجة) → ACCEPT.
+import json as _json
+from intent_classifier import IntentClassifier as _IC
+
+
+def _ai_json(decision, confidence, category, reason):
+    return _json.dumps({"decision": decision, "confidence": confidence,
+                        "category": category, "reason": reason}, ensure_ascii=False)
+
+
+_REQUEST_MARKERS = ("واجب", "رياضيات", "برمجة", "بحث", "تقرير", "تفاضل", "مشروع")
+_AD_MARKERS = ("تداول", "للتواصل", "بوت", "خدمات مدفوعة")
+
+
+def make_mock_request_classifier(model="mock-v4"):
+    """scripted AI: ACCEPT لطلبات المساعدة الأكاديمية الواضحة في هذه
+    السيناريوهات، REJECT للإعلانات — يمرّر عبر السباكة الحقيقية للـv4."""
+
+    async def transport(provider, payload):
+        user_msg = payload["messages"][1]["content"]
+        inner = user_msg.split('"""')[-2] if '"""' in user_msg else user_msg
+        if any(m in inner for m in _REQUEST_MARKERS) and not any(m in inner for m in _AD_MARKERS):
+            content = _ai_json("ACCEPT", 0.93, "homework_execution_request", "طلب مساعدة أكاديمية")
+        else:
+            content = _ai_json("REJECT", 0.95, "other", "ليس طلبًا")
+        return 200, _json.dumps({"choices": [{"message": {"content": content}}]})
+
+    return _IC(providers=[{"key": "k", "url": "u", "model": model, "name": "Mock"}],
+               transport=transport)
+
+
 import bot  # noqa: E402
 import link_system  # noqa: E402
 from link_system import ProductionDB, GroupState, LinkNormalizer  # noqa: E402
@@ -191,6 +225,7 @@ def make_monitor(prod_db, channel_id=-1001234567890,
     bot_client.send_message = send_mock
 
     fm = types.SimpleNamespace(
+        request_classifier=make_mock_request_classifier(),
         config=cfg, prod_db=prod_db,
         message_claim=MessageClaim(prod_db),
         _msg_cache={}, _msg_cache_lock=asyncio.Lock(),

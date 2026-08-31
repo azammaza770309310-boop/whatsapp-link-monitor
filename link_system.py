@@ -938,8 +938,32 @@ async def init_production_tables(db):
     await conn.execute("CREATE INDEX IF NOT EXISTS idx_journal_state ON message_journal (state)")
     await conn.execute("CREATE INDEX IF NOT EXISTS idx_journal_received ON message_journal (received_at)")
 
+    # === [REQUEST-FILTER v4.0 / STAGE 5] جدول سجل قرارات الفلتر ===
+    # يحفظ كل قرار (ACCEPT وREJECT) مع السبب الكامل — تشخيص «لماذا قُبل/رُفض».
+    # يُقرأ عبر /api/filter_stats (STAGE 6). نفس المخطط في filter_store.py
+    # (DecisionLogger.ensure_table idempotent — ينشئه لو ركّ قبل هذا).
+    await conn.execute("""CREATE TABLE IF NOT EXISTS filter_decisions (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        chat_id INTEGER,
+        message_id INTEGER,
+        text_hash TEXT NOT NULL,
+        text_preview TEXT,
+        decision TEXT NOT NULL,
+        confidence REAL NOT NULL DEFAULT 0.0,
+        category TEXT,
+        reason TEXT,
+        model TEXT,
+        latency_ms INTEGER,
+        dedup_kind TEXT,
+        source_phone TEXT,
+        created_at REAL
+    )""")
+    await conn.execute("CREATE INDEX IF NOT EXISTS idx_fd_created ON filter_decisions (created_at)")
+    await conn.execute("CREATE INDEX IF NOT EXISTS idx_fd_decision ON filter_decisions (decision)")
+    await conn.execute("CREATE INDEX IF NOT EXISTS idx_fd_text_hash ON filter_decisions (text_hash)")
+
     await conn.commit()
-    logging.info("✅ Production tables initialized (link_queue, group_states, membership_cache, floodwait_tracker, api_operations_log, system_settings, monitored_chats, message_journal)")
+    logging.info("✅ Production tables initialized (link_queue, group_states, membership_cache, floodwait_tracker, api_operations_log, system_settings, monitored_chats, message_journal, filter_decisions)")
 
 
 # -------------------------------------------------------------------

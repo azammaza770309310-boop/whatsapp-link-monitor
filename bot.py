@@ -53,15 +53,22 @@ from link_system import (
 # Source Registry + Polling Scheduler + Message Claim (unified dedup layer)
 from source_registry import SourceRegistry, PollingScheduler, MessageClaim
 
-# Request Filter v2 — مسار مستقل لاكتشاف طلبات العملاء الحقيقية وإرسالها
+# Request Filter v4.0 — مسار مستقل لاكتشاف طلبات العملاء الحقيقية وإرسالها
 # لقناة الطلبات (REQUESTS_TARGET_CHANNEL). مستقل تمامًا عن مسار استخراج
-# الروابط. v2 المحافظ: Intent + Academic Service (لا مطابقة substring ساذجة).
+# الروابط. v4.0 AI-First: القرار الأساسي من مصنّف LLM (IntentClassifier)،
+# الكلمات المفتاحية demoted إلى إشارات مساعدة فقط (extract_signals).
+# المراحل: text_normalizer (1) → AI classify (2/3) → semantic_dedup (4)
+# → filter_decisions (5) → /api/filter_stats (6).
 # طبقات حماية: Kill Switch + RateLimiter + CircuitBreaker + ContentDeduper.
 from request_filter import (
     analyze_request, RequestAnalysis,
+    analyze_request_v4,
     FILTER_VERSION as REQUEST_FILTER_VERSION,
     FILTER_MODE as REQUEST_FILTER_MODE,
 )
+from intent_classifier import IntentClassifier
+from semantic_dedup import SemanticDeduper
+from filter_store import DecisionLogger
 # NOTE: aliased to RequestRateLimiter to avoid shadowing link_system.RateLimiter.
 # link_system.RateLimiter(db) is instantiated at __init__ as self.rate_limiter
 # and is consumed by MembershipCache (rate_limiter.acquire / record_floodwait)
@@ -843,6 +850,36 @@ class Config:
                 "REQUEST_FILTER_CIRCUIT_BREAKER_COOLDOWN_S", "600"))
         except ValueError:
             self.request_filter_cb_cooldown_s = 600
+        # === [REQUEST-FILTER v4.0] AI Intent Classifier controls ===
+        # العتبة الصارمة: ACCEPT فقط إذا confidence الـAI >= العتبة (default 0.85
+        # — طلب المُشغّل الصريح). أي شك = REJECT.
+        try:
+            self.request_filter_ai_threshold = float(os.getenv(
+                "REQUEST_FILTER_AI_THRESHOLD", "0.85"))
+        except ValueError:
+            self.request_filter_ai_threshold = 0.85
+        self.request_filter_ai_threshold = max(0.5, min(0.99, self.request_filter_ai_threshold))
+        try:
+            self.request_filter_ai_timeout_s = float(os.getenv(
+                "REQUEST_FILTER_AI_TIMEOUT_S", "10"))
+        except ValueError:
+            self.request_filter_ai_timeout_s = 10.0
+        try:
+            self.request_filter_ai_max_attempts = int(os.getenv(
+                "REQUEST_FILTER_AI_MAX_ATTEMPTS", "2"))
+        except ValueError:
+            self.request_filter_ai_max_attempts = 2
+        try:
+            self.request_filter_ai_max_chars = int(os.getenv(
+                "REQUEST_FILTER_AI_MAX_CHARS", "1200"))
+        except ValueError:
+            self.request_filter_ai_max_chars = 1200
+        # [STAGE 4] فترة منع التكرار الدلالي (default 15 دقيقة «فترة قصيرة»)
+        try:
+            self.request_filter_dedup_ttl_s = int(os.getenv(
+                "REQUEST_FILTER_DEDUP_TTL_S", "900"))
+        except ValueError:
+            self.request_filter_dedup_ttl_s = 900
         self.owner_id = None
         oid = os.getenv("OWNER_ID", "")
         if oid:
@@ -3036,6 +3073,17 @@ class Monitor:
         self._quiet_source_task: Optional[asyncio.Task] = None
         # محلل الذكاء الاصطناعي
         self.ai_analyzer = AIAnalyzer()
+        # ===== [REQUEST-FILTER v4.0] AI Intent Classifier (القرار الأساسي) =====
+        # نفس مزوّدي AIAnalyzer (OPENAI_API_KEY / AI_KEY_2..8 / AI_URL_i / AI_MODEL_i)
+        # — صفر إعداد إضافي على المُشغّل. لو لا مفاتيح: enabled=False وكل
+        # الرسائل تُرفض (ai_classifier_not_configured) — لا keyword fallback.
+        self.request_classifier = IntentClassifier(
+            timeout_s=getattr(self.config, 'request_filter_ai_timeout_s', 10.0),
+            max_attempts=getattr(self.config, 'request_filter_ai_max_attempts', 2),
+            max_chars=getattr(self.config, 'request_filter_ai_max_chars', 1200),
+        )
+        # [STAGE 4/5] lazy-init في _handle_request_path (نمط lazy المتّبع هناك):
+        #   self._request_semantic_deduper / self._request_decision_logger
         self._startup_scan_done: Set[str] = set()
         # ===== Production Link System =====
         self.prod_db = ProductionDB(db)
@@ -6032,18 +6080,46 @@ class Monitor:
         if not hasattr(self, '_request_content_deduper'):
             self._request_content_deduper = ContentDeduper(ttl_s=600, max_entries=5000)
 
-        # --- الفلترة v2: analyze_request (Intent + Academic Service) ---
-        # لا مطابقة substring ساذجة على كلمات منفردة («مشروع»/«واجب»/«بحث»
-        # وحدها لا تمر). v2 المحافظ يطلب تركيبة واضحة (intent+service أو
-        # action+service+سؤال أو strong pattern) ويستبعد مقدم الخدمة (provider)
-        # صراحةً. هذا يحلّ مشكلة الـ15,000 رسالة الكاذبة جذريًا.
-        analysis = analyze_request(raw_text)
+        # --- [v4.0 STAGE 4/5] lazy-init: SemanticDeduper + DecisionLogger ---
+        # semantic dedup (exact + semantic-hash + Jaccard near-dup) يمنع إعادة
+        # نشر نفس النص/المعنى خلال TTL قصير (REQUEST_FILTER_DEDUP_TTL_S).
+        # DecisionLogger يحفظ كل قرار في filter_decisions (لماذا قُبل/رُفض).
+        if not hasattr(self, '_request_semantic_deduper'):
+            self._request_semantic_deduper = SemanticDeduper(
+                ttl_s=float(getattr(self.config, 'request_filter_dedup_ttl_s', 900)),
+            )
+        if not hasattr(self, '_request_decision_logger'):
+            self._request_decision_logger = DecisionLogger(self.prod_db)
+
+        # --- الفلترة v4.0: AI Intent Classification Engine (القرار الأساسي) ---
+        # [RADICAL REBUILD — طلب المُشغّل] ليس keyword matching: مصنّف LLM
+        # يحسم القبول/الرفض بعقد JSON {decision, confidence, category, reason}.
+        # الكلمات المفتاحية (extract_signals) تُمرَّر للنموذج كإشارات مساعدة فقط.
+        # ACCEPT فقط إذا confidence >= REQUEST_FILTER_AI_THRESHOLD (0.85).
+        # فشل AI (لا مفاتيح/timeout/parse) = REJECT صارم — لا keyword fallback.
+        # المراحل: normalize (1) → structural gates → semantic dedup (4) →
+        # AI classify (2/3) → threshold → filter_decisions log (5).
+        analysis = await analyze_request_v4(
+            raw_text,
+            getattr(self, 'request_classifier', None),
+            chat_id=chat_id,
+            msg_id=msg_id,
+            source_phone=str(source_phone or ''),
+            decision_logger=getattr(self, '_request_decision_logger', None),
+            deduper=getattr(self, '_request_semantic_deduper', None),
+            threshold=float(getattr(self.config, 'request_filter_ai_threshold', 0.85)),
+        )
         if not analysis.is_request:
             logging.info(
                 f"[REQUEST-FILTER] REJECT reason={analysis.reason} "
-                f"score={analysis.confidence} seeker={analysis.seeker_confidence} "
-                f"provider={analysis.provider_confidence} chat_id={chat_id} "
-                f"msg_id={msg_id}"
+                f"path={analysis.decision_path} ai_ok={analysis.ai_ok} "
+                f"confidence={analysis.confidence} "
+                f"(threshold={analysis.threshold}) category={analysis.intent_type} "
+                f"seeker={analysis.seeker_confidence} "
+                f"provider={analysis.provider_confidence} "
+                f"dedup={analysis.dedup_kind or '-'} "
+                f"model={analysis.ai_model or '-'} latency={analysis.ai_latency_ms}ms "
+                f"chat_id={chat_id} msg_id={msg_id}"
             )
             return
 
@@ -6089,7 +6165,10 @@ class Monitor:
 
         logging.info(
             f"[REQUEST-FILTER] ACCEPT confidence={analysis.confidence} "
-            f"reason={analysis.reason} intents={len(analysis.matched_intents)} "
+            f"(threshold={analysis.threshold}) category={analysis.intent_type} "
+            f"reason={analysis.reason} model={analysis.ai_model} "
+            f"provider={analysis.ai_provider} latency={analysis.ai_latency_ms}ms "
+            f"intents={len(analysis.matched_intents)} "
             f"services={len(analysis.matched_services)} "
             f"patterns={len(analysis.matched_patterns)} "
             f"chat_id={chat_id} msg_id={msg_id}"
@@ -11334,6 +11413,14 @@ class Monitor:
             except (asyncio.TimeoutError, asyncio.CancelledError, Exception):
                 pass
 
+        # [v4.0] إغلاق جلسة مصنّف النوايا (aiohttp session — non-fatal)
+        _rf_cl = getattr(self, 'request_classifier', None)
+        if _rf_cl is not None:
+            try:
+                await asyncio.wait_for(_rf_cl.close(), timeout=5.0)
+            except (asyncio.TimeoutError, asyncio.CancelledError, Exception):
+                pass
+
         # إغلاق البوت
         if self.bot_client and self.bot_client.is_connected():
             try: await self.bot_client.disconnect()
@@ -12675,6 +12762,86 @@ async def api_stats_handler(request):
                                  headers={"Access-Control-Allow-Origin": "*"})
 
 
+# [REQUEST-FILTER v4.0 / STAGE 6] /api/filter_stats — Filter Decisions Dashboard
+# يعرض آخر N قرار (default 100) من جدول filter_decisions مع كل الأسباب
+# (decision, confidence, category, reason, model, latency, dedup_kind) +
+# إحصاءات مجمّعة (accepts/rejects/فئات/أسباب) + حالة الـclassifier الحية.
+# يجيب على: «لماذا قُبلت هذه الرسالة؟» و«لماذا رُفضت؟» — بلا فحص logs.
+# محمي بـ DASHBOARD_API_KEY middleware مثل باقي /api/* (X-Api-Key).
+async def api_filter_stats_handler(request):
+    """GET /api/filter_stats?limit=100 — آخر قرارات الفلتر + إحصاءات."""
+    monitor = request.app.get("monitor")
+    if not monitor:
+        return web.json_response({"error": "not ready"}, status=503,
+                                 headers={"Access-Control-Allow-Origin": "*"})
+    try:
+        # limit: 1..500 (default 100 — طلب المُشغّل: آخر 100 قرار)
+        try:
+            limit = int(request.query.get("limit", "100"))
+        except (TypeError, ValueError):
+            limit = 100
+        limit = max(1, min(limit, 500))
+
+        decisions: list = []
+        db_stats: dict = {}
+        decision_logger = getattr(monitor, '_request_decision_logger', None)
+        if decision_logger is not None:
+            decisions = await decision_logger.recent_decisions(limit=limit)
+            db_stats = await decision_logger.stats()
+        else:
+            # lazy-init لم يحدث بعد (لا رسالة عبر المسار بعد الإقلاع) —
+            # اقرأ عبر prod_db مباشرة (best-effort، non-fatal).
+            prod_db = getattr(monitor, 'prod_db', None)
+            if prod_db is not None:
+                try:
+                    tmp_logger = DecisionLogger(prod_db)
+                    decisions = await tmp_logger.recent_decisions(limit=limit)
+                    db_stats = await tmp_logger.stats()
+                except Exception:
+                    decisions, db_stats = [], {}
+
+        # حالة الـclassifier الحية (counters منذ الإقلاع)
+        classifier = getattr(monitor, 'request_classifier', None)
+        classifier_stats = classifier.stats() if classifier is not None else {"enabled": False}
+        # حالة الـsemantic deduper الحية
+        deduper = getattr(monitor, '_request_semantic_deduper', None)
+        dedup_stats = deduper.stats() if deduper is not None else {}
+
+        # أحدث قرار (newest first من الـDB) للـtimestamp
+        latest_ts = decisions[0].get("created_at") if decisions else None
+
+        return web.json_response({
+            "filter_version": REQUEST_FILTER_VERSION,
+            "filter_mode": REQUEST_FILTER_MODE,
+            "filter_enabled": bool(getattr(monitor.config, 'request_filter_enabled', False)),
+            "ai_threshold": float(getattr(monitor.config, 'request_filter_ai_threshold', 0.85)),
+            "ai_classifier": {
+                "enabled": classifier_stats.get("enabled", False),
+                "providers": classifier_stats.get("providers", 0),
+                "timeout_s": classifier_stats.get("timeout_s", 0),
+                "max_attempts": classifier_stats.get("max_attempts", 0),
+                "calls": classifier_stats.get("calls", 0),
+                "accepts": classifier_stats.get("accepts", 0),
+                "rejects": classifier_stats.get("rejects", 0),
+                "errors": classifier_stats.get("errors", 0),
+                "timeouts": classifier_stats.get("timeouts", 0),
+                "parse_failures": classifier_stats.get("parse_failures", 0),
+                "rotations": classifier_stats.get("rotations", 0),
+                "avg_latency_ms": classifier_stats.get("avg_latency_ms", 0),
+            },
+            "semantic_dedup": dedup_stats,
+            "db_stats": db_stats,
+            "count": len(decisions),
+            "limit": limit,
+            "latest_decision_ts": latest_ts,
+            "decisions": decisions,
+        }, status=200, headers={"Access-Control-Allow-Origin": "*"})
+    except Exception as e:
+        logging.error(f"[API] /api/filter_stats error: {e}")
+        return web.json_response({"error": str(e)}, status=500,
+                                 headers={"Access-Control-Allow-Origin": "*"})
+
+
 # [GROUP-DRILL] /api/group_detail — per-group drill-down for the dashboard.
 # Clicking a row in the top-groups card (or a quiet source) opens a detail
 # view: the group's OWN daily series + its top senders. Answers "WHO posts
@@ -13878,6 +14045,7 @@ async def start_http_server(monitor=None, db=None):
     app.router.add_get("/api/group_detail", api_group_detail_handler)  # [GROUP-DRILL]
     app.router.add_get("/api/sender_detail", api_sender_detail_handler)  # [SENDER-DRILL]
     app.router.add_get("/api/stats", api_stats_handler)
+    app.router.add_get("/api/filter_stats", api_filter_stats_handler)  # [STAGE 6] filter decisions dashboard
     app.router.add_get("/api/deploy_check", api_deploy_check_handler)  # diagnostic
     app.router.add_get("/api/joiners_status", api_joiners_status_handler)  # joiners + groups
     app.router.add_get("/api/monitored_chats", api_monitored_chats_handler)  # monitored chats + AI
@@ -13892,7 +14060,7 @@ async def start_http_server(monitor=None, db=None):
     await runner.setup()
     site = web.TCPSite(runner, "0.0.0.0", port)
     await site.start()
-    logging.info(f"HTTP server listening on port {port} (endpoints: /health /ready /metrics /api/joined_groups /api/pending_approvals /api/links /api/stats /api/deploy_check /api/monitored_chats /api/link_source_check)")
+    logging.info(f"HTTP server listening on port {port} (endpoints: /health /ready /metrics /api/joined_groups /api/pending_approvals /api/links /api/stats /api/filter_stats /api/deploy_check /api/monitored_chats /api/link_source_check)")
     return runner
 
 
@@ -13961,6 +14129,33 @@ async def main():
         f"REQUEST_FILTER_CIRCUIT_BREAKER_THRESHOLD={getattr(config,'request_filter_cb_threshold',100)}"
         f" (window={getattr(config,'request_filter_cb_window_s',600)}s, "
         f"cooldown={getattr(config,'request_filter_cb_cooldown_s',600)}s)"
+    )
+    # [v4.0] AI Intent Classifier status — المفاتيح من نفس مزوّدي AIAnalyzer
+    # (هذا الـboot-log يسبق إنشاء monitor — نقرأ من env مباشرة، نفس منطق
+    # IntentClassifier.load_providers_from_env).
+    _rf_ai_providers = sum(
+        1 for _k in ([os.getenv("OPENAI_API_KEY", "")] +
+                     [os.getenv(f"AI_KEY_{i}", "") for i in range(2, 10)])
+        if _k)
+    logging.info(
+        f"REQUEST_FILTER_AI_THRESHOLD={getattr(config,'request_filter_ai_threshold',0.85)} "
+        f"(ACCEPT فقط إذا confidence >= العتبة — أي شك = REJECT)"
+    )
+    logging.info(
+        f"REQUEST_FILTER_AI_PROVIDERS={_rf_ai_providers} "
+        f"(timeout={getattr(config,'request_filter_ai_timeout_s',10)}s, "
+        f"max_attempts={getattr(config,'request_filter_ai_max_attempts',2)}, "
+        f"dedup_ttl={getattr(config,'request_filter_dedup_ttl_s',900)}s)"
+    )
+    if _rf_en and _rf_ai_providers == 0:
+        logging.warning(
+            "⚠️ REQUEST_FILTER_ENABLED=true لكن لا مفاتيح AI (OPENAI_API_KEY/"
+            "AI_KEY_2..8) — v4.0 سيرفض كل الرسائل (ai_classifier_not_configured). "
+            "لا keyword fallback في v4.0 (تصميم مقصود: الأمان قبل النشر)."
+        )
+    logging.info(
+        "REQUEST_FILTER_V4_STAGES: normalize(1) → AI classify(2/3) → "
+        "semantic dedup(4) → filter_decisions log(5) → /api/filter_stats(6)"
     )
     # RENDER_GIT_COMMIT يُضبط تلقائيًا من Render عند كل deploy — نطبع أول 12
     # حرفًا حتى يستطيع المُشغّل التأكد أن النسخة الحالية هي آخر commit.
