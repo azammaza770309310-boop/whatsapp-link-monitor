@@ -963,6 +963,19 @@ def section_k():
               str(rows2[0].get("error_detail") if rows2 else "no rows"))
         await conn2.close()
 
+        # ---- K11: [v4.1.1] 404 (نموذج مُوقوف) → cooldown طويل (auth) ----
+        async def t404(provider, payload):
+            return 404, '{"error":{"message":"model not found"}}'
+
+        cl404 = IntentClassifier(providers=[{"key": "k", "url": "u", "model": "dead-model", "name": "P"}],
+                                 transport=t404, retry_rounds=1, total_budget_s=1)
+        d404 = await cl404.classify("رسالة لنموذج ميت")
+        h404 = cl404.provider_health()[0]
+        check("K11: 404 model-gone → dead (auth cooldown ≥ 30 دقيقة)",
+              d404.ok is False and "404" in d404.error
+              and h404["status"] == "cooldown" and h404["cooldown_remaining_s"] >= 1700,
+              f"cd={h404['cooldown_remaining_s']}s err={(d404.error or '')[:50]}")
+
     async def _async_ret(c):
         return c
 

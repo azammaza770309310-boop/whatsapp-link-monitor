@@ -257,7 +257,9 @@ def load_providers_from_env() -> List[Dict[str, str]]:
 # v4.1: سياسة cooldown لكل نوع فشل (ثواني — تُضرب في cooldown_scale)
 # ============================================================
 _COOLDOWN_KINDS = {
-    'auth':   1800.0,   # 401/403 — مفتاح ميت/مرفوض: 30 دقيقة تتضاعف (cap 6h)
+    'auth':   1800.0,   # 401/403/404 — مفتاح ميت/مرفوض/نموذج مُوقوف: 30 دقيقة
+                        # تتضاعف (cap 6h) — [v4.1.1] أُضيف 404 (نموذج مُوقوف
+                        # مثل llama-3.3-70b-versatile من Groq = خطأ دائم للـconfig)
     'rate':   12.0,     # 429 — rate-limit عابر: 12s تتضاعف (cap 120s)
     'server': 45.0,     # 5xx — خطأ خادم: ثابت
     'timeout': 30.0,    # مهلة نداء: ثابت
@@ -488,7 +490,9 @@ class IntentClassifier:
                 {"role": "user", "content": self.build_user_prompt(clean_text, hints)},
             ],
             "temperature": 0.0,
-            "max_tokens": 160,
+            # 400: يسمح بنماذج reasoning (gpt-oss تفكّر قبل النص — 160 كان
+            # يخنقها)؛ الناتج الفعلي ~40 tokens (JSON صارم + temperature 0).
+            "max_tokens": 400,
             "stream": False,
         }
 
@@ -601,6 +605,14 @@ class IntentClassifier:
                 if status in (401, 403):
                     self.counters["errors"] += 1
                     last_error = f"http {status} auth/dead key ({provider['name']})"
+                    self._record_failure(idx, last_error, kind='auth')
+                    continue
+                if status == 404:
+                    # [v4.1.1] 404 = endpoint/نموذج غير موجود (مُوقوف من المزوّد —
+                    # llama-3.3-70b-versatile أُوقف من Groq) — خطأ دائم لهذا
+                    # الـconfig: cooldown طويل متضاعف (30 دقيقة+) بدل 30s.
+                    self.counters["errors"] += 1
+                    last_error = f"http 404 model/endpoint gone ({provider['name']})"
                     self._record_failure(idx, last_error, kind='auth')
                     continue
                 if status != 200:
