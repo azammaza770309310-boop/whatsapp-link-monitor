@@ -469,7 +469,8 @@ def section_f():
               all(k in rows_all[0] for k in ("id", "chat_id", "message_id", "text_hash",
                                              "text_preview", "decision", "confidence",
                                              "category", "reason", "model", "latency_ms",
-                                             "dedup_kind", "source_phone", "created_at")),
+                                             "dedup_kind", "source_phone", "error_detail",
+                                             "created_at")),
               str(list(rows_all[0].keys())))
 
         st = await logger.stats()
@@ -537,12 +538,16 @@ def section_g():
         resp = await handler(FakeRequest())
         check("G1: 200 OK", resp.status == 200, f"status={resp.status}")
         data = json.loads(resp.text)
-        check("G2: filter_version + mode", data.get("filter_version") == "v4.0.0"
+        check("G2: filter_version + mode", data.get("filter_version") == FILTER_VERSION
               and data.get("filter_mode") == "ai_intent_classifier", str(data.get("filter_version")))
         check("G3: آخر القرارات مُعادة", data.get("count") == 1
               and data["decisions"][0]["decision"] == "ACCEPT", str(data.get("count")))
         check("G4: حالة الـclassifier الحية", data["ai_classifier"]["enabled"] is True
               and data["ai_classifier"]["providers"] == 1, str(data.get("ai_classifier")))
+        check("G4b: [v4.1] provider_health معروضة", isinstance(data["ai_classifier"].get("provider_health"), list)
+              and len(data["ai_classifier"]["provider_health"]) == 1
+              and data["ai_classifier"]["provider_health"][0]["status"] in ("ok", "cooldown"),
+              str(data["ai_classifier"].get("provider_health")))
         check("G5: العتبة معروضة", data.get("ai_threshold") == 0.85, str(data.get("ai_threshold")))
         check("G6: db_stats مجمّعة", data["db_stats"]["accepts"] == 1, str(data.get("db_stats")))
         check("G7: semantic_dedup stats", "total_seen" in data.get("semantic_dedup", {}), str(data.get("semantic_dedup")))
@@ -762,11 +767,214 @@ def section_j():
 
 
 # ============================================================
+# K. [v4.1] Provider Health Manager — resilience + observability
+# ============================================================
+def section_k():
+    print("\n=== K. [v4.1] Provider Health Manager — circuit breaker + pacing + retry ===")
+
+    def _ai(d, c, cat, r):
+        return json.dumps({"decision": d, "confidence": c, "category": cat, "reason": r},
+                          ensure_ascii=False)
+
+    async def run_k():
+        # ---- K1: مفتاح ميت (403) → circuit breaker: يستُدعى مرة واحدة فقط ----
+        calls = {"P1": 0, "P2": 0}
+
+        async def t403(provider, payload):
+            calls[provider["name"]] += 1
+            if provider["name"] == "P1":
+                return 403, '{"error":{"message":"Forbidden"}}'
+            return 200, json.dumps({"choices": [{"message": {"content": _ai("REJECT", 0.9, "other", "x")}}]})
+
+        clk = IntentClassifier(
+            providers=[{"key": "k1", "url": "u", "model": "m1", "name": "P1"},
+                       {"key": "k2", "url": "u", "model": "m2", "name": "P2"}],
+            transport=t403, cooldown_scale=0.001, retry_rounds=2, total_budget_s=2)
+        d1 = await clk.classify("رسالة 1")
+        d2 = await clk.classify("رسالة 2")
+        d3 = await clk.classify("رسالة 3")
+        check("K1: dead key (403) استُدعي مرة واحدة فقط (circuit breaker)",
+              calls["P1"] == 1 and calls["P2"] == 3, str(calls))
+        check("K1b: الرسائل تُخدم من المزوّد الحي",
+              d2.ok and d3.ok and d2.provider_name == "P2", str(d2.provider_name))
+        h = clk.provider_health()
+        check("K1c: provider_health — الميت في cooldown مع السبب",
+              h[0]["status"] == "cooldown" and "403" in h[0]["last_error"], str(h[0]))
+        check("K1d: provider_health — الحي ok مع عدّادات",
+              h[1]["status"] == "ok" and h[1]["success_count"] == 3, str(h[1]))
+
+        # ---- K2: 429 rate-limit عابر → جولة إعادة محاولة تنقذ الرسالة ----
+        state = {"n": 0}
+
+        async def t429(provider, payload):
+            state["n"] += 1
+            if state["n"] == 1:
+                return 429, "rate limit"
+            return 200, json.dumps({"choices": [{"message": {"content": _ai("REJECT", 0.9, "other", "y")}}]})
+
+        cl429 = IntentClassifier(providers=[{"key": "k", "url": "u", "model": "m", "name": "P"}],
+                                 transport=t429, cooldown_scale=0.01,
+                                 retry_rounds=3, total_budget_s=3)
+        dr = await cl429.classify("رسالة أثناء 429 عابر")
+        check("K2: 429 عابر → إعادة المحاولة بعد cooldown تنجح (لا فقدان)",
+              dr.ok is True, str(dr.error))
+        check("K2b: counters — cooldown_waits سُجّلت",
+              cl429.counters["cooldown_waits"] >= 1, str(cl429.counters))
+
+        # ---- K3: pacing — نداء واحد لكل مفتاح كل min_interval ----
+        times = []
+
+        async def tp(provider, payload):
+            times.append(time.monotonic())
+            return 200, json.dumps({"choices": [{"message": {"content": _ai("REJECT", 0.9, "other", "z")}}]})
+
+        clp = IntentClassifier(providers=[{"key": "k", "url": "u", "model": "m", "name": "P"}],
+                               transport=tp, min_interval_s=0.2)
+        await clp.classify("نداء أول")
+        await clp.classify("نداء ثان")
+        gap = times[1] - times[0]
+        check("K3: pacing يفرّج بين النداءات (gap ≥ min_interval)",
+              gap >= 0.19, f"gap={gap:.3f}")
+
+        # ---- K4: كل المزوّدين فاشلون → ai_error مع تفاصيل كاملة ----
+        async def t500(provider, payload):
+            return 500, "server error"
+
+        clf = IntentClassifier(providers=[{"key": "k", "url": "u", "model": "m", "name": "P"}],
+                               transport=t500, total_budget_s=1.5,
+                               cooldown_scale=0.01, retry_rounds=2, max_attempts=1)
+        df = await clf.classify("رسالة ستفشل")
+        check("K4: فشل كامل → ok=False + category=ai_error + تفاصيل",
+              df.ok is False and df.category == "ai_error" and "http 500" in df.error
+              and "attempts" in df.error, str(df.error))
+
+        # ---- K5: بوابة max_pending — الفائض يُرفض فورًا (أمان الاندفاعات) ----
+        async def tslow(provider, payload):
+            await asyncio.sleep(0.3)
+            return 200, json.dumps({"choices": [{"message": {"content": _ai("REJECT", 0.9, "other", "s")}}]})
+
+        clo = IntentClassifier(providers=[{"key": "k", "url": "u", "model": "m", "name": "P"}],
+                               transport=tslow, max_pending=2,
+                               retry_rounds=1, total_budget_s=5, timeout_s=3)
+        tasks = [asyncio.create_task(clo.classify(f"رسالة {i}")) for i in range(10)]
+        results = await asyncio.gather(*tasks)
+        overloads = sum(1 for r in results if r.category == "overloaded")
+        oks = sum(1 for r in results if r.ok)
+        check("K5: الاندفاعة → بوابة max_pending ترفض الفائض فورًا (overloaded)",
+              overloads >= 1 and oks >= 1, f"ok={oks} overloaded={overloads}")
+        check("K5b: overloaded مُسجّل في counters",
+              clo.counters["overload_rejects"] >= 1, str(clo.counters.get("overload_rejects")))
+
+        # ---- K6: الميزانية تنتهي → ai_error سريع بلا تعليق ----
+        async def tveryslow(provider, payload):
+            await asyncio.sleep(2.0)
+            return 200, "{}"
+
+        clb = IntentClassifier(providers=[{"key": "k", "url": "u", "model": "m", "name": "P"}],
+                               transport=tveryslow, total_budget_s=1.0, timeout_s=0.3,
+                               retry_rounds=1, max_attempts=1)
+        t0 = time.monotonic()
+        db = await clb.classify("رسالة بطيئة")
+        elapsed = time.monotonic() - t0
+        check("K6: الميزانية تُحترم (لا تعليق) + ai_error",
+              db.ok is False and elapsed < 2.5, f"elapsed={elapsed:.2f}s")
+
+        # ---- K7: المحاولات محدودة (attempts × rounds) ----
+        n500 = {"n": 0}
+
+        async def t500c(provider, payload):
+            n500["n"] += 1
+            return 500, "e"
+
+        cla = IntentClassifier(
+            providers=[{"key": f"k{i}", "url": "u", "model": "m", "name": f"P{i}"} for i in range(4)],
+            transport=t500c, retry_rounds=2, max_attempts=2,
+            cooldown_scale=0.001, total_budget_s=2)
+        await cla.classify("رسالة")
+        check("K7: إجمالي المحاولات ≤ attempts×rounds",
+              n500["n"] <= 4, f"calls={n500['n']}")
+
+        # ---- K8: نجاح بعد فشل → يُصفّر حالة الصحة ----
+        state2 = {"n": 0}
+
+        async def tflux(provider, payload):
+            state2["n"] += 1
+            if state2["n"] <= 1:
+                return 429, "rl"
+            return 200, json.dumps({"choices": [{"message": {"content": _ai("REJECT", 0.9, "other", "r")}}]})
+
+        clz = IntentClassifier(providers=[{"key": "k", "url": "u", "model": "m", "name": "P"}],
+                               transport=tflux, cooldown_scale=0.01,
+                               retry_rounds=2, total_budget_s=3)
+        await clz.classify("أولى")   # 429 ثم نجاح في الجولة الثانية
+        await clz.classify("ثانية")  # نجاح مباشر — الحالة مصفّرة
+        h2 = clz.provider_health()[0]
+        check("K8: النجاح يُصفّر حالة الصحة (consecutive_fails=0)",
+              h2["consecutive_fails"] == 0 and h2["status"] == "ok", str(h2))
+
+        # ---- K9: error_detail يُكتب في filter_decisions عبر المسار الكامل ----
+        import aiosqlite
+        from filter_store import DecisionLogger as DL
+
+        conn = await aiosqlite.connect(":memory:")
+        ns = types.SimpleNamespace(_conn=(lambda c=conn: _async_ret(c)))
+        logger = DL(ns)
+
+        async def _failing_transport(provider, payload):
+            return 403, "forbidden"
+
+        clx = IntentClassifier(providers=[{"key": "k", "url": "u", "model": "m", "name": "Dead"}],
+                               transport=_failing_transport, retry_rounds=1,
+                               total_budget_s=1)
+        from request_filter import analyze_request_v4
+        rx = await analyze_request_v4("أحد يشرح لي التفاضل", clx,
+                                      chat_id=-100123, msg_id=77, source_phone="+9665x",
+                                      decision_logger=logger)
+        check("K9: فشل AI عبر المسار الكامل → REJECT",
+              rx.is_request is False and rx.reason == "ai_error", f"reason={rx.reason}")
+        rows = await logger.recent_decisions(5)
+        check("K9b: error_detail مكتوب في filter_decisions (http 403 + provider)",
+              rows and rows[0].get("error_detail") and "403" in rows[0]["error_detail"]
+              and "Dead" in rows[0]["error_detail"],
+              str(rows[0].get("error_detail") if rows else "no rows"))
+        st = await logger.stats()
+        check("K9c: stats — by_error_detail مجمّعة",
+              st.get("by_error_detail") and "403" in list(st["by_error_detail"].keys())[0],
+              str(st.get("by_error_detail")))
+        await conn.close()
+
+        # ---- K10: migration — جدول قديم بلا error_detail يُرقّى تلقائيًا ----
+        conn2 = await aiosqlite.connect(":memory:")
+        await conn2.execute("""CREATE TABLE filter_decisions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, chat_id INTEGER, message_id INTEGER,
+            text_hash TEXT NOT NULL, text_preview TEXT, decision TEXT NOT NULL,
+            confidence REAL NOT NULL DEFAULT 0.0, category TEXT, reason TEXT,
+            model TEXT, latency_ms INTEGER, dedup_kind TEXT, source_phone TEXT,
+            created_at REAL)""")
+        await conn2.commit()
+        ns2 = types.SimpleNamespace(_conn=(lambda c=conn2: _async_ret(c)))
+        logger2 = DL(ns2)
+        okm = await logger2.log_decision(raw_text="x", decision="REJECT",
+                                         category="ai_error", reason="ai_error",
+                                         error_detail="http 429 (P) [test]")
+        rows2 = await logger2.recent_decisions(5)
+        check("K10: migration — ALTER TABLE يضيف error_detail ويكتب فيه",
+              okm and rows2 and rows2[0].get("error_detail") == "http 429 (P) [test]",
+              str(rows2[0].get("error_detail") if rows2 else "no rows"))
+        await conn2.close()
+
+    async def _async_ret(c):
+        return c
+
+    asyncio.run(run_k())
+
+
+# ============================================================
 # main
 # ============================================================
 def main():
     print("=" * 70)
-    print(f"Request Intent Engine {FILTER_VERSION} ({FILTER_MODE}) — v4.0 Test Suite")
+    print(f"Request Intent Engine {FILTER_VERSION} ({FILTER_MODE}) — v4.0/v4.1 Test Suite")
     print("=" * 70)
 
     section_a()
@@ -779,6 +987,7 @@ def main():
     section_h()
     section_i()
     section_j()
+    section_k()
 
     print("\n" + "=" * 70)
     print(f"RESULT: {_TOTAL['pass']} pass / {_TOTAL['fail']} fail")

@@ -1,10 +1,14 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-filter_store.py — Request Intent Engine v4.0 / المرحلة 5: سجل التشخيص
+filter_store.py — Request Intent Engine v4.1 / المرحلة 5: سجل التشخيص
 ================================================================================
-STAGE 5 of the v4.0 rebuild. جدول filter_decisions يحفظ كل قرار (ACCEPT وREJECT)
+STAGE 5 of the v4.0/v4.1 rebuild. جدول filter_decisions يحفظ كل قرار (ACCEPT وREJECT)
 مع السبب الكامل — حتى نستطيع الإجابة على: «لماذا قُبِلت؟» و«لماذا رُفضت؟».
+
+[v4.1] عمود جديد error_detail: تفاصيل فشل الـAI التقنية (http status +
+provider + attempts/budget) لكل قرار ai_error/overloaded — التشخيص من
+الـdashboard بلا runtime logs (Render free plan لا يوفرها).
 
 المخطط (يُنشأ أيضًا من link_system.init_production_tables — idempotent):
     filter_decisions(
@@ -21,8 +25,12 @@ STAGE 5 of the v4.0 rebuild. جدول filter_decisions يحفظ كل قرار (A
         latency_ms    INTEGER,          -- زمن نداء AI
         dedup_kind    TEXT,             -- exact|semantic|near (لو رُفض للتكرار)
         source_phone  TEXT,             -- الحساب الذي استلم الرسالة
+        error_detail  TEXT,             -- [v4.1] تفاصيل خطأ AI (http/provider/محاولات)
         created_at    REAL              -- epoch seconds
     )
+
+Migration: الجداول الموجودة قبل v4.1 (بلا error_detail) تُرقّى تلقائيًا
+بـALTER TABLE ADD COLUMN (idempotent — safe على SQLite).
 
 كل العمليات non-fatal: فشل الكتابة لا يكسر مسار الطلبات أبدًا (يُسجَّل debug فقط).
 DecisionLogger يُغلف ProductionDB (مثل باقي أنظمة link_system).
@@ -51,6 +59,7 @@ CREATE TABLE IF NOT EXISTS filter_decisions (
     latency_ms INTEGER,
     dedup_kind TEXT,
     source_phone TEXT,
+    error_detail TEXT,
     created_at REAL
 )
 """
@@ -82,12 +91,29 @@ class DecisionLogger:
         return await self.prod_db._conn()
 
     async def ensure_table(self) -> bool:
-        """إنشاء الجدول لو لم يوجد (idempotent — link_system ينشئه أيضًا عند الإقلاع)."""
+        """إنشاء الجدول لو لم يوجد + ترقية الجداول القديمة بلا error_detail.
+
+        idempotent — link_system ينشئه أيضًا عند الإقلاع (نفس المخطط).
+        [v4.1] migration: PRAGMA table_info → ALTER TABLE ADD COLUMN
+        error_detail TEXT لو الجدول موجود بلا العمود (قاعدة بيانات قديمة).
+        """
         if self._ensured:
             return True
         try:
             conn = await self._conn()
             await conn.execute(FILTER_DECISIONS_SCHEMA)
+            # [v4.1] migration للجداول الموجودة قبل v4.1
+            try:
+                cursor = await conn.execute("PRAGMA table_info(filter_decisions)")
+                rows = await cursor.fetchall()
+                cols = [r[1] for r in rows] if rows else []
+                if cols and 'error_detail' not in cols:
+                    await conn.execute(
+                        "ALTER TABLE filter_decisions ADD COLUMN error_detail TEXT")
+            except Exception:
+                # مسار غير SQLite (لو انتقل لاحقًا لـPG): الجدول يُنشأ بالمخطط
+                # الجديد من link_system أصلاً. non-fatal.
+                pass
             for idx in _FILTER_DECISIONS_INDEXES:
                 await conn.execute(idx)
             await conn.commit()
@@ -109,8 +135,13 @@ class DecisionLogger:
                            model: str = "",
                            latency_ms: int = 0,
                            dedup_kind: str = "",
-                           source_phone: str = "") -> bool:
-        """يحفظ قرارًا واحدًا. non-fatal — يُرجع False عند الفشل."""
+                           source_phone: str = "",
+                           error_detail: str = "") -> bool:
+        """يحفظ قرارًا واحدًا. non-fatal — يُرجع False عند الفشل.
+
+        [v4.1] error_detail: تفاصيل فشل AI التقنية (http status + provider
+        + attempts/budget) — تُقرأ من /api/filter_stats للتشخيص بلا logs.
+        """
         try:
             if not self._ensured:
                 await self.ensure_table()
@@ -119,8 +150,8 @@ class DecisionLogger:
                 """INSERT INTO filter_decisions
                    (chat_id, message_id, text_hash, text_preview, decision,
                     confidence, category, reason, model, latency_ms,
-                    dedup_kind, source_phone, created_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    dedup_kind, source_phone, error_detail, created_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     _to_int(chat_id), _to_int(message_id),
                     text_hash_of(raw_text),
@@ -133,6 +164,7 @@ class DecisionLogger:
                     _to_int(latency_ms),
                     str(dedup_kind or '')[:16],
                     str(source_phone or '')[:32],
+                    str(error_detail or '')[:250],
                     time.time(),
                 ),
             )
@@ -152,7 +184,8 @@ class DecisionLogger:
             cursor = await conn.execute(
                 """SELECT id, chat_id, message_id, text_hash, text_preview,
                           decision, confidence, category, reason, model,
-                          latency_ms, dedup_kind, source_phone, created_at
+                          latency_ms, dedup_kind, source_phone, error_detail,
+                          created_at
                    FROM filter_decisions
                    ORDER BY id DESC
                    LIMIT ?""",
@@ -171,6 +204,7 @@ class DecisionLogger:
             "total": 0, "accepts": 0, "rejects": 0,
             "avg_confidence": 0.0, "avg_latency_ms": 0.0,
             "by_category": {}, "by_reason": {}, "by_dedup_kind": {},
+            "by_error_detail": {},
         }
         try:
             if not self._ensured:
@@ -208,6 +242,17 @@ class DecisionLogger:
                    WHERE dedup_kind IS NOT NULL AND dedup_kind != ''
                    GROUP BY dedup_kind ORDER BY COUNT(*) DESC LIMIT 10""")
             out["by_dedup_kind"] = {r[0]: r[1] for r in await cursor.fetchall()}
+
+            # [v4.1] توزيع تفاصيل أخطاء AI (http status + provider) —
+            # التشخيص الجذري من الـdashboard مباشرة (بلا runtime logs).
+            try:
+                cursor = await conn.execute(
+                    """SELECT error_detail, COUNT(*) FROM filter_decisions
+                       WHERE error_detail IS NOT NULL AND error_detail != ''
+                       GROUP BY error_detail ORDER BY COUNT(*) DESC LIMIT 10""")
+                out["by_error_detail"] = {r[0]: r[1] for r in await cursor.fetchall()}
+            except Exception:
+                out["by_error_detail"] = {}
         except Exception as e:
             logging.debug(f"[FILTER-STORE] stats failed (non-fatal): {e}")
         return out

@@ -874,6 +874,33 @@ class Config:
                 "REQUEST_FILTER_AI_MAX_CHARS", "1200"))
         except ValueError:
             self.request_filter_ai_max_chars = 1200
+        # [v4.1] Provider Health Manager — تشخيص إنتاجي 2026-09-01:
+        # 3/6 مفاتيح Groq ميتة (403) + rate-limit أثناء الاندفاعات → نصف
+        # الرسائل+ ai_error. هذه المفاتيح تُفعّل الصمامات الجديدة.
+        try:
+            self.request_filter_ai_min_interval_s = float(os.getenv(
+                "REQUEST_FILTER_AI_MIN_INTERVAL_S", "1.05"))
+        except ValueError:
+            self.request_filter_ai_min_interval_s = 1.05
+        self.request_filter_ai_min_interval_s = max(
+            0.0, self.request_filter_ai_min_interval_s)
+        try:
+            self.request_filter_ai_retry_rounds = int(os.getenv(
+                "REQUEST_FILTER_AI_RETRY_ROUNDS", "3"))
+        except ValueError:
+            self.request_filter_ai_retry_rounds = 3
+        self.request_filter_ai_retry_rounds = max(
+            1, self.request_filter_ai_retry_rounds)
+        try:
+            self.request_filter_ai_total_budget_s = float(os.getenv(
+                "REQUEST_FILTER_AI_TOTAL_BUDGET_S", "40"))
+        except ValueError:
+            self.request_filter_ai_total_budget_s = 40.0
+        try:
+            self.request_filter_ai_max_pending = int(os.getenv(
+                "REQUEST_FILTER_AI_MAX_PENDING", "64"))
+        except ValueError:
+            self.request_filter_ai_max_pending = 64
         # [STAGE 4] فترة منع التكرار الدلالي (default 15 دقيقة «فترة قصيرة»)
         try:
             self.request_filter_dedup_ttl_s = int(os.getenv(
@@ -3081,6 +3108,11 @@ class Monitor:
             timeout_s=getattr(self.config, 'request_filter_ai_timeout_s', 10.0),
             max_attempts=getattr(self.config, 'request_filter_ai_max_attempts', 2),
             max_chars=getattr(self.config, 'request_filter_ai_max_chars', 1200),
+            # [v4.1] Provider Health Manager knobs:
+            min_interval_s=getattr(self.config, 'request_filter_ai_min_interval_s', 1.05),
+            retry_rounds=getattr(self.config, 'request_filter_ai_retry_rounds', 3),
+            total_budget_s=getattr(self.config, 'request_filter_ai_total_budget_s', 40.0),
+            max_pending=getattr(self.config, 'request_filter_ai_max_pending', 64),
         )
         # [STAGE 4/5] lazy-init في _handle_request_path (نمط lazy المتّبع هناك):
         #   self._request_semantic_deduper / self._request_decision_logger
@@ -12828,6 +12860,21 @@ async def api_filter_stats_handler(request):
                 "parse_failures": classifier_stats.get("parse_failures", 0),
                 "rotations": classifier_stats.get("rotations", 0),
                 "avg_latency_ms": classifier_stats.get("avg_latency_ms", 0),
+                # [v4.1] Provider Health Manager:
+                "retry_rounds": classifier_stats.get("retry_rounds", 1),
+                "total_budget_s": classifier_stats.get("total_budget_s", 0),
+                "min_interval_s": classifier_stats.get("min_interval_s", 0),
+                "max_pending": classifier_stats.get("max_pending", 0),
+                "cooldown_waits": classifier_stats.get("cooldown_waits", 0),
+                "pace_waits": classifier_stats.get("pace_waits", 0),
+                "budget_exhausted": classifier_stats.get("budget_exhausted", 0),
+                "overload_rejects": classifier_stats.get("overload_rejects", 0),
+                "health_probes": classifier_stats.get("health_probes", 0),
+                "provider_health": (
+                    classifier.provider_health()
+                    if classifier is not None and hasattr(classifier, 'provider_health')
+                    else []
+                ),
             },
             "semantic_dedup": dedup_stats,
             "db_stats": db_stats,
@@ -14146,6 +14193,15 @@ async def main():
         f"(timeout={getattr(config,'request_filter_ai_timeout_s',10)}s, "
         f"max_attempts={getattr(config,'request_filter_ai_max_attempts',2)}, "
         f"dedup_ttl={getattr(config,'request_filter_dedup_ttl_s',900)}s)"
+    )
+    # [v4.1] Provider Health Manager — boot line (تشخيص 2026-09-01)
+    logging.info(
+        f"REQUEST_FILTER_AI_V41_HEALTH: retry_rounds={getattr(config,'request_filter_ai_retry_rounds',3)} "
+        f"budget={getattr(config,'request_filter_ai_total_budget_s',40)}s "
+        f"min_interval={getattr(config,'request_filter_ai_min_interval_s',1.05)}s "
+        f"max_pending={getattr(config,'request_filter_ai_max_pending',64)} "
+        f"(dead keys 401/403 → cooldown 30m+, 429 → retry after short cooldown, "
+        f"error_detail logged to filter_decisions + provider_health in /api/filter_stats)"
     )
     if _rf_en and _rf_ai_providers == 0:
         logging.warning(

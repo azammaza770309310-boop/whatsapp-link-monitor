@@ -43,7 +43,7 @@ import re
 from dataclasses import dataclass, field
 from typing import List, Tuple, Dict, Any, Optional
 
-FILTER_VERSION = "v4.0.0"
+FILTER_VERSION = "v4.1.0"
 FILTER_MODE = "ai_intent_classifier"
 
 
@@ -1387,8 +1387,10 @@ async def analyze_request_v4(
         res.decision_path = "no_classifier"
         res.ai_category = "ai_unavailable"
         res.ai_reason = "no AI providers configured (REQUEST_FILTER cannot accept without AI)"
+        res.ai_error = "no AI providers configured (OPENAI_API_KEY / AI_KEY_2..8 all empty)"
         res.seeker_confidence = _seeker_confidence_int(sig, False, 0.0)
-        await _log_decision_safe(decision_logger, text, res, chat_id, msg_id, source_phone)
+        await _log_decision_safe(decision_logger, text, res, chat_id, msg_id, source_phone,
+                                 error_detail=res.ai_error)
         return res
 
     decision = await classifier.classify(nt.clean, hints=sig.to_hints())
@@ -1408,12 +1410,15 @@ async def analyze_request_v4(
 
     # ---- القرار + العتبة ----
     if not decision.ok:
-        # فشل AI (timeout/error/parse) → REJECT صارم بأسباب صريحة
+        # فشل AI (timeout/error/parse/overloaded) → REJECT صارم بأسباب صريحة
+        # [v4.1] error_detail: التفاصيل التقنية (http status + provider +
+        # attempts/budget) تُخزَّن في filter_decisions — تشخيص بلا runtime logs.
         res.reason = decision.category or "ai_error"
         res.intent_type = decision.category or "ai_error"
         res.decision_path = "ai"
         res.seeker_confidence = _seeker_confidence_int(sig, False, 0.0)
-        await _log_decision_safe(decision_logger, text, res, chat_id, msg_id, source_phone)
+        await _log_decision_safe(decision_logger, text, res, chat_id, msg_id, source_phone,
+                                 error_detail=decision.error or "")
         return res
 
     accepted = (decision.decision == "ACCEPT") and (decision.confidence >= threshold)
@@ -1442,8 +1447,13 @@ async def analyze_request_v4(
 
 async def _log_decision_safe(decision_logger, text: str, res: "RequestAnalysis",
                              chat_id: int, msg_id: int, source_phone: str,
-                             dedup_kind: str = "") -> None:
-    """المرحلة 5: كتابة القرار في filter_decisions — non-fatal دائمًا."""
+                             dedup_kind: str = "",
+                             error_detail: str = "") -> None:
+    """المرحلة 5: كتابة القرار في filter_decisions — non-fatal دائمًا.
+
+    [v4.1] error_detail: تفاصيل فشل AI التقنية (http status + provider +
+    attempts/budget) — تُقرأ من /api/filter_stats للتشخيص الجذري.
+    """
     if decision_logger is None:
         return
     try:
@@ -1459,6 +1469,7 @@ async def _log_decision_safe(decision_logger, text: str, res: "RequestAnalysis",
             latency_ms=res.ai_latency_ms,
             dedup_kind=dedup_kind or res.dedup_kind,
             source_phone=source_phone,
+            error_detail=(error_detail or res.ai_error or "")[:250],
         )
     except Exception:
         # فشل التشخيص لا يكسر المسار أبدًا

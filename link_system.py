@@ -956,6 +956,7 @@ async def init_production_tables(db):
         latency_ms INTEGER,
         dedup_kind TEXT,
         source_phone TEXT,
+        error_detail TEXT,
         created_at REAL
     )""")
     await conn.execute("CREATE INDEX IF NOT EXISTS idx_fd_created ON filter_decisions (created_at)")
