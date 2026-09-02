@@ -3114,6 +3114,9 @@ class Monitor:
             'fleet_down_alerted': False,
         }
         self._joiner_fleet_health_task: Optional[asyncio.Task] = None
+        # [v4.3.3] AUTO-RECOVERY: آخر محاولة auto-enable لكل حساب joiner —
+        # حارس مدة (محاولة واحدة/ساعة/حساب) يمنع عاصفة كتابات Supabase.
+        self._joiner_auto_enable_at: Dict[str, datetime] = {}
         # ===== [QUIET-DIGEST] Quiet-source watch state =====
         # group_name → {"day": "YYYY-MM-DD" (last alert), "volume": N}.
         # In-memory only: a restart re-seeds via the first-cycle digest
@@ -4669,6 +4672,73 @@ class Monitor:
     # ===================================================================
     # [REQAUDIT-3] Joiner Fleet Health monitor — 60s cycle
     # ===================================================================
+    async def _maybe_auto_enable_disabled_joiners(
+            self, disabled_joiners: List[str],
+            connected: List[str], now_dt: datetime) -> List[str]:
+        """[v4.3.3] JOINER AUTO-RECOVERY — جوهر إصلاح «الانضمام متوقف».
+
+        حساب role=joiner متصل فعليًا لكن joiner_enabled=0 هو طاقة معطّلة
+        (إنتاج 2026-09-02: Y/🇸🇦 متصلان معطّلان بينما المفعّل الوحيد ♧F
+        مقطوع → connected_joiners=0 → العامل يتخطى كل الدورات → انضمام
+        متوقف كليًا رغم «تفعيل» المشغّل).
+
+        القاعدة: الحساب المتصل ذو دور joiner يُفعَّل تلقائيًا (كتابة Supabase)
+        ما لم يكن في فترة تبريد إشباع — joiner_sat_<phone> خلال آخر 24h
+        (ChannelsTooMuch: الحساب ممتلئ فيزيائيًا؛ النداء سيفشل حتمًا).
+
+        - المعطّل + المقطوع: لا يُلمس إطلاقًا — يعود للعمل بنفسه عند إعادة
+          الاتصال (طلب المشغّل الصريح) لأن is_connected() فحص حي كل دورة.
+        - التحكم الدائم للمشغّل = /set_role monitor (العلم يُدار ذاتيًا).
+        - حارس ذاكرة: محاولة auto-enable واحدة/ساعة/حساب (يمنع عاصفة
+          كتابات Supabase لو فشلت الكتابة).
+        - يعيد قائمة الهواتف المفعّلة الآن (تُضاف إلى connected فورًا
+          فلا تُهدر دورة الانتظار الحالية).
+
+        تُستدعى من _joiner_fleet_health_loop كل 60s.
+        """
+        enabled_now: List[str] = []
+        for ph in disabled_joiners:
+            client = self.user_clients.get(ph)
+            if not client or not client.is_connected():
+                continue
+            sat_at = None
+            try:
+                sat_at = await self.prod_db.get_setting(f'joiner_sat_{ph}')
+            except Exception:
+                sat_at = None
+            if sat_at:
+                try:
+                    sat_dt = datetime.fromisoformat(str(sat_at))
+                    if (now_dt - sat_dt).total_seconds() < 86400:
+                        continue  # ما زال في تبريد الإشباع (24h)
+                except Exception:
+                    pass  # سجل تالف → عامله كغير مشبع
+            # حارس المدة: محاولة auto-enable واحدة كل ساعة لكل حساب
+            last_try = self._joiner_auto_enable_at.get(ph)
+            if last_try and (now_dt - last_try).total_seconds() < 3600:
+                continue
+            self._joiner_auto_enable_at[ph] = now_dt
+            ok = False
+            try:
+                ok = await self.db._supabase_update_watcher(
+                    ph, joiner_enabled=1)
+            except Exception:
+                ok = False
+            if ok:
+                # امسح سجل الإشباع (إن وُجد) — بدأت دورة حياة جديدة
+                try:
+                    await self.prod_db.set_setting(f'joiner_sat_{ph}', '')
+                except Exception:
+                    pass
+                connected.append(ph)
+                enabled_now.append(ph)
+                logging.info(
+                    f"[FLEET-HEALTH] [AUTO-ENABLE] {ph} متصل + دور joiner + "
+                    f"خارج تبريد الإشباع → joiner_enabled=1 (استرداد تلقائي — "
+                    f"الانضمام أولوية المشغّل)"
+                )
+        return enabled_now
+
     async def _joiner_fleet_health_loop(self):
         """60s cycle: computes a live snapshot of joiner-fleet health and
         writes it to self._fleet_health for /ready + /api/joined_groups +
@@ -4737,6 +4807,11 @@ class Monitor:
                         safety_guard_blocked += 1
                         continue
                     connected.append(ph)
+
+                # [v4.3.3] JOINER AUTO-RECOVERY — استرداد الطاقة المعطّلة
+                # (التفاصيل في docstring الدالة) ثم تحديث العدّاد.
+                await self._maybe_auto_enable_disabled_joiners(
+                    disabled_joiners, connected, datetime.now())
 
                 connected_count = len(connected)
                 prev_snapshot = self._fleet_health
@@ -7926,7 +8001,14 @@ class Monitor:
                     target_phone = parts[1]
                     ok = await self.db._supabase_update_watcher(target_phone, joiner_enabled=0)
                     if ok:
-                        await reply(f"⏸️ تم إيقاف الانضمام للحساب: {target_phone}\n📦 Source: Supabase (sole source of truth)")
+                        await reply(
+                            f"⏸️ تم إيقاف الانضمام للحساب: {target_phone}\n"
+                            f"📦 Source: Supabase (sole source of truth)\n\n"
+                            f"⚠️ [v4.3.3] هذا الإيقاف مؤقت — AUTO-RECOVERY سيعيد "
+                            f"تفعيل الحساب تلقائيًا خلال دقيقة إن ظل متصلًا "
+                            f"(الانضمام أولوية النظام).\n"
+                            f"للإيقاف الدائم: /set_role {target_phone} monitor"
+                        )
                     else:
                         await reply(f"❌ فشل تحديث Supabase للحساب: {target_phone}")
 
@@ -9744,10 +9826,20 @@ class Monitor:
                     try:
                         await self.db._supabase_update_watcher(
                             phone, joiner_enabled=0)
+                        # [v4.3.3] سجل وقت الإشباع — يقرؤه AUTO-RECOVERY في
+                        # fleet-health لإعادة التفعيل تلقائيًا بعد 24h بدل
+                        # «أعد التفعيل يدويًا» (المشغّل لا يدير الأعلام).
+                        try:
+                            await self.prod_db.set_setting(
+                                f'joiner_sat_{phone}',
+                                datetime.now().isoformat())
+                        except Exception:
+                            pass
                         logging.error(
                             f"[AUTO-DISABLE] {phone} ChannelsTooMuchError "
-                            f"→ joiner_enabled=0 (account saturated — re-enable "
-                            f"manually after leaving some channels)"
+                            f"→ joiner_enabled=0 (account saturated — "
+                            f"[v4.3.3] AUTO-RECOVERY سيعيد تفعيله تلقائيًا "
+                            f"بعد 24h cooldown)"
                         )
                     except Exception as dis_e:
                         logging.error(
