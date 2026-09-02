@@ -877,11 +877,15 @@ class Config:
         # [v4.1] Provider Health Manager — تشخيص إنتاجي 2026-09-01:
         # 3/6 مفاتيح Groq ميتة (403) + rate-limit أثناء الاندفاعات → نصف
         # الرسائل+ ai_error. هذه المفاتيح تُفعّل الصمامات الجديدة.
+        # [SPEED-v4.3.4] طلب المُشغّل «أقصى سرعة مسموحة حتى لو مع مخاطرة»:
+        # التباعد بين نداءات كل مزوّد 1.05s → 0.6s (قد يلمس الإنتاج 429 أكثر
+        # لكن Provider Health Manager + AIMD + dead-key latch يتكفلون بالتعافي
+        # الذاتي). قابل للإرجاع عبر REQUEST_FILTER_AI_MIN_INTERVAL_S دون نشر جديد.
         try:
             self.request_filter_ai_min_interval_s = float(os.getenv(
-                "REQUEST_FILTER_AI_MIN_INTERVAL_S", "1.05"))
+                "REQUEST_FILTER_AI_MIN_INTERVAL_S", "0.6"))
         except ValueError:
-            self.request_filter_ai_min_interval_s = 1.05
+            self.request_filter_ai_min_interval_s = 0.6
         self.request_filter_ai_min_interval_s = max(
             0.0, self.request_filter_ai_min_interval_s)
         try:
@@ -891,11 +895,14 @@ class Config:
             self.request_filter_ai_retry_rounds = 3
         self.request_filter_ai_retry_rounds = max(
             1, self.request_filter_ai_retry_rounds)
+        # [SPEED-v4.3.4] ميزانية القرار الكلية 40s → 25s: مع dead-key latch
+        # المفاتيح الميتة لا تُستدعى أصلًا، والقرار السليم (Mistral) يكتمل <2s.
+        # 40s كانت تُحرق فقط في الحالات المرضية — فشل أسرع الآن.
         try:
             self.request_filter_ai_total_budget_s = float(os.getenv(
-                "REQUEST_FILTER_AI_TOTAL_BUDGET_S", "40"))
+                "REQUEST_FILTER_AI_TOTAL_BUDGET_S", "25"))
         except ValueError:
-            self.request_filter_ai_total_budget_s = 40.0
+            self.request_filter_ai_total_budget_s = 25.0
         try:
             self.request_filter_ai_max_pending = int(os.getenv(
                 "REQUEST_FILTER_AI_MAX_PENDING", "64"))
@@ -906,9 +913,9 @@ class Config:
         # زمن قرار 50.7s وتراكم overloaded).
         try:
             self.request_filter_ai_pool_wait_budget_s = float(os.getenv(
-                "REQUEST_FILTER_AI_POOL_WAIT_BUDGET_S", "4"))
+                "REQUEST_FILTER_AI_POOL_WAIT_BUDGET_S", "2"))
         except ValueError:
-            self.request_filter_ai_pool_wait_budget_s = 4.0
+            self.request_filter_ai_pool_wait_budget_s = 2.0
         self.request_filter_ai_pool_wait_budget_s = max(
             0.5, self.request_filter_ai_pool_wait_budget_s)
         # [v4.2] admission gate: رسائل بلا أي إشارة معجمية → REJECT هيكلي بلا
@@ -3207,15 +3214,29 @@ class Monitor:
         # (الميتريك الحقيقي يعيش في link_system.py record_link_ring_hit).
         # === ACTIVE POLLING WORKER ===
         # بدل الاعتماد على NewMessage events فقط (اللي قد تتأخر أو تُحذف قبل ما توصل),
-        # نضيف polling نشط: كل 3 ثواني نسحب آخر 3 رسائل من كل مجموعة نشطة
-        # هذا يضمن التقاط الرسائل خلال 3 ثواني حتى لو بوت حماية حذفها بسرعة
+        # نضيف polling نشط: كل ثانيتين نسحب آخر الرسائل الجديدة من كل مجموعة نشطة
+        # هذا يضمن التقاط الرسائل خلال ثانيتين حتى لو بوت حماية حذفها بسرعة
         # Key: chat_id → آخر msg_id شافه البوت
         self._polling_state: Dict[int, int] = {}
         self._polling_lock = asyncio.Lock()
         self._active_polling_task = None
         # المجموعات النشطة المرشحة للـ polling (تُحدَّث ديناميكياً من monitored_chats)
         self._active_polling_chats: List[dict] = []
-        self._polling_interval = 5  # ثواني
+        # [SPEED-v4.3.4] طلب المُشغّل «أقصى سرعة التقاط»:
+        #   - الفترة 5s → 2s (قابلة للضبط عبر POLLING_INTERVAL_S)
+        #   - حدّ السحب 3 → 10 رسائل/دورة (POLLING_FETCH_LIMIT) — نفس نداء API
+        #     الواحد، لكن يغطي الاندفاعات الكبيرة (لو وصلت 10 رسائل في دورة
+        #     واحدة كان القديم يلتقط 3 فقط والباقي يفوته للأبد).
+        try:
+            self._polling_interval = max(1.0, float(os.getenv(
+                "POLLING_INTERVAL_S", "2")))
+        except (ValueError, TypeError):
+            self._polling_interval = 2.0
+        try:
+            self._polling_fetch_limit = max(1, int(os.getenv(
+                "POLLING_FETCH_LIMIT", "10")))
+        except (ValueError, TypeError):
+            self._polling_fetch_limit = 10
         # === SOURCE REGISTRY + POLLING SCHEDULER + MESSAGE CLAIM ===
         # طبقة موحدة لـ: اكتشاف المصادر، اختيار القارئ، atomic dedup
         self.source_registry: Optional[SourceRegistry] = None
@@ -5860,20 +5881,27 @@ class Monitor:
                 except Exception:
                     pass  # pre-write فشل — لكن async path أسفل قد ينجح
 
-            # === الخطوة 0a.5: مسار الطلبات المستقل — Capture First → Snapshot → Filter → Send ===
-            # [RACE-CAPTURE] يُرسل تنبيه الطلب BEFORE journal_write و BEFORE cache lock
-            # و BEFORE async LRB cap enforcement. اللقطة (raw_text, chat_id, msg_id,
-            # source_phone) أُخذت أعلاه تزامنياً من event. event.chat/event.sender
-            # تُقرأ تزامنياً داخل _handle_request_path بلا API إضافي (Telethon يُرجع
-            # cached attrs). لو الحذف حدث بعد اللقطة، الإرسال ينجح اعتماداً على snapshot.
-            # مسار مستقل تمامًا: dedup خاص (in-memory dict)، قرار analyze_request
-            # مستقل، فشله مُغلّف بـtry/except لا يكسر مسار الروابط أبدًا.
-            # (رسالة قد تكون طلبًا وفيها رابط → تُرسل للقناتين — المساران مستقلان).
+            # === الخطوة 0a.5: مسار الطلبات المستقل — خلفية غير حاجبة ===
+            # [SPEED-v4.3.4] طلب المُشغّل «أقصى سرعة التقاط»: سابقًا كان هذا
+            # `await self._handle_request_path(...)` — يعني تصنيف AI
+            # (0.5-2s لكل رسالة) يحجب PRE-CACHE + journal + claim + enqueue
+            # لنفس الرسالة، ويعني أيضًا أن رسالة بطيئة AI تؤخر سلسلة
+            # المعالجة. الآن: نشوّن مهمة خلفية مُتعقَّبة (_dispatch_request_path)
+            # تعمل المسار كاملًا (AI → إرسال) بسرعتها، بينما مسار الروابط
+            # يكمل فورًا (cache/journal/claim/enqueue بالميلي ثانية).
+            # اللقطة (raw_text, chat_id, msg_id, source_phone) أُخذت أعلاه
+            # تزامنياً من event؛ event.chat/event.sender تُقرأ داخل المهمة
+            # الخلفية من كائن event ذاته (cached attrs — تعمل حتى لو حُذفت
+            # الرسالة لاحقًا: كائن الـevent يبقى في الذاكرة).
+            # مسار مستقل تمامًا: dedup خاص (in-memory dict)، قرار
+            # analyze_request مستقل، فشله مُغلّف بـtry/except لا يكسر مسار
+            # الروابط أبدًا. (رسالة قد تكون طلبًا وفيها رابط → تُرسل
+            # للقناتين — المساران مستقلان).
             try:
-                await self._handle_request_path(event, raw_text, chat_id, msg_id, source_phone)
+                await self._dispatch_request_path(event, raw_text, chat_id, msg_id, source_phone)
             except Exception as _req_err:
-                # فشل المسار لا يكسر مسار الروابط أبدًا
-                logging.debug(f"[REQUEST-PATH] non-fatal error (link path continues): {_req_err}")
+                # فشل تشغيل المسار الخلفي لا يكسر مسار الروابط أبدًا
+                logging.debug(f"[REQUEST-PATH] dispatch error (link path continues): {_req_err}")
 
             # === الخطوة 0b: LINK-ONLY FAST CAPTURE — async housekeeping ===
             # cap enforcement (_link_ring_put) + metrics — مؤجلة عن snapshot الـLRB
@@ -6131,6 +6159,58 @@ class Monitor:
     #   - لا يُرجع — مسار الروابط أسفلها يكمّل عمله بلا تأثير
     #   - فشله لا يكسر الإطلاق مسار الروابط (مغلّف بـ try/except)
     # ============================================================
+    # [SPEED-v4.3.4] سقف المهام الخلفية المتزامنة لمسار الطلبات — حماية
+    # ذاكرة فقط (المهمة نفسها خفيفة؛ التصنيف AI محدود أصلًا بـ semaphore
+    # intent_classifier + rate limiters). لو بلغ السقف (حالة مرضية نادرة):
+    # fallback إلى التشغيل inline (صحة الطلب > سرعة الرسالة الواحدة).
+    _REQUEST_PATH_MAX_INFLIGHT = 512
+
+    async def _dispatch_request_path(self, event, raw_text: str, chat_id, msg_id, source_phone: str):
+        """[SPEED-v4.3.4] جسر التشغيل الخلفي لمسار الطلبات.
+
+        يُستدعى من _on_user_message (الخطوة 0a.5). يشغّل _handle_request_path
+        كمهمة خلفية مُتعقَّبة ويعود فورًا (microseconds) — تصنيف AI
+        (0.5-2s) لم يعد يحجب PRE-CACHE/journal/claim/enqueue للرسالة
+        نفسها. المهمة تُنظَّف من المجموعة تلقائيًا عند انتهائها، وأي
+        استثناء فيها يُسجَّل (لا يُترك dangling — لا Task exception never
+        retrieved). لو بلغت المهام النشطة السقف: تشغيل inline (انتظار)
+        بدل الإسقاط — الطلب لا يُفقد أبدًا بسبب السرعة.
+        """
+        tasks = getattr(self, '_request_bg_tasks', None)
+        if tasks is None:
+            try:
+                tasks = self._request_bg_tasks = set()
+            except Exception:
+                tasks = None  # namespace لا يقبل setattr (نادر جدًا)
+        if tasks is None:
+            # لا نستطيع التعقب — شغّل inline (السلوك القديم، صحيح دائمًا)
+            await self._handle_request_path(event, raw_text, chat_id, msg_id, source_phone)
+            return
+        # getattr دفاعي: ثابت الصنف لا يُنقل مع MethodType-binding في
+        # الاختبارات (fake namespaces) — الافتراضي نفس قيمة الإنتاج.
+        _max_inflight = int(getattr(self, '_REQUEST_PATH_MAX_INFLIGHT', 512) or 512)
+        if len(tasks) >= _max_inflight:
+            logging.warning(
+                f"[REQUEST-PATH] inflight cap {_max_inflight} hit — "
+                "running inline (correctness over speed for this one message)"
+            )
+            await self._handle_request_path(event, raw_text, chat_id, msg_id, source_phone)
+            return
+
+        def _on_request_task_done(task: asyncio.Task) -> None:
+            tasks.discard(task)
+            if task.cancelled():
+                return
+            exc = task.exception()
+            if exc is not None:
+                logging.error(f"[REQUEST-PATH] background task error: {exc}")
+
+        t = asyncio.create_task(
+            self._handle_request_path(event, raw_text, chat_id, msg_id, source_phone)
+        )
+        tasks.add(t)
+        t.add_done_callback(_on_request_task_done)
+
     async def _handle_request_path(self, event, raw_text: str, chat_id, msg_id, source_phone: str):
         """يرصد طلبات العملاء ويُرسلها لقناة الطلبات. مسار غير قاتل.
 
@@ -6162,6 +6242,28 @@ class Monitor:
 
         if not raw_text or not raw_text.strip():
             return  # نص فارغ — ليس طلبًا
+
+        # === [CHANNEL-EXCLUDE-v4.3.4] طلبات المُشغّل: من المجموعات فقط ===
+        # تشخيص إنتاجي: مسار الطلبات كان يسحب منشورات قنوات البث (قنوات
+        # مواد دراسية) — منشورات تُصنَّف أحيانًا كطلبات فتصل قناة الطلبات
+        # خطأً + تحرق ميزانية AI. الحسم: أي chat له broadcast=True هو قناة
+        # بث (ليست مجموعة) → تخطٍّ قاطع قبل dedup وقبل AI.
+        # (ملاحظة: megagroup=False + broadcast=True = قناة؛ المجموعات
+        # الكبيرة megagroup=True تمرّ؛ المجموعات العادية Chat تمرّ.)
+        try:
+            _co = getattr(event, 'chat', None)
+            if _co is not None and getattr(_co, 'broadcast', False):
+                logging.info(
+                    f"[REQUEST-PATH] skip broadcast channel (groups-only) "
+                    f"chat_id={chat_id} msg_id={msg_id}"
+                )
+                try:
+                    await self.metrics.record_skip('request_broadcast_channel')
+                except Exception:
+                    pass  # metrics لا يوقف المسار
+                return
+        except Exception:
+            pass  # فشل الفحص لا يوقف المسار (اترك الرسالة تُعالج)
 
         # --- [CROSS-ACCOUNT-DEDUP] dedup سريع race-safe (in-memory, TTL 1h, bounded) ---
         # lazy init (لا نعتمد على ترتيب __init__ للاختبارات القديمة) + lock.
@@ -6345,6 +6447,12 @@ class Monitor:
 
         sender_username = ''
         sender_display = 'غير متوفر'
+        # [TASK-FORMAT-v4.3.4] sender_id يُلتقط هنا لبناء زر «مراسلة» —
+        # deep-link بمعرف المستخدم يعمل حتى بلا username أو مع خاصية مغلقة.
+        try:
+            sender_id = int(getattr(event, 'sender_id', 0) or 0)
+        except Exception:
+            sender_id = 0
         try:
             sender_obj = event.sender
             if sender_obj:
@@ -6370,19 +6478,19 @@ class Monitor:
 
         # --- تنسيق التنبيه (HTML-escaped لمنع الحقن) ---
         # النص الأصلي يُرسل دون تشويه، لكن HTML-escaped للسلامة.
-        # [STYLE-MATCH] التنسيق يطابق قناة الروابط (MessageFormatter.format_link_message):
-        #   - نفس إطار <blockquote>
-        #   - نفس ترتيب الحقول: المجموعة → المرسل → الحساب → التاريخ → المصدر
-        #   - نفس روابط الإجراء: "عرض الرسالة الأصلية" + النص في الأسفل
-        #   - أيقونات emoji متناسقة (👥 👤 📟 🕒 📡 🔑)
+        # [TASK-FORMAT-v4.3.4] تنظيف طلب المُشغّل:
+        #   - حُذفت: "طلب مساعدة" (الهيدر) + "الحساب" + "المصدر"
+        #   - "المرسل": يُضاف @username بجانب الاسم (لو موجود)
+        #   - زر «مراسلة» تحت النص → يفتح محادثة المرسل مباشرة
+        #   - بقي: نفس إطار <blockquote> + المجموعة/التاريخ/الكلمات +
+        #     "عرض الرسالة الأصلية" + النص في الأسفل (توافق قناة الروابط)
         safe_text = html_module.escape(str(raw_text)[:1500])
         if len(raw_text) > 1500:
             safe_text += "…"
         safe_sender = html_module.escape(str(sender_display))
-        safe_username = html_module.escape(str(sender_username or 'غير متوفر'))
+        safe_username = html_module.escape(str(sender_username or ''))
         safe_chat = html_module.escape(str(chat_title or 'غير معروف'))
         safe_link = html_module.escape(message_link, quote=True)
-        safe_source = html_module.escape(str(source_phone or ''))
 
         keywords_found = ', '.join(
             (analysis.matched_intents + analysis.matched_services
@@ -6399,16 +6507,37 @@ class Monitor:
             date_str = "غير معروف"
 
         # بناء <blockquote> واحد شامل — مطابق لقناة الروابط
-        content = "🔔 <b>طلب مساعدة</b>\n\n"
-        content += f"👥 <b>المجموعة:</b> {safe_chat}\n"
-        content += f"👤 <b>المرسل:</b> {safe_sender}\n"
-        content += f"📟 <b>الحساب:</b> {safe_username}\n"
+        if safe_username:
+            sender_line = f"👤 <b>المرسل:</b> {safe_sender} ({safe_username})"
+        else:
+            sender_line = f"👤 <b>المرسل:</b> {safe_sender}"
+        content = f"👥 <b>المجموعة:</b> {safe_chat}\n"
+        content += sender_line + "\n"
         content += f"🕒 <b>التاريخ:</b> {date_str}\n"
-        content += f"📡 <b>المصدر:</b> <code>{safe_source}</code>\n"
         content += f"🔑 <b>الكلمات:</b> {safe_keywords}\n\n"
         content += f'🔗 <a href="{safe_link}">عرض الرسالة الأصلية</a>'
         content += f"\n\n💬 <b>نص الطلب:</b>\n<i>{safe_text}</i>"
         alert = f"<blockquote>{content}</blockquote>"
+
+        # --- [TASK-FORMAT-v4.3.4] زر «مراسلة» — محادثة المرسل المباشرة ---
+        # استراتيجية الرابط:
+        #   - مع username → https://t.me/<username> (رسمي، يعمل في كل العملاء)
+        #   - بلا username → tg://user?id=<uid> (deep-link بمعرف المستخدم —
+        #     يفتح المحادثة حتى لو لا يوجد username أو الخاص مغلق؛ المُشغّل
+        #     يشارك غالبًا نفس المجموعات فيعمل الresolve في عميله)
+        #   - sender_id <= 0 (مرسل مجهول/قناة) → بلا زر (لا يوجد مستخدم للمراسلة)
+        dm_buttons = None
+        try:
+            _sid = int(sender_id or 0)
+            if _sid > 0:
+                if sender_username:
+                    _dm_url = f"https://t.me/{str(sender_username).lstrip('@')}"
+                else:
+                    _dm_url = f"tg://user?id={_sid}"
+                dm_buttons = [[Button.url("✉️ مراسلة", _dm_url)]]
+                logging.debug(f"[REQUEST-PATH] DM button url={_dm_url}")
+        except Exception:
+            dm_buttons = None  # فشل بناء الزر لا يمنع إرسال التنبيه
 
         # --- الإرسال لقناة الطلبات (retry + FloodWait handling) ---
         # getattr دفاعي لـbot_client: لو fake namespace (اختبارات) بلا bot_client،
@@ -6427,12 +6556,14 @@ class Monitor:
                 f"  (chat_id={chat_id} msg_id={msg_id} source={source_phone})"
             )
             await _bot_client.send_message(
-                target, alert, parse_mode='html', link_preview=False
+                target, alert, parse_mode='html', link_preview=False,
+                buttons=dm_buttons,
             )
             logging.info(
                 f"[REQUEST-PATH] ✅ sent request alert "
                 f"chat_id={chat_id} msg_id={msg_id} "
-                f"keywords={keywords_found} source={source_phone}"
+                f"keywords={keywords_found} source={source_phone} "
+                f"dm_button={'yes' if dm_buttons else 'no'}"
             )
         except FloodWaitError as e:
             # أعد المحاولة بعد الانتظار (محدود لتجنب التعليق)
@@ -6440,7 +6571,10 @@ class Monitor:
             logging.warning(f"[REQUEST-PATH] FloodWait {wait_s}s — retrying")
             try:
                 await asyncio.sleep(wait_s)
-                await _bot_client.send_message(target, alert, parse_mode='html', link_preview=False)
+                await _bot_client.send_message(
+                    target, alert, parse_mode='html', link_preview=False,
+                    buttons=dm_buttons,
+                )
                 logging.info(f"[REQUEST-PATH] ✅ sent after FloodWait chat_id={chat_id} msg_id={msg_id}")
             except Exception as e2:
                 logging.error(f"[REQUEST-PATH] send failed after FloodWait retry: {e2}")
@@ -6966,13 +7100,13 @@ class Monitor:
             logging.error(f"[POLLING] refresh error: {e}")
 
     async def _active_polling_worker(self):
-        """Active Polling Worker — يسحب آخر 3 رسائل من كل مجموعة نشطة كل 3 ثواني.
+        """Active Polling Worker — يسحب آخر الرسائل من كل مجموعة نشطة كل ثانيتين ([SPEED-v4.3.4]).
         
         الحل الجذري لمشكلة بوتات الحماية:
         - بوتات الحماية (جبل/صقير) admin وتحذف الرسائل بسرعة (100-300ms)
         - بوتنا عضو عادي، ما يحصل على MessageDeleted event
         - NewMessage event قد يتأخر أو يصل بعد الحذف
-        - الحل: polling نشط كل 3 ثواني يلتقط الرسائل قبل ما تُحذف
+        - الحل: polling نشط كل ثانيتين يلتقط الرسائل قبل ما تُحذف
         
         الاستراتيجية:
         1. لكل مجموعة نشطة، نتذكر آخر msg_id شفناه
@@ -6987,8 +7121,9 @@ class Monitor:
         
         while self._running:
             try:
-                # حدّث القائمة كل 5 دقايق
-                if time.time() - last_refresh > 300:
+                # حدّث القائمة كل دقيقتين ([SPEED-v4.3.4]: كانت 5 دقايق — اكتشاف
+                # أسرع للمجموعات النشطة الجديدة، نداء Supabase واحد فقط)
+                if time.time() - last_refresh > 120:
                     await self._refresh_active_polling_chats()
                     last_refresh = time.time()
                 
@@ -7041,10 +7176,12 @@ class Monitor:
             last_msg_id = self._polling_state.get(chat_id, 0)
         
         try:
-            # اسحب آخر 3 رسائل بـ id > last_msg_id
-            # limit=3 + min_id=last_msg_id = كفاءة عالية (صفر payload لو ما فيه جديد)
+            # اسحب الرسائل الجديدة (id > last_msg_id) — [SPEED-v4.3.4]
+            # limit قابلة للضبط (default 10) + min_id=last_msg_id = كفاءة عالية
+            # (صفر payload إضافي لو ما فيه جديد — نفس نداء API الواحد)
+            _pf_limit = max(1, int(getattr(self, '_polling_fetch_limit', 10) or 10))
             messages = await client.get_messages(
-                chat_id, limit=3, min_id=last_msg_id
+                chat_id, limit=_pf_limit, min_id=last_msg_id
             )
             if not messages:
                 return  # ما فيه جديد
@@ -12089,9 +12226,19 @@ async def api_polling_status_handler(request):
 
         cache_size = len(monitor._msg_cache)
 
+        # [SPEED-v4.3.4] إعدادات السرعة الجديدة + حالة المهام الخلفية
+        _bg_tasks = getattr(monitor, '_request_bg_tasks', None) or set()
+        _sched = getattr(monitor, 'polling_scheduler', None)
         return web.json_response({
             'polling_enabled': True,
             'polling_interval': monitor._polling_interval,
+            'polling_fetch_limit': getattr(monitor, '_polling_fetch_limit', 10),
+            'tier_intervals': (
+                {k: v['poll_interval_s'] for k, v in _sched.TIERS.items()}
+                if _sched is not None else None),
+            'scheduler_batch': (
+                getattr(_sched, 'BATCH_SIZE', None) if _sched is not None else None),
+            'request_bg_inflight': len(_bg_tasks),
             'active_chats_count': active_chats_count,
             'active_chats': active_chats,
             'scheduler_running': scheduler_running,

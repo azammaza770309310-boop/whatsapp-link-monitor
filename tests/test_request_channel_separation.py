@@ -252,10 +252,22 @@ def make_monitor(prod_db, channel_id=-1001234567890,
         '_link_ring_put', '_link_ring_pop', '_link_ring_evict',
         '_normalized_to_link_data', '_rescue_link_only',
         '_on_user_message', '_on_message_deleted', '_handle_request_path',
+        # [SPEED-v4.3.4] مسار الطلبات أصبح خلفية غير حاجبة — الاختبارات تُربط
+        # الجسر الحقيقي وتُصفّي المهام الخلفية قبل التحقق من الإرسال.
+        '_dispatch_request_path',
     ):
         setattr(fm, method_name,
                 types.MethodType(getattr(bot.Monitor, method_name), fm))
     return fm
+
+
+async def drain_request_tasks(fm):
+    """[SPEED-v4.3.4] انتظار مهام مسار الطلبات الخلفية حتى تكتمل —
+    _on_user_message يشغّل المسار الآن كـ fire-and-forget task.
+    تُستدعى قبل أي تأكيد على send_message."""
+    tasks = list(getattr(fm, '_request_bg_tasks', None) or set())
+    if tasks:
+        await asyncio.gather(*tasks, return_exceptions=True)
 
 
 def get_request_send_targets(fm):
@@ -276,6 +288,7 @@ async def test_1_request_message_sent_to_requests_channel_not_link_channel():
         raw_text = "مين يحل لي واجب رياضيات؟ محتاج مساعدة"
         ev = FakeNewMessageEvent(raw_text, chat, msg_id, chat=None, sender=None)
         await fm._on_user_message(ev, '+TEST_SOURCE')
+        await drain_request_tasks(fm)
 
         sm = fm.bot_client.send_message
         record("1: send_message was called (request alert dispatched)",
@@ -352,6 +365,7 @@ async def test_3_no_target_no_send_no_fallback_to_link_channel():
         raw_text = "مين يحل لي واجب رياضيات؟ محتاج مساعدة"
         ev = FakeNewMessageEvent(raw_text, chat, msg_id, chat=None, sender=None)
         await fm._on_user_message(ev, '+TEST_SOURCE')
+        await drain_request_tasks(fm)
 
         sm = fm.bot_client.send_message
         record("3: send_message NOT called (no target configured)",
@@ -388,6 +402,7 @@ async def test_4_link_only_message_request_path_silent_link_path_runs():
         raw_text = f"انضموا للقروب https://t.me/{link_username}"
         ev = FakeNewMessageEvent(raw_text, chat, msg_id, chat=None, sender=None)
         await fm._on_user_message(ev, '+TEST_SOURCE')
+        await drain_request_tasks(fm)
 
         sm = fm.bot_client.send_message
         # request path: لا يُرسل (الرسالة لا تحوي كلمات طلب حقيقية — انضموا للقروب
@@ -438,6 +453,7 @@ async def test_5_both_paths_run_on_request_plus_link_message():
         raw_text = f"مين يحل لي واجب البرمجة؟ انضموا https://t.me/{link_username}"
         ev = FakeNewMessageEvent(raw_text, chat, msg_id, chat=None, sender=None)
         await fm._on_user_message(ev, '+TEST_SOURCE')
+        await drain_request_tasks(fm)
 
         sm = fm.bot_client.send_message
         # link path must run regardless of request classification
@@ -571,6 +587,7 @@ async def test_10_alert_format_matches_link_channel_style():
         raw_text = "مين يحل لي واجب رياضيات؟ محتاج مساعدة عاجلة"
         ev = FakeNewMessageEvent(raw_text, chat, msg_id, chat=None, sender=None)
         await fm._on_user_message(ev, '+TEST_SOURCE')
+        await drain_request_tasks(fm)
 
         sm = fm.bot_client.send_message
         record("10: send_message was called (alert dispatched)",
@@ -584,27 +601,46 @@ async def test_10_alert_format_matches_link_channel_style():
                alert.startswith('<blockquote>') and alert.endswith('</blockquote>'),
                f"alert starts/ends: {alert[:30]!r}...{alert[-30:]!r}")
 
-        # [STYLE-MATCH] header: "طلب مساعدة" (matches link channel's "🔗 رابط محفوظ")
-        record("10: alert has header 'طلب مساعدة'",
-               'طلب مساعدة' in alert,
-               f"alert snippet: {alert[:200]!r}")
+        # [TASK-FORMAT-v4.3.4] تنظيف طلب المُشغّل:
+        #   - حُذف: "طلب مساعدة" (header) + "📟 الحساب" + "📡 المصدر"
+        record("10: alert does NOT have header 'طلب مساعدة' (removed by operator)",
+               'طلب مساعدة' not in alert,
+               f"header still present: {alert[:200]!r}")
+        record("10: alert does NOT have '📟 <b>الحساب:</b>' (removed by operator)",
+               '📟 <b>الحساب:</b>' not in alert,
+               "account line still present")
+        record("10: alert does NOT have '📡 <b>المصدر:</b>' (removed by operator)",
+               '📡 <b>المصدر:</b>' not in alert,
+               "source line still present")
 
-        # [STYLE-MATCH] field labels matching link channel
+        # [STYLE-MATCH] field labels matching link channel (المُبقَاة)
         record("10: alert has '👥 <b>المجموعة:</b>' (link channel: 👥 العضوية)",
                '👥 <b>المجموعة:</b>' in alert,
                "missing group label")
         record("10: alert has '👤 <b>المرسل:</b>' (link channel: 👤 الاسم)",
                '👤 <b>المرسل:</b>' in alert,
                "missing sender label")
-        record("10: alert has '🕒 <b>التاريخ:</b>' (link channel: 🕒 التاريخ — NEW field)",
+        record("10: alert has '🕒 <b>التاريخ:</b>' (link channel: 🕒 التاريخ)",
                '🕒 <b>التاريخ:</b>' in alert,
-               "missing date label (new field)")
-        record("10: alert has '📡 <b>المصدر:</b>' with <code> wrapping (link channel: 📡 العدد)",
-               '📡 <b>المصدر:</b> <code>' in alert,
-               "missing source label with code tag")
+               "missing date label")
         record("10: alert has '🔑 <b>الكلمات:</b>' field",
                '🔑 <b>الكلمات:</b>' in alert,
                "missing keywords label")
+
+        # [TASK-FORMAT-v4.3.4] زر «مراسلة» — deep-link بمعرف المستخدم
+        # (FakeNewMessageEvent sender_id=42, بلا username → tg://user?id=42)
+        kw = sm.calls[0]['kwargs']
+        record("10: send_message called with buttons kwarg (DM button present)",
+               'buttons' in kw and kw.get('buttons') is not None,
+               f"kwargs keys: {list(kw.keys())!r}")
+        _btn = (kw.get('buttons') or [[None]])[0][0]
+        if _btn is not None:
+            record("10: DM button label 'مراسلة'",
+                   'مراسلة' in (getattr(_btn, 'text', '') or ''),
+                   f"button text: {getattr(_btn, 'text', None)!r}")
+            record("10: DM button uses user-ID deep-link tg://user?id=42 (no username)",
+                   (getattr(_btn, 'url', '') or '') == 'tg://user?id=42',
+                   f"button url: {getattr(_btn, 'url', None)!r}")
 
         # [STYLE-MATCH] link text "عرض الرسالة الأصلية" (matches link channel exactly)
         record("10: alert has link text 'عرض الرسالة الأصلية' (matches link channel)",
@@ -650,11 +686,12 @@ async def test_11_cross_account_dedup_race_safe():
         ev1 = FakeNewMessageEvent(raw_text, chat, msg_id, chat=None, sender=None)
         ev2 = FakeNewMessageEvent(raw_text, chat, msg_id, chat=None, sender=None)
 
-        # تشغيل الاستدعاءين بشكل متوازي (محاكاة سباق)
+        # تشغيل الاستدعاءين بشكل متوازي (محاكاة سباق) ثم تصفية المهام الخلفية
         await asyncio.gather(
             fm._on_user_message(ev1, '+MONITOR_ACCOUNT'),
             fm._on_user_message(ev2, '+JOINER_ACCOUNT'),
         )
+        await drain_request_tasks(fm)
 
         sm = fm.bot_client.send_message
         record("11: exactly 1 send_message call (race-safe dedup prevented duplicate)",
@@ -699,6 +736,7 @@ async def test_12_different_messages_no_false_dedup():
             fm._on_user_message(ev1, '+ACCOUNT_A'),
             fm._on_user_message(ev2, '+ACCOUNT_B'),
         )
+        await drain_request_tasks(fm)
 
         sm = fm.bot_client.send_message
         record("12: exactly 2 send_message calls (different msg_id → no false dedup)",
@@ -744,6 +782,7 @@ async def test_13_alert_html_escapes_user_content():
             chat=malicious_chat, sender=malicious_sender
         )
         await fm._on_user_message(ev, '+TEST_SOURCE')
+        await drain_request_tasks(fm)
 
         sm = fm.bot_client.send_message
         record("13: send_message was called (alert dispatched)",
@@ -797,6 +836,7 @@ async def test_14_alert_has_date_field_in_link_channel_format():
         ev = FakeNewMessageEvent(raw_text, chat, msg_id, chat=None, sender=None)
         ev.message = fake_msg  # نضيف السمة بعد الإنشاء
         await fm._on_user_message(ev, '+TEST_SOURCE')
+        await drain_request_tasks(fm)
 
         sm = fm.bot_client.send_message
         record("14: send_message was called (alert dispatched)",
@@ -814,6 +854,168 @@ async def test_14_alert_has_date_field_in_link_channel_format():
             record("14: date value matches injected message.date (2025-08-29 14:30)",
                    date_match.group(1) == '2025-08-29 14:30',
                    f"got date={date_match.group(1)}")
+    finally:
+        await conn.close()
+        try: os.remove(db_path)
+        except: pass
+
+
+# =====================================================================
+# Test 15: [CHANNEL-EXCLUDE-v4.3.4] broadcast channel → NO request send.
+# المسار يقبل الطلبات من المجموعات فقط — قنوات البث تُستثنى قاطعًا قبل
+# dedup وقبل AI. مجموعة megagroup تمرّ (سيطرة).
+# =====================================================================
+class FakeBroadcastChat:
+    broadcast = True
+    megagroup = False
+    title = 'قناة مواد دراسية'
+    username = 'study_materials_ch'
+
+
+class FakeMegagroupChat:
+    broadcast = False
+    megagroup = True
+    title = 'مجموعة المناقشة'
+    username = 'discussion_group'
+
+
+async def test_15_broadcast_channel_excluded_groups_only():
+    print("\n--- Test 15: [CHANNEL-EXCLUDE] broadcast channel → NO request alert (groups only) ---")
+    prod_db, db_path, conn = await make_test_db()
+    try:
+        fm = make_monitor(prod_db)
+        # (أ) رسالة نص طلب من قناة بث → لا إرسال إطلاقًا
+        ev_ch = FakeNewMessageEvent(
+            "مين يحل لي واجب رياضيات؟ محتاج مساعدة عاجلة",
+            -1003333001, 330001,
+            chat=FakeBroadcastChat(), sender=None)
+        await fm._on_user_message(ev_ch, '+TEST_SOURCE')
+        await drain_request_tasks(fm)
+        sm = fm.bot_client.send_message
+        record("15: broadcast channel post → NO send_message (excluded)",
+               not sm.called, f"got {sm.call_count} sends")
+        # ميتريك التخطي سُجّل
+        skip_calls = [c.args[0] if c.args else None
+                      for c in fm.metrics.record_skip.await_args_list]
+        record("15: metrics.record_skip('request_broadcast_channel') recorded",
+               'request_broadcast_channel' in skip_calls,
+               f"skip calls: {skip_calls!r}")
+
+        # (ب) نفس النص من مجموعة megagroup → يُرسل (سيطرة: المجموعات تمرّ)
+        sm.reset_mock()
+        ev_g = FakeNewMessageEvent(
+            "مين يحل لي واجب رياضيات؟ محتاج مساعدة عاجلة",
+            -1003333002, 330002,
+            chat=FakeMegagroupChat(), sender=None)
+        await fm._on_user_message(ev_g, '+TEST_SOURCE')
+        await drain_request_tasks(fm)
+        record("15: megagroup message → send_message DOES fire (control)",
+               sm.call_count == 1,
+               f"got {sm.call_count} sends (expected 1)")
+    finally:
+        await conn.close()
+        try: os.remove(db_path)
+        except: pass
+
+
+# =====================================================================
+# Test 16: [TASK-FORMAT] sender WITH username → المرسسل يحمل @username
+# وزر «مراسلة» يستخدم https://t.me/<username>.
+# =====================================================================
+class FakeUserWithUsername:
+    username = 'ahmed_test'
+    first_name = 'أحمد'
+    last_name = None
+
+
+async def test_16_sender_username_in_line_and_tme_button():
+    print("\n--- Test 16: sender with username → المرسل (@user) + t.me DM button ---")
+    prod_db, db_path, conn = await make_test_db()
+    try:
+        fm = make_monitor(prod_db)
+        ev = FakeNewMessageEvent(
+            "مين يحل لي واجب رياضيات؟ محتاج مساعدة",
+            -1003333003, 330003, sender_id=777,
+            chat=FakeMegagroupChat(), sender=FakeUserWithUsername())
+        await fm._on_user_message(ev, '+TEST_SOURCE')
+        await drain_request_tasks(fm)
+        sm = fm.bot_client.send_message
+        record("16: alert sent", sm.called, "send_message not called")
+        if not sm.called:
+            return
+        alert = sm.calls[0]['alert']
+        record("16: المرسل line contains '@ahmed_test' beside name",
+               'المرسل:</b> أحمد (@ahmed_test)' in alert,
+               f"sender snippet: {alert[:220]!r}")
+        kw = sm.calls[0]['kwargs']
+        _btn = (kw.get('buttons') or [[None]])[0][0]
+        record("16: DM button uses https://t.me/ahmed_test (username path)",
+               (getattr(_btn, 'url', '') or '') == 'https://t.me/ahmed_test',
+               f"button url: {getattr(_btn, 'url', None)!r}")
+        record("16: DM button does NOT use tg://user (username exists)",
+               'tg://user' not in (getattr(_btn, 'url', '') or ''),
+               f"button url: {getattr(_btn, 'url', None)!r}")
+    finally:
+        await conn.close()
+        try: os.remove(db_path)
+        except: pass
+
+
+# =====================================================================
+# Test 17: [SPEED-v4.3.4] fire-and-forget — AI بطيء (0.8s) لا يحجب
+# مسار الروابط: _on_user_message يعود سريعًا، PRE-CACHE مكتوب، والمهمة
+# الخلفية لا تزال نشطة، وبعد التصفية يُرسل التنبيه ويُنظَّف الحوض.
+# =====================================================================
+def make_slow_request_classifier(sleep_s=0.8):
+    async def transport(provider, payload):
+        await asyncio.sleep(sleep_s)
+        user_msg = payload["messages"][1]["content"]
+        inner = user_msg.split('"""')[-2] if '"""' in user_msg else user_msg
+        if any(m in inner for m in _REQUEST_MARKERS) and not any(m in inner for m in _AD_MARKERS):
+            content = _ai_json("ACCEPT", 0.93, "homework_execution_request", "طلب مساعدة أكاديمية")
+        else:
+            content = _ai_json("REJECT", 0.95, "other", "ليس طلبًا")
+        return 200, _json.dumps({"choices": [{"message": {"content": content}}]})
+    return _IC(providers=[{"key": "k", "url": "u", "model": "mock-slow", "name": "Slow"}],
+               transport=transport)
+
+
+async def test_17_fire_and_forget_request_path():
+    print("\n--- Test 17: [SPEED] slow AI (0.8s) does NOT block link path (fire-and-forget) ---")
+    prod_db, db_path, conn = await make_test_db()
+    try:
+        fm = make_monitor(prod_db)
+        fm.request_classifier = make_slow_request_classifier(0.8)
+        chat = -1003333004
+        msg_id = 330004
+        raw_text = "مين يحل لي واجب رياضيات؟ https://t.me/SomeGroup"
+        ev = FakeNewMessageEvent(raw_text, chat, msg_id, chat=None, sender=None)
+
+        t0 = time.monotonic()
+        await fm._on_user_message(ev, '+TEST_SOURCE')
+        handler_elapsed = time.monotonic() - t0
+
+        # المسار الرئيسي عاد سريعًا — AI (0.8s) لم يحجبه
+        record("17: _on_user_message returned in < 0.4s while AI sleeps 0.8s",
+               handler_elapsed < 0.4,
+               f"handler took {handler_elapsed:.3f}s (AI sleeps 0.8s)")
+        # مسار الروابط اكتمل رغم أن AI لا يزال يعمل
+        record("17: PRE-CACHE written while AI still running",
+               (chat, msg_id) in fm._msg_cache,
+               "message not in _msg_cache right after handler returned")
+        # المهمة الخلفية لا تزال نشطة (غير حاجبة)
+        inflight = len(getattr(fm, '_request_bg_tasks', set()) or set())
+        record("17: request bg task still in-flight right after handler returned",
+               inflight == 1, f"inflight={inflight} (expected 1)")
+
+        # التصفية: التنبيه يُرسل الآن والحوض يُنظَّف
+        await drain_request_tasks(fm)
+        sm = fm.bot_client.send_message
+        record("17: after drain — request alert sent (async path completed)",
+               sm.call_count == 1, f"got {sm.call_count} sends")
+        record("17: bg task pool cleaned after completion",
+               len(getattr(fm, '_request_bg_tasks', set()) or set()) == 0,
+               "task set not empty after drain")
     finally:
         await conn.close()
         try: os.remove(db_path)
@@ -845,6 +1047,9 @@ async def main():
     await test_12_different_messages_no_false_dedup()
     await test_13_alert_html_escapes_user_content()
     await test_14_alert_has_date_field_in_link_channel_format()
+    await test_15_broadcast_channel_excluded_groups_only()
+    await test_16_sender_username_in_line_and_tme_button()
+    await test_17_fire_and_forget_request_path()
     print("\n" + "=" * 70)
     passed = sum(1 for r in RESULTS if r['passed'])
     failed = sum(1 for r in RESULTS if not r['passed'])

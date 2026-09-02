@@ -182,6 +182,11 @@ class RateLimiter:
     """
 
     # حدود كل نوع عملية (مخففة)
+    # [SPEED-v4.3.4] طلب المُشغّل «أقصى سرعة التقاط — حتى لو مع مخاطرة»:
+    # polling 25→40 نداء/دقيقة لكل حساب و min_delay 2s→1s (قابلة للضبط عبر
+    # POLLING_RATE_PER_MIN و POLLING_MIN_DELAY_S). أي FloodWait ناتج يُلتقط
+    # بالـFloodWaitManager ويؤجّل الجدولة تلقائيًا (self-healing) — الخطر
+    # المقبول صراحةً من المُشغّل مقابل أسرع التقاط.
     OP_LIMITS = {
         'join':              {'max': 15,  'window': 3600, 'min_delay': 60},  # 15/ساعة, 60 ثانية بين كل واحد
         'import_invite':     {'max': 15,  'window': 3600, 'min_delay': 60},
@@ -189,7 +194,9 @@ class RateLimiter:
         'get_entity':        {'max': 30,  'window': 60,   'min_delay': 2},
         'membership_check':  {'max': 20,  'window': 60,   'min_delay': 3},
         'message_send':      {'max': 20,  'window': 60,   'min_delay': 3},
-        'polling':           {'max': 25,  'window': 60,   'min_delay': 2},  # 25 get_messages/دقيقة لكل حساب
+        'polling':           {'max': int(os.getenv('POLLING_RATE_PER_MIN', '40')),
+                              'window': 60,
+                              'min_delay': float(os.getenv('POLLING_MIN_DELAY_S', '1'))},
         'generic':           {'max': 20,  'window': 60,   'min_delay': 3},
     }
 

@@ -218,6 +218,8 @@ def make_monitor(prod_db, channel_id=-1001234567890,
         '_link_ring_put', '_link_ring_pop', '_link_ring_evict',
         '_normalized_to_link_data', '_rescue_link_only',
         '_on_user_message', '_on_message_deleted', '_handle_request_path',
+        # [SPEED-v4.3.4] مسار الطلبات خلفية غير حاجبة — نربط الجسر الحقيقي
+        '_dispatch_request_path',
         '_poll_one_chat',
     ):
         setattr(fm, method_name,
@@ -229,6 +231,14 @@ def make_monitor(prod_db, channel_id=-1001234567890,
     fm._get_sender_name = bot.Monitor._get_sender_name
     fm._send_mock = send_mock
     return fm
+
+
+async def drain_request_tasks(fm):
+    """[SPEED-v4.3.4] انتظار مهام مسار الطلبات الخلفية حتى تكتمل —
+    _on_user_message يشغّل المسار الآن كـ fire-and-forget task."""
+    tasks = list(getattr(fm, '_request_bg_tasks', None) or set())
+    if tasks:
+        await asyncio.gather(*tasks, return_exceptions=True)
 
 
 # =========================================================================
@@ -269,6 +279,7 @@ async def test_newmessage_bot_skipped():
         ev = FakeNewMessageEvent(raw, chat_id, msg_id,
                                   sender_id=7770001, sender=bot_sender)
         await fm._on_user_message(ev, '966500000001')
+        await drain_request_tasks(fm)
         no_send = (fm._send_mock.call_count == 0)
         no_lrb = ((chat_id, msg_id) not in fm._link_ring)
         no_cache = ((chat_id, msg_id) not in fm._msg_cache)
@@ -304,6 +315,7 @@ async def test_newmessage_bot_purges_lrb():
         ev = FakeNewMessageEvent(raw, chat_id, msg_id,
                                   sender_id=7770002, sender=bot_sender)
         await fm._on_user_message(ev, '966500000002')
+        await drain_request_tasks(fm)
         purged = (key not in fm._link_ring)
         purged_ts = (key not in fm._link_ring_ts)
         no_send = (fm._send_mock.call_count == 0)
@@ -336,6 +348,7 @@ async def test_newmessage_user_continues():
         ev = FakeNewMessageEvent(raw, chat_id, msg_id,
                                   sender_id=5550001, sender=user_sender)
         await fm._on_user_message(ev, '966500000003')
+        await drain_request_tasks(fm)
         lrb_has = ((chat_id, msg_id) in fm._link_ring)
         record("user message → LRB entry written", lrb_has,
                f"link_ring keys={list(fm._link_ring.keys())}")
@@ -358,8 +371,11 @@ def test_static_guard_ordering_in_on_user_message():
     idx_guard = src.find('_sender_is_bot')
     # extract_links call (real invocation, not comment)
     idx_extract = src.find('LinkNormalizer.extract_links')
-    # _handle_request_path real call site — نبحث عن النداء الفعلي لا التعليق
-    idx_req = src.find('await self._handle_request_path(event')
+    # request-path call site — نبحث عن النداء الفعلي لا التعليق.
+    # [SPEED-v4.3.4] النداء أصبح عبر الجسر الخلفي _dispatch_request_path.
+    idx_req = src.find('await self._dispatch_request_path(event')
+    if idx_req == -1:
+        idx_req = src.find('await self._handle_request_path(event')
     order_ok = (idx_guard != -1 and idx_extract != -1 and idx_req != -1
                 and idx_guard < idx_extract and idx_guard < idx_req)
     record("_sender_is_bot present in _on_user_message", has_guard)

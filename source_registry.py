@@ -483,19 +483,23 @@ class PollingScheduler:
     - FloodWait handled dynamically: record_floodwait + delay next_poll_at
     """
 
+    # [SPEED-v4.3.4] طلب المُشغّل «أقصى سرعة التقاط — حتى لو مع مخاطرة»:
+    # الطبقات أسرع 2.5x (قابلة للضبط عبر POLL_TIER_*_S دون نشر جديد).
+    # الحماية الفعلية ليست هنا بل في RateLimiter('polling') + FloodWaitManager
+    # (أي تجاوز لحدود Telegram يُسجّل فلوّيت ويؤجّل الجدولة تلقائيًا).
     TIERS = {
-        'hot':    {'max_age_min': 5,    'poll_interval_s': 10},
-        'active': {'max_age_min': 60,   'poll_interval_s': 30},
-        'cool':   {'max_age_min': 1440, 'poll_interval_s': 120},
-        'cold':   {'max_age_min': None, 'poll_interval_s': 600},
+        'hot':    {'max_age_min': 5,    'poll_interval_s': float(os.getenv('POLL_TIER_HOT_S', '4'))},
+        'active': {'max_age_min': 60,   'poll_interval_s': float(os.getenv('POLL_TIER_ACTIVE_S', '12'))},
+        'cool':   {'max_age_min': 1440, 'poll_interval_s': float(os.getenv('POLL_TIER_COOL_S', '45'))},
+        'cold':   {'max_age_min': None, 'poll_interval_s': float(os.getenv('POLL_TIER_COLD_S', '240'))},
     }
 
-    BATCH_SIZE = 25
+    BATCH_SIZE = int(os.getenv('POLL_BATCH_SIZE', '30'))
     BATCH_PAUSE_S = 0.3
-    CYCLE_SLEEP_S = 2
+    CYCLE_SLEEP_S = float(os.getenv('POLL_CYCLE_SLEEP_S', '1'))
     # Polling متزامن محدود — التوازي عبر الحسابات المختلفة فقط
-    # (RateLimiter يسلسل عمليات نفس الحساب عبر قفل لكل هاتف + min_delay=2s)
-    MAX_CONCURRENT_POLLS = 4
+    # (RateLimiter يسلسل عمليات نفس الحساب عبر قفل لكل هاتف + min_delay)
+    MAX_CONCURRENT_POLLS = int(os.getenv('POLL_MAX_CONCURRENT', '6'))
 
     def __init__(self, source_registry, prod_db, rate_limiter, floodwait_mgr,
                  message_claim, monitor_ref):

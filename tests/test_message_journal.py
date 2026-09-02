@@ -841,16 +841,25 @@ async def test_O():
 # === Test P: PollingScheduler constants ===
 
 async def test_P():
-    """ثوابت الجدولة: batch=25، تزامن=4."""
-    print("\n--- Test P: PollingScheduler constants ---")
+    """ثوابت الجدولة — [SPEED-v4.3.4]: batch=30، تزامن=6 (قيم افتراضية
+    قابلة للضبط عبر POLL_BATCH_SIZE و POLL_MAX_CONCURRENT)."""
+    print("\n--- Test P: PollingScheduler constants (SPEED-v4.3.4) ---")
     try:
         from source_registry import PollingScheduler
-        record("P: PollingScheduler.BATCH_SIZE == 25",
-               PollingScheduler.BATCH_SIZE == 25,
+        import os as _os
+        _exp_batch = int(_os.getenv('POLL_BATCH_SIZE', '30'))
+        _exp_conc = int(_os.getenv('POLL_MAX_CONCURRENT', '6'))
+        record(f"P: PollingScheduler.BATCH_SIZE == {_exp_batch}",
+               PollingScheduler.BATCH_SIZE == _exp_batch,
                f"got {PollingScheduler.BATCH_SIZE}")
-        record("P: PollingScheduler.MAX_CONCURRENT_POLLS == 4",
-               PollingScheduler.MAX_CONCURRENT_POLLS == 4,
+        record(f"P: PollingScheduler.MAX_CONCURRENT_POLLS == {_exp_conc}",
+               PollingScheduler.MAX_CONCURRENT_POLLS == _exp_conc,
                f"got {PollingScheduler.MAX_CONCURRENT_POLLS}")
+        # [SPEED-v4.3.4] الطبقات أسرع — الافتراضي الجديد
+        _exp_hot = float(_os.getenv('POLL_TIER_HOT_S', '4'))
+        record(f"P: hot tier interval == {_exp_hot}s (was 10s — max capture speed)",
+               PollingScheduler.TIERS['hot']['poll_interval_s'] == _exp_hot,
+               f"got {PollingScheduler.TIERS['hot']['poll_interval_s']}")
     except Exception as e:
         record("P: exception", False, str(e))
 

@@ -545,6 +545,8 @@ def make_fm(prod_db=None, channel_id=-1001234567890,
               '_link_ring_put', '_link_ring_pop', '_link_ring_evict',
               '_normalized_to_link_data', '_rescue_link_only',
               '_on_user_message', '_on_message_deleted', '_handle_request_path',
+              # [SPEED-v4.3.4] مسار الطلبات خلفية غير حاجبة
+              '_dispatch_request_path',
               '_poll_one_chat'):
         setattr(fm, m, types.MethodType(getattr(bot.Monitor, m), fm))
     # staticmethods — plain function attrs (no MethodType binding)
@@ -678,6 +680,9 @@ async def test_section_F():
     ev = FakeEvent(raw, -100555000777, 9500,
                    sender=FakeSender(first_name="Z"), chat=FakeChat())
     await fm._on_user_message(ev, '9665')
+    _tasks = list(getattr(fm, '_request_bg_tasks', None) or set())
+    if _tasks:
+        await asyncio.gather(*_tasks, return_exceptions=True)
     link_captured = ((ev.chat_id, ev.id) in fm._link_ring)
     no_req_send = (fm._send_mock.call_count == 0)
     results.append(("link path captures link even when request filter disabled",

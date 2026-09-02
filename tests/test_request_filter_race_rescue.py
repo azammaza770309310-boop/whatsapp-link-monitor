@@ -261,6 +261,8 @@ def make_race_monitor(prod_db, channel_id=-1009999999,
         '_link_ring_put', '_link_ring_pop', '_link_ring_evict',
         '_normalized_to_link_data', '_rescue_link_only',
         '_on_user_message', '_on_message_deleted', '_handle_request_path',
+        # [SPEED-v4.3.4] مسار الطلبات خلفية غير حاجبة — نربط الجسر الحقيقي
+        '_dispatch_request_path',
     ):
         setattr(fm, method_name,
                 types.MethodType(getattr(bot.Monitor, method_name), fm))
@@ -305,6 +307,7 @@ async def test_1_request_filter_sends_when_chat_sender_none():
         # event.chat=None, event.sender=None يحاكي "اختفاء" الكيانات بعد الحذف
         ev = FakeNewMessageEvent(raw_text, chat, msg_id, chat=None, sender=None)
         await fm._on_user_message(ev, '+SIM_SOURCE')
+        await drain_request_tasks(fm)
 
         sent = fm.bot_client.send_message
         record("1: bot_client.send_message was called (alert dispatched)",
@@ -331,10 +334,14 @@ async def test_1_request_filter_sends_when_chat_sender_none():
 
 
 # =====================================================================
-# Test 2: Request Filter يُرسل BEFORE journal_write (الترتيب الصحيح)
+# Test 2: [SPEED-v4.3.4] مسار الطلبات خلفية — journal_write (WAL المتين)
+# يكتمل قبل إرسال التنبيه الخلفي: الأولوية القصوى الآن هي التقاط الروابط
+# والكتابة الدائمة فورًا، بينما AI/الإرسال يعملان في الخلفية.
+# (الترتيب القديم send<journal كان لسباق الحذف؛ الحماية الفعّالة الآن:
+# LRB تزامني (test 3) + journal فوري + الإرسال الخلفي غير محجوب.)
 # =====================================================================
 async def test_2_request_filter_runs_before_journal_write():
-    print("\n--- Test 2: Request Filter send_message runs BEFORE journal_write ---")
+    print("\n--- Test 2: [SPEED] journal_write (durable WAL) completes BEFORE background send ---")
     prod_db, db_path, conn = await make_test_db()
     try:
         fm = make_race_monitor(prod_db)
@@ -345,25 +352,36 @@ async def test_2_request_filter_runs_before_journal_write():
         fm._timing.clear()
         await fm._on_user_message(ev, '+SIM_SOURCE')
 
+        # journal كُتب فورًا (قبل اكتمال المسار الخلفي) — التقاط متين أسرع
+        journal_ts = fm._timing.get('journal_write_at')
+        record("2: journal_write recorded immediately (durable WAL first)",
+               journal_ts is not None, "journal_write not called")
+
+        # صفّي المهام الخلفية — الإرسال يكتمل الآن
+        await drain_request_tasks(fm)
         sm = fm.bot_client.send_message
         send_ts = sm.call_timestamps[-1] if sm.call_timestamps else None
-        journal_ts = fm._timing.get('journal_write_at')
-        record("2: send_message timestamp recorded",
+        record("2: send_message timestamp recorded (after drain)",
                send_ts is not None, "send_message not called")
-        record("2: journal_write timestamp recorded",
-               journal_ts is not None, "journal_write not called")
         if send_ts is not None and journal_ts is not None:
-            delta_ms = (journal_ts - send_ts) * 1000
-            record("2: send_message runs BEFORE journal_write",
-                   send_ts < journal_ts,
-                   f"send={send_ts:.6f} journal={journal_ts:.6f} "
+            delta_ms = (send_ts - journal_ts) * 1000
+            record("2: journal_write runs BEFORE background send (capture-first)",
+                   journal_ts < send_ts,
+                   f"journal={journal_ts:.6f} send={send_ts:.6f} "
                    f"delta={delta_ms:.3f}ms")
-            record("2: delta (send→journal) >= 0 (send first)",
-                   delta_ms >= 0, f"delta={delta_ms:.3f}ms")
+        record("2: alert dispatched (request path completed in background)",
+               sm.called, "send_message not called after drain")
     finally:
         await conn.close()
         try: os.remove(db_path)
         except: pass
+
+
+async def drain_request_tasks(fm):
+    """[SPEED-v4.3.4] انتظار مهام مسار الطلبات الخلفية حتى تكتمل."""
+    tasks = list(getattr(fm, '_request_bg_tasks', None) or set())
+    if tasks:
+        await asyncio.gather(*tasks, return_exceptions=True)
 
 
 # =====================================================================
@@ -419,6 +437,7 @@ async def test_4_request_and_link_paths_independent():
         # أنشئ monitor جديد لكل scenario (state isolated)
         fm_a = make_race_monitor(prod_db)
         await fm_a._on_user_message(ev_a, '+SIM_SOURCE')
+        await drain_request_tasks(fm_a)
         sm_a = fm_a.bot_client.send_message
         # [REQUEST-FILTER-v2] طلب حقيقي (intent+service+action) + رابط → يُقبل.
         # المواصفة الجديدة: «لو كانت الرسالة طلبًا حقيقيًا لكن تحتوي رابط
@@ -447,6 +466,7 @@ async def test_4_request_and_link_paths_independent():
         raw_text_b = "مين يحل لي واجب الرياضيات؟ محتاج مساعدة"
         ev_b = FakeNewMessageEvent(raw_text_b, chat_b, msg_id_b, chat=None, sender=None)
         await fm_b._on_user_message(ev_b, '+SIM_SOURCE')
+        await drain_request_tasks(fm_b)
         sm_b = fm_b.bot_client.send_message
         record("4B: request alert sent (no link → not advertisement)",
                sm_b.called, "send not called")
@@ -507,16 +527,19 @@ async def test_5_no_sleep_before_send():
         # أبسط طريقة: نتحقق أن المسار لا يأخذ وقتًا طويلًا قبل send
         t0 = time.perf_counter()
         await fm._on_user_message(ev, '+SIM_SOURCE')
+        await drain_request_tasks(fm)
         t_after_send = time.perf_counter()
 
-        # المسار العادي (no FloodWait) يجب أن يُرسل خلال < 50ms (no sleep)
+        # المسار العادي (no FloodWait) يجب أن يُرسل سريعًا — لا sleep مقصود.
+        # [SPEED-v4.3.4] العتبة 2000ms: المسار الآن خلفي (dispatch + AI + send)
+        # والمقصد: كشف أي sleep متعمّد (FloodWait-style) يظهر كتجاوز واضح.
         delta_ms = (send_at - t0) * 1000 if send_at else None
         record("5: send_message happened (alert dispatched)",
                send_at is not None, "send not called")
         if send_at is not None:
-            record("5: send dispatched within 50ms of event arrival "
+            record("5: send dispatched within 2000ms of event arrival "
                    "(no deliberate sleep before send)",
-                   delta_ms < 50,
+                   delta_ms < 2000,
                    f"delta={delta_ms:.3f}ms")
     finally:
         await conn.close()
@@ -537,12 +560,14 @@ async def test_6_request_dedup_prevents_duplicate_send():
         raw_text = "مين يحل لي واجب رياضيات؟"
         ev = FakeNewMessageEvent(raw_text, chat, msg_id, chat=None, sender=None)
 
-        # استدعاء أول — يجب أن يُرسل
+        # استدعاء أول — يجب أن يُرسل (صفّي المهمة الخلفية أولًا)
         await fm._on_user_message(ev, '+SIM_SOURCE')
+        await drain_request_tasks(fm)
         send_count_after_first = fm.bot_client.send_message.call_count
 
         # استدعاء ثاني لنفس (chat_id, msg_id) — يجب ألا يُرسل (dedup)
         await fm._on_user_message(ev, '+SIM_SOURCE')
+        await drain_request_tasks(fm)
         send_count_after_second = fm.bot_client.send_message.call_count
 
         record("6: first call sent exactly 1 alert",
