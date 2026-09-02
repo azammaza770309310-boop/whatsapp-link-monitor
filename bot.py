@@ -12920,6 +12920,13 @@ async def api_filter_stats_handler(request):
                 "budget_exhausted": classifier_stats.get("budget_exhausted", 0),
                 "overload_rejects": classifier_stats.get("overload_rejects", 0),
                 "health_probes": classifier_stats.get("health_probes", 0),
+                # [v4.2] AIMD diagnostics (كانت مفقودة من العرض):
+                "pool_dead_fasts": classifier_stats.get("pool_dead_fasts", 0),
+                "busy_skips": classifier_stats.get("busy_skips", 0),
+                "aimd_grow": classifier_stats.get("aimd_grow", 0),
+                "aimd_shrink": classifier_stats.get("aimd_shrink", 0),
+                # [v4.3.2] dead-key latch:
+                "dead_key_latches": classifier_stats.get("dead_key_latches", 0),
                 "provider_health": (
                     classifier.provider_health()
                     if classifier is not None and hasattr(classifier, 'provider_health')

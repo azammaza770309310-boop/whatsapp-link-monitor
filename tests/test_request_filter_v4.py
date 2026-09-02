@@ -1293,6 +1293,108 @@ def section_m():
 
 
 # ============================================================
+# N. [v4.3.2] Dead-Key Latch + منع تلوث semantic dedup
+# ============================================================
+def section_n():
+    print(f"\n=== N. [v4.3.2] dead-key latch + منع تلوث semantic dedup ({FILTER_VERSION}) ===")
+
+    async def run_n():
+        # ---- N1: 19 فشلًا متتاليًا → لا latch (rate cooldown فقط، cap 120s) ----
+        async def ok_transport(provider, payload):
+            return 200, json.dumps({"choices": [{"message": {"content": _ai_json("REJECT", 0.9, "other", "x")}}]})
+
+        cl = IntentClassifier(
+            providers=[{"key": "k", "url": "u", "model": "m", "name": "Dead"}],
+            transport=ok_transport, cooldown_scale=1.0)
+        for _ in range(19):
+            cl._record_failure(0, "http 429 rate limit (Dead)", kind='rate')
+        cd19 = cl._pstate[0]['cooldown_until'] - time.monotonic()
+        check("N1: 19 فشلًا متتاليًا → لا latch (rate cooldown ≤120s)",
+              cd19 <= 121.0 and cl._pstate[0]['last_kind'] == 'rate',
+              f"cd={cd19:.1f}s kind={cl._pstate[0]['last_kind']}")
+        check("N1b: counter dead_key_latches = 0 قبل العتبة",
+              cl.stats().get("dead_key_latches", -1) == 0,
+              str(cl.stats().get("dead_key_latches")))
+
+        # ---- N2: الفشل رقم 20 → LATCH (cooldown 30 دقيقة) ----
+        cl._record_failure(0, "http 429 rate limit (Dead)", kind='rate')
+        st = cl._pstate[0]
+        cd20 = st['cooldown_until'] - time.monotonic()
+        check("N2: الفشل رقم 20 → latch 30 دقيقة",
+              cd20 >= 1700.0 and st['last_kind'] == 'dead_key',
+              f"cd={cd20:.1f}s kind={st['last_kind']}")
+        health = cl.provider_health()[0]
+        check("N2b: provider_health يُظهر status=dead_key",
+              health['status'] == 'dead_key' and health['cooldown_kind'] == 'dead_key',
+              f"status={health.get('status')} kind={health.get('cooldown_kind')}")
+        check("N2c: counter dead_key_latches = 1",
+              cl.stats().get("dead_key_latches") == 1,
+              str(cl.stats().get("dead_key_latches")))
+
+        # ---- N3: أول نجاح → إفراغ كامل وفوري (عودة للخدمة) ----
+        cl._record_success(0)
+        health = cl.provider_health()[0]
+        check("N3: أول نجاح → عودة فورية (status=ok، consecutive=0)",
+              health['status'] == 'ok' and health['consecutive_fails'] == 0,
+              str(health))
+        cl._record_failure(0, "http 429 rate limit (Dead)", kind='rate')
+        health = cl.provider_health()[0]
+        check("N3b: فشل واحد بعد النجاح لا يعيد الـlatch (consecutive=1 < 20)",
+              health['status'] != 'dead_key' and health['consecutive_fails'] == 1,
+              f"status={health.get('status')} consec={health.get('consecutive_fails')}")
+
+        # ---- N4: دورة الاستكشاف — فشل واحد بعد انتهاء latch يعيد القفل فورًا ----
+        cl2 = IntentClassifier(
+            providers=[{"key": "k", "url": "u", "model": "m", "name": "Dead2"}],
+            transport=ok_transport, cooldown_scale=1.0)
+        for _ in range(20):
+            cl2._record_failure(0, "http 429 rate limit (Dead2)", kind='rate')
+        latches_before = cl2.stats()["dead_key_latches"]
+        # محاكاة انتهاء الـlatch (مرور 30 دقيقة) ثم محاولة استكشاف فاشلة واحدة
+        cl2._pstate[0]['cooldown_until'] = time.monotonic() - 0.1
+        cl2._record_failure(0, "http 429 rate limit (Dead2)", kind='rate')
+        st2 = cl2._pstate[0]
+        cd26 = st2['cooldown_until'] - time.monotonic()
+        check("N4: فشل الاستكشاف بعد انتهاء latch يعيد القفل فورًا — probe واحد/30د",
+              cd26 >= 1700.0 and st2['last_kind'] == 'dead_key'
+              and cl2.stats()["dead_key_latches"] == latches_before + 1,
+              f"cd={cd26:.1f} latches={cl2.stats()['dead_key_latches']}")
+
+        # ---- N5/N6: ai_error لا يلوّث الـsemantic dedup ----
+        async def failing_transport(provider, payload):
+            return 429, "rate limit"
+        clf = IntentClassifier(
+            providers=[{"key": "k", "url": "u", "model": "m", "name": "F"}],
+            transport=failing_transport, max_attempts=1, retry_rounds=1,
+            total_budget_s=1.0, pool_wait_budget_s=0.5)
+        dd = SemanticDeduper(ttl_s=900)
+        rx = await analyze_request_v4("أحد يشرح لي تفاضل 1", clf, deduper=dd)
+        check("N5: فشل AI كامل (429) → REJECT ai_error",
+              rx.is_request is False and rx.reason == "ai_error",
+              f"reason={rx.reason}")
+
+        # المزوّد يتعافى — نفس النص يجب أن يحصل على قرار AI حقيقي
+        # (قديمًا: كان مسجّلًا في الـdedup → semantic_duplicate بلا قرار قط)
+        cl_ok = make_scripted_classifier(
+            {"تفاضل": _ai_json("ACCEPT", 0.97, "tutoring_request", "طلب شرح مادة")})
+        ry = await analyze_request_v4("أحد يشرح لي تفاضل 1", cl_ok, deduper=dd)
+        check("N6: النص ذاته بعد التعافي → قرار حقيقي (لا تلوث dedup)",
+              ry.is_request is True,
+              f"reason={ry.reason} path={ry.decision_path}")
+
+        # ---- N7: القرار الحقيقي يُسجَّل في dedup كالسابق (سلوك محفوظ) ----
+        dd2 = SemanticDeduper(ttl_s=900)
+        r1 = await analyze_request_v4("أحد يشرح لي تفاضل 1", cl_ok, deduper=dd2)
+        r2 = await analyze_request_v4("التفاضل لي يشرح أحد", cl_ok, deduper=dd2)
+        check("N7: قرار AI حقيقي يُسجَّل — المشابه التالي semantic_duplicate",
+              r1.is_request is True and r2.is_request is False
+              and r2.reason == "semantic_duplicate",
+              f"r2.reason={r2.reason}")
+
+    asyncio.run(run_n())
+
+
+# ============================================================
 def main():
     print("=" * 70)
     print(f"Request Intent Engine {FILTER_VERSION} ({FILTER_MODE}) — v4.0/v4.1/v4.2/v4.3 Test Suite")
@@ -1311,6 +1413,7 @@ def main():
     section_k()
     section_l()
     section_m()
+    section_n()
 
     print("\n" + "=" * 70)
     print(f"RESULT: {_TOTAL['pass']} pass / {_TOTAL['fail']} fail")

@@ -43,7 +43,7 @@ import re
 from dataclasses import dataclass, field
 from typing import List, Tuple, Dict, Any, Optional
 
-FILTER_VERSION = "v4.3.1"
+FILTER_VERSION = "v4.3.2"
 FILTER_MODE = "ai_intent_classifier"
 
 
@@ -1818,8 +1818,11 @@ async def analyze_request_v4(
     res.ai_latency_ms = decision.latency_ms
     res.ai_error = decision.error
 
-    # ---- المرحلة 4 (register): كل رسالة صُنِّفت تُسجَّل بصمتها ----
-    if deduper is not None and nt.canonical:
+    # ---- المرحلة 4 (register): كل رسالة قُطِع فيها قرار AI حقيقي تُسجَّل ----
+    # [v4.3.2] الشرط decision.ok: نصوص ai_error/overloaded ليست قرارات
+    # محتوى — تسجيلها كان يلوّث الـdedup (TTL 15 دقيقة) فيُرفض الطلب
+    # المشابه التالي semantic_duplicate دون أن يحصل على قرار AI حقيقي قط.
+    if deduper is not None and nt.canonical and decision.ok:
         deduper.register(nt.canonical)
 
     # ---- القرار + العتبة ----

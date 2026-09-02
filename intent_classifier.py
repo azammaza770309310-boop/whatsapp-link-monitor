@@ -372,6 +372,17 @@ _COOLDOWN_KINDS = {
 _COOLDOWN_CAPS = {'auth': 21600.0, 'rate': 120.0}
 _COOLDOWN_DOUBLING = {'auth', 'rate'}
 
+# [v4.3.2] DEAD-KEY LATCH: مزوّد يفشل 20 مرة متتالية بلا أي نجاح = ميت
+# عمليًا (إنتاج 2026-09-02: مفاتيح Groq — 0-2 نجاح مقابل 29-31 فشلًا/ساعة،
+# لكن cap الـ429 = 120s فقط فيُحاكَم كل دقيقتين للأبد: ~90 نداءًا ضائعًا/
+# ساعة + latency مضافة لكل رسالة قبل الدوران إلى Mistral). Latch =
+# cooldown 30 دقيقة؛ محاولة واحدة عند كل انتهاء (فشل واحد يكفي لإعادة
+# الـlatch فورًا — consecutive_fails لم يُصفَّر)، وأول نجاح يُصفّر كل
+# شيء ويعيده للخدمة فورًا. يعتمد consecutive_fails (يُصفَّر عند النجاح)
+# لا الإجمالي التراكمي — فالمفتاح المتعافي بعد فترة موت يعود فورًا.
+_DEAD_KEY_CONSECUTIVE_FAILS = 20
+_DEAD_KEY_COOLDOWN_S = 1800.0
+
 
 def _new_provider_state(interval_floor_s: float = 0.0,
                         interval_cap_s: float = 30.0) -> Dict[str, Any]:
@@ -471,6 +482,8 @@ class IntentClassifier:
             "busy_skips": 0,          # تخطّي مزوّد مشغول (pace>0 داخل القفل) — بلا نداء
             "aimd_grow": 0,          # مرات نمو فترة pacing (بعد 429)
             "aimd_shrink": 0,        # مرات انكماش فترة pacing (بعد نجاح)
+            # v4.3.2:
+            "dead_key_latches": 0,   # مرات قفل مفتاح ميت (فشل متتالٍ بلا نجاح)
         }
 
     # --------------------------------------------------------
@@ -573,6 +586,17 @@ class IntentClassifier:
             if new_iv > st['interval_s']:
                 self.counters["aimd_grow"] += 1
             st['interval_s'] = new_iv
+        # [v4.3.2] DEAD-KEY LATCH — فشل متتالٍ بلا نجاح يكافئ مفتاحًا ميتًا:
+        # cooldown طويل (30 دقيقة) بدل دورة cap-120s الأبدية. فشل واحد بعد
+        # انتهاء الـlatch يُعيده فورًا (consecutive_fails ما زال ≥20) — محاولة
+        # استكشاف واحدة كل 30 دقيقة فقط. أول نجاح (_record_success) يُصفّر
+        # consecutive_fails فيخرج المفتاح من الـlatch نهائيًا.
+        if st['consecutive_fails'] >= _DEAD_KEY_CONSECUTIVE_FAILS:
+            st['last_kind'] = 'dead_key'
+            st['cooldown_until'] = max(
+                st['cooldown_until'],
+                time.monotonic() + _DEAD_KEY_COOLDOWN_S * self.cooldown_scale)
+            self.counters["dead_key_latches"] += 1
         self._rotate()
 
     def _record_success(self, idx: int) -> None:
@@ -600,10 +624,12 @@ class IntentClassifier:
         for i, p in enumerate(self.providers):
             st = self._pstate[i]
             cd = max(0.0, st['cooldown_until'] - now)
+            # [v4.3.2] حالة dead_key تظهر صراحةً (تشخيص فوري للمفاتيح الميتة)
+            latched = cd > 0 and st.get('last_kind') == 'dead_key'
             out.append({
                 'name': p.get('name', ''),
                 'model': p.get('model', ''),
-                'status': 'cooldown' if cd > 0 else 'ok',
+                'status': 'dead_key' if latched else ('cooldown' if cd > 0 else 'ok'),
                 'cooldown_remaining_s': round(cd, 1),
                 'cooldown_kind': st.get('last_kind', '') if cd > 0 else '',
                 'consecutive_fails': st['consecutive_fails'],
