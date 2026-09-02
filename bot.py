@@ -3116,7 +3116,7 @@ class Monitor:
         self._joiner_fleet_health_task: Optional[asyncio.Task] = None
         # [v4.3.3] AUTO-RECOVERY: آخر محاولة auto-enable لكل حساب joiner —
         # حارس مدة (محاولة واحدة/ساعة/حساب) يمنع عاصفة كتابات Supabase.
-        self._joiner_auto_enable_at: Dict[str, datetime] = {}
+        self._joiner_auto_enable_at: Dict[str, Dict] = {}
         # ===== [QUIET-DIGEST] Quiet-source watch state =====
         # group_name → {"day": "YYYY-MM-DD" (last alert), "volume": N}.
         # In-memory only: a restart re-seeds via the first-cycle digest
@@ -4689,8 +4689,9 @@ class Monitor:
         - المعطّل + المقطوع: لا يُلمس إطلاقًا — يعود للعمل بنفسه عند إعادة
           الاتصال (طلب المشغّل الصريح) لأن is_connected() فحص حي كل دورة.
         - التحكم الدائم للمشغّل = /set_role monitor (العلم يُدار ذاتيًا).
-        - حارس ذاكرة: محاولة auto-enable واحدة/ساعة/حساب (يمنع عاصفة
-          كتابات Supabase لو فشلت الكتابة).
+        - حارس ذاكرة ثنائي المسار: بعد نجاح — ساعة؛ بعد فشل كتابة عابر —
+          دقيقتان فقط (يمنع عاصفة كتابات لو فشل Supabase باستمرار دون
+          أن يجمدّ حسابًا ساعة كاملة على فشل واحد).
         - يعيد قائمة الهواتف المفعّلة الآن (تُضاف إلى connected فورًا
           فلا تُهدر دورة الانتظار الحالية).
 
@@ -4713,11 +4714,17 @@ class Monitor:
                         continue  # ما زال في تبريد الإشباع (24h)
                 except Exception:
                     pass  # سجل تالف → عامله كغير مشبع
-            # حارس المدة: محاولة auto-enable واحدة كل ساعة لكل حساب
+            # [v4.3.3b] حارس المدة ثنائي المسار: بعد نجاح — ساعة (لا لزوم
+            # لإعادة فورية للحساب المفعّل أصلاً)؛ بعد فشل كتابة عابر —
+            # دقيقتان فقط (إنتاج: فشل PATCH واحد لـ🇸🇦 جمّد الحساب ساعة
+            # كاملة بلا داعٍ). فشل متكرر = محاولة كل دقيقتين — حمل زهيد.
             last_try = self._joiner_auto_enable_at.get(ph)
-            if last_try and (now_dt - last_try).total_seconds() < 3600:
-                continue
-            self._joiner_auto_enable_at[ph] = now_dt
+            if last_try:
+                elapsed = (now_dt - last_try['at']).total_seconds()
+                retry_s = 3600.0 if last_try.get('ok') else 120.0
+                if elapsed < retry_s:
+                    continue
+            self._joiner_auto_enable_at[ph] = {'at': now_dt, 'ok': False}
             ok = False
             try:
                 ok = await self.db._supabase_update_watcher(
@@ -4725,6 +4732,7 @@ class Monitor:
             except Exception:
                 ok = False
             if ok:
+                self._joiner_auto_enable_at[ph] = {'at': now_dt, 'ok': True}
                 # امسح سجل الإشباع (إن وُجد) — بدأت دورة حياة جديدة
                 try:
                     await self.prod_db.set_setting(f'joiner_sat_{ph}', '')

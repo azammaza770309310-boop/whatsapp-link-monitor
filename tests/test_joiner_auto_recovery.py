@@ -190,7 +190,7 @@ async def run_tests():
            len(supa.calls) == 2 and enabled3 == [Y],
            f"calls={len(supa.calls)} enabled3={enabled3}")
 
-    # ---- T7: فشل Supabase → لا إضافة للأسطول + لا عاصفة ----
+    # ---- T7: فشل Supabase → لا إضافة للأسطول + إعادة سريعة ----
     prod = FakeProdDB()
     supa = FakeSupabaseDB(fail_phones={Y})
     fm, m = make_monitor({Y: FakeClient(True)}, supa, prod)
@@ -198,10 +198,17 @@ async def run_tests():
     enabled = await m([Y], connected, now)
     record("T7: فشل كتابة Supabase → خارج الأسطول، بلا استثناء",
            enabled == [] and Y not in connected)
-    enabled2 = await m([Y], connected, now + timedelta(minutes=2))
-    record("T7b: الحارس يسري أيضًا عند الفشل (لا عاصفة كتابات)",
+    enabled2 = await m([Y], connected, now + timedelta(seconds=60))
+    record("T7b: بعد 60 ثانية من الفشل → لا كتابة (حارس الدقيقتين)",
            len(supa.calls) == 0 and enabled2 == [],
            f"calls={len(supa.calls)}")
+    # الفشل العابر يشفي: Supabase عاد للعمل بعد >2 دقيقة → يُفعّل
+    supa.fail_phones = set()
+    connected2 = []
+    enabled3 = await m([Y], connected2, now + timedelta(seconds=125))
+    record("T7c: فشل عابر ثم شفاء بعد دقيقتين → تفعيل فوري (لا ساعة انتظار)",
+           enabled3 == [Y] and Y in connected2 and len(supa.calls) == 1,
+           f"enabled3={enabled3} calls={len(supa.calls)}")
 
     # ---- T8: «يعود للعمل بنفسه» — مقطوع ثم اتصل ----
     prod = FakeProdDB()
