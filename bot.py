@@ -6447,14 +6447,54 @@ class Monitor:
 
         sender_username = ''
         sender_display = 'غير متوفر'
-        # [TASK-FORMAT-v4.3.4] sender_id يُلتقط هنا لبناء زر «مراسلة» —
-        # deep-link بمعرف المستخدم يعمل حتى بلا username أو مع خاصية مغلقة.
         try:
             sender_id = int(getattr(event, 'sender_id', 0) or 0)
         except Exception:
             sender_id = 0
+
+        # [DM-FIX-v4.3.5] جلب بيانات المرسل الكاملة عبر API — إصلاح عطلين
+        # رصدهما المُشغّل في الإنتاج:
+        #   (1) «اليوزر غير موجود أمام المرسل»: event.sender خاصية تزامنية
+        #       تعيد min-entity من التحديث (أو None) — كثيرًا بلا @username
+        #       رغم وجوده فعليًا عند المستخدم.
+        #   (2) «تنسيق الرابط غير معروف» عند ضغط زر المراسلة: غياب username
+        #       كان يُهبط الزر إلى tg://user?id=<uid> وهو deep-link غير مدعوم
+        #       في عملاء الموبايل (iOS/بعض أندرويد).
+        # الحل: نحلّ كيان المرسل عبر API من حساب الالتقاط (هو عضو المجموعة
+        # → الحل ينجح) → username حقيقي → سطر المرسل يحمله + الزر يصبح
+        # https://t.me/<username> (رسمي — يعمل في كل العملاء).
+        sender_obj = None
         try:
-            sender_obj = event.sender
+            _gs = getattr(event, 'get_sender', None)
+            if callable(_gs):
+                # wait_for: get_entity قد يعلق على حساب بطيء — لا يعطّل الإرسال
+                try:
+                    sender_obj = await asyncio.wait_for(_gs(), timeout=4)
+                except Exception:
+                    sender_obj = None
+        except Exception:
+            sender_obj = None
+        if sender_obj is None:
+            # fallback 1: الخاصية التزامنية (min-entity أفضل من لا شيء)
+            try:
+                sender_obj = event.sender
+            except Exception:
+                sender_obj = None
+        if sender_id > 0 and not (getattr(sender_obj, 'username', None)):
+            # fallback 2 [DM-FIX]: min-entity بلا username → حلّ كامل عبر
+            # عميل الالتقاط مباشرة (user_clients[source_phone] عضو المجموعة
+            # → get_entity يعيد الحساب الكامل مع username لو موجود).
+            try:
+                _cap_client = (getattr(self, 'user_clients', None) or {}).get(source_phone)
+                if _cap_client is not None and _cap_client.is_connected():
+                    from telethon.tl.types import PeerUser as _PeerUser
+                    _full = await asyncio.wait_for(
+                        _cap_client.get_entity(_PeerUser(sender_id)), timeout=4)
+                    if _full is not None:
+                        sender_obj = _full
+            except Exception:
+                pass
+        try:
             if sender_obj:
                 if hasattr(sender_obj, 'username') and sender_obj.username:
                     sender_username = f"@{sender_obj.username}"
@@ -6519,25 +6559,31 @@ class Monitor:
         content += f"\n\n💬 <b>نص الطلب:</b>\n<i>{safe_text}</i>"
         alert = f"<blockquote>{content}</blockquote>"
 
-        # --- [TASK-FORMAT-v4.3.4] زر «مراسلة» — محادثة المرسل المباشرة ---
-        # استراتيجية الرابط:
-        #   - مع username → https://t.me/<username> (رسمي، يعمل في كل العملاء)
-        #   - بلا username → tg://user?id=<uid> (deep-link بمعرف المستخدم —
-        #     يفتح المحادثة حتى لو لا يوجد username أو الخاص مغلق؛ المُشغّل
-        #     يشارك غالبًا نفس المجموعات فيعمل الresolve في عميله)
-        #   - sender_id <= 0 (مرسل مجهول/قناة) → بلا زر (لا يوجد مستخدم للمراسلة)
+        # --- [DM-FIX-v4.3.5] زر «مراسلة» — استراتيجية مطوَّرة ---
+        #   - مع username (بعد الحل الكامل عبر API) → https://t.me/<username>
+        #     (رسمي — يعمل في كل العملاء دون استثناء).
+        #   - بلا username حتى بعد الحل الكامل → NO tg://user?id= button
+        #     (غير مدعوم في الموبايل — سبب خطأ «تنسيق الرابط غير معروف»).
+        #     البديل: جسر تواصل (contact bridge) — بعد إرسال التنبيه نُعيد
+        #     توجيه الرسالة الأصلية إلى قناة الطلبات عبر سلسلة
+        #     (حساب الالتقاط → PM البوت → القناة). ترويسة «Forwarded from
+        #     <اسم المرسل>» قابلة للنقر في كل العملاء → تفتح ملف المرسل →
+        #     مراسلة. المصدر (المجموعة) لا يظهر — الترويسة تحمل المُرسِل فقط.
+        #   - sender_id <= 0 (مرسل مجهول/قناة) → بلا زر ولا جسر.
         dm_buttons = None
+        dm_mode = 'none'  # button:t.me | bridge:forward | none
         try:
             _sid = int(sender_id or 0)
-            if _sid > 0:
-                if sender_username:
-                    _dm_url = f"https://t.me/{str(sender_username).lstrip('@')}"
-                else:
-                    _dm_url = f"tg://user?id={_sid}"
+            if _sid > 0 and sender_username:
+                _dm_url = f"https://t.me/{str(sender_username).lstrip('@')}"
                 dm_buttons = [[Button.url("✉️ مراسلة", _dm_url)]]
+                dm_mode = 'button:t.me'
                 logging.debug(f"[REQUEST-PATH] DM button url={_dm_url}")
+            elif _sid > 0:
+                dm_mode = 'bridge:forward'  # لا username — جسر التواصل بعد الإرسال
         except Exception:
             dm_buttons = None  # فشل بناء الزر لا يمنع إرسال التنبيه
+            dm_mode = 'none'
 
         # --- الإرسال لقناة الطلبات (retry + FloodWait handling) ---
         # getattr دفاعي لـbot_client: لو fake namespace (اختبارات) بلا bot_client،
@@ -6563,8 +6609,47 @@ class Monitor:
                 f"[REQUEST-PATH] ✅ sent request alert "
                 f"chat_id={chat_id} msg_id={msg_id} "
                 f"keywords={keywords_found} source={source_phone} "
-                f"dm_button={'yes' if dm_buttons else 'no'}"
+                f"dm={dm_mode}"
             )
+
+            # [DM-FIX-v4.3.5] جسر التواصل — مرسل بلا username:
+            # الزر القديم tg://user?id= كان معطوبًا في الموبايل، والزر الوحيد
+            # الموثوق بلا username هو الترويسة القابلة للنقر «Forwarded
+            # from <المرسل>». السلسلة:
+            #   1) حساب الالتقاط (عضو المجموعة، يملك الرسالة) يُعيد توجيه
+            #      الرسالة الأصلية إلى PM البوت — أي حساب يستطيع مراسلة
+            #      أي مستخدم في الخاص.
+            #   2) البوت يُعيد توجيهها من خاصه إلى قناة الطلبات (له صلاحية
+            #      الإرسال هناك مثبتة يوميًا). الترويسة تحتفظ بالمُرسِل
+            #      الأصلي (لا بسلسلة الوساطة).
+            # أي حلقة تفشل → تحذير فقط (التنبيه أُرسل — الأولوية له).
+            if dm_mode == 'bridge:forward':
+                try:
+                    _me = await asyncio.wait_for(_bot_client.get_me(), timeout=5)
+                    _bot_uid = getattr(_me, 'id', None)
+                    _cap_client = (getattr(self, 'user_clients', None) or {}).get(source_phone)
+                    if _bot_uid and _cap_client is not None and _cap_client.is_connected():
+                        _pm_fwd = await asyncio.wait_for(
+                            _cap_client.forward_messages(
+                                _bot_uid, msg_id, from_peer=chat_id),
+                            timeout=10)
+                        _pm_id = getattr(_pm_fwd, 'id', None)
+                        if _pm_id:
+                            await asyncio.wait_for(
+                                _bot_client.forward_messages(
+                                    target, _pm_id, from_peer='me'),
+                                timeout=10)
+                            logging.info(
+                                f"[REQUEST-PATH] ✅ contact-bridge forwarded "
+                                f"chat_id={chat_id} msg_id={msg_id} "
+                                f"sender_id={sender_id} (no username — "
+                                f"tap 'Forwarded from' to DM)"
+                            )
+                except Exception as _bridge_e:
+                    logging.warning(
+                        f"[REQUEST-PATH] contact-bridge forward failed "
+                        f"chat_id={chat_id} msg_id={msg_id}: {_bridge_e}"
+                    )
         except FloodWaitError as e:
             # أعد المحاولة بعد الانتظار (محدود لتجنب التعليق)
             wait_s = min(getattr(e, 'seconds', 30), 60)

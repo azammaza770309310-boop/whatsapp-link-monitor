@@ -627,20 +627,17 @@ async def test_10_alert_format_matches_link_channel_style():
                '🔑 <b>الكلمات:</b>' in alert,
                "missing keywords label")
 
-        # [TASK-FORMAT-v4.3.4] زر «مراسلة» — deep-link بمعرف المستخدم
-        # (FakeNewMessageEvent sender_id=42, بلا username → tg://user?id=42)
+        # [DM-FIX-v4.3.5] المرسل بلا username (fake sender=None, sender_id=42):
+        #   - لا زر tg://user?id= إطلاقًا — كان يسبب خطأ «تنسيق الرابط غير
+        #     معروف» في عملاء الموبايل (غير مدعوم هناك).
+        #   - بديله: جسر التواصل (contact-bridge) — forward الرسالة الأصلية
+        #     بعد الإرسال (يفشل بصمت في fake namespace بلا user_clients).
         kw = sm.calls[0]['kwargs']
-        record("10: send_message called with buttons kwarg (DM button present)",
-               'buttons' in kw and kw.get('buttons') is not None,
-               f"kwargs keys: {list(kw.keys())!r}")
-        _btn = (kw.get('buttons') or [[None]])[0][0]
-        if _btn is not None:
-            record("10: DM button label 'مراسلة'",
-                   'مراسلة' in (getattr(_btn, 'text', '') or ''),
-                   f"button text: {getattr(_btn, 'text', None)!r}")
-            record("10: DM button uses user-ID deep-link tg://user?id=42 (no username)",
-                   (getattr(_btn, 'url', '') or '') == 'tg://user?id=42',
-                   f"button url: {getattr(_btn, 'url', None)!r}")
+        record("10: NO broken tg://user?id button for usernameless sender (mobile-safe)",
+               (kw.get('buttons') is None)
+               or ('tg://user' not in str(
+                   getattr((kw.get('buttons') or [[None]])[0][0], 'url', '') or '')),
+               f"buttons kwarg: {kw.get('buttons')!r}")
 
         # [STYLE-MATCH] link text "عرض الرسالة الأصلية" (matches link channel exactly)
         record("10: alert has link text 'عرض الرسالة الأصلية' (matches link channel)",
@@ -1022,6 +1019,135 @@ async def test_17_fire_and_forget_request_path():
         except: pass
 
 
+# =====================================================================
+# Test 18: [DM-FIX-v4.3.5] حلّ كيان المرسل عبر API (get_sender) —
+# العطل الإنتاجي: «اليوزر غير موجود أمام المرسل». event.sender التزامني
+# يعيد min-entity/None بلا username، بينما get_sender() يحلّ عبر API
+# → المرسل يحمل (@username) + زر t.me يعمل.
+# =====================================================================
+class FakeUserSara:
+    username = 'sara_ux'
+    first_name = 'سارة'
+    last_name = None
+
+
+class FakeEventApiResolve(FakeNewMessageEvent):
+    """fake event: get_sender() async يعيد كيانًا كاملاً (API)، بينما
+    الخاصية التزامنية sender=None (min-entity مفقودة) — يحاكي الإنتاج."""
+
+    async def get_sender(self):
+        return FakeUserSara()
+
+
+async def test_18_api_sender_resolution_fixes_username_and_button():
+    print("\n--- Test 18: [DM-FIX] get_sender() API resolution → (@username) + t.me button ---")
+    prod_db, db_path, conn = await make_test_db()
+    try:
+        fm = make_monitor(prod_db)
+        ev = FakeEventApiResolve(
+            "مين يحل لي واجب رياضيات؟ محتاج مساعدة عاجلة",
+            -1003333005, 330005, sender_id=888,
+            chat=FakeMegagroupChat(), sender=None)
+        await fm._on_user_message(ev, '+TEST_SOURCE')
+        await drain_request_tasks(fm)
+        sm = fm.bot_client.send_message
+        record("18: alert sent", sm.called, "send_message not called")
+        if not sm.called:
+            return
+        alert = sm.calls[0]['alert']
+        record("18: sync sender=None but API get_sender() resolves @sara_ux",
+               'المرسل:</b> سارة (@sara_ux)' in alert,
+               f"sender snippet: {alert[:240]!r}")
+        kw = sm.calls[0]['kwargs']
+        _btn = ((kw.get('buttons') or [[None]])[0][0])
+        record("18: DM button uses https://t.me/sara_ux (resolved via API)",
+               (getattr(_btn, 'url', '') or '') == 'https://t.me/sara_ux',
+               f"button url: {getattr(_btn, 'url', None)!r}")
+        record("18: no mobile-broken tg://user link anywhere in button",
+               'tg://user' not in (getattr(_btn, 'url', '') or ''),
+               f"button url: {getattr(_btn, 'url', None)!r}")
+    finally:
+        await conn.close()
+        try: os.remove(db_path)
+        except: pass
+
+
+# =====================================================================
+# Test 19: [DM-FIX-v4.3.5] جسر التواصل (contact-bridge) — مرسل بلا
+# username: زر tg://user?id= أُلغي (معطوب في الموبايل) واستُبدل بسلسلة
+# forward: حساب الالتقاط → PM البوت → قناة الطلبات. الترويسة النهائية
+# «Forwarded from <المرسل>» قابلة للنقر من أي عميل.
+# =====================================================================
+class FakeCaptureClient:
+    """يحاكي حساب الالتقاط (عضو المجموعة) — يسجّل عمليات الـforward."""
+
+    def __init__(self):
+        self.forwarded = []
+
+    def is_connected(self):
+        return True
+
+    async def forward_messages(self, entity, messages, from_peer=None):
+        self.forwarded.append((entity, messages, from_peer))
+        return types.SimpleNamespace(id=555001)
+
+
+async def test_19_contact_bridge_forward_for_usernameless_sender():
+    print("\n--- Test 19: [DM-FIX] usernameless → contact-bridge forward chain ---")
+    prod_db, db_path, conn = await make_test_db()
+    try:
+        fm = make_monitor(prod_db)
+        # زوّد حساب الالتقاط (fake) + bot_client.get_me/forward_messages (async)
+        cap = FakeCaptureClient()
+        fm.user_clients = {'+TEST_SOURCE': cap}
+        fm.bot_client.get_me = AsyncMock(
+            return_value=types.SimpleNamespace(id=999))
+        fm.bot_client.forward_messages = AsyncMock(
+            return_value=types.SimpleNamespace(id=556002))
+
+        chat = -1003333006
+        msg_id = 330006
+        ev = FakeNewMessageEvent(
+            "مين يحل لي واجب رياضيات؟ محتاج مساعدة عاجلة",
+            chat, msg_id, sender_id=42, chat=FakeMegagroupChat(), sender=None)
+        await fm._on_user_message(ev, '+TEST_SOURCE')
+        await drain_request_tasks(fm)
+
+        sm = fm.bot_client.send_message
+        record("19: alert sent", sm.called, "send_message not called")
+        kw = sm.calls[0]['kwargs']
+        record("19: NO button for usernameless sender (tg://user removed)",
+               kw.get('buttons') is None,
+               f"buttons kwarg: {kw.get('buttons')!r}")
+
+        # الحلقة 1: حساب الالتقاط أرسل forward لـPM البوت (uid=999)
+        record("19: hop-1 capture client forwarded original to bot PM (uid=999)",
+               len(cap.forwarded) == 1 and cap.forwarded[0][0] == 999
+               and cap.forwarded[0][1] == msg_id
+               and cap.forwarded[0][2] == chat,
+               f"cap.forwarded={cap.forwarded!r}")
+        # الحلقة 2: البوت أعاد التوجيه من خاصه إلى قناة الطلبات
+        _fw = fm.bot_client.forward_messages
+        _aw = getattr(_fw, 'await_args_list', [])
+        record("19: hop-2 bot forwarded PM msg to requests channel",
+               len(_aw) == 1,
+               f"bot forward await count: {len(_aw)}")
+        if len(_aw) == 1:
+            _call = _aw[0]
+            _args, _kwargs = _call.args, _call.kwargs
+            record("19: hop-2 target = '@dhkskwksjskwk' (requests channel)",
+                   (_args[0] if _args else _kwargs.get('entity')) == '@dhkskwksjskwk',
+                   f"args={_args!r} kwargs={_kwargs!r}")
+            record("19: hop-2 forwarded the PM msg id + from_peer='me'",
+                   (_args[1] if len(_args) > 1 else _kwargs.get('messages')) == 555001
+                   and (_kwargs.get('from_peer') == 'me'),
+                   f"args={_args!r} kwargs={_kwargs!r}")
+    finally:
+        await conn.close()
+        try: os.remove(db_path)
+        except: pass
+
+
 async def main():
     print("=" * 70)
     print("Request Channel Separation Hardening — Test Suite [CHANNEL-SEPARATION]")
@@ -1050,6 +1176,8 @@ async def main():
     await test_15_broadcast_channel_excluded_groups_only()
     await test_16_sender_username_in_line_and_tme_button()
     await test_17_fire_and_forget_request_path()
+    await test_18_api_sender_resolution_fixes_username_and_button()
+    await test_19_contact_bridge_forward_for_usernameless_sender()
     print("\n" + "=" * 70)
     passed = sum(1 for r in RESULTS if r['passed'])
     failed = sum(1 for r in RESULTS if not r['passed'])
