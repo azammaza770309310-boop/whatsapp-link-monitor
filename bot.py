@@ -901,6 +901,28 @@ class Config:
                 "REQUEST_FILTER_AI_MAX_PENDING", "64"))
         except ValueError:
             self.request_filter_ai_max_pending = 64
+        # [v4.2] pool-wait budget: لو كل المزوّدين في cooldown/pacing — انتظار
+        # محدود ثم فشل فوري (بدل حرق ميزانية كاملة انتظارًا — تشخيص الإنتاج:
+        # زمن قرار 50.7s وتراكم overloaded).
+        try:
+            self.request_filter_ai_pool_wait_budget_s = float(os.getenv(
+                "REQUEST_FILTER_AI_POOL_WAIT_BUDGET_S", "4"))
+        except ValueError:
+            self.request_filter_ai_pool_wait_budget_s = 4.0
+        self.request_filter_ai_pool_wait_budget_s = max(
+            0.5, self.request_filter_ai_pool_wait_budget_s)
+        # [v4.2] admission gate: رسائل بلا أي إشارة معجمية → REJECT هيكلي بلا
+        # نداء AI (الطاقة المجانية ≈ 0.9 RPS أمام سيل 4 msg/s). REJECT-only:
+        # أي رسالة ذات إشارات تمر دائمًا. default = مفعّل.
+        self.request_filter_admission_gate = os.getenv(
+            "REQUEST_FILTER_ADMISSION_GATE", "true").lower() in (
+                "true", "1", "yes", "on")
+        # [v4.3] chatter guard: بوابات هيكلية رفضية لأنماط السوالف المؤكدة
+        # إنتاجيًا (استطلاع دكاترة/طلب ملفات/نصائح/ألعاب/إداريات). REJECT-only
+        # مع صمام أمان أفعال الخدمة — أي فشل في التفعيل يرد للمصدر. default = مفعّل.
+        self.request_filter_chatter_guard = os.getenv(
+            "REQUEST_FILTER_CHATTER_GUARD", "true").lower() in (
+                "true", "1", "yes", "on")
         # [STAGE 4] فترة منع التكرار الدلالي (default 15 دقيقة «فترة قصيرة»)
         try:
             self.request_filter_dedup_ttl_s = int(os.getenv(
@@ -3113,6 +3135,9 @@ class Monitor:
             retry_rounds=getattr(self.config, 'request_filter_ai_retry_rounds', 3),
             total_budget_s=getattr(self.config, 'request_filter_ai_total_budget_s', 40.0),
             max_pending=getattr(self.config, 'request_filter_ai_max_pending', 64),
+            # [v4.2] fail-fast pool wait (لا حرق ميزانية داخل اصطفام المزوّدين)
+            pool_wait_budget_s=getattr(
+                self.config, 'request_filter_ai_pool_wait_budget_s', 4.0),
         )
         # [STAGE 4/5] lazy-init في _handle_request_path (نمط lazy المتّبع هناك):
         #   self._request_semantic_deduper / self._request_decision_logger
@@ -6123,13 +6148,24 @@ class Monitor:
         if not hasattr(self, '_request_decision_logger'):
             self._request_decision_logger = DecisionLogger(self.prod_db)
 
-        # --- الفلترة v4.0: AI Intent Classification Engine (القرار الأساسي) ---
+        # --- [v4.3] استخراج عنوان المجموعة قبل التحليل (سياق ضعيف للـAI) ---
+        # قراءة تزامنية من event.chat (Telethon cached attrs — بلا API إضافي)
+        _chat_title_for_ai = ''
+        try:
+            _chat_obj = getattr(event, 'chat', None)
+            if _chat_obj and hasattr(_chat_obj, 'title') and _chat_obj.title:
+                _chat_title_for_ai = str(_chat_obj.title)
+        except Exception:
+            pass
+
+        # --- الفلترة v4.0/v4.3: AI Intent Classification Engine (القرار الأساسي) ---
         # [RADICAL REBUILD — طلب المُشغّل] ليس keyword matching: مصنّف LLM
         # يحسم القبول/الرفض بعقد JSON {decision, confidence, category, reason}.
         # الكلمات المفتاحية (extract_signals) تُمرَّر للنموذج كإشارات مساعدة فقط.
         # ACCEPT فقط إذا confidence >= REQUEST_FILTER_AI_THRESHOLD (0.85).
         # فشل AI (لا مفاتيح/timeout/parse) = REJECT صارم — لا keyword fallback.
-        # المراحل: normalize (1) → structural gates → semantic dedup (4) →
+        # المراحل: normalize (1) → structural gates → persistent dedup (v4.2) →
+        # semantic dedup (4) → admission gate (v4.2) → CHATTER GUARD (v4.3) →
         # AI classify (2/3) → threshold → filter_decisions log (5).
         analysis = await analyze_request_v4(
             raw_text,
@@ -6137,9 +6173,14 @@ class Monitor:
             chat_id=chat_id,
             msg_id=msg_id,
             source_phone=str(source_phone or ''),
+            chat_title=_chat_title_for_ai,
             decision_logger=getattr(self, '_request_decision_logger', None),
             deduper=getattr(self, '_request_semantic_deduper', None),
             threshold=float(getattr(self.config, 'request_filter_ai_threshold', 0.85)),
+            admission_gate=bool(getattr(
+                self.config, 'request_filter_admission_gate', True)),
+            chatter_guard=bool(getattr(
+                self.config, 'request_filter_chatter_guard', True)),
         )
         if not analysis.is_request:
             logging.info(
@@ -12801,7 +12842,11 @@ async def api_stats_handler(request):
 # يجيب على: «لماذا قُبلت هذه الرسالة؟» و«لماذا رُفضت؟» — بلا فحص logs.
 # محمي بـ DASHBOARD_API_KEY middleware مثل باقي /api/* (X-Api-Key).
 async def api_filter_stats_handler(request):
-    """GET /api/filter_stats?limit=100 — آخر قرارات الفلتر + إحصاءات."""
+    """GET /api/filter_stats?limit=100&decision=ACCEPT|REJECT — آخر قرارات الفلتر.
+
+    [v4.3] decision filter: تدقيق المقبولات فقط (?decision=ACCEPT) — طلب
+    المُشغّل: «ركز على الرسائل المسحوبة». بلا البارامتر = آخر القرارات كلها.
+    """
     monitor = request.app.get("monitor")
     if not monitor:
         return web.json_response({"error": "not ready"}, status=503,
@@ -12813,12 +12858,17 @@ async def api_filter_stats_handler(request):
         except (TypeError, ValueError):
             limit = 100
         limit = max(1, min(limit, 500))
+        # [v4.3] decision filter: ACCEPT أو REJECT (بلا قيمة = الكل)
+        decision_filter = (request.query.get("decision", "") or "").strip().upper()
+        if decision_filter not in ("ACCEPT", "REJECT"):
+            decision_filter = None
 
         decisions: list = []
         db_stats: dict = {}
         decision_logger = getattr(monitor, '_request_decision_logger', None)
         if decision_logger is not None:
-            decisions = await decision_logger.recent_decisions(limit=limit)
+            decisions = await decision_logger.recent_decisions(
+                limit=limit, decision=decision_filter)
             db_stats = await decision_logger.stats()
         else:
             # lazy-init لم يحدث بعد (لا رسالة عبر المسار بعد الإقلاع) —
@@ -14209,9 +14259,28 @@ async def main():
             "AI_KEY_2..8) — v4.0 سيرفض كل الرسائل (ai_classifier_not_configured). "
             "لا keyword fallback في v4.0 (تصميم مقصود: الأمان قبل النشر)."
         )
+    # [v4.2/v4.3] Capacity + Chatter Precision — boot line (تشخيص 2026-09-01)
     logging.info(
-        "REQUEST_FILTER_V4_STAGES: normalize(1) → AI classify(2/3) → "
-        "semantic dedup(4) → filter_decisions log(5) → /api/filter_stats(6)"
+        f"REQUEST_FILTER_AI_V42_CAPACITY: pool_wait_budget="
+        f"{getattr(config,'request_filter_ai_pool_wait_budget_s',4.0)}s "
+        f"(fail-fast بدل حرق الميزانية) + AIMD pacing per provider class "
+        f"(groq/mistral floors) + smart pick (جاهز فعلًا)"
+    )
+    logging.info(
+        f"REQUEST_FILTER_V43_GUARDS: admission_gate="
+        f"{'on' if getattr(config,'request_filter_admission_gate',True) else 'off'} "
+        f"(zero-signal → REJECT بلا AI) chatter_guard="
+        f"{'on' if getattr(config,'request_filter_chatter_guard',True) else 'off'} "
+        f"(سوالف الإنتاج المؤكدة: استطلاع دكاترة/طلب ملفات/نصائح/ألعاب/"
+        f"إداريات → REJECT هيكلي؛ أفعال الخدمة (يشرح/يحل/خصوصي...) تُحصّن "
+        f"الطلبات الحقيقية) + prompt v4.3 (فئات مستحدثة + أمثلة الإنتاج) + "
+        f"سياق المجموعة للـAI"
+    )
+    logging.info(
+        "REQUEST_FILTER_V4_STAGES: normalize(1) → relay/persistent-dedup → "
+        "semantic dedup(4) → admission-gate/chatter-guard(v4.2/v4.3) → "
+        "AI classify(2/3) → threshold → filter_decisions log(5) → "
+        "/api/filter_stats(6, ?decision=ACCEPT للتدقيق)"
     )
     # RENDER_GIT_COMMIT يُضبط تلقائيًا من Render عند كل deploy — نطبع أول 12
     # حرفًا حتى يستطيع المُشغّل التأكد أن النسخة الحالية هي آخر commit.

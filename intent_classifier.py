@@ -1,8 +1,33 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-intent_classifier.py — Request Intent Engine v4.1 / المرحلتان 2+3: تصنيف النية بالـAI
+intent_classifier.py — Request Intent Engine v4.3 / المرحلتان 2+3: تصنيف النية بالـAI
 ================================================================================
+v4.3 CAPACITY + CHATTER PRECISION (تشخيص إنتاجي 2026-09-01):
+  RC2-A: pacing ثابت 1.05s/مفتاح يتجاوز حدود الطبقة المجانية الفعلية
+        (Groq ≈ 0.2 RPS فعليًا، Mistral ≈ 0.3) → عاصفة 429 دائمة
+        (fail_count 14-45 ألف لكل مفتاح!).
+  RC2-B: المهام تنتظر انفراج cooldown داخل ميزانية 60s (cooldown_waits
+        316 ألف) → متوسط زمن القرار 50.7 ثانية → تراكم → overloaded.
+  RC2-C: انتظار pacing داخل قفل المزوّد — القطيع يتراكم على نفس المفتاح.
+
+  إصلاحات v4.2 (المعمارية):
+    1. فئات مزوّدين + AIMD: لكل مزوّد فترة pacing تكيفية تبدأ من حد فئة
+       المزوّد (groq=4.5s / mistral=3.0s / عام=min_interval_s)؛ 429 يضاعفها
+       (×1.6 حتى cap 60s)، النجاح ينكمشها ببطء (×0.95 حتى floor).
+    2. Smart pick: يُختار مزوّد جاهز فعلًا (خارج cooldown وخارج pacing)؛
+       لو لا يوجد — انتظار محدود pool_wait_budget (default 4s) ثم فشل
+       فوري (pool_dead_fast) بدل حرق الميزانية كاملة انتظارًا.
+    3. لا انتظار أبدًا داخل قفل المزوّد: pace>0.15 → تخطّ + نوم خارج
+       القفل + إعادة اختيار (توزيع أفضل بين المفاتيح).
+
+  v4.3 prompt hardening: فئات مستحدثة من الإنتاج (resource_request /
+  teacher_review_inquiry / advice_giving / social_game /
+  registration_admin) + شرطان إلزاميان للقبول + أمثلة من الإنتاج
+  الفعلي + تحذير مشدّد من الـhints + سياق اسم المجموعة (ضعيف).
+  extract_json_text يفكّ الـJSON مزدوج الترميز (بعض البوابات
+  OpenAI-compat تعيده escaped — متانة إنتاجية).
+
 v4.1 RESILIENCE REBUILD (تشخيص إنتاجي 2026-09-01 — بعد نشر v4.0 مباشرة):
   الإنتاج كشف أربع مشاكل جذرية في سلوك المزوّدين:
     RC-A: 3/6 مفاتيح Groq = HTTP 403 (ميتة نهائيًا) — نصف الطاقة ضائع.
@@ -91,6 +116,13 @@ REJECT_CATEGORIES = frozenset({
     "recommendation_or_opinion",   # طلب رأي/توصية عامة («مين أفضل مدرس؟»)
     "general_discussion",          # نقاش عام/فضفضة/ملاحظة
     "other",                       # أي شيء آخر
+    # [v4.3] فئات مستحدثة من تشخيص قناة الإنتاج 2026-09-01 (سوالف تُنشر
+    # كطلبات): كل فئة صيغت من رسائل فعلية وصلت القناة خطأً.
+    "resource_request",            # طلب مواد/ملفات جاهزة («أحد عنده كويزات؟»)
+    "teacher_review_inquiry",      # استطلاع جودة/تجربة مدرس («كيف دكتور X؟»)
+    "advice_giving",               # المرسل يقدّم نصيحة للآخرين («لخص وانت تذاكر»)
+    "social_game",                 # لعبة/تحدي اجتماعي («اكتبي اسم جدك»)
+    "registration_admin",          # جدولة/شعب/تسجيل إداري («ابي شعب انجليزي»)
 })
 
 VALID_CATEGORIES = ACCEPT_CATEGORIES | REJECT_CATEGORIES
@@ -122,44 +154,73 @@ class IntentDecision:
 
 # ============================================================
 # Prompt — العقد الدلالي (المرحلة 2: تعريف النية)
+# [v4.3] إعادة صياغة مقسّاة بتشخيص قناة الإنتاج 2026-09-01:
+#   آخر 20 رسالة منشورة في قناة الطلبات فُحصت يدويًا — 15 منها سوالف
+#   (استطلاع دكاترة/طلب كويزات/ألعاب/نصائح/إداريات). الأسباب الجذرية:
+#   RC1: أمثلة الـprompt القديمة قريبة شكليًا من السوالف («مين يعرف
+#        دكتور يشرح رياضيات؟» أمام «احد يعرف دكتوره بدريه؟») → النموذج
+#        يعمّم خطأً. RC2: الفئات الثماني لا تغطي أنماط السوالف الفعلية.
+#        RC3: الـhints المعجمية («أحد»/«مين») تدفع نحو القبول.
+#   العلاج: فئات مستحدثة + قواعد صريحة + أمثلة من الإنتاج نفسه +
+#   تحذير مشدّد من الـhints + شرطان إلزاميان للقبول.
 # ============================================================
 SYSTEM_PROMPT = """أنت مصنّف نوايا (Intent Classifier) صارم لقناة «طلبات مساعدة أكاديمية» تخدم طلاب جامعات الخليج. مهمتك: تحديد هل الرسالة «طلب مساعدة أكاديمية شخصي مباشر» يستحق النشر للطلاب، أم لا.
 
 القاعدة الذهبية (لا تتنازل عنها أبدًا):
-ACCEPT فقط إذا وُجد دليل واضح وصريح أن المرسل نفسه يطلب من شخص آخر أن ينفّذ/يحلّ/يشرح/يدرّس/يتولّى خدمة أكاديمية تخص المرسل شخصيًا.
-أي غموض، أو شك، أو نقص الدليل = REJECT.
+ACCEPT فقط إذا وُجد دليل واضح وصريح أن المرسل نفسه يطلب من شخص آخر أن يعلّمه أو يشرح له أو يحلّ له أو ينجز له خدمة أكاديمية تخص المرسل شخصيًا.
+أي غموض، أو شك، أو نقص الدليل، أو بلا مادة/خدمة محددة = REJECT.
+
+شرطان إلزاميان للقبول (يجب اجتماعهما معًا):
+1) المرسل هو الطالب المحتاج — الطلب لنفسه («أحد يشرح لي»، «ابي مدرس خصوصي»، «احتاج شخص يحل واجبي»).
+2) الطلب تدريس مباشر أو تنفيذ عمل أكاديمي محدد (شرح مادة، حل واجب/سؤال/بحث/تقرير/مشروع).
 
 فئات ACCEPT المسموحة (لا شيء غيرها):
-- "tutoring_request": المرسل يبحث عن مدرس/دكتور/معلم/أستاذ يدرّسه أو يشرح له مادة. أمثلة: «مين يعرف دكتور يشرح رياضيات؟»، «أبي مدرس خصوصي للمادة».
-- "homework_execution_request": المرسل يطلب أحدًا يحل/ينجز/يسوي/يكتب له واجب أو بحث أو تقرير أو مشروع أو سؤالًا. أمثلة: «أحد يشرح لي تفاضل 1»، «احتاج شخص يحل معي السؤال»، «محتاج أحد يكتب بحثي».
+- "tutoring_request": المرسل يبحث عن مدرس/دكتور/معلم/أستاذ يدرّسه أو يشرح له مادة. أمثلة: «مين يعرف دكتور يشرح رياضيات؟»، «أبي مدرس خصوصي للمادة»، «في احد يشرح احياء تحضيري احتاج مساعده؟»، «مافي خصوصي للمادة أو احد يشرح الاولد اكز؟».
+- "homework_execution_request": المرسل يطلب أحدًا يحل/ينجز/يسوي/يكتب له واجبًا أو بحثًا أو تقريرًا أو مشروعًا أو سؤالًا. أمثلة: «أحد يشرح لي تفاضل 1»، «احتاج شخص يحل معي السؤال»، «محتاج أحد يكتب بحثي».
 
 فئات REJECT (كل ما ليس ACCEPT أعلاه):
 - "advertisement": إعلان تجاري أو ترويج: تعلّم التداول واربح، بوت خصوصي، للتواصل واتساب، كورسات مدفوعة.
 - "service_offer": المرسل يعرض خدمته أو يُحيل لجهة تقدم خدمة: «عندي دكتور يساعد في الرسائل والتكاليف»، «حل واجبات وبحوث».
 - "praise_testimonial": مدح أو شكر أو تجربة شخصية مع منصة/مدرس: «شكراً منصة اكتمال جبت درجة عالية».
 - "religious_general_content": محتوى ديني أو وعظي أو دعاء أو حكمة عامة: «حين يحبك الله يبدل وجه الحياة».
-- "non_request_question": سؤال معلوماتي عن الدراسة لا يطلب تنفيذ خدمة: «كم نسبة الحرمان؟»، «هل الاختبار 5 أقسام؟».
-- "recommendation_or_opinion": طلب رأي أو توصية عامة وليست طلب خدمة مباشرة: «مين أفضل مدرس؟».
-- "general_discussion": نقاش عام أو فضفضة أو ملاحظة: «مدري ليه جابوا فلان»، «احس تفرق من أستاذ لأستاذ».
-- "other": أي شيء آخر لا يناسب ما أعلاه.
+- "resource_request": طلب ملفات أو مواد جاهزة — لا تدريس ولا تنفيذ: «أحد عنده كويزات لدروس الكمي؟»، «تكفون عطوني اساله هندسه»، «فيه احد عنده الصوره حقت كل ماده؟»، «بنات وين الاقي كتاب الريدنق والرايتينق محلول؟»، «مين عنده ملخصات الفيزياء؟». طلب ملف = REJECT دائمًا حتى لو فيه «تكفون» أو «بالله يفيدني».
+- "teacher_review_inquiry": استطلاع رأي أو تجربة أو جودة مدرس/دكتور، أو السؤال عنه بلا طلب خدمة: «دكتوره علا ياسمين البار عربي كيف؟ مين قد درس عندها؟»، «الي يدرس فيها دكتور نايف طبيعي رجال؟»، «احد يعرف دكتوره بدريه العمري؟»، «مين ياخذ احياء عملي مع دكتوره سلمى؟». الفرق الحاسم: السؤال عن المدرس (رأي/معرفة/تواجد) ≠ طلب مدرس يخدم المرسل — «مين يعرف دكتور يشرح رياضيات؟» = ACCEPT لأن فيها فعل الخدمة للمرسل.
+- "registration_admin": أسئلة الجدولة والتسجيل والشعب والأمور الإدارية: «ابي شعب انجليزي تكفون بيقفل»، «فيه احد نزل له الجدول بالتحضيري؟»، «وين احصل صورة الجدول؟»، «مين بقا معه بالشعبة؟».
+- "advice_giving": المرسل يقدّم نصيحة أو توصية للآخرين بماذا يفعلون: «واقعد لخص وانت تذاكر وحط زبده التعاريف والمفاهيم على جنب»، «حطي المواد وسوي تنفيذ»، «ذاكروا من الملخصات».
+- "social_game": الألعاب والمحادثات والتحديات الاجتماعية: «اكتبي اسم جدك اول حرف له بس»، «مين من جده؟».
+- "non_request_question": سؤال معلوماتي عن الدراسة لا يطلب تنفيذ خدمة: «كم نسبة الحرمان؟»، «هل الاختبار 5 أقسام؟»، «احد يعرف كيف افرق بين الازمنة بطريقه مبسطه؟» (طلب طريقة معرفية وليس طلب شخص).
+- "recommendation_or_opinion": طلب رأي أو توصية عامة وليست طلب خدمة مباشرة: «مين أفضل مدرس؟»، «وش أفضل طريقة للمذاكرة؟».
+- "general_discussion": نقاش عام أو فضفضة أو ملاحظة: «مدري ليه جابوا فلان».
+- "other": أي شيء آخر، ومنها الرسائل المبتورة/غير المفهومة/بلا مادة محددة مثل «الله يساعدكم أحد يفيدني».
 
 قواعد تفصيلية حاسمة:
-1. «مين يعرف مدرس رياضيات؟» = ACCEPT (tutoring_request) — يبحث عن مدرس يخدمه.
-2. «مين أفضل مدرس؟» = REJECT (recommendation_or_opinion) — يستطلع آراء، لا يطلب خدمة.
-3. الرسالة التي يعرض فيها المرسل خدمة = REJECT دائمًا حتى لو استعمل كلمات مثل يساعد/يشرح/يحل («عندي دكتور يساعد»).
-4. المدح/الشكر على خدمة سابقة = REJECT (praise_testimonial) وليست طلبًا.
-5. الإعلانات والمحتوى الديني والأسئلة المعلوماتية = REJECT دائمًا.
-6. الإشارات اللغوية المرفقة (إن وُجدت) مستخرجة آليًا من قوائم كلمات مفتاحية قديمة — اعتبرها استدلالًا مساعدًا ضعيفًا فقط. القرار قرارك المستقل من فهم المعنى الكامل للرسالة. لو تعارضت الإشارات مع المعنى الواضح، اتبع المعنى.
-7. الرسائل غير المفهومة أو المبتورة أو بلا معنى واضح = REJECT (other).
+1. «مين يعرف مدرس رياضيات؟» = ACCEPT (tutoring_request) — يبحث عن مدرس يخدمه. «مين أفضل مدرس؟» = REJECT — استطلاع آراء.
+2. الرسالة التي يعرض فيها المرسل خدمة = REJECT دائمًا حتى لو استعمل كلمات مثل يساعد/يشرح/يحل («عندي دكتور يساعد»).
+3. المدح/الشكر على خدمة سابقة = REJECT.
+4. طلب مواد/ملفات/كويزات/كتب/ملخصات/صور/بنوك أسئلة = REJECT (resource_request) دائمًا — حتى لو اقترن بـ«تكفون» أو «محتاج».
+5. السؤال عن رأي/جودة/تجربة/تواجد مدرس بلا فعل خدمة موجّه للمرسل = REJECT (teacher_review_inquiry).
+6. «كيف اذاكر؟»، «كيف افرق بين الازمنة؟»، «وش الطريقة؟» = طلبات نصيحة/معرفة عامة = REJECT — ليست طلب تدريس ولا تنفيذ.
+7. النصيحة الموجهة للآخرين (المرسل يوصي بما يفعلون: «لخص وانت تذاكر»، «اكتبي/حطي/سوي...») = REJECT (advice_giving) — المرسل يقدّم، لا يطلب.
+8. «أحد يفيدني»/«الله يساعدكم أحد يفيدني» بلا مادة أو خدمة محددة = REJECT (other).
+9. أسئلة الجدول والشعب والتسجيل = REJECT (registration_admin).
+10. الإشارات اللغوية المرفقة (إن وُجدت) مستخرجة آليًا من قوائم كلمات مفتاحية قديمة — نسبة خطئها عالية جدًا على سوالف المجموعات: مجرد وجود «أحد» أو «مين» أو «يعلم» في قائمة الإشارات لا يعني طلبًا؛ أغلب رسائل المجموعات تحتوي هذه الكلمات وهي سوالف. القرار قرارك المستند إلى فهم المعنى الكامل للرسالة فقط؛ لو تعارضت الإشارات مع المعنى الواضح، اتبع المعنى.
+11. اسم المجموعة المصدر (إن وُجد) سياق ضعيف فقط — لا يكفي وحده لإثبات طلب ولا يغيّر تصنيف نص بلا طلب صريح.
+12. الرسائل المبتورة أو غير المفهومة أو بلا مادة محددة = REJECT.
 
 الناتج: JSON فقط، بلا أي نص إضافي، بهذا الشكل بالضبط:
 {"decision":"ACCEPT أو REJECT","confidence":رقم من 0.0 إلى 1.0,"category":"إحدى الفئات أعلاه","reason":"سبب مختصر جدًا بالعربية"}
 
-أمثلة:
-- «أحد يشرح لي التفاضل» → {"decision":"ACCEPT","confidence":0.93,"category":"homework_execution_request","reason":"طالب شخصًا يشرح له مادة"}
+أمثلة مصدرها الإنتاج الفعلي:
+- «في احد يشرح احياء تحضيري احتاج مساعده؟» → {"decision":"ACCEPT","confidence":0.95,"category":"tutoring_request","reason":"طلب صريح شرح مادة محددة"}
+- «مافي خصوصي للمادة أو احد يشرح الاولد اكز» → {"decision":"ACCEPT","confidence":0.9,"category":"tutoring_request","reason":"يبحث عن خصوصي أو من يشرح"}
+- «دكتوره علا ياسمين البار عربي كيف؟مين قد درس عندها بالله يفيدني» → {"decision":"REJECT","confidence":0.95,"category":"teacher_review_inquiry","reason":"استطلاع تجربة مع دكتوره"}
+- «احد عنده كويزات لدروس الكمي؟» → {"decision":"REJECT","confidence":0.95,"category":"resource_request","reason":"طلب مواد جاهزة لا تدريس"}
+- «فيه احد نزل له الجدول بالتحضيريه ؟» → {"decision":"REJECT","confidence":0.93,"category":"registration_admin","reason":"سؤال إداري عن الجدول"}
+- «اكتبي اسم جدك اول حرف له بس» → {"decision":"REJECT","confidence":0.98,"category":"social_game","reason":"لعبة اجتماعية"}
+- «واقعد لخص وانت تذاكر وحط زبده التعاريف والمفاهيم على جنب» → {"decision":"REJECT","confidence":0.95,"category":"advice_giving","reason":"يقدم نصيحة دراسية للآخرين"}
+- «الله يساعدكم أحد يفيدني» → {"decision":"REJECT","confidence":0.9,"category":"other","reason":"بلا مادة أو خدمة محددة"}
 - «شكراً اكتمال جبت درجة عالية» → {"decision":"REJECT","confidence":0.97,"category":"praise_testimonial","reason":"مدح منصة بعد تجربة"}
-- «مين أفضل مدرس؟» → {"decision":"REJECT","confidence":0.88,"category":"recommendation_or_opinion","reason":"استطلاع رأي عام وليس طلب خدمة"}
-- «مين يعرف دكتور يشرح رياضيات؟» → {"decision":"ACCEPT","confidence":0.9,"category":"tutoring_request","reason":"يبحث عن مدرس لمادة الرياضيات"}"""
+- «مين أفضل مدرس؟» → {"decision":"REJECT","confidence":0.88,"category":"recommendation_or_opinion","reason":"استطلاع رأي عام"}"""
 
 
 # ============================================================
@@ -169,10 +230,28 @@ _FENCE_RE = re.compile(r'```(?:json)?\s*\n?(.*?)```', re.DOTALL)
 
 
 def extract_json_text(text: str) -> str:
-    """يستخرج نص الـJSON من رد النموذج (يتعامل مع ```json وnoise قبل/بعد)."""
+    """يستخرج نص الـJSON من رد النموذج (يتعامل مع ```json وnoise قبل/بعد).
+
+    [v4.3] يتعامل أيضًا مع الـJSON مزدوج الترميز (double-encoded): بعض
+    النماذج/البوابات تُعيد الـJSON كقيمة سلسلة JSON-escaped كاملة
+    ("\\\"decision\\\"..." — تُفكّ طبقة الترميز (حتى طبقتين) قبل
+    الاستخراج. التشخيص: ردّ سليم واحد ضاع لأن البوابة أعادته
+    مزدوج الترميز فصُنّف parse-failure بلا داعٍ.
+    """
     if not text:
         return ""
     t = text.strip()
+    # [v4.3] double-encoded unwrap — سلسلة JSON كاملة ("...") تُفكّ مرتين كحد أقصى
+    for _ in range(2):
+        if len(t) >= 2 and t[0] == '"' and t[-1] == '"':
+            try:
+                decoded = json.loads(t)
+            except (json.JSONDecodeError, TypeError):
+                break
+            if isinstance(decoded, str) and decoded.strip():
+                t = decoded.strip()
+                continue
+        break
     if '```' in t:
         m = _FENCE_RE.search(t)
         if m:
@@ -256,6 +335,30 @@ def load_providers_from_env() -> List[Dict[str, str]]:
 # ============================================================
 # v4.1: سياسة cooldown لكل نوع فشل (ثواني — تُضرب في cooldown_scale)
 # ============================================================
+# [v4.2] فئات المزوّدين — حدود الطبقة المجانية تختلف جذريًا حسب المزوّد.
+# هذه نقاط البداية (floors) لفترة pacing لكل نداء؛ AIMD يعدّلها بعدها ديناميكيًا.
+# الإنتاج أثبت: 1.05s/مفتاح = عاصفة 429 دائمة (Groq 1.8% نجاح، Mistral 29%).
+_PROVIDER_CLASS_INTERVALS = {
+    'groq':    (4.5, 60.0),   # (floor_s, aimd_cap_s) — 4.5s ≈ 13 RPM/مفتاح
+    'mistral': (3.0, 60.0),   # 3.0s ≈ 20 RPM/مفتاح
+    'generic': (0.0, 30.0),   # floor = min_interval_s من المُنشئ
+}
+
+# [v4.2] AIMD: نمو فترة pacing عند 429 (multiplicative decrease للسعة)
+_AIMD_GROW = 1.6      # 429 → interval × 1.6 (حتى cap)
+_AIMD_SHRINK = 0.95   # نجاح → interval × 0.95 (حتى floor — استرداد بطيء)
+
+
+def _provider_class(url: str) -> str:
+    """فئة المزوّد من URL — تحدد حدّ pacing الابتدائي (طبقة مجانية)."""
+    u = (url or '').lower()
+    if 'groq.com' in u:
+        return 'groq'
+    if 'mistral.ai' in u:
+        return 'mistral'
+    return 'generic'
+
+
 _COOLDOWN_KINDS = {
     'auth':   1800.0,   # 401/403/404 — مفتاح ميت/مرفوض/نموذج مُوقوف: 30 دقيقة
                         # تتضاعف (cap 6h) — [v4.1.1] أُضيف 404 (نموذج مُوقوف
@@ -270,8 +373,9 @@ _COOLDOWN_CAPS = {'auth': 21600.0, 'rate': 120.0}
 _COOLDOWN_DOUBLING = {'auth', 'rate'}
 
 
-def _new_provider_state() -> Dict[str, Any]:
-    """حالة صحة مزوّد واحد (v4.1 Provider Health Manager)."""
+def _new_provider_state(interval_floor_s: float = 0.0,
+                        interval_cap_s: float = 30.0) -> Dict[str, Any]:
+    """حالة صحة مزوّد واحد (v4.1 + v4.2 AIMD pacing)."""
     return {
         'lock': asyncio.Lock(),           # نداء واحد في الوقت لكل مزوّد
         'ready_at': 0.0,                  # pacing: أقرب وقت للنداء التالي (monotonic)
@@ -284,6 +388,10 @@ def _new_provider_state() -> Dict[str, Any]:
         'last_error': '',
         'last_error_at': 0.0,             # epoch (wall) للعرض
         'last_kind': '',
+        # [v4.2] AIMD pacing: الفترة الحالية بين نداءات هذا المزوّد
+        'interval_s': max(0.0, float(interval_floor_s)),
+        'interval_floor_s': max(0.0, float(interval_floor_s)),
+        'interval_cap_s': max(float(interval_floor_s), float(interval_cap_s)),
     }
 
 
@@ -315,6 +423,7 @@ class IntentClassifier:
                  total_budget_s: float = 12.0,
                  max_pending: int = 0,
                  cooldown_scale: float = 1.0,
+                 pool_wait_budget_s: float = 4.0,
                  ):
         self.providers = providers if providers is not None else load_providers_from_env()
         self.timeout_s = float(timeout_s)
@@ -336,10 +445,15 @@ class IntentClassifier:
                              if int(max_pending) > 0 else None)
         self._max_pending_value = int(max_pending)
         self._pending_wait_s = 2.0
-        # [v4.1] per-provider health state
-        self._pstate: List[Dict[str, Any]] = [
-            _new_provider_state() for _ in self.providers
-        ]
+        # [v4.2] فشل سريع عند موت كل المزوّدين — لا حرق للميزانية انتظارًا
+        self.pool_wait_budget_s = max(0.0, float(pool_wait_budget_s))
+        # [v4.1 + v4.2] per-provider health state (فترة pacing حسب فئة المزوّد)
+        self._pstate: List[Dict[str, Any]] = []
+        for p in self.providers:
+            pcls = _provider_class(p.get('url', ''))
+            floor, cap = _PROVIDER_CLASS_INTERVALS.get(pcls, (0.0, 30.0))
+            floor = max(floor, self.min_interval_s)  # المُشغّل يرفع الحد فقط
+            self._pstate.append(_new_provider_state(floor, cap))
         self.enabled = bool(self.providers)
         # counters (تشخيص /api/filter_stats)
         self.counters = {
@@ -352,6 +466,11 @@ class IntentClassifier:
             "budget_exhausted": 0,    # رسائل انتهت ميزانيتها قبل القرار
             "overload_rejects": 0,    # رسائل رُفضت فورًا (max_pending ممتلئ)
             "health_probes": 0,       # محاولات على مزوّد خرج من cooldown
+            # v4.2:
+            "pool_dead_fasts": 0,     # فشل فوري: كل المزوّدين ميتان (pool-wait انتهى)
+            "busy_skips": 0,          # تخطّي مزوّد مشغول (pace>0 داخل القفل) — بلا نداء
+            "aimd_grow": 0,          # مرات نمو فترة pacing (بعد 429)
+            "aimd_shrink": 0,        # مرات انكماش فترة pacing (بعد نجاح)
         }
 
     # --------------------------------------------------------
@@ -392,31 +511,46 @@ class IntentClassifier:
     # [v4.1] Provider Health Manager
     # --------------------------------------------------------
     def _pick_provider_locked(self) -> Optional[int]:
-        """أول مزوّد حي (خارج cooldown) من موضع الدوران — يقدّم الدوران بعده.
+        """أول مزوّد جاهز فعلًا (خارج cooldown وخارج pacing) — يقدّم الدوران بعده.
 
-        يستدعى تحت self._lock. المزوّدون في cooldown يُتخطَّون فورًا: المفتاح
-        الميت (403) لا يستهلك أي محاولة بعد اكتشافه مرة واحدة.
+        يستدعى تحت self._lock. [v4.2]: الجاهزية تشمل ready_at (pacing) —
+        المهام لا تتراكم على قفل مزوّد لم يحِن وقته بعد؛ مَن ليس جاهزًا
+        يُتخطّى لصالح زميل جاهز (توزيع أفضل بين المفاتيح). الميت (403)
+        لا يستهلك أي محاولة بعد اكتشافه مرة واحدة.
         """
         n = len(self.providers)
         now = time.monotonic()
         for i in range(n):
             idx = (self._current + i) % n
-            if now >= self._pstate[idx]['cooldown_until']:
+            st = self._pstate[idx]
+            if now >= st['cooldown_until'] and now >= st['ready_at']:
                 # probe-count لو خرج لتوه من cooldown (تشخيص)
-                if self._pstate[idx]['cooldown_until'] > 0:
+                if st['cooldown_until'] > 0:
                     self.counters["health_probes"] += 1
                 self._current = (idx + 1) % n
                 return idx
         return None
 
-    def _earliest_cooldown_release(self) -> float:
-        """أقرب وقت ينفرج فيه cooldown (monotonic). لا مزوّدين → الآن."""
+    def _soonest_usable_locked(self) -> float:
+        """أقرب وقت يصبح فيه أي مزوّد قابلًا للاستخدام (cooldown أو pacing).
+
+        يستدعى تحت self._lock. لا مزوّدين/لا شيء قادم → الآن.
+        """
         now = time.monotonic()
-        releases = [st['cooldown_until'] for st in self._pstate if st['cooldown_until'] > now]
-        return min(releases) if releases else now
+        soonest = now
+        for st in self._pstate:
+            usable = max(st['cooldown_until'], st['ready_at'])
+            if usable > now:
+                if soonest == now or usable < soonest:
+                    soonest = usable
+        return soonest
 
     def _record_failure(self, idx: int, error_str: str, kind: str) -> None:
-        """يسجّل فشلًا ويضبط cooldown حسب نوع الخطأ (متضاعف للـauth/rate)."""
+        """يسجّل فشلًا ويضبط cooldown حسب نوع الخطأ (متضاعف للـauth/rate).
+
+        [v4.2] AIMD: فشل rate (429) يطيل فترة pacing للمزوّد (×1.6 حتى
+        cap) — تقارب تدريجي مع الحد الحقيقي للمفتاح بدل عاصفة 429 دائمة.
+        """
         st = self._pstate[idx]
         st['fail_count'] += 1
         st['consecutive_fails'] += 1
@@ -433,10 +567,20 @@ class IntentClassifier:
         cooldown = base * self.cooldown_scale
         st['cooldown_until'] = max(
             st['cooldown_until'], time.monotonic() + cooldown)
+        if kind == 'rate':
+            # [v4.2] AIMD grow — 429 دليل أن الفترة الحالية أقصر من حدّ المفتاح
+            new_iv = min(st['interval_s'] * _AIMD_GROW, st['interval_cap_s'])
+            if new_iv > st['interval_s']:
+                self.counters["aimd_grow"] += 1
+            st['interval_s'] = new_iv
         self._rotate()
 
     def _record_success(self, idx: int) -> None:
-        """النجاح يُصفّر كل حالات الفشل ويرفع cooldown فورًا."""
+        """النجاح يُصفّر كل حالات الفشل ويرفع cooldown فورًا.
+
+        [v4.2] AIMD shrink: النجاح المستمر يسترد الفترة ببطء (×0.95 حتى
+        floor) — استرداد حذر بعد التوسّع.
+        """
         st = self._pstate[idx]
         st['success_count'] += 1
         st['consecutive_fails'] = 0
@@ -444,6 +588,10 @@ class IntentClassifier:
         st['consecutive_rate_fails'] = 0
         st['cooldown_until'] = 0.0
         st['last_kind'] = ''
+        new_iv = max(st['interval_s'] * _AIMD_SHRINK, st['interval_floor_s'])
+        if new_iv < st['interval_s']:
+            self.counters["aimd_shrink"] += 1
+        st['interval_s'] = new_iv
 
     def provider_health(self) -> List[Dict[str, Any]]:
         """حالة كل مزوّد (للـ/api/filter_stats) — تشخيص بلا runtime logs."""
@@ -463,6 +611,9 @@ class IntentClassifier:
                 'last_error_at': st['last_error_at'] or None,
                 'success_count': st['success_count'],
                 'fail_count': st['fail_count'],
+                # [v4.2] AIMD pacing diagnostics:
+                'interval_s': round(st['interval_s'], 2),
+                'ready_in_s': round(max(0.0, st['ready_at'] - now), 2),
             })
         return out
 
@@ -470,10 +621,25 @@ class IntentClassifier:
     # prompt construction
     # --------------------------------------------------------
     @staticmethod
-    def build_user_prompt(clean_text: str, hints: Optional[Dict[str, Any]]) -> str:
+    def build_user_prompt(clean_text: str, hints: Optional[Dict[str, Any]],
+                          context: str = "") -> str:
+        """[v4.3] بناء user prompt — hints مع تحذير مشدّد + سياق المجموعة.
+
+        تشخيص الإنتاج: الـhints المعجمية («أحد»/«مين»/«يعلم») كانت تدفع
+        النماذج الضعيفة نحو ACCEPT على السوالف — أغلب رسائل المجموعات
+        تحتوي هذه الكلمات. التحذير الصريح + الطلب بالاستناد للمعنى فقط
+        يقلّل هذا التلوث. اسم المجموعة يُمرّر كسياق ضعيف صريح التوصيف.
+        """
         parts = []
+        if context:
+            parts.append(f"المجموعة المصدر (سياق ضعيف فقط — لا يكفي وحده): {context[:120]}")
+            parts.append("")
         if hints:
-            parts.append("إشارات لغوية مستخرجة آليًا (استدلال مساعد فقط — القرار قرارك):")
+            parts.append(
+                "إشارات معجمية آلية (مطابقات كلمات مفتاحية قديمة — نسبة"
+                " خطئها عالية جدًا على سوالف المجموعات؛ لا تُعطها وزنًا يذكر"
+                " — القرار من فهم المعنى فقط):"
+            )
             parts.append(json.dumps(hints, ensure_ascii=False))
             parts.append("")
         parts.append("الرسالة:")
@@ -482,12 +648,13 @@ class IntentClassifier:
         parts.append("صنّفها وأعد الـJSON فقط.")
         return "\n".join(parts)
 
-    def _build_payload(self, clean_text: str, hints: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    def _build_payload(self, clean_text: str, hints: Optional[Dict[str, Any]],
+                       context: str = "") -> Dict[str, Any]:
         return {
             "model": "",  # يُملأ لكل provider
             "messages": [
                 {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user", "content": self.build_user_prompt(clean_text, hints)},
+                {"role": "user", "content": self.build_user_prompt(clean_text, hints, context)},
             ],
             "temperature": 0.0,
             # 400: يسمح بنماذج reasoning (gpt-oss تفكّر قبل النص — 160 كان
@@ -499,11 +666,14 @@ class IntentClassifier:
     # --------------------------------------------------------
     # main entry
     # --------------------------------------------------------
-    async def classify(self, text: str, hints: Optional[Dict[str, Any]] = None) -> IntentDecision:
+    async def classify(self, text: str, hints: Optional[Dict[str, Any]] = None,
+                       context: str = "") -> IntentDecision:
         """يصنّف الرسالة. لا يطبّق عتبة القبول — يُعيد قرار الـAI المقاس.
 
         v4.1: يعيد المحاولة داخل الجولات ضمن ميزانية زمنية؛ يتخطّى المزوّدين
         في cooldown؛ pacing لكل مفتاح؛ بوابة max_pending للاندفاعات.
+        v4.2: AIMD pacing + fail-fast pool-wait + لا نوم داخل قفل المزوّد.
+        v4.3: context = اسم المجموعة المصدر (سياق ضعيف يُمرّر للـprompt).
         الفشل النهائي = REJECT صارم مع error تفصيلي — لا keyword fallback.
         """
         if not self.enabled:
@@ -515,12 +685,15 @@ class IntentClassifier:
                                   category="empty", reason="empty", error="empty text")
 
         clean = text.strip()[: self.max_chars]
-        payload = self._build_payload(clean, hints)
+        payload = self._build_payload(clean, hints, context)
         attempts_per_round = max(1, min(self.max_attempts, len(self.providers)))
         max_total_attempts = attempts_per_round * self.retry_rounds
         deadline = time.monotonic() + self.total_budget_s
         last_error = ""
         total_attempts = 0
+        # [v4.2] ميزانية انتظار مخصّصة لموت المجمّع كله — لو انتهت فشل فوري
+        # بدل حرق كامل الميزانية انتظارًا (كان يصنع زمن قرار 50s+ وتراكمًا).
+        pool_waited = 0.0
 
         # [v4.1] بوابة الاندفاعة: عدد محدود ينتظر داخل classify — الفائض
         # يُرفض فورًا (أمان: REJECT وليس تراكمًا لا نهائيًا للمهام).
@@ -550,14 +723,25 @@ class IntentClassifier:
                         self.counters["budget_exhausted"] += 1
                     break
 
-                # اختيار مزوّد حي (تخطي الموتى/المبرَّدين فورًا)
+                # [v4.2] اختيار مزوّد جاهز فعلًا (خارج cooldown وخارج pacing)
+                wait_s = 0.0
                 async with self._lock:
                     idx = self._pick_provider_locked()
+                    if idx is None:
+                        wait_s = self._soonest_usable_locked() - time.monotonic()
                 if idx is None:
-                    # كل المزوّدين في cooldown — انتظر أقرب انفراج (bounded)
-                    wait_s = self._earliest_cooldown_release() - time.monotonic()
-                    wait_s = min(wait_s + 0.05, 10.0,
+                    # كل المزوّدين غير متاحين (cooldown أو pacing) —
+                    # [v4.2] fail-fast: انتظار محدود pool_wait_budget فقط.
+                    if pool_waited >= self.pool_wait_budget_s:
+                        self.counters["pool_dead_fasts"] += 1
+                        last_error = (f"all providers unavailable "
+                                      f"(cooldown/pacing) — fail-fast after "
+                                      f"{pool_waited:.1f}s pool-wait "
+                                      f"(budget {self.total_budget_s}s)")
+                        break
+                    wait_s = min(wait_s + 0.05, 2.5,
                                  max(0.05, deadline - time.monotonic()))
+                    pool_waited += max(0.05, wait_s)
                     self.counters["cooldown_waits"] += 1
                     await asyncio.sleep(max(0.05, wait_s))
                     continue
@@ -566,24 +750,30 @@ class IntentClassifier:
                 pstate = self._pstate[idx]
                 payload["model"] = provider["model"]
                 t0 = time.monotonic()
-                self.counters["calls"] += 1
-                total_attempts += 1
                 status, body = -1, ""
+                skipped_busy = False
+                pace = 0.0
                 try:
                     async with pstate['lock']:
-                        # [v4.1] pacing: نداء واحد لكل مفتاح كل min_interval_s
+                        # [v4.2] لا ننام داخل قفل المزوّد أبدًا: لو صار مشغولًا
+                        # (pace>0 — التقطه مهمام أخرى قبلنا) نحرّر القفل ونتخطّى
+                        # بلا نداء — إعادة الاختيار توزّعنا على مفتاح آخر.
                         pace = pstate['ready_at'] - time.monotonic()
-                        if pace > 0:
-                            self.counters["pace_waits"] += 1
-                            await asyncio.sleep(min(
-                                pace, 5.0, max(0.0, deadline - time.monotonic())))
-                        status, body = await asyncio.wait_for(
-                            self._call_transport(provider, payload),
-                            timeout=self.timeout_s,
-                        )
-                        pstate['ready_at'] = time.monotonic() + self.min_interval_s
-                    latency = int((time.monotonic() - t0) * 1000)
-                    self.counters["total_latency_ms"] += latency
+                        if pace > 0.15:
+                            skipped_busy = True
+                        else:
+                            if pace > 0:
+                                self.counters["pace_waits"] += 1
+                            self.counters["calls"] += 1
+                            total_attempts += 1
+                            status, body = await asyncio.wait_for(
+                                self._call_transport(provider, payload),
+                                timeout=self.timeout_s,
+                            )
+                            # [v4.2] AIMD: الفترة الحالية لهذا المزوّد (ليست
+                            # min_interval الثابت) — تتكيّف مع 429/النجاح.
+                            pstate['ready_at'] = (time.monotonic()
+                                                  + pstate['interval_s'])
                 except asyncio.TimeoutError:
                     self.counters["timeouts"] += 1
                     last_error = f"timeout after {self.timeout_s}s ({provider['name']})"
@@ -596,6 +786,14 @@ class IntentClassifier:
                     last_error = f"{type(e).__name__}: {e} ({provider['name']})"
                     self._record_failure(idx, last_error, kind='network')
                     continue
+                if skipped_busy:
+                    self.counters["busy_skips"] += 1
+                    await asyncio.sleep(min(
+                        max(0.05, pace), 2.0,
+                        max(0.0, deadline - time.monotonic())))
+                    continue  # لا تُحسب محاولة — أعِد الاختيار
+                latency = int((time.monotonic() - t0) * 1000)
+                self.counters["total_latency_ms"] += latency
 
                 if status == 429:
                     self.counters["errors"] += 1
@@ -729,6 +927,8 @@ class IntentClassifier:
             "total_budget_s": self.total_budget_s,
             "min_interval_s": self.min_interval_s,
             "max_pending": self._max_pending_value,
+            # v4.2 knobs:
+            "pool_wait_budget_s": self.pool_wait_budget_s,
             **dict(self.counters),
             "avg_latency_ms": round(self.counters["total_latency_ms"] / calls, 1),
         }

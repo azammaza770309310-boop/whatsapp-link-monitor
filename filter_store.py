@@ -1,14 +1,20 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-filter_store.py — Request Intent Engine v4.1 / المرحلة 5: سجل التشخيص
+filter_store.py — Request Intent Engine v4.2 / المرحلة 5: سجل التشخيص
 ================================================================================
-STAGE 5 of the v4.0/v4.1 rebuild. جدول filter_decisions يحفظ كل قرار (ACCEPT وREJECT)
+STAGE 5 of the v4.0/v4.1/v4.2 rebuild. جدول filter_decisions يحفظ كل قرار (ACCEPT وREJECT)
 مع السبب الكامل — حتى نستطيع الإجابة على: «لماذا قُبِلت؟» و«لماذا رُفضت؟».
 
 [v4.1] عمود جديد error_detail: تفاصيل فشل الـAI التقنية (http status +
 provider + attempts/budget) لكل قرار ai_error/overloaded — التشخيص من
 الـdashboard بلا runtime logs (Render free plan لا يوفرها).
+
+[v4.2] Persistent decision dedup: seen_before(chat_id, message_id) يمنع
+إعادة معالجة نفس الرسالة (LRB rescue reflood / إعادة تشغيل / إعادة تسليم
+بين الحسابات) بلا نداء AI جديد. القرارات العابرة فقط (ai_error/
+ai_unavailable/overloaded) لا تحجب إعادة المحاولة — الطلب الحقيقي يستحق
+فرصة جديدة بعد تعافي المزوّدين. فهرس (chat_id, message_id) idempotent.
 
 المخطط (يُنشأ أيضًا من link_system.init_production_tables — idempotent):
     filter_decisions(
@@ -68,7 +74,22 @@ _FILTER_DECISIONS_INDEXES = (
     "CREATE INDEX IF NOT EXISTS idx_fd_created ON filter_decisions (created_at)",
     "CREATE INDEX IF NOT EXISTS idx_fd_decision ON filter_decisions (decision)",
     "CREATE INDEX IF NOT EXISTS idx_fd_text_hash ON filter_decisions (text_hash)",
+    # [v4.2] persistent decision dedup — lookup (chat_id, message_id) O(log n)
+    "CREATE INDEX IF NOT EXISTS idx_fd_chat_msg ON filter_decisions (chat_id, message_id)",
 )
+
+
+# [v4.2] القرارات العابرة لا تُعتبر نهائية: فشل المزوّدين ليس حكمًا على
+# الرسالة — إعادة التسليم/إعادة التشغيل تستحق فرصة تصنيف جديدة.
+# (تصنيف فارغ = حكم نهائي هيكلي).
+_TRANSIENT_CATEGORIES = frozenset({
+    "ai_error", "ai_unavailable", "overloaded", "invalid_output",
+    "ai_classifier_not_configured",
+})
+
+# [v4.2] سعة الذاكرة المؤقتة للقرارات النهائية (chat_id, message_id) —
+# O(1) hit path بعد التسخين؛ الإفلات FIFO يحفظ الذاكرة محدودة.
+_SEEN_CACHE_MAX = 20000
 
 
 def text_hash_of(raw_text: str) -> str:
@@ -86,6 +107,8 @@ class DecisionLogger:
     def __init__(self, prod_db):
         self.prod_db = prod_db
         self._ensured = False
+        # [v4.2] persistent decision dedup cache: {(chat_id, msg_id)} نهائية
+        self._seen: Dict[tuple, None] = {}   # dict كـordered set (O(1) FIFO)
 
     async def _conn(self):
         return await self.prod_db._conn()
@@ -169,28 +192,99 @@ class DecisionLogger:
                 ),
             )
             await conn.commit()
+            # [v4.2] القرار النهائي (ليس عابرًا) يدخل ذاكرة seen-cache —
+            # seen_before يصيب O(1) بلا نداء DB.
+            cat = str(category or '').strip()
+            if cat not in _TRANSIENT_CATEGORIES:
+                self._seen_cache_add(_to_int(chat_id), _to_int(message_id))
             return True
         except Exception as e:
             logging.debug(f"[FILTER-STORE] log_decision failed (non-fatal): {e}")
             return False
 
-    async def recent_decisions(self, limit: int = 100) -> List[Dict[str, Any]]:
-        """آخر N قرار (للـ/api/filter_stats). newest first."""
+    # --------------------------------------------------------
+    # [v4.2] Persistent decision dedup
+    # --------------------------------------------------------
+    def _seen_cache_add(self, chat_id: int, message_id: int) -> None:
+        """يضيف قرارًا نهائيًا للذاكرة المؤقتة (bounded FIFO)."""
+        key = (chat_id, message_id)
+        self._seen[key] = None
+        if len(self._seen) > _SEEN_CACHE_MAX:
+            # إزالة أقدم 25% — بلا O(n) في كل إضافة
+            drop = _SEEN_CACHE_MAX // 4
+            for k in list(self._seen.keys())[:drop]:
+                self._seen.pop(k, None)
+
+    async def seen_before(self, chat_id: int, message_id: int) -> bool:
+        """[v4.2] هل صدر قرار نهائي لهذه الرسالة سابقًا (chat_id, message_id)؟
+
+        البحث: ذاكرة O(1) → فهرس SQLite. القرارات العابرة (ai_error/
+        overloaded...) لا تُعتبر نهائية — رسالتها تستحق إعادة التصنيف
+        بعد تعافي المزوّدين. non-fatal: أي فشل → False (المسار لا يتوقف).
+        """
+        key = (_to_int(chat_id), _to_int(message_id))
+        if not key[0] or not key[1]:
+            return False
+        if key in self._seen:
+            return True
+        try:
+            if not self._ensured:
+                await self.ensure_table()
+            conn = await self._conn()
+            cursor = await conn.execute(
+                """SELECT category FROM filter_decisions
+                   WHERE chat_id = ? AND message_id = ?
+                   ORDER BY id DESC LIMIT 1""",
+                (key[0], key[1]),
+            )
+            row = await cursor.fetchone()
+            if row is None:
+                return False
+            cat = (row[0] or '').strip()
+            if cat in _TRANSIENT_CATEGORIES:
+                return False   # قرار عابر — ليست نهائية
+            self._seen_cache_add(key[0], key[1])
+            return True
+        except Exception as e:
+            logging.debug(f"[FILTER-STORE] seen_before failed (non-fatal): {e}")
+            return False
+
+    async def recent_decisions(self, limit: int = 100,
+                               decision: Optional[str] = None) -> List[Dict[str, Any]]:
+        """آخر N قرار (للـ/api/filter_stats). newest first.
+
+        [v4.3] decision filter: 'ACCEPT' أو 'REJECT' (أو '' / None = الكل) —
+        يمكّن المُشغّل من تدقيق المقبولات فقط: /api/filter_stats?decision=ACCEPT
+        (طلب المُشغّل: «ركز على الرسائل المسحوبة» — الآن يراها مباشرة).
+        """
         try:
             if not self._ensured:
                 await self.ensure_table()
             limit = max(1, min(int(limit), 500))
             conn = await self._conn()
-            cursor = await conn.execute(
-                """SELECT id, chat_id, message_id, text_hash, text_preview,
-                          decision, confidence, category, reason, model,
-                          latency_ms, dedup_kind, source_phone, error_detail,
-                          created_at
-                   FROM filter_decisions
-                   ORDER BY id DESC
-                   LIMIT ?""",
-                (limit,),
-            )
+            if decision in ('ACCEPT', 'REJECT'):
+                cursor = await conn.execute(
+                    """SELECT id, chat_id, message_id, text_hash, text_preview,
+                              decision, confidence, category, reason, model,
+                              latency_ms, dedup_kind, source_phone, error_detail,
+                              created_at
+                       FROM filter_decisions
+                       WHERE decision = ?
+                       ORDER BY id DESC
+                       LIMIT ?""",
+                    (decision, limit),
+                )
+            else:
+                cursor = await conn.execute(
+                    """SELECT id, chat_id, message_id, text_hash, text_preview,
+                              decision, confidence, category, reason, model,
+                              latency_ms, dedup_kind, source_phone, error_detail,
+                              created_at
+                       FROM filter_decisions
+                       ORDER BY id DESC
+                       LIMIT ?""",
+                    (limit,),
+                )
             rows = await cursor.fetchall()
             cols = [d[0] for d in cursor.description]
             return [dict(zip(cols, r)) for r in rows]

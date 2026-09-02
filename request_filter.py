@@ -43,7 +43,7 @@ import re
 from dataclasses import dataclass, field
 from typing import List, Tuple, Dict, Any, Optional
 
-FILTER_VERSION = "v4.1.0"
+FILTER_VERSION = "v4.3.1"
 FILTER_MODE = "ai_intent_classifier"
 
 
@@ -1278,7 +1278,366 @@ def _seeker_confidence_int(sig: SignalReport, accepted: bool, ai_conf: float) ->
 
 
 # ============================================================
-# v4.0 Orchestrator — المراحل 1→2/3→4→5
+# [v4.2] Admission Gate — بوابة توجيه الأولوية للـAI (ليست قرارًا)
+# ============================================================
+# المبدأ: الطاقة الحقيقية للمزوّدين المجانيين ≈ 0.9 RPS بينما السيل
+# ≈ 4 رسائل/ثانية. كل رسالة بلا أي إشارة ذات صلة بالطلبات سيرفضها الـAI
+# بأغلبية ساحقة (فئات other/religious/general في DB: 97% من قرارات AI
+# الحقيقية = REJECT). توجيه بلا إشارات بعيدًا عن الـAI يخفض الطلب إلى
+# ما تحت الطاقة — فيعود التصنيف موثوقًا للرسائل التي تحتاجه فعلًا.
+#
+# الأمان (القاعدة الذهبية محفوظة): البوابة ترفض فقط (REJECT) ولا تقبل
+# أبدًا — القرار الوحيد للقبول يبقى للـAI. أي رسالة تحمل أي إشارة من
+# 18 قائمة إشارات أو علامات تواصل أو معجم إنجليزي صريح → تمر للـAI.
+_ADMISSION_GATE_DESCRIPTION = "admission gate: REJECT-only pre-AI router (zero-signal chatter never reaches AI)"
+
+# معجم إنجليزي صريح للبوابة فقط (قوائم v3 عربية أساسًا — 20 مدخلًا
+# إنجليزيًا فقط). رسالة إنجليزية صريحة الطلب لا تحجبها البوابة أبدًا.
+_ADMISSION_EN_LEXICON = (
+    "anyone", "someone", "anybody", "need", "help", "tutor", "teacher",
+    "doctor", "math", "homework", "hw", "assignment", "project", "exam",
+    "quiz", "essay", "research", "thesis", "report", "solve", "explain",
+    "teach", "please", "want", "looking",
+)
+_ADMISSION_EN_RES = [re.compile(r'\b' + re.escape(w) + r'\b', re.IGNORECASE)
+                     for w in _ADMISSION_EN_LEXICON]
+
+
+def admission_allowed(sig: "SignalReport", text: str = "") -> bool:
+    """[v4.2] هل تستحق الرسالة نداء AI؟ (بوابة REJECT-only — ليست قرار قبول)
+
+    تمرّ للـAI لو وُجدت أي إشارة من أي قائمة (شخص/طلب/تنفيذ/خدمة/مزوّد/
+    إعلان/معلومات/توصية/...) أو علامات تواصل (هاتف/رابط/@) أو كلمة
+    إنجليزية صريحة. بلا أي شيء من ذلك — الـAI سيرفضها بنسبة ساحقة
+    (رسائل عامة/دينية/فضفضة) والنداء مكلف إنتاجيًا.
+    """
+    total = (len(sig.person_signals) + len(sig.requester_signals)
+             + len(sig.execution_signals) + len(sig.ownership_signals)
+             + len(sig.service_signals) + len(sig.provider_signals)
+             + len(sig.ad_signals) + len(sig.info_signals)
+             + len(sig.resource_signals) + len(sig.recommend_signals)
+             + len(sig.outsource_signals) + len(sig.delegation_signals)
+             + len(sig.role_signals) + len(sig.ready_made_signals)
+             + len(sig.contact_info_signals) + len(sig.decision_signals)
+             + len(sig.person_status_signals) + len(sig.plural_noun_signals))
+    if total > 0:
+        return True
+    if sig.has_phone or sig.has_contact_url or sig.has_at_handle or sig.has_dotted_word:
+        return True
+    n = sig.normalized or normalize_text(text or "")
+    if n:
+        for rx in _ADMISSION_EN_RES:
+            if rx.search(n):
+                return True
+    return False
+
+
+# ============================================================
+# [v4.3] CHATTER GUARD — بوابات هيكلية رفضية عالية الدقة
+# ============================================================
+# تشخيص قناة الإنتاج 2026-09-01 (طلب المُشغّل: «الرسائل المسحوبة سوالف
+# مالها داعي — تأكد بنفسك واصلح بأعلى دقة»): فُحصت آخر 20 رسالة
+# منشورة في قناة الطلبات — 15 منها سوالف مؤكدة (استطلاع دكاترة/طلب
+# كويزات/ألعاب/نصائح/إداريات). الـAI (gpt-oss/mistral-small) يقبلها
+# بثقة عالية لأن أمثلة الـprompt قريبة شكليًا منها — العلاج على
+# مسارين: (1) prompt مقسّى بفئات وأمثلة من الإنتاج نفسه (المصنّف),
+# (2) هذه البوابات الهيكلية كشبكة أمان حتمية.
+#
+# الفلسفة (نفس مبدأ admission gate — متوافقة مع القاعدة الذهبية):
+#   - البوابات ترفض فقط (REJECT-only) ولا تقبل أبدًا — القرار الوحيد
+#     للقبول يبقى للـAI. أي شك = رفض (بقاعدة المُشغّل نفسها).
+#   - كل نمط مُستخرج من رسالة فعلية وصلت القناة خطأً (مذكورة أدناه).
+#   - صمام أمان داخلي: أي رسالة تحمل فعلاً خدميًا للمرسل (يشرح/يعلمني/
+#     يحل/خصوصي...) أو مستفيدًا (لي/ني/معي) تتجاوز البوابات كلها —
+#     الطلب الحقيقي لا يلمسه الحرس أبدًا.
+_CHATTER_GUARD_DESCRIPTION = "chatter guard: REJECT-only structural safety net (production FP patterns)"
+
+# --- أنماط رفض دقيقة (كلها بصيغة مطبّعة: ا/ة→ه/ى→ي، lowercase) ---
+
+# [G1] كلمات المدرسين — لاستطلاع الرأي/الجودة/التواجد
+_GUARD_TEACHER_WORDS = (
+    'دكتور', 'دكتوره', 'دكاتره', 'دكاترة', 'مدرس', 'مدرسه', 'مدرسين',
+    'معلم', 'معلمه', 'استاذ', 'استاذه', 'اساتذه', 'بروفيسور', 'بروف',
+)
+
+# [G1] أنماط الاستطلاع/الاستفسار عن المدرس (بلا فعل خدمة).
+# «يعرف» المجردة آمنة هنا: أي طلب حقيقي يحمل فعل خدمة (يشرح/خصوصي/...)
+# يفلت من الحرس كله قبل الوصول لهذه القائمة (صمام الأمان الأول).
+_GUARD_INQUIRY_PATTERNS = (
+    'كيف', 'طبيعي', 'رجال', 'مين قد درس', 'مين درس', 'وش راي',
+    'وش رايك', 'تعرفون', 'تعرفين', 'يعرف', 'ياخذ مع',
+    'تاخذون مع', 'مين ياخذ', 'ياخذون مع', 'زفت', 'شخصيته',
+    'تعامله', 'درس عنده', 'درست عندها', 'متعاون', 'رافع',
+    'افضل', 'احسن', 'مين افضل', 'وش افضل', 'توصي', 'ترشح',
+)
+
+# [G2] أسماء المواد/الملفات الجاهزة (المطلوبة كملفات لا كخدمة)
+_GUARD_RESOURCE_NOUNS = (
+    'كويز', 'كويزات', 'كتاب', 'كتب', 'ملف', 'ملفات', 'صور', 'بنك',
+    'اسال', 'اسئله', 'سلايد', 'سلايدات', 'ملخص', 'ملخصات', 'ملخصات',
+    'تسريبات', 'اوراق', 'حلول', 'محلول', 'مذكره', 'مذكرات', 'اكز',
+    'اكسام', 'شيت', 'شيتات', 'تلخيص', 'مصادر', 'سلايدرات', 'بوربوينت',
+)
+
+# [G2] أفعال/عبارات طلب الملف (بلا فعل خدمة)
+_GUARD_RESOURCE_ASK = (
+    'عنده', 'عندك', 'عندكم', 'معك', 'معاه', 'معها', 'معايا', 'معكم',
+    'عطوني', 'اعطوني', 'عطيني', 'عطني', 'ابعتولي', 'تبعتولي', 'تبعثولي',
+    'ادفعوا', 'ترسلون', 'ابعتوا', 'وين القى', 'وين الاقي', 'وين احصل',
+    'من وين', 'وين القاه', 'وين القا', 'عندي لكم', 'تحتاجونه',
+)
+
+# [G3] بدايات الأمر/النصيحة (imperative) — يبدأ الكلام بفعل أمر للآخرين
+_GUARD_IMPERATIVE_STARTS = (
+    'اكتبي', 'اكتب', 'حطي', 'حط', 'سوي', 'روحي', 'روح', 'ادخلي', 'ادخل',
+    'نزلي', 'نزل', 'ذكري', 'ذاكر', 'راجعي', 'راجع', 'لخص', 'اقعد',
+    'ركز', 'افهم', 'شوف', 'شوفي', 'خذي', 'عيش', 'تعلمي', 'تعلم',
+    'جرب', 'جربي', 'افتحي', 'افتح', 'اسمعي', 'اسمع', 'اقري', 'اقرا',
+    'احفظي', 'احفظ', 'ادفعي', 'ادفع', 'اشربي', 'كلي', 'ذوقي',
+    'اكتبيها', 'حطيها', 'سويها', 'خلي', 'خليها', 'اكسبي', 'اشتري', 'بيعي',
+)
+
+# [G3] علامات الطالب (وجودها = الرسالة طلب، ليست أمرًا للآخرين)
+_GUARD_REQUESTER_MARKERS = (
+    'ابي', 'ابغي', 'ابغى', 'بغيت', 'احتاج', 'محتاج', 'ممكن', 'تكفون',
+    'لو سمحت', 'مين', 'احد', 'هل', 'وين', 'وش', 'ليش', 'كيف', 'انا',
+    'عندي', 'بغوا', 'ودي', 'نفسي', 'ابي ا', 'لوسمحتم', 'منكم',
+)
+
+# [G3] لواحق المستفيد: «ني» لاحقة فعل (يعلمني/يساعدني — آمنة كsubstring
+# لأن اتجاه الخطأ = إفلات من الحرس، لا رفض طلب). أما «لي/لى/معي/ليا/لنا»
+# فتُفحص ككلمات مستقلة فقط — «علي/الى» حرفا جر شائعان يحتويان «لي»
+# وهما ليسا مستفيدًا («وحط زبده التعاريف علي جنب» — تشخيص إنتاجي).
+_GUARD_BENEFICIARY_SUFFIX = 'ني'
+_GUARD_BENEFICIARY_WORDS = frozenset({'لي', 'لى', 'معي', 'ليا', 'لنا', 'الي'})
+
+# [G4] مصطلحات أكاديمية (وجود أي منها = محتوى أكاديمي).
+# ملاحظة تصميم: استُبعدت مصطلحات الميتا-الدراسية (ازمنه/قواعد/تعاريف/
+# مفاهيم/معدل/حرمان...) — أغلب ورودها في أسئلة النصائح والمعلومات
+# («كيف احفظ القواعد؟»)؛ أي طلب حقيقي عنها يحمل فعل خدمة (يشرح/يعلمني)
+# فيفلت من الحرس كله قبل G4 — الإزالة لا ترفض طلبًا حقيقيًا.
+_GUARD_ACADEMIC_TERMS = (
+    'ماده', 'مواد', 'درس', 'دروس', 'محاضره', 'محاضرات', 'اختبار',
+    'اختبارات', 'كويز', 'كويزات', 'واجب', 'واجبات', 'بحث', 'بحوث',
+    'تقرير', 'تقارير', 'مشروع', 'مشاريع', 'مقرر', 'مقررات', 'ترم',
+    'فصل دراسي', 'جامعه', 'كليات', 'كليه', 'ماجستير', 'دكتوراه',
+    'بكالوريوس', 'تحضيري', 'صيفي', 'تفاضل', 'رياضيات', 'جبر', 'احصاء',
+    'كيمياء', 'كيميا', 'فيزياء', 'فيزيا', 'احياء', 'بيولوجي', 'جيولوجي',
+    'انجليزي', 'عربي', 'فرنسي', 'تاريخ', 'جغرافيا', 'فلسفه', 'تخصص',
+    'مساله', 'مسائل', 'قانون', 'محاسبه', 'اقتصاد', 'اداره', 'حاسب',
+    'برمجه', 'نظم', 'شريعه', 'طب', 'تمريض', 'صيدله', 'هندسه', 'معماري',
+    'مدني', 'تربيه', 'علوم', 'لغه', 'نحو', 'بلاغه',
+    'اسايمنت', 'هومورك', 'بروجكت', 'ايسي', 'كورس', 'كورسات', 'دبلوم',
+    'مختبر', 'عملي', 'نظري', 'منهج', 'مناهج', 'مقرر',
+    # [v4.3.1] مفردات الطالب الخليجي الناقصة (فجوة اكتشفها الفحص
+    # adversarial: «عندي امتحان ابغى مساعده» صُرفت no_academic_content
+    # لأن القائمة فيها «اختبار» فقط دون مرادفاته الشائعة)
+    'امتحان', 'امتحانات', 'ميدتيرم', 'ميدترم', 'ميد', 'فاينل', 'فينل',
+    'بارشال', 'بارشيال', 'ويكلي', 'تسك', 'برزنتيشن', 'برزنتيشن',
+    'روبرت', 'ربورت', 'بحوثي', 'تزنيم', 'معمل',
+)
+
+# [G5] مصطلحات إدارية/جدولة (+ [v4.3.1] مواقع الحرم: صاله/مبنى/قاعه/مكتب —
+# أسئلة «وين صالة 12؟» إدارية موقعية؛ أي طلب حقيقي يقترن بموقع يحمل فعل
+# خدمة (يشرح/خصوصي...) فيفلت من الحرس قبل G5)
+_GUARD_ADMIN_TERMS = (
+    'شعبه', 'شعب', 'سكشن', 'سيكشن', 'جدول', 'تسجيل', 'قفل', 'يقفل',
+    'مليان', 'فاضي', 'سحب', 'انسحاب', 'الغاء', 'حذف ماده', 'اضافه',
+    'تعديل', 'شعبة', 'شعبيه', 'سكشنات', 'يقفلون',
+    'صاله', 'مبنى', 'مبني', 'قاعه', 'اداره', 'مكتب', 'عماده', 'بوابه',
+)
+
+# [G5] علامات السياق الإداري
+_GUARD_ADMIN_MARKERS = (
+    'نزل', 'ينزل', 'ابي', 'ابغى', 'فيه احد', 'مين', 'بيقفل', 'مليان',
+    'ضبط', 'وين', 'وش', 'كيف', 'متى', 'هل', 'فتح', 'فتحوا', 'طلع',
+)
+
+# --- صمام الأمان: أفعال الخدمة للمرسل (وجودها = طلب حقيقي محتمل،
+# لا تلمسه البوابات أبدًا؛ لاحظ استثناء «يدرس» المجردة — التشخيص
+# الإنتاجي أثبت أن «الي يدرس فيها دكتور نايف» وصفٌ لا طلب) ---
+_GUARD_SERVICE_ESCAPES = (
+    'يشرح', 'يشرحلي', 'اشرح', 'شرحو', 'يشرحو', 'شرحا', 'يعلم',
+    'يعلمني', 'علمني', 'ادرسني', 'يدرسني', 'خصوصي', 'خصوصيه',
+    'يحل', 'يحلها', 'يحللي', 'يسوي', 'يسويها', 'يسوها', 'ينجز',
+    'ينجزها', 'يكتب', 'يكتبها', 'اكتبلي', 'يرسم', 'يبرمج', 'يترجم',
+    'يخلص', 'يخلصها', 'يحله', 'حليها', 'حللي', 'يساعدني', 'ينفذ لي',
+    'يشرحو لي', 'اشرحوا', 'علّمني', 'شرح لي', 'حل لي',
+    'يلخص', 'يلخصها', 'لخصلي', 'يراجع', 'يراجعها', 'يدربني',
+)
+
+# [v4.3.1] أنماط إضافية من فحص adversarial مستقل (تحصين الحرس):
+# 7 أنماط سوالف شائعة كانت تفلت: العروض المخصومة («عندي كويزات اللي
+# يبيها يكلمني»)، تعليق الخبر الماضي («الاختبار كان صعب»)، حسم شخصي
+# («شكلي بانسحب»)، سؤال السعر («كم سعر الكتاب؟»)، توصية يقدّمها
+# («انصحكم فيه»)، أسئلة الموقع («وين صاله 12؟»). كلها ثنائية الشرط
+# (اقتران علامتين) لضمان الدقة، وكلها بعد صمام أفعال الخدمة.
+
+# [G6] اتجاه العرض: المرسل يملك شيئًا ويعرضه — «عندي» + دليل عرض
+_GUARD_OFFER_MARKERS = (
+    'اللي يبيها', 'اللي يبيهم', 'يبيها', 'يبيهم', 'يحتاجها',
+    'يحتاجونها', 'كلمني', 'راسلني', 'كلموني', 'عندي جاهز',
+    'عندي كل', 'تبيها', 'تبيهم', 'من عندي',
+)
+
+# [G7] تعليق خبر ماضٍ على اختبار/درجة (وصف تجربة، ليس طلبًا)
+_GUARD_PAST_COMMENT = (
+    'كان صعب', 'كان سهل', 'كان مقبل', 'كان مقلع', 'كان تعبان',
+    'كان طويل', 'كان غريب', 'كان زفت', 'كان جميل', 'كان تحفه',
+    'جبت درجه', 'طلعت درجه', 'نزلت درجه', 'حرمني', 'حرمان',
+)
+
+# [G8] حسم شخصي/فضفضة — اقتران (تردد/نية ذاتية) × (فعل تغيير مسار)
+_GUARD_SELF_HESITATION = ('شكلي', 'افكر', 'مدري', 'مبتلى', 'اقدر', 'ودي')
+_GUARD_SELF_TURN = (
+    'انسحب', 'انسحاب', 'اسحب', 'اكمل', 'اروح', 'احول', 'اغير',
+    'استمر', 'اسجل', 'انقل',
+)
+
+# [G9] أسئلة السعر/التكلفة (استفسار معلوماتي لا طلب خدمة)
+_GUARD_PRICE_PHRASES = ('كم سعر', 'كم يكلف', 'كم كلف', 'كم قيمته')
+_GUARD_PRICE_TOKENS = frozenset({'بكم', 'بكم؟'})
+
+# [G10] توصية يقدّمها المرسل للآخرين (لا يطلب شيئًا لنفسه)
+_GUARD_ADVICE_GIVEN = (
+    'انصحكم', 'انصحك', 'انصيحكم', 'انصح به', 'نصيحتي', 'ونصيحتي',
+    'انصحكم فيه', 'نصيحه مني',
+)
+
+
+def _first_word(norm: str) -> str:
+    """أول كلمة بعد تنظيف الرموز/الإيموجي المتبقية من بداية النص."""
+    if not norm:
+        return ''
+    first = norm.split(' ', 1)[0]
+    # إزالة الرموز غير الحرفية من البداية (إيموجي/ترقيم متبقٍ)
+    cleaned = re.sub(r'^[^\w\u0600-\u06FF]+', '', first)
+    return cleaned.strip()
+
+
+def chatter_guard_check(norm: str, sig: "SignalReport | None" = None) -> str:
+    """[v4.3] فحص بوابات السوالف — يُعيد سبب الرفض أو '' (يمرّ).
+
+    REJECT-only حتميًا: النتيجة '' (يمرّ للـAI) أو سبب رفض صريح.
+    لا توجد أي حالة تجعل هذه الدالة سببًا للقبول.
+
+    [v4.3.1] صمام أمان مزدوج: إضافة إلى أفعال الخدمة النصية، إشارات
+    التنفيذ/التوكيل من محرك v3.2 المُجرّب (367 اختبار أخضر + 20 حالة
+    إنتاج) تُعفي الرسالة من الحرس كله — «محتاج شخص يصمم/يجهز/يعمل لي»
+    و«أوكل أحد بالمهمة» و«حد يشتغل عليه» كلها طلبات تنفيذ حقيقية
+    لا يمسّها الحرس أبدًا (تشخيص corpus H1: 10/111).
+
+    أمثلة الإنتاج التي صُممت البوابات لصدها (وصلت القناة خطأً 2026-09-01):
+      G1 teacher_review: «دكتوره علا ياسمين البار عربي كيف؟مين قد درس عندها...»
+                        «نزلت لي ماده والي يدرس فيها دكتور نايف طبيعي رجال؟»
+                        «احد يعرف دكتوره بدريه العمري؟»
+                        «مين ياخذ احياء عملي مع دكتوره سلمي المطرفي...»
+      G2 resource: «احد عنده كويزات لدروس الكمي؟؟؟»
+                   «تكفون عطوني اساله هندسه بس ولا اساله طبيعيه...»
+                   «فيه احد عنده الصوره حقت كل ماده ووش تعادل»
+                   «بنات وين الاقي كتاب الريدنق والرايتينق محلول؟»
+      G3 advice/game: «اكتبي اسم جدك اول حرف له بس»
+                      «حطي المواد وسوي تنفيذ»
+                      «واقعد لخص وانت تذاكر وحط زبده التعاريف...»
+      G4 no_content: «الله يساعدكم أحد يفيدني»
+                     «ياليت اللي عنده علم عن هالموضوع يع»
+      G5 admin: «الحين يالربع فيه احد نزل له الجدول بالتحضيريه ؟»
+                «ابي شعب انجليزي تكفون بيقفل ولاماده انجليزي ضبطت»
+
+    الطلبات الحقيقية التي يجب أن تمرّ (لا تُلمس — مثبتة بالاختبارات):
+      «مافي خصوصي للمادة أو احد يشرح الاولد اكز» (خصوصي+يشرح)
+      «في احد يشرح احياء تحضيري احتاج مساعده؟» (يشرح)
+      «مين يعرف دكتور يشرح رياضيات؟» (يشرح)
+      «احتاج شخص يحل معي السؤال» (يحل)
+    """
+    if not norm:
+        return ''
+    has_service = any(v in norm for v in _GUARD_SERVICE_ESCAPES)
+    # [v4.3.1] صمام الأمان المزدوج: أفعال الخدمة النصية + إشارات محرك v3.2
+    # المُجرّب — وجودها = طلب تنفيذ محتمل → لا تلمس الرسالة أبدًا:
+    #   - delegation (أوكل/أفوض...) = إعفاء مطلق (توكيل صريح بلا لبس).
+    #   - execution (يصنع/يجهز/يعمل...) = إعفاء مشروط بسياق طالب فعلًا
+    #     (requester مثل «محتاج شخص» أو outsource مثل «لي») — إشارة تنفيذ
+    #     وحيدة بلا طالب = وصف/خبر ثالث («الله يساعدكم أحد يفيدني» — تشخيص
+    #     إنتاجي: exec=['يساعد'] بلا أي requester → ليس إعفاءً).
+    sig_deleg = bool(sig is not None and getattr(sig, 'delegation_signals', None))
+    sig_exec = bool(sig is not None and getattr(sig, 'execution_signals', None))
+    sig_requester_ctx = bool(
+        sig is not None and (getattr(sig, 'requester_signals', None)
+                             or getattr(sig, 'outsource_signals', None)))
+    if has_service or sig_deleg or (sig_exec and sig_requester_ctx):
+        return ''
+
+    # [G1] استطلاع مدرس — كلمة مدرس + نمط استفسار، بلا فعل خدمة
+    has_teacher = any(w in norm for w in _GUARD_TEACHER_WORDS)
+    if has_teacher and any(p in norm for p in _GUARD_INQUIRY_PATTERNS):
+        return 'teacher_review_inquiry'
+
+    # [G2] طلب ملفات/مواد جاهزة — اسم مادة مطلوبة + عبارة طلب ملف
+    has_resource = any(w in norm for w in _GUARD_RESOURCE_NOUNS)
+    if has_resource and any(p in norm for p in _GUARD_RESOURCE_ASK):
+        return 'resource_request'
+
+    # [G5] إداري/جدولة/شعب (+ مواقع الحرم [v4.3.1])
+    has_admin = any(t in norm for t in _GUARD_ADMIN_TERMS)
+    if has_admin and any(m in norm for m in _GUARD_ADMIN_MARKERS):
+        return 'registration_admin'
+
+    # [G6] اتجاه العرض — المرسل يملك ويُعرض («عندي كويزات اللي يبيها
+    # يكلمني» / «تبي ملخصات؟ عندي كل شيء»): عرض ≠ طلب
+    if 'عندي' in norm and any(m in norm for m in _GUARD_OFFER_MARKERS):
+        return 'resource_offer'
+
+    # [G7] تعليق خبر ماضٍ («الاختبار كان صعب»، «جبت درجه عالية») —
+    # وصف تجربة سابقة ليس طلبًا
+    if any(p in norm for p in _GUARD_PAST_COMMENT):
+        return 'past_experience_comment'
+
+    # [G8] حسم شخصي/فضفضة («شكلي بانسحب»، «افكر اكمل») — قرار ذاتي
+    if (any(a in norm for a in _GUARD_SELF_HESITATION)
+            and any(b in norm for b in _GUARD_SELF_TURN)):
+        return 'self_decision_musing'
+
+    # [G9] سؤال سعر/تكلفة («كم سعر الكتاب؟»، «بكم التدريس؟») —
+    # استفسار معلوماتي لا طلب خدمة
+    if any(p in norm for p in _GUARD_PRICE_PHRASES):
+        return 'price_inquiry'
+    if any(tok in _GUARD_PRICE_TOKENS for tok in norm.split(' ')):
+        return 'price_inquiry'
+
+    # [G10] توصية يقدّمها المرسل («دكتور خالد شرحه ممتاز انصحكم فيه») —
+    # يقدّم رأيًا للآخرين، لا يطلب خدمة لنفسه
+    if any(a in norm for a in _GUARD_ADVICE_GIVEN):
+        return 'advice_giving'
+
+    # [G3] أمر/نصيحة/لعبة موجهة للآخرين — يبدأ الكلام بفعل أمر بلا
+    # علامة طالب وبلا مستفيد («اكتبي اسم جدك»، «حطي المواد وسوي تنفيذ»)
+    word = _first_word(norm)
+    if word:
+        bare = word[1:] if (word.startswith('و') and len(word) > 3) else word
+        if any(bare.startswith(v) for v in _GUARD_IMPERATIVE_STARTS):
+            has_requester = any(m in norm for m in _GUARD_REQUESTER_MARKERS)
+            has_beneficiary = (
+                _GUARD_BENEFICIARY_SUFFIX in word
+                or any(tok in _GUARD_BENEFICIARY_WORDS for tok in norm.split(' '))
+            )
+            if not has_requester and not has_beneficiary:
+                # ألعاب الكتابة (اكتب/اكتبي...) هي النمط الاجتماعي الشائع؛
+                # بقية بدايات الأمر = نصائح/توجيه للآخرين
+                if bare.startswith(('اكتب', 'اكتبي')):
+                    return 'social_game'
+                return 'advice_giving'
+
+    # [G4] بلا أي محتوى أكاديمي — لا مصطلح، لا ملف، لا مدرس
+    if not any(t in norm for t in _GUARD_ACADEMIC_TERMS) and not has_resource \
+            and not has_teacher:
+        return 'no_academic_content'
+
+    return ''
+
+
+# ============================================================
+# v4.0 Orchestrator — المراحل 1→2/3→4/5
 # ============================================================
 async def analyze_request_v4(
     text: str,
@@ -1287,17 +1646,29 @@ async def analyze_request_v4(
     chat_id: int = 0,
     msg_id: int = 0,
     source_phone: str = "",
+    chat_title: str = "",
     decision_logger=None,
     deduper=None,
     threshold: float = 0.85,
+    admission_gate: bool = False,
+    chatter_guard: bool = True,
+    db_dedup: bool = True,
 ) -> RequestAnalysis:
-    """يحلل الرسالة عبر Intent Classification Engine v4.0.
+    """يحلل الرسالة عبر Intent Classification Engine v4.0→v4.3.
 
     المسار:
       المرحلة 1  text_normalizer.normalize → clean (للـAI) + canonical (للـhash)
       بوابات هيكلية: empty / relay-wrapper (نسخة بوت ناقل مكررة)
+      [v4.2] persistent dedup: قرار نهائي سابق لنفس (chat_id, msg_id) →
+              REJECT already_decided_db (بلا نداء AI — يمنع فيضان الإعادة)
       المرحلة 4  semantic dedup pre-check → REJECT duplicate (يوفر نداء AI)
-      المرحلة 2/3 AI classify (clean + hints من extract_signals) → JSON قرار
+      [v4.2] admission gate (لو مفعّل): بلا إشارات → REJECT no_signals —
+              بوابة REJECT-only ترفع أولوية الـAI للرسائل المؤهلة فقط
+      [v4.3] CHATTER GUARD: أنماط سوالف إنتاجية مؤكدة (استطلاع دكاترة/
+              طلب ملفات/نصائح/ألعاب/إداريات/بلا محتوى) → REJECT هيكلي
+              حتمي بلا نداء AI. REJECT-only: أي فعل خدمة (يشرح/يعلمني/
+              يحل/خصوصي...) يتجاوز الحرس دائمًا — الطلب الحقيقي محمي.
+      المرحلة 2/3 AI classify (clean + hints + سياق المجموعة) → JSON قرار
       العتبة      ACCEPT فقط إذا confidence >= threshold (default 0.85)
       المرحلة 4  register البصمة (كل رسالة صُنِّفت)
       المرحلة 5  log_decision (non-fatal)
@@ -1339,6 +1710,23 @@ async def analyze_request_v4(
         await _log_decision_safe(decision_logger, text, res, chat_id, msg_id, source_phone)
         return res
 
+    # ---- [v4.2] persistent decision dedup (chat_id, msg_id) ----
+    # قرار نهائي سابق لنفس الرسالة (إعادة تسليم بين الحسابات / restart)
+    # → REJECT فوري بلا نداء AI. القرارات العابرة (ai_error/overloaded)
+    # لا تحجب إعادة المحاولة — الطلب الحقيقي يستحق فرصة بعد التعافي.
+    if db_dedup and decision_logger is not None and chat_id and msg_id:
+        try:
+            if await decision_logger.seen_before(chat_id, msg_id):
+                res.reason = "already_decided_db"
+                res.intent_type = "duplicate"
+                res.decision_path = "persistent_dedup"
+                res.confidence = 0.0
+                await _log_decision_safe(decision_logger, text, res,
+                                         chat_id, msg_id, source_phone)
+                return res
+        except Exception:
+            pass  # فشل الفهرس/الـDB لا يكسر المسار أبدًا
+
     # ---- المرحلة 4 (pre): semantic dedup ----
     if deduper is not None and nt.canonical:
         dup = deduper.check(nt.canonical)
@@ -1379,6 +1767,31 @@ async def analyze_request_v4(
     res.provider_confidence = _provider_confidence_int(sig)
     res.service = _classify_service(sig.normalized, sig.execution_signals)
 
+    # ---- [v4.2] admission gate: بلا أي إشارة → REJECT (يوفر نداء AI) ----
+    # REJECT-only: الرسائل ذات الإشارات تمر دائمًا (القرار للـAI).
+    if admission_gate and not admission_allowed(sig, text):
+        res.reason = "no_signals"
+        res.intent_type = "no_signals"
+        res.decision_path = "admission_gate"
+        res.confidence = 0.0
+        await _log_decision_safe(decision_logger, text, res, chat_id, msg_id, source_phone)
+        return res
+
+    # ---- [v4.3] CHATTER GUARD: أنماط سوالف مؤكدة من الإنتاج ----
+    # على النص المطبّع (normalize_text لـ nt.clean — إيموجي/روابط/توقيعات
+    # مزالة). REJECT-only حتميًا؛ صمام أمان أفعال الخدمة داخل
+    # chatter_guard_check نفسه («مافي خصوصي أو احد يشرح» لا يُلمس أبدًا).
+    if chatter_guard:
+        guard_reason = chatter_guard_check(normalize_text(nt.clean), sig)
+        if guard_reason:
+            res.reason = f"chatter_guard:{guard_reason}"
+            res.intent_type = guard_reason
+            res.decision_path = "chatter_guard"
+            res.confidence = 0.0
+            await _log_decision_safe(decision_logger, text, res,
+                                     chat_id, msg_id, source_phone)
+            return res
+
     # ---- المرحلة 2/3: AI Intent Classification (القرار الأساسي) ----
     if classifier is None:
         # لا مصنِّف (لا مفاتيح AI) → REJECT صارم. لا keyword fallback.
@@ -1393,7 +1806,8 @@ async def analyze_request_v4(
                                  error_detail=res.ai_error)
         return res
 
-    decision = await classifier.classify(nt.clean, hints=sig.to_hints())
+    decision = await classifier.classify(
+        nt.clean, hints=sig.to_hints(), context=str(chat_title or ""))
     res.ai_ok = decision.ok
     res.ai_decision = decision.decision
     res.confidence = decision.confidence

@@ -163,7 +163,12 @@ class SemanticDeduper:
     # public API
     # --------------------------------------------------------
     def check(self, canonical: str, now: Optional[float] = None) -> DupResult:
-        """يفحص فقط (بلا تسجيل). يُستخدم للفحص قبل AI."""
+        """يفحص فقط (بلا تسجيل). يُستخدم للفحص قبل AI.
+
+        [v4.2] يزيد _dup_count عند اكتشاف تكرار — كان يُحصى فقط في
+        is_duplicate() القديمة فبيّن stats total_duplicates=0 بينما
+        المسار الفعلي (check+register في v4) كان يكتشف آلاف التكرارات.
+        """
         now = time.time() if now is None else float(now)
         self._prune(now)
         fp = self.fingerprint(canonical)
@@ -171,11 +176,13 @@ class SemanticDeduper:
         # 1) exact
         ts = self._exact.get(fp.exact_hash)
         if ts is not None and ts >= now - self.ttl:
+            self._dup_count += 1
             return DupResult(True, 'exact', 1.0, fp.exact_hash)
 
         # 2) semantic (نفس مجموعة الكلمات بأي ترتيب)
         ts = self._semantic.get(fp.semantic_hash)
         if ts is not None and ts >= now - self.ttl:
+            self._dup_count += 1
             return DupResult(True, 'semantic', 1.0, fp.semantic_hash)
 
         # 3) near-dup (Jaccard) — فقط لو فيه كلمات كافية للتمييز
@@ -191,6 +198,7 @@ class SemanticDeduper:
                 union = len(fp.tokens | other.tokens)
                 sim = inter / union
                 if sim >= self.jaccard_threshold:
+                    self._dup_count += 1
                     return DupResult(True, 'near', round(sim, 3), other.semantic_hash)
         return DupResult(False, '', 0.0, '')
 

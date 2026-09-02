@@ -962,6 +962,8 @@ async def init_production_tables(db):
     await conn.execute("CREATE INDEX IF NOT EXISTS idx_fd_created ON filter_decisions (created_at)")
     await conn.execute("CREATE INDEX IF NOT EXISTS idx_fd_decision ON filter_decisions (decision)")
     await conn.execute("CREATE INDEX IF NOT EXISTS idx_fd_text_hash ON filter_decisions (text_hash)")
+    # [v4.2] persistent decision dedup — (chat_id, message_id) lookup index
+    await conn.execute("CREATE INDEX IF NOT EXISTS idx_fd_chat_msg ON filter_decisions (chat_id, message_id)")
 
     await conn.commit()
     logging.info("✅ Production tables initialized (link_queue, group_states, membership_cache, floodwait_tracker, api_operations_log, system_settings, monitored_chats, message_journal, filter_decisions)")

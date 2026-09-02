@@ -3198,3 +3198,44 @@ Stage Summary:
 - ✅ الإنتاج الآن يشغّل: v3.2.0 Intent Engine (12 إصلاح جذري) + PENDING-RECHECK crashfix.
 - ⏳ التحقق الكامل من سلوك الإنتاج يحتاج logs جديدة: يجب أن تظهر أسباب REJECT الجديدة (relay_bot_repost_duplicate / decision_or_advice / contact_info / person_status) واختفاء التكرارات (relay). المُشغّل يرسل logs + رسائل القناة القادمة للمقارنة.
 - 🔒 الـtokens (GitHub + Render) ظهرت في المحادثة — يُنصح بإبطالها بعد انتهاء الجلسة.
+
+---
+Task ID: PROD-FP-V43-REBUILD-DEPLOY
+Agent: main (v4.3.1 إعادة بناء كاملة بعد فقدان الحاوية + دفع)
+Task: المُشغّل زوّد توكن GitHub جديدًا (ghp_mXf...) لدفع v4.3.1 — لكن الحاوية
+الجديدة فقدت مجلد المشروع بالكامل (/home/z/wlm). أُعيد بناء v4.2+v4.3+v4.3.1
+كاملًا من المعرفة التفصيلية بالتغييرات، ثم دُفع.
+
+Work Log:
+- [RECOVERY] الحاوية الجديدة بلا /home/z/wlm — الالتزام d0991d0 (v4.3.1) ضاع
+  محليًا؛ origin على 730823a (v4.1.1). استُنسخ المشروع من GitHub بالتوكن الجديد.
+- [REBUILD intent_classifier.py] v4.2 AIMD (provider classes groq=4.5s/mistral=3.0s
+  floors، 429×1.6 حتى 60s، نجاح×0.95، smart-pick ready_at، pool_wait_budget 4s
+  fail-fast، لا نوم داخل قفل المزوّد busy_skips) + v4.3 prompt مقسّى (5 فئات
+  مستحدثة resource_request/teacher_review_inquiry/registration_admin/advice_giving/
+  social_game + شرطان إلزاميان + أمثلة الإنتاج + تحذير hints + سياق المجموعة)
+  + extract_json_text يفكّ الـJSON مزدوج الترميز (طبقتان).
+- [REBUILD request_filter.py] v4.3.1: admission gate (REJECT-only، 18 قائمة
+  إشارات + تواصل + معجم إنجليزي) + CHATTER GUARD بعشر بوابات G1..G10 (استطلاع
+  مدرس/طلب ملفات/إداري+مواقع/عرض مخصوم/خبر ماضٍ/حسم ذاتي/سعر/توصية يقدّمها/
+  أمر-لعبة/بلا محتوى) + صمام أمان مزدوج (أفعال الخدمة + إشارات delegation/
+  exec+requester من v3.2) + مفردات خليجية (امتحان/ميدتيرم/فاينل/بارشال/ويكلي/
+  تسك/برزنتيشن/روبرت) + persistent dedup (chat_id,msg_id) في المنسّق.
+- [REBUILD filter_store.py] seen_before (ذاكرة 20k FIFO + فهرس SQLite + قرارات
+  عابرة لا تحجب) + recent_decisions(decision=ACCEPT|REJECT).
+- [REBUILD semantic_dedup.py] عدّاد التكرار يُحصى في check() أيضًا.
+- [REBUILD bot.py] config (pool_wait/admission_gate/chatter_guard env) + wiring
+  (chat_title من event.chat + البوابات) + /api/filter_stats?decision= + boot lines.
+- [REBUILD link_system.py] فهرس idx_fd_chat_msg.
+- [TESTS] C13b (double-JSON) + القسم L (21 إنتاج + 12 حقيقي + 12 adversarial +
+  5 متحاكٍ + عزل الصمام) + القسم M (admission gate + persistent dedup + decision
+  filter). 3 إصلاحات لأخطاء إعادة كتابة الاختبارات (typo دكـ→دكتوره، عزل
+  الحرس في فحص admission، نص يعبر الحرس لفحص القرار العابر).
+
+Stage Summary:
+- كل الأجنحة خضراء: v4 190/190 + intent_engine 367/367 + v2 80/80 + race 23/23
+  + channel 52/52 + bot_filter 20/20 = 732 assertions.
+- الإلزامي التسع ✓ (5 REJECT عبر حرس/AI + 4 ACCEPT عبر AI).
+- سوالف: 21 إنتاج + 12 adversarial + 5 إلزامي = 38/38 تُرفض هيكليًا؛ طلبات
+  حقيقية 17/17 تعبر للـAI.
+- ينتظر: commit + push (autoDeploy Render) — الخطوة التالية مباشرة.

@@ -246,6 +246,15 @@ def section_c():
         dec2 = await cl2.classify("أي رسالة")
         check("C13: مخرجات غير JSON → ok=False (رفض آمن)", dec2.ok is False, str(dec2))
 
+        # [v4.3] double-encoded JSON (بوابة تعيد الـJSON كسلسلة escaped)
+        async def double_transport(provider, payload):
+            return 200, json.dumps({"choices": [{"message": {"content": json.dumps(
+                _ai_json("REJECT", 0.91, "other", "double-encoded"))}}]})
+        cl2b = IntentClassifier(providers=[{"key": "k", "url": "u", "model": "m", "name": "Mock"}], transport=double_transport)
+        dec2b = await cl2b.classify("أي رسالة")
+        check("C13b: JSON مزدوج الترميز → يُفكّ ويُقرأ (ok=True)",
+              dec2b.ok and dec2b.decision == "REJECT" and dec2b.category == "other", str(dec2b))
+
         # rotation: أول مزوّد فاشل (HTTP 500) → الثاني يعمل
         state = {"n": 0}
 
@@ -299,8 +308,8 @@ def section_d():
           "مين يعرف دكتور يشرح رياضيات" in SYSTEM_PROMPT)
     check("D6: التمييز الحرج (مين أفضل مدرس = REJECT توصية)",
           "مين أفضل مدرس" in SYSTEM_PROMPT and "recommendation_or_opinion" in SYSTEM_PROMPT)
-    check("D7: الإشارات keyword معلنة كاستدلال مساعد ضعيف",
-          "استدلالًا مساعدًا ضعيفًا" in SYSTEM_PROMPT or "استدلالا مساعدا ضعيفا" in SYSTEM_PROMPT)
+    check("D7: الإشارات keyword محذَّر منها صراحة (نسبة خطئها عالية)",
+          "نسبة خطئها عالية" in SYSTEM_PROMPT or "لا تُعطها وزنًا يذكر" in SYSTEM_PROMPT)
 
 
 # ============================================================
@@ -327,10 +336,13 @@ def section_e():
         cl = make_scripted_classifier(MANDATORY_SCRIPTS)
 
         print("  — الإلزامي REJECT (5):")
+        # [v4.3] المسار المقبول للرفض: AI قرارًا أو chatter_guard هيكليًا
+        # أو admission_gate — المطلب الإلزامي للمُشغّل هو الرفض نفسه.
         for t in MANDATORY_REJECT:
             r = await analyze_request_v4(t, cl, threshold=0.85)
             check(f"E: REJECT «{t[:30]}…»",
-                  r.is_request is False and r.decision_path == "ai",
+                  r.is_request is False and r.decision_path in (
+                      "ai", "chatter_guard", "admission_gate"),
                   f"path={r.decision_path} reason={r.reason} cat={r.intent_type}")
 
         print("  — الإلزامي ACCEPT (4):")
@@ -984,10 +996,306 @@ def section_k():
 
 # ============================================================
 # main
+
+
+# ============================================================
+# L. [v4.2/v4.3] Chatter Guard + Admission Gate — corpus الإنتاج الفعلي
+# ============================================================
+# [v4.3] 21 سوالف من قناة الإنتاج (2026-09-01: 15/20 منشورة كانت سوالف)
+# + الحالات الإلزامية. كلها يجب أن تُرفض هيكليًا (بلا نداء AI).
+PRODUCTION_CHATTER = [
+    "دكتوره علا ياسمين البار عربي كيف؟مين قد درس عندها بالله يفيدني",  # استطلاع دكتوره
+    "تكفون عطوني اساله هندسه بس ولا اساله طبيعيه",                    # طلب ملفات
+    "احد عنده كويزات لدروس الكمي؟؟؟",                                   # طلب كويزات
+    "الحين يالربع فيه احد نزل له الجدول بالتحضيريه ؟",                 # إداري
+    "الله يساعدكم أحد يفيدني",                                          # بلا مادة
+    "بنات وين الاقي كتاب الريدنق والرايتينق محلول؟",                   # كتاب
+    "واقعد لخص وانت تذاكر وحط زبده التعاريف والمفاهيم على جنب",         # نصيحة
+    "نزلت لي ماده والي يدرس فيها دكتور نايف طبيعي رجال؟",              # استطلاع
+    "ابي شعب انجليزي تكفون بيقفل ولاماده انجليزي ضبطت",                # شعب
+    "فيه احد عنده الصوره حقت كل ماده ووش تعادل",                        # صور مواد
+    "ياليت اللي عنده علم عن هالموضوع يع",                               # مبتورة
+    "احد يعرف دكتوره بدريه العمري؟",                                    # استفسار مدرس
+    "بنات احد يعرف مكتب دكتورة منال السالم لرسائل الماجستير؟",        # مكتب
+    "اكتبي اسم جدك اول حرف له بس",                                      # لعبة
+    "حطي المواد وسوي تنفيذ",                                            # أمر
+    "السلام عليكم مين ياخذ احياء عملي مع دكتوره سلمي المطرفي وكيمياء عملي مع د",  # تنسيق زملاء
+    "احد يعرف كيف افرق بين الازمنة بطريقه مبسطه وسهله",                # سؤال معرفي
+    "حين يحبك الله يبدل وجه الحياة...",                                 # ديني (إلزامي)
+    "تعلم التداول واربح",                                               # إعلان (إلزامي)
+    "شكراً اكتمال جبت درجة عالية",                                      # مدح (إلزامي)
+    "مين افضل مدرس؟",                                                   # توصية (إلزامي)
+]
+
+# طلبات حقيقية (من القناة + الإلزامي) — الحرس لا يلمسها أبدًا (القرار للـAI)
+PRODUCTION_REAL_REQUESTS = [
+    "مافي خصوصي للمادة أو احد يشرح الاولد اكز",       # من القناة (حقيقي)
+    "في احد يشرح احياء تحضيري احتاج مساعده؟",          # من القناة (حقيقي)
+    "مرحبا في احد يشرح احياء تحضيري احتاج مساعده؟",    # من القناة (حقيقي)
+    "مين يعرف دكتور يشرح رياضيات؟",                     # إلزامي
+    "أحد يشرح لي تفاضل 1",                              # إلزامي
+    "احتاج شخص يحل معي السؤال",                         # إلزامي
+    "أبي مدرس خصوصي للمادة",                            # إلزامي
+    "اشرحوا لي الماده قبل الاختبار",                    # أمر جمع + مستفيد
+    "سوي لي بحث التخرج بليز",                           # أمر + مستفيد
+    "اكتب لي ملخص الماده",                              # أمر + مستفيد
+    "راجعوا معي قبل الاختبار",                          # أمر جمع + معي
+    "محتاجة شخص يجهز عرضي",                             # corpus (exec+requester)
+]
+
+# [v4.3.1] فحص adversarial مستقل — سوالف شائعة لم تكن في corpus الإنتاج
+# لكنها تُحاكي نفس الأنماط (عروض/خبر ماضٍ/حسم ذاتي/سعر/توصية/موقع)
+ADVERSARIAL_CHATTER = [
+    "الله يعطيكم العافيه على المجهود",      # شكر عام
+    "مبروك التخرج يارب",                    # تهنئة
+    "صباح الخير ياجماعه",                   # تحية
+    "مين من جده؟",                          # لعبة اجتماعية
+    "عندي كويزات جاهزه اللي يبيها يكلمني",  # عرض ملفات [G6]
+    "ارفعوا ايديكم اذا معكم نفس الشعبه",    # لعبة/استطلاع
+    "شكلي بانسحب من الماده",                # حسم شخصي [G8]
+    "الاختبار كان صعب اليوم",               # خبر ماضٍ [G7]
+    "تبي ملخصات؟ عندي كل شيء",              # عرض [G6]
+    "كم سعر الكتاب بالنسخه؟",                # سؤال سعر [G9]
+    "دكتور خالد شرحه ممتاز انصحكم فيه",     # توصية يقدّمها [G10]
+    "وين صالة 12 بالجامعه؟",                # موقع إداري [G5]
+]
+
+# عبارات تحاكي أنماط الأنماط الجديدة لكنها طلبات حقيقية — الحرس يجب
+# ألا يلمسها (صمام أفعال الخدمة + مفردات امتحان/ميدتيرم)
+ADVERSARIAL_REAL_REQUESTS = [
+    "عندي بحث محتاج احد ينجزه لي",            # عندي + تنفيذ
+    "الاختبار اللي كان صعب ابي احد يشرحه لي", # خبر ماضٍ + خدمة
+    "افكر اروح لمدرس خصوصي",                   # تردد + خصوصي
+    "ابغى احد يشرح لي في القاعه؟",             # موقع + خدمة
+    "عندي امتحان ابغى مساعده",                 # عندي + امتحان (مفردات جديدة)
+]
+
+
+def section_l():
+    print("\n=== L. [v4.3] Chatter Guard — corpus الإنتاج الفعلي ===")
+    from request_filter import chatter_guard_check, normalize_text
+    from text_normalizer import normalize as _tn
+
+    print("  — سوالف القناة الفعلية (21) — كلها يجب أن تُرفض هيكليًا:")
+    for t in PRODUCTION_CHATTER:
+        nt = _tn(t)
+        clean = nt.clean if nt.clean else t
+        sig = extract_signals(t)
+        r = chatter_guard_check(normalize_text(clean), sig)
+        check(f"L: REJECT «{t[:38]}…»",
+              bool(r), f"reason={r or '(PASS!!)'}")
+
+    print("  — طلبات حقيقية (12) — الحرس لا يلمسها (يمرّ للـAI):")
+    for t in PRODUCTION_REAL_REQUESTS:
+        nt = _tn(t)
+        clean = nt.clean if nt.clean else t
+        sig = extract_signals(t)
+        r = chatter_guard_check(normalize_text(clean), sig)
+        check(f"L: PASS «{t[:38]}…»",
+              r == '', f"reason={r}")
+
+    # [v4.3.1] فحص adversarial مستقل (توليد الوكيل لا المُشغّل) — 12 سوالف
+    # جديدة + 5 طلبات تحاكي الأنماط الجديدة
+    print("  — [v4.3.1] adversarial سوالف جديدة (12) — كلها تُرفض هيكليًا:")
+    for t in ADVERSARIAL_CHATTER:
+        nt = _tn(t)
+        clean = nt.clean if nt.clean else t
+        sig = extract_signals(t)
+        r = chatter_guard_check(normalize_text(clean), sig)
+        check(f"L: ADVERSARIAL REJECT «{t[:38]}…»",
+              bool(r), f"reason={r or '(PASS!!)'}")
+
+    print("  — [v4.3.1] adversarial طلبات تحاكي الأنماط (5) — لا تُلمس:")
+    for t in ADVERSARIAL_REAL_REQUESTS:
+        nt = _tn(t)
+        clean = nt.clean if nt.clean else t
+        sig = extract_signals(t)
+        r = chatter_guard_check(normalize_text(clean), sig)
+        check(f"L: ADVERSARIAL PASS «{t[:38]}…»",
+              r == '', f"reason={r}")
+
+    # عبر المنسّق الكامل: chatter_guard يرفض قبل نداء AI (عدّاد calls صفر)
+    async def run_l():
+        calls = {"n": 0}
+
+        async def transport(provider, payload):
+            calls["n"] += 1
+            return 200, json.dumps({"choices": [{"message": {"content":
+                _ai_json("ACCEPT", 0.99, "tutoring_request", "scripted-accept")}}]})
+
+        cl = IntentClassifier(
+            providers=[{"key": "k", "url": "u", "model": "m", "name": "P"}],
+            transport=transport)
+        # سوالف → الـAI لا يُستدعى أصلًا (guard قبل classify)
+        for t in PRODUCTION_CHATTER:
+            r = await analyze_request_v4(t, cl, threshold=0.85)
+            if r.decision_path == "chatter_guard":
+                continue
+            # السوالف التي عبرت الحرس (قلة) — الـAI المبرمج ACCEPT سيرفضها
+            # لأنها لا تحمل مفتاح التصنيف المبرمج → REJECT
+        guard_calls = calls["n"]
+        # طلب حقيقي واحد على الأقل يجب أن يصل الـAI
+        r = await analyze_request_v4(
+            "مافي خصوصي للمادة أو احد يشرح الاولد اكز", cl, threshold=0.85)
+        check("L: طلب حقيقي وصل الـAI وقُبل (الحرس لم يمنعه)",
+              r.is_request is True and calls["n"] > guard_calls,
+              f"path={r.decision_path} calls={calls['n']}")
+        # ملاحظة: بعض السوالف تعبر الحرس (بلا نمط) — الـAI المبرمج هنا
+        # يرد ACCEPT لأي نداء، لذا لا نفحص عدّاد الصفر الكامل؛ الحسم
+        # يحدث في فحص الحالات الفردية أعلاه + فحوصات الـAI الحقيقية.
+
+    asyncio.run(run_l())
+
+    # عزل الحرس: chatter_guard=False → الرسالة تمر للـAI (الصمام قابل للعزل)
+    async def run_l2():
+        async def transport(provider, payload):
+            return 200, json.dumps({"choices": [{"message": {"content":
+                _ai_json("REJECT", 0.9, "other", "scripted-reject")}}]})
+        cl = IntentClassifier(
+            providers=[{"key": "k", "url": "u", "model": "m", "name": "P"}],
+            transport=transport)
+        r = await analyze_request_v4(
+            "اكتبي اسم جدك اول حرف له بس", cl, threshold=0.85,
+            chatter_guard=False)
+        check("L: chatter_guard=False → القرار يعود للـAI (عزل الصمام)",
+              r.decision_path == "ai" and r.is_request is False,
+              f"path={r.decision_path}")
+
+    asyncio.run(run_l2())
+
+
+# ============================================================
+# M. [v4.2] Admission Gate + Persistent Decision Dedup
+# ============================================================
+def section_m():
+    print("\n=== M. [v4.2] Admission Gate + Persistent Decision Dedup ===")
+    from request_filter import admission_allowed
+
+    # admission gate: بلا إشارات → REJECT no_signals بلا نداء AI
+    async def run_m():
+        calls = {"n": 0}
+
+        async def transport(provider, payload):
+            calls["n"] += 1
+            return 200, json.dumps({"choices": [{"message": {"content":
+                _ai_json("ACCEPT", 0.99, "tutoring_request", "x")}}]})
+
+        cl = IntentClassifier(
+            providers=[{"key": "k", "url": "u", "model": "m", "name": "P"}],
+            transport=transport)
+        # رسالة بلا أي إشارة معجمية
+        r = await analyze_request_v4(
+            "الحمد لله على كل حال", cl, threshold=0.85, admission_gate=True)
+        check("M: admission gate — بلا إشارات → REJECT no_signals (بلا AI)",
+              r.decision_path == "admission_gate" and r.is_request is False
+              and calls["n"] == 0,
+              f"path={r.decision_path} calls={calls['n']}")
+
+        # رسالة ذات إشارات → تمر للـAI حتى لو كانت البوابة مفعّلة
+        calls["n"] = 0
+        r = await analyze_request_v4(
+            "مافي خصوصي للمادة أو احد يشرح الاولد اكز", cl, threshold=0.85,
+            admission_gate=True)
+        check("M: ذات إشارات → تمر البوابة للـAI",
+              calls["n"] >= 1 and r.is_request is True,
+              f"path={r.decision_path} calls={calls['n']}")
+
+        # admission gate معطّل → حتى بلا إشارات تصل الـAI (قراره)
+        # (chatter_guard معطّل هنا أيضًا — عزل آلية واحدة في كل فحص)
+        calls["n"] = 0
+        r = await analyze_request_v4(
+            "الحمد لله على كل حال", cl, threshold=0.85,
+            admission_gate=False, chatter_guard=False)
+        check("M: admission_gate=False → الرسالة تصل الـAI (البوابة قابلة للعزل)",
+              calls["n"] >= 1,
+              f"path={r.decision_path} calls={calls['n']}")
+
+    asyncio.run(run_m())
+
+    # persistent decision dedup: قرار نهائي سابق لنفس (chat_id, msg_id)
+    async def run_m2():
+        import aiosqlite
+        db_path = "/tmp/_v4_test_dedup_m2.sqlite"
+        try:
+            os.remove(db_path)
+        except OSError:
+            pass
+        conn = await aiosqlite.connect(db_path)
+
+        class FakeProdDB:
+            async def _conn(self):
+                return conn
+
+        logger = DecisionLogger(FakeProdDB())
+
+        calls = {"n": 0}
+
+        async def transport(provider, payload):
+            calls["n"] += 1
+            return 200, json.dumps({"choices": [{"message": {"content":
+                _ai_json("REJECT", 0.9, "other", "scripted")}}]})
+
+        cl = IntentClassifier(
+            providers=[{"key": "k", "url": "u", "model": "m", "name": "P"}],
+            transport=transport)
+        # قرار نهائي أول (REJECT other)
+        r1 = await analyze_request_v4(
+            "رسالة نهائية أي نص", cl, threshold=0.85,
+            chat_id=100, msg_id=200, decision_logger=logger)
+        # إعادة نفس الرسالة → already_decided_db بلا نداء AI جديد
+        calls_before = calls["n"]
+        r2 = await analyze_request_v4(
+            "رسالة نهائية أي نص", cl, threshold=0.85,
+            chat_id=100, msg_id=200, decision_logger=logger)
+        check("M: persistent dedup — قرار نهائي سابق → already_decided_db",
+              r2.decision_path == "persistent_dedup" and r2.is_request is False
+              and calls["n"] == calls_before,
+              f"path={r2.decision_path} calls={calls['n']}/{calls_before}")
+
+        # قرار عابر (ai_error) لا يحجب إعادة المحاولة
+        async def failing_transport(provider, payload):
+            return 500, "server error"
+        cl_fail = IntentClassifier(
+            providers=[{"key": "k", "url": "u", "model": "m", "name": "P"}],
+            transport=failing_transport, total_budget_s=1.0, max_attempts=1)
+        logger2 = DecisionLogger(FakeProdDB())
+        # نص يحمل فعل خدمة (يشرح) → يعبر الحرس ويبلغ الـAI الفاشل → ai_error
+        rf1 = await analyze_request_v4(
+            "ابي احد يشرح لي الماده", cl_fail, threshold=0.85,
+            chat_id=300, msg_id=400, decision_logger=logger2)
+        check("M: قرار عابر (ai_error) يُسجّل",
+              rf1.is_request is False and rf1.ai_ok is False
+              and rf1.decision_path == "ai",
+              f"path={rf1.decision_path} reason={rf1.reason}")
+        # نفس الرسالة الآن بمزوّد حي → يجب أن تُصنَّف (القرار العابر لا يحجب)
+        r_ok = await analyze_request_v4(
+            "مافي خصوصي للمادة أو احد يشرح الاولد اكز", cl, threshold=0.85,
+            chat_id=300, msg_id=400, decision_logger=logger2)
+        check("M: قرار عابر لا يحجب إعادة التصنيف بعد التعافي",
+              r_ok.decision_path == "ai",
+              f"path={r_ok.decision_path} reason={r_ok.reason}")
+
+        # decision filter في recent_decisions
+        acc = await logger2.recent_decisions(limit=10, decision="ACCEPT")
+        rej = await logger2.recent_decisions(limit=10, decision="REJECT")
+        check("M: recent_decisions decision filter — ACCEPT/REJECT منفصلان",
+              all(d["decision"] == "ACCEPT" for d in acc)
+              and all(d["decision"] == "REJECT" for d in rej) and len(rej) >= 1,
+              f"acc={len(acc)} rej={len(rej)}")
+
+        await conn.close()
+        try:
+            os.remove(db_path)
+        except OSError:
+            pass
+
+    asyncio.run(run_m2())
+
+
 # ============================================================
 def main():
     print("=" * 70)
-    print(f"Request Intent Engine {FILTER_VERSION} ({FILTER_MODE}) — v4.0/v4.1 Test Suite")
+    print(f"Request Intent Engine {FILTER_VERSION} ({FILTER_MODE}) — v4.0/v4.1/v4.2/v4.3 Test Suite")
     print("=" * 70)
 
     section_a()
@@ -1001,6 +1309,8 @@ def main():
     section_i()
     section_j()
     section_k()
+    section_l()
+    section_m()
 
     print("\n" + "=" * 70)
     print(f"RESULT: {_TOTAL['pass']} pass / {_TOTAL['fail']} fail")
