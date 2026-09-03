@@ -6516,27 +6516,51 @@ class Monitor:
             internal_id = str(chat_id).replace('-100', '')
             message_link = f"https://t.me/c/{internal_id}/{msg_id}"
 
-        # --- تنسيق التنبيه (HTML-escaped لمنع الحقن) ---
-        # النص الأصلي يُرسل دون تشويه، لكن HTML-escaped للسلامة.
-        # [TASK-FORMAT-v4.3.4] تنظيف طلب المُشغّل:
-        #   - حُذفت: "طلب مساعدة" (الهيدر) + "الحساب" + "المصدر"
-        #   - "المرسل": يُضاف @username بجانب الاسم (لو موجود)
-        #   - زر «مراسلة» تحت النص → يفتح محادثة المرسل مباشرة
-        #   - بقي: نفس إطار <blockquote> + المجموعة/التاريخ/الكلمات +
-        #     "عرض الرسالة الأصلية" + النص في الأسفل (توافق قناة الروابط)
+        # --- [PREMIUM-FORMAT-v4.3.6] تصميم متقن لتنبيه قناة الطلبات ---
+        # البنية (من أعلى لأسفل):
+        #   1) عنوان من فئة الـAI (🎓 شرح/📝 واجب) — معلوماتي لكل رسالة
+        #   2) سطر سبب تحريري (سبب الـAI بالعربية — مختصر)
+        #   3) فاصل ━━━ + بطاقة معلومات: المرسل أولًا (الأهم للتواصل)
+        #   ثم المجموعة ثم التاريخ + فاصل
+        #   4) نص الطلب داخل اقتباس مستقل — قابل للتوسيع للنصوص الطويلة
+        #   5) ذيل: رابط الرسالة الأصلية + زر «مراسلة»
+        # حذف «الكلمات» — حقول legacy فارغة في وضع AI (كانت تظهر سطرًا فارغًا
+        # في الإنتاج). كل قيمة من المستخدم HTML-escaped لمنع الحقن.
         safe_text = html_module.escape(str(raw_text)[:1500])
         if len(raw_text) > 1500:
             safe_text += "…"
         safe_sender = html_module.escape(str(sender_display))
-        safe_username = html_module.escape(str(sender_username or ''))
         safe_chat = html_module.escape(str(chat_title or 'غير معروف'))
         safe_link = html_module.escape(message_link, quote=True)
+
+        # [PREMIUM-FORMAT] username موحّد ومعقّم — الحروف/الأرقام/الشرطة
+        # فقط (يوزرنيم تلغرام الحقيقي ضمنها دائمًا). يمنع أي حقن في
+        # href أو رابط الزر. غير الصالح (<4 محارف) → يُعامل كـ«بلا username».
+        _uname_clean = re.sub(r'[^A-Za-z0-9_]', '',
+                              str(sender_username or '').lstrip('@'))
+        if len(_uname_clean) < 4:
+            _uname_clean = ''
 
         keywords_found = ', '.join(
             (analysis.matched_intents + analysis.matched_services
              + analysis.matched_patterns)[:5]
         )
-        safe_keywords = html_module.escape(keywords_found)
+
+        # العنوان: من فئة الـAI (فئتا القبول فقط تصل إلى هنا)
+        _cat = str(getattr(analysis, 'intent_type', '') or '')
+        if _cat == 'tutoring_request':
+            title_line = '🎓 <b>طلب تدريس وشرح</b>'
+        elif _cat == 'homework_execution_request':
+            title_line = '📝 <b>طلب حل وإنجاز واجب</b>'
+        else:
+            title_line = '📩 <b>طلب أكاديمي</b>'
+
+        # السطر التحريري: سبب الـAI إن كان عربيًا ومختصرًا (فئات النظام
+        # مثل low_confidence إنجليزية → تُهمل — لا مكان لها في مظهر القناة)
+        _reason = str(getattr(analysis, 'reason', '') or '').strip()
+        _reason_ar = _reason if (_reason and any(
+            '\u0600' <= ch <= '\u06FF' for ch in _reason)
+            and len(_reason) <= 90) else ''
 
         # [STYLE-MATCH] التاريخ بنفس صيغة قناة الروابط: %Y-%m-%d %H:%M
         try:
@@ -6546,18 +6570,31 @@ class Monitor:
         except Exception:
             date_str = "غير معروف"
 
-        # بناء <blockquote> واحد شامل — مطابق لقناة الروابط
-        if safe_username:
-            sender_line = f"👤 <b>المرسل:</b> {safe_sender} ({safe_username})"
+        SEP = '━━━━━━━━━━━━━━━━━━━'
+
+        # سطر المرسل: الاسم + اليوزرنيم كرابط قابل للنقر (يفتح الملف)
+        if _uname_clean:
+            sender_line = (f'👤 <b>المرسل:</b> {safe_sender} '
+                           f'<a href="https://t.me/{_uname_clean}">(@{_uname_clean})</a>')
         else:
-            sender_line = f"👤 <b>المرسل:</b> {safe_sender}"
-        content = f"👥 <b>المجموعة:</b> {safe_chat}\n"
-        content += sender_line + "\n"
-        content += f"🕒 <b>التاريخ:</b> {date_str}\n"
-        content += f"🔑 <b>الكلمات:</b> {safe_keywords}\n\n"
-        content += f'🔗 <a href="{safe_link}">عرض الرسالة الأصلية</a>'
-        content += f"\n\n💬 <b>نص الطلب:</b>\n<i>{safe_text}</i>"
-        alert = f"<blockquote>{content}</blockquote>"
+            sender_line = f'👤 <b>المرسل:</b> {safe_sender}'
+
+        # نص الطلب: اقتباس مستقل — قابل للتوسيع للنصوص الطويلة
+        # (blockquote expandable = علامة ⌄ للفتح في تطبيقات تلغرام)
+        _quote_open = ('blockquote expandable'
+                      if len(raw_text) > 300 else 'blockquote')
+
+        alert = title_line + "\n"
+        if _reason_ar:
+            alert += f'<i>{html_module.escape(_reason_ar)}</i>\n'
+        alert += f"{SEP}\n"
+        alert += sender_line + "\n"
+        alert += f"👥 <b>المجموعة:</b> {safe_chat}\n"
+        alert += f"🕒 <b>التاريخ:</b> {html_module.escape(date_str)}\n"
+        alert += f"{SEP}\n"
+        alert += "💬 <b>نص الطلب:</b>\n"
+        alert += f"<{_quote_open}>{safe_text}</blockquote>\n\n"
+        alert += f'🔗 <a href="{safe_link}">عرض الرسالة الأصلية</a>'
 
         # --- [DM-FIX-v4.3.5] زر «مراسلة» — استراتيجية مطوَّرة ---
         #   - مع username (بعد الحل الكامل عبر API) → https://t.me/<username>
@@ -6574,8 +6611,10 @@ class Monitor:
         dm_mode = 'none'  # button:t.me | bridge:forward | none
         try:
             _sid = int(sender_id or 0)
-            if _sid > 0 and sender_username:
-                _dm_url = f"https://t.me/{str(sender_username).lstrip('@')}"
+            # [PREMIUM-FORMAT] يستخدم _uname_clean (المعقّم) — لا sender_username
+            # الخام: يوزرنيم غير صالح/ملوث يهبط لوضع الجسر بدل زر معطوب.
+            if _sid > 0 and _uname_clean:
+                _dm_url = f"https://t.me/{_uname_clean}"
                 dm_buttons = [[Button.url("✉️ مراسلة", _dm_url)]]
                 dm_mode = 'button:t.me'
                 logging.debug(f"[REQUEST-PATH] DM button url={_dm_url}")

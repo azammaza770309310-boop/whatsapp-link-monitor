@@ -96,7 +96,7 @@ def make_mock_request_classifier(model="mock-v4"):
         user_msg = payload["messages"][1]["content"]
         inner = user_msg.split('"""')[-2] if '"""' in user_msg else user_msg
         if any(m in inner for m in _REQUEST_MARKERS) and not any(m in inner for m in _AD_MARKERS):
-            content = _ai_json("ACCEPT", 0.93, "homework_execution_request", "طلب مساعدة أكاديمية")
+            content = _ai_json("ACCEPT", 0.93, "homework_execution_request", "طلب واجب صريح")
         else:
             content = _ai_json("REJECT", 0.95, "other", "ليس طلبًا")
         return 200, _json.dumps({"choices": [{"message": {"content": content}}]})
@@ -569,16 +569,14 @@ async def test_9_validate_does_not_require_rtc():
 
 
 # =====================================================================
-# Test 10: [STYLE-MATCH] alert format matches link channel's blockquote
-# Verifies the new alert uses the same style as MessageFormatter.format_link_message:
-#   - <blockquote> wrapper
-#   - "طلب مساعدة" header
-#   - field labels: 👥 المجموعة، 👤 المرسل، 📟 الحساب، 🕒 التاريخ، 📡 المصدر، 🔑 الكلمات
-#   - "عرض الرسالة الأصلية" link text (matches link channel's "عرض الرسالة الأصلية")
-#   - "💬 نص الطلب" at the bottom (matches link channel's "💬 النص" at bottom)
+# Test 10: [PREMIUM-FORMAT-v4.3.6] تصميم متقن لتنبيه قناة الطلبات:
+#   - عنوان معلوماتي من فئة الـAI (📝 طلب حل وإنجاز واجب / 🎓 شرح)
+#   - سطر سبب الـAI التحريري (italic) + فواصل ━━━ + بطاقة معلومات
+#     (المرسل أولًا) + نص الطلب في اقتباسه الخاص + ذيل روابط/زر
+#   - تسميات البطاقة نفس تسميات قناة الروابط (المجموعة/المرسل/التاريخ)
 # =====================================================================
 async def test_10_alert_format_matches_link_channel_style():
-    print("\n--- Test 10: Alert format matches link channel blockquote style ---")
+    print("\n--- Test 10: [PREMIUM-FORMAT] alert design (title + reason + card + quote) ---")
     prod_db, db_path, conn = await make_test_db()
     try:
         fm = make_monitor(prod_db)
@@ -596,70 +594,75 @@ async def test_10_alert_format_matches_link_channel_style():
             return
         alert = sm.calls[0]['alert']
 
-        # [STYLE-MATCH] same blockquote wrapper as link channel
-        record("10: alert wrapped in <blockquote>...</blockquote>",
-               alert.startswith('<blockquote>') and alert.endswith('</blockquote>'),
-               f"alert starts/ends: {alert[:30]!r}...{alert[-30:]!r}")
+        # [PREMIUM-FORMAT-v4.3.6] العنوان من فئة الـAI (معلوماتي — ليس الهيدر
+        # القديم الثابت «طلب مساعدة» الذي حذفه المُشغّل):
+        # mock يرجع homework_execution_request → 📝 طلب حل وإنجاز واجب
+        record("10: title derived from AI category '📝 طلب حل وإنجاز واجب'",
+               '📝 <b>طلب حل وإنجاز واجب</b>' in alert,
+               f"title missing — alert head: {alert[:150]!r}")
+        # السطر التحريري: سبب الـAI بالعربية (italic) تحت العنوان
+        record("10: editorial reason line (italic) under the title",
+               '<i>طلب واجب صريح</i>' in alert,
+               "reason subtitle missing")
+        # فاصلان (━━━) يفصلان العنوان/البطاقة/الذيل
+        record("10: two separator lines (━━━━) zoning the design",
+               alert.count('━━━━━━━━━━━━━━━━━━━') == 2,
+               f"SEP count={alert.count('━━━━━━━━━━━━━━━━━━━')} (expected 2)")
 
-        # [TASK-FORMAT-v4.3.4] تنظيف طلب المُشغّل:
-        #   - حُذف: "طلب مساعدة" (header) + "📟 الحساب" + "📡 المصدر"
-        record("10: alert does NOT have header 'طلب مساعدة' (removed by operator)",
+        # [TASK-FORMAT-v4.3.4] خطوط المُشغّل المحذوفة تبقى محذوفة:
+        record("10: alert does NOT have old header 'طلب مساعدة' (removed by operator)",
                'طلب مساعدة' not in alert,
                f"header still present: {alert[:200]!r}")
-        record("10: alert does NOT have '📟 <b>الحساب:</b>' (removed by operator)",
-               '📟 <b>الحساب:</b>' not in alert,
-               "account line still present")
-        record("10: alert does NOT have '📡 <b>المصدر:</b>' (removed by operator)",
-               '📡 <b>المصدر:</b>' not in alert,
-               "source line still present")
+        record("10: alert does NOT have '📟 الحساب' (removed by operator)",
+               '📟' not in alert, "account line still present")
+        record("10: alert does NOT have '📡 المصدر' (removed by operator)",
+               '📡' not in alert, "source line still present")
 
-        # [STYLE-MATCH] field labels matching link channel (المُبقَاة)
-        record("10: alert has '👥 <b>المجموعة:</b>' (link channel: 👥 العضوية)",
-               '👥 <b>المجموعة:</b>' in alert,
-               "missing group label")
-        record("10: alert has '👤 <b>المرسل:</b>' (link channel: 👤 الاسم)",
-               '👤 <b>المرسل:</b>' in alert,
-               "missing sender label")
-        record("10: alert has '🕒 <b>التاريخ:</b>' (link channel: 🕒 التاريخ)",
-               '🕒 <b>التاريخ:</b>' in alert,
-               "missing date label")
-        record("10: alert has '🔑 <b>الكلمات:</b>' field",
-               '🔑 <b>الكلمات:</b>' in alert,
-               "missing keywords label")
+        # [PREMIUM-FORMAT] «الكلمات» أُزيلت — حقول legacy فارغة في وضع AI
+        # (كانت تُظهر سطرًا فارغًا في الإنتاج)
+        record("10: NO '🔑 الكلمات' line (legacy empty in AI mode — removed)",
+               '🔑' not in alert, "keywords line still present")
 
-        # [DM-FIX-v4.3.5] المرسل بلا username (fake sender=None, sender_id=42):
-        #   - لا زر tg://user?id= إطلاقًا — كان يسبب خطأ «تنسيق الرابط غير
-        #     معروف» في عملاء الموبايل (غير مدعوم هناك).
-        #   - بديله: جسر التواصل (contact-bridge) — forward الرسالة الأصلية
-        #     بعد الإرسال (يفشل بصمت في fake namespace بلا user_clients).
-        kw = sm.calls[0]['kwargs']
-        record("10: NO broken tg://user?id button for usernameless sender (mobile-safe)",
-               (kw.get('buttons') is None)
-               or ('tg://user' not in str(
-                   getattr((kw.get('buttons') or [[None]])[0][0], 'url', '') or '')),
-               f"buttons kwarg: {kw.get('buttons')!r}")
+        # بطاقة المعلومات: التسميات الباقية (نفس تسميات قناة الروابط)
+        record("10: alert has '👥 <b>المجموعة:</b>'",
+               '👥 <b>المجموعة:</b>' in alert, "missing group label")
+        record("10: alert has '👤 <b>المرسل:</b>'",
+               '👤 <b>المرسل:</b>' in alert, "missing sender label")
+        record("10: alert has '🕒 <b>التاريخ:</b>'",
+               '🕒 <b>التاريخ:</b>' in alert, "missing date label")
+        record("10: sender line FIRST in the info card (before group line)",
+               alert.find('👤 <b>المرسل:</b>') != -1
+               and alert.find('👤 <b>المرسل:</b>') < alert.find('👥 <b>المجموعة:</b>'),
+               "sender line not first")
 
-        # [STYLE-MATCH] link text "عرض الرسالة الأصلية" (matches link channel exactly)
-        record("10: alert has link text 'عرض الرسالة الأصلية' (matches link channel)",
-               'عرض الرسالة الأصلية' in alert,
-               "missing link text 'عرض الرسالة الأصلية'")
+        # نص الطلب داخل اقتباسه الخاص (ليس اقتباسًا يلف الرسالة كلها)
+        record("10: request text quoted in its own <blockquote>",
+               '<blockquote>' in alert and '</blockquote>' in alert,
+               "blockquote wrapper missing for text")
+        record("10: text label '💬 <b>نص الطلب:</b>' before the quote",
+               '💬 <b>نص الطلب:</b>' in alert, "missing text label")
 
-        # [STYLE-MATCH] text at the bottom: "💬 <b>نص الطلب:</b>" (link channel: "💬 <b>النص:</b>")
-        record("10: alert has '💬 <b>نص الطلب:</b>' at bottom (link channel: 💬 النص at bottom)",
-               '💬 <b>نص الطلب:</b>' in alert,
-               "missing text label")
-
-        # [STYLE-MATCH] text label should come AFTER the link (order: link → text)
+        # الذيل: الرابط بعد النص (ترتيب premium: محتوى ثم إجراء)
         link_pos = alert.find('عرض الرسالة الأصلية')
         text_label_pos = alert.find('💬 <b>نص الطلب:</b>')
-        record("10: 'عرض الرسالة الأصلية' comes BEFORE '💬 نص الطلب' (link channel order)",
-               link_pos != -1 and text_label_pos != -1 and link_pos < text_label_pos,
+        record("10: footer link comes AFTER the text (action at the bottom)",
+               link_pos != -1 and text_label_pos != -1 and link_pos > text_label_pos,
                f"link_pos={link_pos} text_label_pos={text_label_pos}")
 
         # [CONTENT] alert contains the original request text (HTML-escaped)
         record("10: alert contains original request text 'مين يحل لي واجب رياضيات؟'",
                'مين يحل لي واجب رياضيات' in alert,
                f"alert snippet: {alert[:300]!r}")
+
+        # [DM-FIX-v4.3.5] المرسل بلا username (fake sender=None, sender_id=42):
+        #   - لا زر tg://user?id= إطلاقًا — كان يسبب خطأ «تنسيق الرابط غير
+        #     معروف» في عملاء الموبايل (غير مدعوم هناك).
+        kw = sm.calls[0]['kwargs']
+        record("10: NO broken tg://user?id button for usernameless sender (mobile-safe)",
+               (kw.get('buttons') is None)
+               or ('tg://user' not in str(
+                   getattr((kw.get('buttons') or [[None]])[0][0], 'url', '') or '')),
+               f"buttons kwarg: {kw.get('buttons')!r}")
     finally:
         await conn.close()
         try: os.remove(db_path)
@@ -941,9 +944,10 @@ async def test_16_sender_username_in_line_and_tme_button():
         if not sm.called:
             return
         alert = sm.calls[0]['alert']
-        record("16: المرسل line contains '@ahmed_test' beside name",
-               'المرسل:</b> أحمد (@ahmed_test)' in alert,
-               f"sender snippet: {alert[:220]!r}")
+        record("16: المرسل line contains name + (@ahmed_test) — now clickable",
+               'المرسل:</b> أحمد' in alert and '(@ahmed_test)' in alert
+               and 'href="https://t.me/ahmed_test"' in alert,
+               f"sender snippet: {alert[:260]!r}")
         kw = sm.calls[0]['kwargs']
         _btn = (kw.get('buttons') or [[None]])[0][0]
         record("16: DM button uses https://t.me/ahmed_test (username path)",
@@ -969,7 +973,7 @@ def make_slow_request_classifier(sleep_s=0.8):
         user_msg = payload["messages"][1]["content"]
         inner = user_msg.split('"""')[-2] if '"""' in user_msg else user_msg
         if any(m in inner for m in _REQUEST_MARKERS) and not any(m in inner for m in _AD_MARKERS):
-            content = _ai_json("ACCEPT", 0.93, "homework_execution_request", "طلب مساعدة أكاديمية")
+            content = _ai_json("ACCEPT", 0.93, "homework_execution_request", "طلب واجب صريح")
         else:
             content = _ai_json("REJECT", 0.95, "other", "ليس طلبًا")
         return 200, _json.dumps({"choices": [{"message": {"content": content}}]})
@@ -1056,8 +1060,9 @@ async def test_18_api_sender_resolution_fixes_username_and_button():
             return
         alert = sm.calls[0]['alert']
         record("18: sync sender=None but API get_sender() resolves @sara_ux",
-               'المرسل:</b> سارة (@sara_ux)' in alert,
-               f"sender snippet: {alert[:240]!r}")
+               'المرسل:</b> سارة' in alert and '(@sara_ux)' in alert
+               and 'href="https://t.me/sara_ux"' in alert,
+               f"sender snippet: {alert[:260]!r}")
         kw = sm.calls[0]['kwargs']
         _btn = ((kw.get('buttons') or [[None]])[0][0])
         record("18: DM button uses https://t.me/sara_ux (resolved via API)",
@@ -1148,6 +1153,60 @@ async def test_19_contact_bridge_forward_for_usernameless_sender():
         except: pass
 
 
+# =====================================================================
+# Test 20: [PREMIUM-FORMAT-v4.3.6] اقتباس قابل للتوسيع — النصوص الطويلة
+# (> 300 حرف) تُعرض «مطوية» بعلامة ⌄ في التطبيق (blockquote expandable)،
+# والنصوص القصيرة اقتباس عادي دائمًا (بلا مطوية).
+# =====================================================================
+async def test_20_quote_expandable_for_long_text():
+    print("\n--- Test 20: [PREMIUM-FORMAT] long text → expandable quote; short → plain ---")
+    prod_db, db_path, conn = await make_test_db()
+    try:
+        fm = make_monitor(prod_db)
+        # نص طويل (> 300 حرف) — طلب واقعي بطويلته
+        long_text = ("محتاج أحد يحل لي واجب الرياضيات كامل مع الشرح خطوة"
+                     " خطوة لكل سؤال، الواجب فيه مسائل تفاضل وتكامل ومشتقات"
+                     " وحدود، وأبغاه قبل يوم الأحد لأن التسليم يوم الاثنين"
+                     " الصبح، واللي يقدر يساعدني يراسلني على الخاص وأنا"
+                     " مستعد أدفع اللي ينبغي، المهم يكون الشرح واضح حتى"
+                     " أفهم أنا بنفسي وإذا فيه رسوم بيانية بعد أحسن، وشكرًا"
+                     " مقدماً للجميع والله يوفقكم جميعًا يا رب.")
+        assert len(long_text) > 300
+        ev = FakeNewMessageEvent(long_text, -1003333007, 330007,
+                                 chat=FakeMegagroupChat(), sender=None)
+        await fm._on_user_message(ev, '+TEST_SOURCE')
+        await drain_request_tasks(fm)
+        sm = fm.bot_client.send_message
+        record("20: long-text alert sent", sm.called, "send_message not called")
+        if sm.called:
+            alert = sm.calls[0]['alert']
+            record("20: long text wrapped in EXPANDABLE quote (collapsed in app)",
+                   '<blockquote expandable>' in alert,
+                   f"expandable quote missing — snippet: {alert[:200]!r}")
+            record("20: expandable closes with </blockquote>",
+                   '</blockquote>' in alert, "closing tag missing")
+
+        # نص قصير → اقتباس عادي (بلا expandable — يظهر كاملًا دائمًا)
+        send_mock_reset = sm
+        sm.reset_mock()
+        short_text = "مين يشرح لي تفاضل 1؟"
+        ev2 = FakeNewMessageEvent(short_text, -1003333008, 330008,
+                                  chat=FakeMegagroupChat(), sender=None)
+        await fm._on_user_message(ev2, '+TEST_SOURCE')
+        await drain_request_tasks(fm)
+        record("20: short-text alert sent", sm.called, "short send_message not called")
+        if sm.called:
+            alert2 = sm.calls[0]['alert']
+            record("20: short text uses PLAIN quote (fully visible, no collapse)",
+                   '<blockquote>' in alert2
+                   and '<blockquote expandable>' not in alert2,
+                   f"unexpected expandable — snippet: {alert2[:200]!r}")
+    finally:
+        await conn.close()
+        try: os.remove(db_path)
+        except: pass
+
+
 async def main():
     print("=" * 70)
     print("Request Channel Separation Hardening — Test Suite [CHANNEL-SEPARATION]")
@@ -1178,6 +1237,7 @@ async def main():
     await test_17_fire_and_forget_request_path()
     await test_18_api_sender_resolution_fixes_username_and_button()
     await test_19_contact_bridge_forward_for_usernameless_sender()
+    await test_20_quote_expandable_for_long_text()
     print("\n" + "=" * 70)
     passed = sum(1 for r in RESULTS if r['passed'])
     failed = sum(1 for r in RESULTS if not r['passed'])
