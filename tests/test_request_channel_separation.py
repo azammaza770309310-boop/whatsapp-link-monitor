@@ -1399,6 +1399,114 @@ async def test_23_private_handler_ignores_forwards():
 
 
 
+# =====================================================================
+# Test 24: [v4.3.9 DELEGATION-BROADENING] قائمة المُشغّل الحقيقية (18 طلبًا
+# اختبرها بنفسه): (1) الصيغة الخليجية المختصرة «مين يسوي X؟/احد يسوي X؟»
+# بلا «لي» = طلب تفويض → ACCEPT. (2) خدمات الطلاب المسنودة (CV/جدول/عذر)
+# = فئة student_service_execution_request → عنوان «🛠️ طلب خدمة طلابية».
+# (3) طلبات التدريس تبقى مرفوضة (لا انحدار عن v4.3.7).
+# =====================================================================
+def make_delegation_v439_classifier():
+    """scripted AI يحاكي سلوك SYSTEM_PROMPT v4.3.9: صيغة خليجية مختصرة
+    + خدمات طلابية → فئتا ACCEPT؛ التدريس/الشرح → REJECT tutoring."""
+    TUTOR_MARKERS = ("يشرح", "يعلمني", "خصوصي", "يدرسني", "مراجعة معي",
+                     "مدرس خصوصي", "يدرس مقرر")
+    HOMEWORK_MARKERS = ("واجب", "بحث", "تقرير", "مشروع تخرج", "سكليف", "كويزات",
+                        "تكليف", "أسئلة")
+    SERVICE_MARKERS = ("cv", "سي في", "سيفيات", "سيره", "سيرة ذاتية", "جدول",
+                       "جداول", "عذر", "اعذار", "فيديو", "ats")
+
+    async def transport(provider, payload):
+        user_msg = payload["messages"][1]["content"]
+        inner = user_msg.split('"""')[-2] if '"""' in user_msg else user_msg
+        low = inner.lower()
+        if any(m in inner for m in TUTOR_MARKERS):
+            content = _ai_json("REJECT", 0.95, "tutoring_only_request",
+                               "طلب تدريس وشرح وليس تنفيذًا للعمل بدلاً عنه")
+        elif any(m in low for m in HOMEWORK_MARKERS):
+            content = _ai_json("ACCEPT", 0.95, "homework_execution_request",
+                               "طلب تنفيذ العمل الأكاديمي بدلاً عن المرسل")
+        elif any(m in low for m in SERVICE_MARKERS):
+            content = _ai_json("ACCEPT", 0.94, "student_service_execution_request",
+                               "طلب تنفيذ خدمة طلابية بدلاً عن المرسل")
+        else:
+            content = _ai_json("REJECT", 0.9, "other", "ليس طلبًا")
+        return 200, _json.dumps({"choices": [{"message": {"content": content}}]})
+
+    return _IC(providers=[{"key": "k", "url": "u", "model": "mock-v439", "name": "Del"}],
+               transport=transport)
+
+
+async def test_24_delegation_dialect_and_student_services():
+    print("\n--- Test 24: [v4.3.9] Gulf terse dialect + student services (operator list) ---")
+    prod_db, db_path, conn = await make_test_db()
+    try:
+        fm = make_monitor(prod_db)
+        fm.request_classifier = make_delegation_v439_classifier()
+        sm = fm.bot_client.send_message
+
+        # (أ) صيغة خليجية مختصرة بلا «لي» — طلب تفويض أكاديمي
+        ev1 = FakeNewMessageEvent(
+            "مين يسوي تقرير ؟؟",
+            -1003333012, 330012, chat=FakeMegagroupChat(), sender=None)
+        await fm._on_user_message(ev1, '+TEST_SOURCE')
+        await drain_request_tasks(fm)
+        record("24: terse dialect «مين يسوي تقرير ؟؟» → alert sent (homework)",
+               sm.call_count == 1, f"send count={sm.call_count}")
+        if sm.called:
+            alert = sm.calls[0]['alert']
+            record("24: homework title '📝 طلب حل وإنجاز واجب'",
+                   '📝 <b>طلب حل وإنجاز واجب</b>' in alert,
+                   f"title missing — {alert[:120]!r}")
+
+        # (ب) خدمة طلابية (جدول) → فئة student_service + عنوانها الجديد
+        sm.reset_mock()
+        ev2 = FakeNewMessageEvent(
+            "مين الي يقدر يسوي لي جدول ؟",
+            -1003333013, 330013, chat=FakeMegagroupChat(), sender=None)
+        await fm._on_user_message(ev2, '+TEST_SOURCE')
+        await drain_request_tasks(fm)
+        record("24: student service «يسوي لي جدول» → alert sent",
+               sm.call_count == 1, f"send count={sm.call_count}")
+        if sm.called:
+            alert2 = sm.calls[0]['alert']
+            record("24: service title '🛠️ طلب خدمة طلابية' (new v4.3.9 category)",
+                   '🛠️ <b>طلب خدمة طلابية</b>' in alert2,
+                   f"title missing — {alert2[:120]!r}")
+            record("24: service alert NOT mislabeled as homework title",
+                   '📝 <b>طلب حل وإنجاز واجب</b>' not in alert2,
+                   f"wrong title — {alert2[:120]!r}")
+
+        # (ج) CV بخدمة الطلاب (من قائمة المُشغّل الحقيقية)
+        sm.reset_mock()
+        ev3 = FakeNewMessageEvent(
+            "احد يعرف يسوي cv ؟",
+            -1003333014, 330014, chat=FakeMegagroupChat(), sender=None)
+        await fm._on_user_message(ev3, '+TEST_SOURCE')
+        await drain_request_tasks(fm)
+        record("24: «يسوي cv» (operator list) → alert sent (student service)",
+               sm.call_count == 1, f"send count={sm.call_count}")
+        if sm.called:
+            record("24: cv alert has service title",
+                   '🛠️ <b>طلب خدمة طلابية</b>' in sm.calls[0]['alert'],
+                   f"title missing — {sm.calls[0]['alert'][:120]!r}")
+
+        # (د) لا انحدار: التدريس/الشرح يُرفض رغم توسيع القبول
+        sm.reset_mock()
+        ev4 = FakeNewMessageEvent(
+            "مين يعرف دكتور يشرح رياضيات؟",
+            -1003333015, 330015, chat=FakeMegagroupChat(), sender=None)
+        await fm._on_user_message(ev4, '+TEST_SOURCE')
+        await drain_request_tasks(fm)
+        record("24: tutoring still rejected (no regression from v4.3.7)",
+               sm.call_count == 0,
+               f"send count={sm.call_count} — tutoring must stay rejected")
+    finally:
+        await conn.close()
+        try: os.remove(db_path)
+        except: pass
+
+
 async def main():
     print("=" * 70)
     print("Request Channel Separation Hardening — Test Suite [CHANNEL-SEPARATION]")
@@ -1433,6 +1541,7 @@ async def main():
     await test_21_execution_only_tutoring_rejected()
     await test_22_bridge_fully_removed_no_pm_traffic()
     await test_23_private_handler_ignores_forwards()
+    await test_24_delegation_dialect_and_student_services()
     print("\n" + "=" * 70)
     passed = sum(1 for r in RESULTS if r['passed'])
     failed = sum(1 for r in RESULTS if not r['passed'])

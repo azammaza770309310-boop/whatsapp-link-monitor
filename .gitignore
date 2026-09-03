@@ -93,3 +93,8 @@ __pycache__/
 # Render/blueprint local snapshots
 render.yaml.local
 dash-after-sso-fix.png
+
+# AI test harness secrets (Render env keys) — NEVER commit
+.test_env.json
+*.log
+test_real_requests_results.json

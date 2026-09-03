@@ -6464,12 +6464,15 @@ class Monitor:
         # → الحل ينجح) → username حقيقي → سطر المرسل يحمله + الزر يصبح
         # https://t.me/<username> (رسمي — يعمل في كل العملاء).
         sender_obj = None
+        _resolve_via = ''
         try:
             _gs = getattr(event, 'get_sender', None)
             if callable(_gs):
                 # wait_for: get_entity قد يعلق على حساب بطيء — لا يعطّل الإرسال
                 try:
                     sender_obj = await asyncio.wait_for(_gs(), timeout=4)
+                    if sender_obj is not None:
+                        _resolve_via = 'get_sender'
                 except Exception:
                     sender_obj = None
         except Exception:
@@ -6478,6 +6481,8 @@ class Monitor:
             # fallback 1: الخاصية التزامنية (min-entity أفضل من لا شيء)
             try:
                 sender_obj = event.sender
+                if sender_obj is not None:
+                    _resolve_via = 'sync_attr'
             except Exception:
                 sender_obj = None
         if sender_id > 0 and not (getattr(sender_obj, 'username', None)):
@@ -6492,8 +6497,42 @@ class Monitor:
                         _cap_client.get_entity(_PeerUser(sender_id)), timeout=4)
                     if _full is not None:
                         sender_obj = _full
+                        _resolve_via = f'capture_client:{source_phone}'
             except Exception:
                 pass
+        # fallback 3 [v4.3.9]: ما زال بلا username؟ جرّب حسابات الالتقاط
+        # الأخرى المتصلة (قد يكون لديها الكيان الكامل في ذاكرة/ذاكرة جلسة
+        # مختلفة). بلاغ المُشغّل: «طلبات في القناة بلا يوزر مع أنه موجود
+        # عند المرسل» — تعزيز الاحتمال بأن الحل ينجح عبر حساب آخر عضو
+        # في نفس المجموعة. حد أقصى حسابان إضافيان × 3s (لا يبطئ المسار
+        # إلا في أسوأ الحالات، والأغلب ينجح من الطبقات الثلاث الأولى).
+        if sender_id > 0 and not (getattr(sender_obj, 'username', None)):
+            _others = [ph for ph in (getattr(self, 'user_clients', None) or {})
+                       if ph != source_phone]
+            for _ph in _others[:2]:
+                try:
+                    _oc = (getattr(self, 'user_clients', None) or {}).get(_ph)
+                    if _oc is None or not _oc.is_connected():
+                        continue
+                    _full2 = await asyncio.wait_for(
+                        _oc.get_entity(int(sender_id)), timeout=3)
+                    if _full2 is not None and getattr(_full2, 'username', None):
+                        sender_obj = _full2
+                        _resolve_via = f'other_client:{_ph}'
+                        break
+                except Exception:
+                    continue
+        # [v4.3.9] سجل تشخيصي INFO: يوثّق الطبقة التي حُلّ بها المرسل
+        # وهل وُجد username — لتشخيص بلاغات «بلا يوزر» من السجلات مباشرة
+        # بدل التخمين (لا يظهر في القناة — سجل فقط).
+        try:
+            logging.info(
+                f"[REQUEST-PATH] sender resolve id={sender_id} "
+                f"username={'yes' if getattr(sender_obj, 'username', None) else 'NO'} "
+                f"via={_resolve_via or 'none'} chat_id={chat_id} msg_id={msg_id}"
+            )
+        except Exception:
+            pass
         try:
             if sender_obj:
                 if hasattr(sender_obj, 'username') and sender_obj.username:
@@ -6546,12 +6585,16 @@ class Monitor:
              + analysis.matched_patterns)[:5]
         )
 
-        # [v4.3.7 EXECUTION-ONLY] فئة القبول الوحيدة بعد إصلاح المُشغّل:
-        # «الطالب يطلب أحدًا يقوم بالعمل بدله». طلبات التدريس/الشرح
-        # تُرفض في المصنّف (tutoring_only_request) — لا تصل هنا أبدًا.
+        # [v4.3.7 EXECUTION-ONLY / v4.3.9 فئتان] فئتا القبول بعد إصلاح
+        # المُشغّل: «الطالب يطلب أحدًا يقوم بالعمل بدله» (أكاديمي) أو
+        # «خدمة طلابية تنفَّذ بدله» (CV/جدول/عذر/فيديو). طلبات التدريس/
+        # الشرح تُرفض في المصنّف (tutoring_only_request) — لا تصل هنا أبدًا.
         _cat = str(getattr(analysis, 'intent_type', '') or '')
         if _cat == 'homework_execution_request':
             title_line = '📝 <b>طلب حل وإنجاز واجب</b>'
+        elif _cat == 'student_service_execution_request':
+            # [v4.3.9] خدمات طلابية: CV/ATS، بناء جدول، عذر، فيديو/تصميم
+            title_line = '🛠️ <b>طلب خدمة طلابية</b>'
         else:
             title_line = '📩 <b>طلب أكاديمي</b>'
 
