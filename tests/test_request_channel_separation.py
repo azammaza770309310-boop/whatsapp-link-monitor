@@ -1084,24 +1084,26 @@ async def test_18_api_sender_resolution_fixes_username_and_button():
 
 
 # =====================================================================
-# Test 19: [DM-FIX-v4.3.5] جسر التواصل (contact-bridge) — مرسل بلا
-# username: زر tg://user?id= أُلغي (معطوب في الموبايل) واستُبدل بسلسلة
-# forward: حساب الالتقاط → PM البوت → قناة الطلبات. الترويسة النهائية
-# «Forwarded from <المرسل>» قابلة للنقر من أي عميل.
+# Test 19: [v4.3.8] الجسر حُذف نهائيًا (بلاغ المُشغّل 2026-09-03: البوت
+# كان يستقبل رسائل محوّلة في خاصه ويرد عليها بقائمة الأوامر — بينما القفزة
+# الثانية للجسر فاشلة 100% في الإنتاج). مرسل بلا username → التنبيه مع
+# text-mention هو مسار التواصل الوحيد. لا forward من أي طرف.
 # =====================================================================
 class FakeCaptureClient:
     """يحاكي حساب الالتقاط (عضو المجموعة) — يسجّل عمليات الـforward.
-    [v4.3.7 Bridge v2] get_messages: الرسالة موجودة (id صحيح، ليست
-    خدمية) → الجسر يمضي للتوجيه. msg_exists=False → محذوفة (skip)."""
+    [v4.3.8] الجسر حُذف: يجب أن يبقى forwarded فارغًا دائمًا مهما كانت
+    حالة الرسالة الأصلية (موجودة/محذوفة)."""
 
     def __init__(self, msg_exists=True):
         self.forwarded = []
         self.msg_exists = msg_exists
+        self.get_messages_calls = 0
 
     def is_connected(self):
         return True
 
     async def get_messages(self, entity, ids=None):
+        self.get_messages_calls += 1
         if not self.msg_exists:
             return None
         return types.SimpleNamespace(id=int(ids) if ids is not None else 0,
@@ -1112,12 +1114,13 @@ class FakeCaptureClient:
         return types.SimpleNamespace(id=555001)
 
 
-async def test_19_contact_bridge_forward_for_usernameless_sender():
-    print("\n--- Test 19: [DM-FIX] usernameless → contact-bridge forward chain ---")
+async def test_19_usernameless_text_mention_only_no_bridge():
+    print("\n--- Test 19: [v4.3.8] usernameless → text-mention only, NO bridge forwards ---")
     prod_db, db_path, conn = await make_test_db()
     try:
         fm = make_monitor(prod_db)
         # زوّد حساب الالتقاط (fake) + bot_client.get_me/forward_messages (async)
+        # للتحقق القاطع أنهما لم يُستدعيا قط (كانا حلقتي الجسر القديم)
         cap = FakeCaptureClient()
         fm.user_clients = {'+TEST_SOURCE': cap}
         fm.bot_client.get_me = AsyncMock(
@@ -1136,37 +1139,28 @@ async def test_19_contact_bridge_forward_for_usernameless_sender():
         sm = fm.bot_client.send_message
         record("19: alert sent", sm.called, "send_message not called")
         kw = sm.calls[0]['kwargs']
-        record("19: NO button for usernameless sender (tg://user removed)",
+        record("19: NO button for usernameless sender (text-mention is the path)",
                kw.get('buttons') is None,
                f"buttons kwarg: {kw.get('buttons')!r}")
-        # [v4.3.7] سطح النقر البديل: اسم المرسل text-mention في التنبيه
+        # [v4.3.7] سطح النقر: اسم المرسل text-mention في التنبيه
         alert = sm.calls[0]['alert']
-        record("19: usernameless sender name is clickable text-mention (v4.3.7)",
+        record("19: usernameless sender name is clickable text-mention",
                'tg://user?id=42' in alert,
                f"text-mention missing — alert: {alert[:200]!r}")
 
-        # الحلقة 1: حساب الالتقاط أرسل forward لـPM البوت (uid=999)
-        record("19: hop-1 capture client forwarded original to bot PM (uid=999)",
-               len(cap.forwarded) == 1 and cap.forwarded[0][0] == 999
-               and cap.forwarded[0][1] == msg_id
-               and cap.forwarded[0][2] == chat,
-               f"cap.forwarded={cap.forwarded!r}")
-        # الحلقة 2: البوت أعاد التوجيه من خاصه إلى قناة الطلبات
-        _fw = fm.bot_client.forward_messages
-        _aw = getattr(_fw, 'await_args_list', [])
-        record("19: hop-2 bot forwarded PM msg to requests channel",
-               len(_aw) == 1,
+        # [v4.3.8] الجسر محذوف: صفر توجيه من حساب الالتقاط (لا PM للبوت)
+        record("19: ZERO forwards from capture client (bridge removed v4.3.8)",
+               len(cap.forwarded) == 0,
+               f"cap.forwarded={cap.forwarded!r} — bridge must be gone")
+        # وصفر توجيه من البوت إلى القناة
+        _aw = getattr(fm.bot_client.forward_messages, 'await_args_list', [])
+        record("19: ZERO bot forwards to channel (bridge removed v4.3.8)",
+               len(_aw) == 0,
                f"bot forward await count: {len(_aw)}")
-        if len(_aw) == 1:
-            _call = _aw[0]
-            _args, _kwargs = _call.args, _call.kwargs
-            record("19: hop-2 target = '@dhkskwksjskwk' (requests channel)",
-                   (_args[0] if _args else _kwargs.get('entity')) == '@dhkskwksjskwk',
-                   f"args={_args!r} kwargs={_kwargs!r}")
-            record("19: hop-2 forwarded the PM msg id + from_peer='me'",
-                   (_args[1] if len(_args) > 1 else _kwargs.get('messages')) == 555001
-                   and (_kwargs.get('from_peer') == 'me'),
-                   f"args={_args!r} kwargs={_kwargs!r}")
+        # get_me كانت طلب الجسر الأول — لم تعد تُستدعى في مسار الطلب
+        record("19: bot_client.get_me not called (bridge-only call removed)",
+               fm.bot_client.get_me.await_count == 0,
+               f"get_me await count: {fm.bot_client.get_me.await_count}")
     finally:
         await conn.close()
         try: os.remove(db_path)
@@ -1296,17 +1290,19 @@ async def test_21_execution_only_tutoring_rejected():
         except: pass
 
 
+
 # =====================================================================
-# Test 22: [v4.3.7 Bridge v2] الرسالة الأصلية محذوفة قبل الجسر (طالب/
-# بوت مضاد) → تخطٍّ واضح بدل تحذير غامض، وsurface النقر = text-mention
-# داخل التنبيه (لا زر ولا forward).
+# Test 22: [v4.3.8] حتى لو الرسالة الأصلية موجودة والمرسل بلا username —
+# لا وجود إطلاقًا لحركة PM البوت (الجسر محذوف من الجذر): لا get_messages
+# ولا forward من أي حساب. التنبيه هو الأثر الوحيد.
 # =====================================================================
-async def test_22_bridge_v2_deleted_message_skip():
-    print("\n--- Test 22: [v4.3.7 Bridge v2] original deleted → clean skip, no forward ---")
+async def test_22_bridge_fully_removed_no_pm_traffic():
+    print("\n--- Test 22: [v4.3.8] bridge fully removed — zero PM traffic (message exists) ---")
     prod_db, db_path, conn = await make_test_db()
     try:
         fm = make_monitor(prod_db)
-        cap = FakeCaptureClient(msg_exists=False)  # الرسالة محذوفة
+        # الرسالة الأصلية موجودة (msg_exists=True) — ومع ذلك: صفر توجيه
+        cap = FakeCaptureClient(msg_exists=True)
         fm.user_clients = {'+TEST_SOURCE': cap}
         fm.bot_client.get_me = AsyncMock(
             return_value=types.SimpleNamespace(id=999))
@@ -1321,14 +1317,17 @@ async def test_22_bridge_v2_deleted_message_skip():
         await drain_request_tasks(fm)
 
         sm = fm.bot_client.send_message
-        record("22: alert still sent (bridge failure never blocks the alert)",
+        record("22: alert sent (the only artifact — to the channel)",
                sm.called, "send_message not called")
-        record("22: deleted original → NO forward attempt (hop-1 skipped)",
+        record("22: zero forwards from capture account (bridge removed)",
                len(cap.forwarded) == 0,
                f"forwarded={cap.forwarded!r}")
+        record("22: no existence probe either (get_messages never called)",
+               cap.get_messages_calls == 0,
+               f"get_messages calls: {cap.get_messages_calls}")
         _fw = fm.bot_client.forward_messages
         _aw = getattr(_fw, 'await_args_list', [])
-        record("22: bot hop-2 never called (bridge cleanly skipped)",
+        record("22: zero bot forwards (no hop-2 — bridge removed)",
                len(_aw) == 0, f"bot forward count={len(_aw)}")
         if sm.called:
             alert = sm.calls[0]['alert']
@@ -1339,6 +1338,65 @@ async def test_22_bridge_v2_deleted_message_skip():
         await conn.close()
         try: os.remove(db_path)
         except: pass
+
+
+# =====================================================================
+# Test 23: [v4.3.8] بلاغ المُشغّل: «البوت يرد على الرسائل المحوّلة بقائمة
+# الأوامر». الرسائل المُحوّلة في خاص البوت تُتجاهل بصمت — قائمة الترحيب
+# للمستخدم البشري الذي يكتب فقط.
+# =====================================================================
+class FakePrivateEvent:
+    """يحاكي حدث رسالة خاصة للبوت — forward=None للرسائل العادية
+    وSimpleNamespace للمحوّلة، ويسجّل كل reply."""
+
+    def __init__(self, text, fwd=None, sender_id=12345):
+        self.message = types.SimpleNamespace(text=text, forward=fwd)
+        self.chat_id = sender_id
+        self.sender_id = sender_id
+        self._sender = types.SimpleNamespace(
+            id=sender_id, first_name='مستخدم', phone=None)
+        self.replies = []
+
+    async def get_sender(self):
+        return self._sender
+
+    async def reply(self, t):
+        self.replies.append(t)
+
+
+async def test_23_private_handler_ignores_forwards():
+    print("\n--- Test 23: [v4.3.8] bot PM: forwarded messages → silent, no onboarding ---")
+    prod_db, db_path, conn = await make_test_db()
+    try:
+        fm = make_monitor(prod_db)
+        # ربط المعالج الحقيقي + متطلباته (login sessions / cleanup)
+        fm._on_private_message = types.MethodType(
+            bot.Monitor._on_private_message, fm)
+        fm._login_sessions = {}
+        fm._cleanup_expired_login_sessions = lambda: None
+        fm.config.owner_id = 12345
+
+        # (أ) رسالة محوّلة (سلوك الجسر القديم) → صمت تام
+        fwd_ev = FakePrivateEvent(
+            "فيه احد يدرس مقرر مقدمه ف الاحصاء غير رحاب ؟",
+            fwd=types.SimpleNamespace(from_id=777))
+        await fm._on_private_message(fwd_ev)
+        record("23: forwarded PM message → ZERO replies (silent)",
+               len(fwd_ev.replies) == 0,
+               f"replies={fwd_ev.replies!r} — forwards must be ignored")
+
+        # (ب) رسالة عادية (نص بشري) → قائمة الترحيب تعمل كالمعتاد
+        plain_ev = FakePrivateEvent("مرحبا", fwd=None)
+        await fm._on_private_message(plain_ev)
+        record("23: plain human text → onboarding menu replied",
+               len(plain_ev.replies) == 1
+               and 'الأوامر المتاحة' in plain_ev.replies[0],
+               f"replies={plain_ev.replies!r}")
+    finally:
+        await conn.close()
+        try: os.remove(db_path)
+        except: pass
+
 
 
 async def main():
@@ -1370,10 +1428,11 @@ async def main():
     await test_16_sender_username_in_line_and_tme_button()
     await test_17_fire_and_forget_request_path()
     await test_18_api_sender_resolution_fixes_username_and_button()
-    await test_19_contact_bridge_forward_for_usernameless_sender()
+    await test_19_usernameless_text_mention_only_no_bridge()
     await test_20_quote_expandable_for_long_text()
     await test_21_execution_only_tutoring_rejected()
-    await test_22_bridge_v2_deleted_message_skip()
+    await test_22_bridge_fully_removed_no_pm_traffic()
+    await test_23_private_handler_ignores_forwards()
     print("\n" + "=" * 70)
     passed = sum(1 for r in RESULTS if r['passed'])
     failed = sum(1 for r in RESULTS if not r['passed'])

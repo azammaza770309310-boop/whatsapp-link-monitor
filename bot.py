@@ -6602,30 +6602,27 @@ class Monitor:
         alert += f"<{_quote_open}>{safe_text}</blockquote>\n\n"
         alert += f'🔗 <a href="{safe_link}">عرض الرسالة الأصلية</a>'
 
-        # --- [DM-FIX-v4.3.5] زر «مراسلة» — استراتيجية مطوَّرة ---
+        # --- [DM-FIX-v4.3.8] زر «مراسلة» — استراتيجية مبسطة ---
         #   - مع username (بعد الحل الكامل عبر API) → https://t.me/<username>
-        #     (رسمي — يعمل في كل العملاء دون استثناء).
-        #   - بلا username حتى بعد الحل الكامل → NO tg://user?id= button
-        #     (غير مدعوم في الموبايل — سبب خطأ «تنسيق الرابط غير معروف»).
-        #     البديل: جسر تواصل (contact bridge) — بعد إرسال التنبيه نُعيد
-        #     توجيه الرسالة الأصلية إلى قناة الطلبات عبر سلسلة
-        #     (حساب الالتقاط → PM البوت → القناة). ترويسة «Forwarded from
-        #     <اسم المرسل>» قابلة للنقر في كل العملاء → تفتح ملف المرسل →
-        #     مراسلة. المصدر (المجموعة) لا يظهر — الترويسة تحمل المُرسِل فقط.
-        #   - sender_id <= 0 (مرسل مجهول/قناة) → بلا زر ولا جسر.
+        #     زر رسمي يعمل في كل العملاء دون استثناء.
+        #   - بلا username → text-mention داخل التنبيه نفسه (اسم المرسل
+        #     رابط قابل للنقر tg://user?id=) — مسار التواصل الوحيد.
+        #   - sender_id <= 0 (مرسل مجهول/قناة) → بلا زر.
+        # [v4.3.8] حُذف جسر التواصل (contact bridge) نهائيًا — راجع التعليق
+        # أسفل الإرسال. لا توجيه إطلاقًا إلى PM البوت لأي رسالة.
         dm_buttons = None
-        dm_mode = 'none'  # button:t.me | bridge:forward | none
+        dm_mode = 'none'  # button:t.me | text_mention | none
         try:
             _sid = int(sender_id or 0)
             # [PREMIUM-FORMAT] يستخدم _uname_clean (المعقّم) — لا sender_username
-            # الخام: يوزرنيم غير صالح/ملوث يهبط لوضع الجسر بدل زر معطوب.
+            # الخام: يوزرنيم غير صالح/ملوث يهبط لوضع text_mention بدل زر معطوب.
             if _sid > 0 and _uname_clean:
                 _dm_url = f"https://t.me/{_uname_clean}"
                 dm_buttons = [[Button.url("✉️ مراسلة", _dm_url)]]
                 dm_mode = 'button:t.me'
                 logging.debug(f"[REQUEST-PATH] DM button url={_dm_url}")
             elif _sid > 0:
-                dm_mode = 'bridge:forward'  # لا username — جسر التواصل بعد الإرسال
+                dm_mode = 'text_mention'  # لا username — الاسم القابل للنقر داخل التنبيه
         except Exception:
             dm_buttons = None  # فشل بناء الزر لا يمنع إرسال التنبيه
             dm_mode = 'none'
@@ -6657,102 +6654,14 @@ class Monitor:
                 f"dm={dm_mode}"
             )
 
-            # [DM-FIX-v4.3.5] جسر التواصل — مرسل بلا username:
-            # الزر القديم tg://user?id= كان معطوبًا في الموبايل، والزر الوحيد
-            # الموثوق بلا username هو الترويسة القابلة للنقر «Forwarded
-            # from <المرسل>». السلسلة:
-            #   1) حساب الالتقاط (عضو المجموعة، يملك الرسالة) يُعيد توجيه
-            #      الرسالة الأصلية إلى PM البوت — أي حساب يستطيع مراسلة
-            #      أي مستخدم في الخاص.
-            #   2) البوت يُعيد توجيهها من خاصه إلى قناة الطلبات (له صلاحية
-            #      الإرسال هناك مثبتة يوميًا). الترويسة تحتفظ بالمُرسِل
-            #      الأصلي (لا بسلسلة الوساطة).
-            # أي حلقة تفشل → تحذير فقط (التنبيه أُرسل — الأولوية له).
-            # [v4.3.7 Bridge v2] جسر تواصل مقاوم — تشخيص الإنتاج كشف أن
-            # التوجيه فشل 100% من فشلين مختلفين: (1) الرسالة الأصلية
-            # تُحذف خلال ثوانٍ (طالب/بوت مضاد للإعلانات) → MSG_ID_INVALID،
-            # (2) مجموعات «protected content» تمنع التوجيه أصلًا.
-            # التصميم الجديد: تحقق الوجود أولًا (get_messages — نداء واحد
-            # رخيص يميّز الحذف عن القيود)، ثم التوجيه، ومع الفشل محاولة
-            # عبر كائن الرسالة، والتشخيص الصريح في السجل لكل حالة.
-            # الفشل في أي حلقة لا يمنع التنبيه (أُرسل) — وسطح النقر
-            # البديل: text-mention لاسم المرسل داخل التنبيه نفسه أعلاه.
-            if dm_mode == 'bridge:forward':
-                try:
-                    _me = await asyncio.wait_for(_bot_client.get_me(), timeout=5)
-                    _bot_uid = getattr(_me, 'id', None)
-                    _cap_client = (getattr(self, 'user_clients', None) or {}).get(source_phone)
-                    if _bot_uid and _cap_client is not None and _cap_client.is_connected():
-                        # الخطوة 1: هل الرسالة الأصلية ما زالت موجودة؟
-                        # (None = محذوفة؛ action = رسالة خدمية لا تُوجّه)
-                        _msg_check = None
-                        try:
-                            _msg_check = await asyncio.wait_for(
-                                _cap_client.get_messages(chat_id, ids=int(msg_id)),
-                                timeout=6)
-                        except Exception:
-                            _msg_check = None
-                        if _msg_check is None or getattr(_msg_check, 'action', None) is not None:
-                            logging.info(
-                                f"[REQUEST-PATH] contact-bridge skip — original "
-                                f"message deleted (student/anti-spam) "
-                                f"chat_id={chat_id} msg_id={msg_id} — "
-                                f"sender text-mention in alert is the contact path"
-                            )
-                        else:
-                            # الخطوة 2: توجيه (msg_id, from_peer) — ثم عبر
-                            # كائن الرسالة كخطة بديلة عند الفشل
-                            _pm_fwd = None
-                            _fw_err = ''
-                            try:
-                                _pm_fwd = await asyncio.wait_for(
-                                    _cap_client.forward_messages(
-                                        _bot_uid, int(msg_id), from_peer=chat_id),
-                                    timeout=10)
-                            except Exception as _fw_e:
-                                _fw_err = str(_fw_e)
-                                _err_low = _fw_err.lower()
-                                if ('protected' in _err_low
-                                        or 'forwards' in _err_low
-                                        or ("forward" in _err_low and 'restrict' in _err_low)
-                                        or "can't forward" in _err_low):
-                                    logging.info(
-                                        f"[REQUEST-PATH] contact-bridge blocked — "
-                                        f"group restricts forwarding chat_id={chat_id} "
-                                        f"msg_id={msg_id} — sender text-mention in "
-                                        f"alert is the contact path"
-                                    )
-                                else:
-                                    try:
-                                        _pm_fwd = await asyncio.wait_for(
-                                            _cap_client.forward_messages(
-                                                _bot_uid, _msg_check),
-                                            timeout=10)
-                                    except Exception:
-                                        _pm_fwd = None
-                            _pm_id = getattr(_pm_fwd, 'id', None)
-                            if _pm_id:
-                                await asyncio.wait_for(
-                                    _bot_client.forward_messages(
-                                        target, _pm_id, from_peer='me'),
-                                    timeout=10)
-                                logging.info(
-                                    f"[REQUEST-PATH] ✅ contact-bridge forwarded "
-                                    f"chat_id={chat_id} msg_id={msg_id} "
-                                    f"sender_id={sender_id} (no username — "
-                                    f"tap 'Forwarded from' to DM)"
-                                )
-                            elif _pm_fwd is None and _fw_err:
-                                logging.warning(
-                                    f"[REQUEST-PATH] contact-bridge forward failed "
-                                    f"chat_id={chat_id} msg_id={msg_id}: {_fw_err} — "
-                                    f"sender text-mention in alert is the contact path"
-                                )
-                except Exception as _bridge_e:
-                    logging.warning(
-                        f"[REQUEST-PATH] contact-bridge forward failed "
-                        f"chat_id={chat_id} msg_id={msg_id}: {_bridge_e}"
-                    )
+            # [v4.3.8] حُذف «جسر التواصل» (contact bridge) نهائيًا:
+            # تشخيص الإنتاج أثبت أنه ضجيج بلا قيمة — القفزة 1 (توجيه الرسالة
+            # إلى PM البوت) تولّد ردّ قائمة الأوامر المحيّر في محادثة البوت
+            # (بلاغ المُشغّل 2026-09-03)، والقفزة 2 (PM البوت → القناة)
+            # فشلت 100% (from_peer='me' لا يشير لشات حساب الالتقاط)،
+            # بينما القناة تستلم أصلًا التنبيه الكامل مع text-mention
+            # قابل للنقر للمرسل بلا username. مسار التواصل الوحيد الآن:
+            # زر t.me (مع username) أو text-mention (بلا username).
         except FloodWaitError as e:
             # أعد المحاولة بعد الانتظار (محدود لتجنب التعليق)
             wait_s = min(getattr(e, 'seconds', 30), 60)
@@ -7733,6 +7642,20 @@ class Monitor:
         try:
             text = (event.message.text or "").strip()
             if not text:
+                return
+
+            # [v4.3.8] تجاهل الرسائل المُحوَّلة بصمت — لا قائمة ترحيب:
+            # التحويلات ليست مستخدمًا بشريًا يكتب للبوت (سابقًا كان جسر
+            # التواصل يمرّر الرسائل هنا فيردّ البوت بقائمة الأوامر داخل
+            # محادثته — بلاغ المُشغّل 2026-09-03 «محوَّلة من Haya1»).
+            # Telethon 1.44: السمة message.forward (fwd_from للتوافق).
+            _fwd = (getattr(event.message, 'fwd_from', None)
+                    or getattr(event.message, 'forward', None))
+            if _fwd is not None:
+                logging.debug(
+                    "[PRIVATE] silently ignoring forwarded message "
+                    f"from sender={event.sender_id} (no onboarding for forwards)"
+                )
                 return
 
             sender = await event.get_sender()
