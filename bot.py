@@ -6546,11 +6546,11 @@ class Monitor:
              + analysis.matched_patterns)[:5]
         )
 
-        # العنوان: من فئة الـAI (فئتا القبول فقط تصل إلى هنا)
+        # [v4.3.7 EXECUTION-ONLY] فئة القبول الوحيدة بعد إصلاح المُشغّل:
+        # «الطالب يطلب أحدًا يقوم بالعمل بدله». طلبات التدريس/الشرح
+        # تُرفض في المصنّف (tutoring_only_request) — لا تصل هنا أبدًا.
         _cat = str(getattr(analysis, 'intent_type', '') or '')
-        if _cat == 'tutoring_request':
-            title_line = '🎓 <b>طلب تدريس وشرح</b>'
-        elif _cat == 'homework_execution_request':
+        if _cat == 'homework_execution_request':
             title_line = '📝 <b>طلب حل وإنجاز واجب</b>'
         else:
             title_line = '📩 <b>طلب أكاديمي</b>'
@@ -6570,12 +6570,20 @@ class Monitor:
         except Exception:
             date_str = "غير معروف"
 
-        SEP = '━━━━━━━━━━━━━━━━━━━'
+        # [v4.3.7] بلا فواصل أفقية ━━━ (طلب المُشغّل: «شيلها ما لها داعي»)
+        # — التنظيم البصري بالرموز (👤👥🕒💬🔗) وحدها.
 
-        # سطر المرسل: الاسم + اليوزرنيم كرابط قابل للنقر (يفتح الملف)
+        # سطر المرسل: الاسم + اليوزرنيم كرابط قابل للنقر (يفتح الملف).
+        # [v4.3.7] بلا username: اسم المرسل نفسه يصبح text-mention
+        # (tg://user?id) — يُعرض اسمًا أزرق قابلًا للنقر؛ يفتح ملف المرسل
+        # في عملاء من يعرفه (المشغّل يشارك مجموعات المراقبة غالبًا)
+        # → مراسلة. سطح نقر إضافي فوق جسر التوجيه أسفله.
         if _uname_clean:
             sender_line = (f'👤 <b>المرسل:</b> {safe_sender} '
                            f'<a href="https://t.me/{_uname_clean}">(@{_uname_clean})</a>')
+        elif sender_id > 0:
+            sender_line = (f'👤 <b>المرسل:</b> '
+                           f'<a href="tg://user?id={int(sender_id)}">{safe_sender}</a>')
         else:
             sender_line = f'👤 <b>المرسل:</b> {safe_sender}'
 
@@ -6587,11 +6595,9 @@ class Monitor:
         alert = title_line + "\n"
         if _reason_ar:
             alert += f'<i>{html_module.escape(_reason_ar)}</i>\n'
-        alert += f"{SEP}\n"
         alert += sender_line + "\n"
         alert += f"👥 <b>المجموعة:</b> {safe_chat}\n"
         alert += f"🕒 <b>التاريخ:</b> {html_module.escape(date_str)}\n"
-        alert += f"{SEP}\n"
         alert += "💬 <b>نص الطلب:</b>\n"
         alert += f"<{_quote_open}>{safe_text}</blockquote>\n\n"
         alert += f'🔗 <a href="{safe_link}">عرض الرسالة الأصلية</a>'
@@ -6662,28 +6668,86 @@ class Monitor:
             #      الإرسال هناك مثبتة يوميًا). الترويسة تحتفظ بالمُرسِل
             #      الأصلي (لا بسلسلة الوساطة).
             # أي حلقة تفشل → تحذير فقط (التنبيه أُرسل — الأولوية له).
+            # [v4.3.7 Bridge v2] جسر تواصل مقاوم — تشخيص الإنتاج كشف أن
+            # التوجيه فشل 100% من فشلين مختلفين: (1) الرسالة الأصلية
+            # تُحذف خلال ثوانٍ (طالب/بوت مضاد للإعلانات) → MSG_ID_INVALID،
+            # (2) مجموعات «protected content» تمنع التوجيه أصلًا.
+            # التصميم الجديد: تحقق الوجود أولًا (get_messages — نداء واحد
+            # رخيص يميّز الحذف عن القيود)، ثم التوجيه، ومع الفشل محاولة
+            # عبر كائن الرسالة، والتشخيص الصريح في السجل لكل حالة.
+            # الفشل في أي حلقة لا يمنع التنبيه (أُرسل) — وسطح النقر
+            # البديل: text-mention لاسم المرسل داخل التنبيه نفسه أعلاه.
             if dm_mode == 'bridge:forward':
                 try:
                     _me = await asyncio.wait_for(_bot_client.get_me(), timeout=5)
                     _bot_uid = getattr(_me, 'id', None)
                     _cap_client = (getattr(self, 'user_clients', None) or {}).get(source_phone)
                     if _bot_uid and _cap_client is not None and _cap_client.is_connected():
-                        _pm_fwd = await asyncio.wait_for(
-                            _cap_client.forward_messages(
-                                _bot_uid, msg_id, from_peer=chat_id),
-                            timeout=10)
-                        _pm_id = getattr(_pm_fwd, 'id', None)
-                        if _pm_id:
-                            await asyncio.wait_for(
-                                _bot_client.forward_messages(
-                                    target, _pm_id, from_peer='me'),
-                                timeout=10)
+                        # الخطوة 1: هل الرسالة الأصلية ما زالت موجودة؟
+                        # (None = محذوفة؛ action = رسالة خدمية لا تُوجّه)
+                        _msg_check = None
+                        try:
+                            _msg_check = await asyncio.wait_for(
+                                _cap_client.get_messages(chat_id, ids=int(msg_id)),
+                                timeout=6)
+                        except Exception:
+                            _msg_check = None
+                        if _msg_check is None or getattr(_msg_check, 'action', None) is not None:
                             logging.info(
-                                f"[REQUEST-PATH] ✅ contact-bridge forwarded "
-                                f"chat_id={chat_id} msg_id={msg_id} "
-                                f"sender_id={sender_id} (no username — "
-                                f"tap 'Forwarded from' to DM)"
+                                f"[REQUEST-PATH] contact-bridge skip — original "
+                                f"message deleted (student/anti-spam) "
+                                f"chat_id={chat_id} msg_id={msg_id} — "
+                                f"sender text-mention in alert is the contact path"
                             )
+                        else:
+                            # الخطوة 2: توجيه (msg_id, from_peer) — ثم عبر
+                            # كائن الرسالة كخطة بديلة عند الفشل
+                            _pm_fwd = None
+                            _fw_err = ''
+                            try:
+                                _pm_fwd = await asyncio.wait_for(
+                                    _cap_client.forward_messages(
+                                        _bot_uid, int(msg_id), from_peer=chat_id),
+                                    timeout=10)
+                            except Exception as _fw_e:
+                                _fw_err = str(_fw_e)
+                                _err_low = _fw_err.lower()
+                                if ('protected' in _err_low
+                                        or 'forwards' in _err_low
+                                        or ("forward" in _err_low and 'restrict' in _err_low)
+                                        or "can't forward" in _err_low):
+                                    logging.info(
+                                        f"[REQUEST-PATH] contact-bridge blocked — "
+                                        f"group restricts forwarding chat_id={chat_id} "
+                                        f"msg_id={msg_id} — sender text-mention in "
+                                        f"alert is the contact path"
+                                    )
+                                else:
+                                    try:
+                                        _pm_fwd = await asyncio.wait_for(
+                                            _cap_client.forward_messages(
+                                                _bot_uid, _msg_check),
+                                            timeout=10)
+                                    except Exception:
+                                        _pm_fwd = None
+                            _pm_id = getattr(_pm_fwd, 'id', None)
+                            if _pm_id:
+                                await asyncio.wait_for(
+                                    _bot_client.forward_messages(
+                                        target, _pm_id, from_peer='me'),
+                                    timeout=10)
+                                logging.info(
+                                    f"[REQUEST-PATH] ✅ contact-bridge forwarded "
+                                    f"chat_id={chat_id} msg_id={msg_id} "
+                                    f"sender_id={sender_id} (no username — "
+                                    f"tap 'Forwarded from' to DM)"
+                                )
+                            elif _pm_fwd is None and _fw_err:
+                                logging.warning(
+                                    f"[REQUEST-PATH] contact-bridge forward failed "
+                                    f"chat_id={chat_id} msg_id={msg_id}: {_fw_err} — "
+                                    f"sender text-mention in alert is the contact path"
+                                )
                 except Exception as _bridge_e:
                     logging.warning(
                         f"[REQUEST-PATH] contact-bridge forward failed "

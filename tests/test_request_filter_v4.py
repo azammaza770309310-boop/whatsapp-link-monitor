@@ -112,11 +112,15 @@ MANDATORY_SCRIPTS = {
     "التداول": _ai_json("REJECT", 0.98, "advertisement", "إعلان تداول"),
     "اكتمال جبت": _ai_json("REJECT", 0.96, "praise_testimonial", "مدح منصة بعد تجربة"),
     "افضل مدرس": _ai_json("REJECT", 0.88, "recommendation_or_opinion", "استطلاع رأي عام"),
-    # ✅ ACCEPT (طلب المُشغّل)
-    "تفاضل 1": _ai_json("ACCEPT", 0.93, "homework_execution_request", "طلب شخص يشرح له"),
+    # ✅ ACCEPT (طلب المُشغّل — v4.3.7: تنفيذ العمل بدلاً عن الطالب فقط)
+    "تفاضل 1": _ai_json("ACCEPT", 0.93, "homework_execution_request", "طلب شخص ينفّذ الواجب بدلاً عنه"),
     "يحل معي السؤال": _ai_json("ACCEPT", 0.91, "homework_execution_request", "طلب شخص يحل معه"),
-    "يعرف دكتور يشرح": _ai_json("ACCEPT", 0.90, "tutoring_request", "يبحث عن مدرس رياضيات"),
-    "مدرس خصوصي للمادة": _ai_json("ACCEPT", 0.92, "tutoring_request", "يريد مدرس خصوصي"),
+    "يسوي لي البحث": _ai_json("ACCEPT", 0.94, "homework_execution_request", "طلب تنفيذ البحث بدلاً عنه"),
+    "يخلص لي التقرير": _ai_json("ACCEPT", 0.92, "homework_execution_request", "طلب إنجاز التقرير بدلاً عنه"),
+    # ❌ REJECT — [v4.3.7] التدريس/الشرح لم يعد طلبًا مقبولاً (طلب المُشغّل)
+    "يعرف دكتور يشرح": _ai_json("REJECT", 0.95, "tutoring_only_request", "طلب تدريس وشرح وليس تنفيذًا للعمل بدلاً عنه"),
+    "مدرس خصوصي للمادة": _ai_json("REJECT", 0.94, "tutoring_only_request", "يبحث عن خصوصي وشرح"),
+    "أكواد لشخصيات": _ai_json("REJECT", 0.95, "non_academic_request", "طلب أكواد ألعاب غير أكاديمي"),
 }
 
 
@@ -215,18 +219,23 @@ def section_c():
           extract_json_text('القرار هو: {"decision":"REJECT"} شكرًا') == '{"decision":"REJECT"}')
 
     # validation
-    v = validate_ai_output({"decision": "ACCEPT", "confidence": 0.93, "category": "tutoring_request", "reason": "ok"})
+    v = validate_ai_output({"decision": "ACCEPT", "confidence": 0.93, "category": "homework_execution_request", "reason": "ok"})
     check("C4: ACCEPT صالح مع فئة ACCEPT", v is not None and v["decision"] == "ACCEPT")
-    v = validate_ai_output({"decision": "ACCEPT", "confidence": 1.7, "category": "tutoring_request", "reason": "ok"})
+    v = validate_ai_output({"decision": "ACCEPT", "confidence": 1.7, "category": "homework_execution_request", "reason": "ok"})
     check("C5: confidence يُقصّ إلى [0,1]", v is not None and v["confidence"] == 1.0)
-    v = validate_ai_output({"decision": "ACCEPT", "confidence": -5, "category": "tutoring_request", "reason": "ok"})
+    v = validate_ai_output({"decision": "ACCEPT", "confidence": -5, "category": "homework_execution_request", "reason": "ok"})
     check("C6: confidence سالب → 0.0", v is not None and v["confidence"] == 0.0)
     v = validate_ai_output({"decision": "MAYBE", "confidence": 0.9, "category": "x", "reason": "y"})
     check("C7: قرار غير معروف → invalid (None)", v is None)
     v = validate_ai_output({"decision": "ACCEPT", "confidence": 0.9, "category": "advertisement", "reason": "y"})
     check("C8: ACCEPT مع فئة REJECT → رفض تناقض (None)", v is None)
-    v = validate_ai_output({"decision": "REJECT", "confidence": 0.9, "category": "tutoring_request", "reason": "y"})
+    v = validate_ai_output({"decision": "REJECT", "confidence": 0.9, "category": "homework_execution_request", "reason": "y"})
     check("C9: REJECT مع فئة ACCEPT → رفض تناقض (None)", v is None)
+    # [v4.3.7] EXECUTION-ONLY: التدريس فئة REJECT صالحة الآن
+    v = validate_ai_output({"decision": "REJECT", "confidence": 0.95, "category": "tutoring_only_request", "reason": "y"})
+    check("C9b: REJECT مع tutoring_only_request → صالح (EXECUTION-ONLY)", v is not None and v["category"] == "tutoring_only_request")
+    v = validate_ai_output({"decision": "ACCEPT", "confidence": 0.95, "category": "tutoring_only_request", "reason": "y"})
+    check("C9c: ACCEPT مع tutoring_only_request → None (لا قبول للتدريس)", v is None)
     v = validate_ai_output({"decision": "REJECT", "confidence": "nan", "category": "other", "reason": "y"})
     check("C10: confidence NaN → 0.0", v is not None and v["confidence"] == 0.0)
     v = validate_ai_output("not a dict")
@@ -324,12 +333,15 @@ def section_e():
         "تعلم التداول واربح",
         "شكراً اكتمال جبت درجة عالية",
         "مين افضل مدرس؟",
-    ]
-    MANDATORY_ACCEPT = [
-        "أحد يشرح لي تفاضل 1",
-        "احتاج شخص يحل معي السؤال",
+        # [v4.3.7] التدريس/الشرح = REJECT (EXECUTION-ONLY)
         "مين يعرف دكتور يشرح رياضيات؟",
         "أبي مدرس خصوصي للمادة",
+    ]
+    MANDATORY_ACCEPT = [
+        "أحد يحل لي واجب تفاضل 1",
+        "احتاج شخص يحل معي السؤال",
+        "من يسوي لي البحث بدالي بمقابل",
+        "ابي أحد يخلص لي التقرير",
     ]
 
     async def run_e():
@@ -1121,7 +1133,7 @@ def section_l():
         async def transport(provider, payload):
             calls["n"] += 1
             return 200, json.dumps({"choices": [{"message": {"content":
-                _ai_json("ACCEPT", 0.99, "tutoring_request", "scripted-accept")}}]})
+                _ai_json("ACCEPT", 0.99, "homework_execution_request", "scripted-accept")}}]})
 
         cl = IntentClassifier(
             providers=[{"key": "k", "url": "u", "model": "m", "name": "P"}],
@@ -1178,7 +1190,7 @@ def section_m():
         async def transport(provider, payload):
             calls["n"] += 1
             return 200, json.dumps({"choices": [{"message": {"content":
-                _ai_json("ACCEPT", 0.99, "tutoring_request", "x")}}]})
+                _ai_json("ACCEPT", 0.99, "homework_execution_request", "x")}}]})
 
         cl = IntentClassifier(
             providers=[{"key": "k", "url": "u", "model": "m", "name": "P"}],
@@ -1376,7 +1388,7 @@ def section_n():
         # المزوّد يتعافى — نفس النص يجب أن يحصل على قرار AI حقيقي
         # (قديمًا: كان مسجّلًا في الـdedup → semantic_duplicate بلا قرار قط)
         cl_ok = make_scripted_classifier(
-            {"تفاضل": _ai_json("ACCEPT", 0.97, "tutoring_request", "طلب شرح مادة")})
+            {"تفاضل": _ai_json("ACCEPT", 0.97, "homework_execution_request", "طلب تنفيذ بدلاً عن الطالب")})
         ry = await analyze_request_v4("أحد يشرح لي تفاضل 1", cl_ok, deduper=dd)
         check("N6: النص ذاته بعد التعافي → قرار حقيقي (لا تلوث dedup)",
               ry.is_request is True,

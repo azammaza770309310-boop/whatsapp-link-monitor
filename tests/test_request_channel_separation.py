@@ -571,7 +571,8 @@ async def test_9_validate_does_not_require_rtc():
 # =====================================================================
 # Test 10: [PREMIUM-FORMAT-v4.3.6] تصميم متقن لتنبيه قناة الطلبات:
 #   - عنوان معلوماتي من فئة الـAI (📝 طلب حل وإنجاز واجب / 🎓 شرح)
-#   - سطر سبب الـAI التحريري (italic) + فواصل ━━━ + بطاقة معلومات
+#   - سطر سبب الـAI التحريري (italic) + بطاقة معلومات (بلا فواصل ━━━ —
+#     حُذفت بطلب المُشغّل v4.3.7: «الخطوط العرضية شيلها ما لها داعي»)
 #     (المرسل أولًا) + نص الطلب في اقتباسه الخاص + ذيل روابط/زر
 #   - تسميات البطاقة نفس تسميات قناة الروابط (المجموعة/المرسل/التاريخ)
 # =====================================================================
@@ -604,10 +605,10 @@ async def test_10_alert_format_matches_link_channel_style():
         record("10: editorial reason line (italic) under the title",
                '<i>طلب واجب صريح</i>' in alert,
                "reason subtitle missing")
-        # فاصلان (━━━) يفصلان العنوان/البطاقة/الذيل
-        record("10: two separator lines (━━━━) zoning the design",
-               alert.count('━━━━━━━━━━━━━━━━━━━') == 2,
-               f"SEP count={alert.count('━━━━━━━━━━━━━━━━━━━')} (expected 2)")
+        # [v4.3.7] الفواصل الأفقية حُذفت نهائيًا (طلب المُشغّل الصريح)
+        record("10: NO horizontal separators ━━━ (removed by operator request)",
+               '━' not in alert,
+               f"separator chars present — alert: {alert[:200]!r}")
 
         # [TASK-FORMAT-v4.3.4] خطوط المُشغّل المحذوفة تبقى محذوفة:
         record("10: alert does NOT have old header 'طلب مساعدة' (removed by operator)",
@@ -658,11 +659,16 @@ async def test_10_alert_format_matches_link_channel_style():
         #   - لا زر tg://user?id= إطلاقًا — كان يسبب خطأ «تنسيق الرابط غير
         #     معروف» في عملاء الموبايل (غير مدعوم هناك).
         kw = sm.calls[0]['kwargs']
-        record("10: NO broken tg://user?id button for usernameless sender (mobile-safe)",
+        record("10: NO broken tg://user?id BUTTON for usernameless sender (mobile-safe)",
                (kw.get('buttons') is None)
                or ('tg://user' not in str(
                    getattr((kw.get('buttons') or [[None]])[0][0], 'url', '') or '')),
                f"buttons kwarg: {kw.get('buttons')!r}")
+        # [v4.3.7] سطح النقر البديل: اسم المرسل text-mention (tg://user?id
+        # داخل النص — يفتح الملف في عملاء من يعرفه) جنبًا إلى جنب مع الجسر.
+        record("10: usernameless sender name is a clickable TEXT-MENTION (v4.3.7)",
+               'tg://user?id=42' in alert,
+               f"text-mention missing — alert: {alert[:260]!r}")
     finally:
         await conn.close()
         try: os.remove(db_path)
@@ -1084,13 +1090,22 @@ async def test_18_api_sender_resolution_fixes_username_and_button():
 # «Forwarded from <المرسل>» قابلة للنقر من أي عميل.
 # =====================================================================
 class FakeCaptureClient:
-    """يحاكي حساب الالتقاط (عضو المجموعة) — يسجّل عمليات الـforward."""
+    """يحاكي حساب الالتقاط (عضو المجموعة) — يسجّل عمليات الـforward.
+    [v4.3.7 Bridge v2] get_messages: الرسالة موجودة (id صحيح، ليست
+    خدمية) → الجسر يمضي للتوجيه. msg_exists=False → محذوفة (skip)."""
 
-    def __init__(self):
+    def __init__(self, msg_exists=True):
         self.forwarded = []
+        self.msg_exists = msg_exists
 
     def is_connected(self):
         return True
+
+    async def get_messages(self, entity, ids=None):
+        if not self.msg_exists:
+            return None
+        return types.SimpleNamespace(id=int(ids) if ids is not None else 0,
+                                     action=None)
 
     async def forward_messages(self, entity, messages, from_peer=None):
         self.forwarded.append((entity, messages, from_peer))
@@ -1124,6 +1139,11 @@ async def test_19_contact_bridge_forward_for_usernameless_sender():
         record("19: NO button for usernameless sender (tg://user removed)",
                kw.get('buttons') is None,
                f"buttons kwarg: {kw.get('buttons')!r}")
+        # [v4.3.7] سطح النقر البديل: اسم المرسل text-mention في التنبيه
+        alert = sm.calls[0]['alert']
+        record("19: usernameless sender name is clickable text-mention (v4.3.7)",
+               'tg://user?id=42' in alert,
+               f"text-mention missing — alert: {alert[:200]!r}")
 
         # الحلقة 1: حساب الالتقاط أرسل forward لـPM البوت (uid=999)
         record("19: hop-1 capture client forwarded original to bot PM (uid=999)",
@@ -1207,6 +1227,120 @@ async def test_20_quote_expandable_for_long_text():
         except: pass
 
 
+# =====================================================================
+# Test 21: [v4.3.7 EXECUTION-ONLY] طلب المُشغّل الصريح: «الطلبات اللي أبي
+# يسحبها: الطالب يطلب أحدًا أن يقوم بالعمل بدله». طلب التنفيذ → يُرسل؛
+# طلب التدريس/الشرح (كان المصدر الأول للرسائل غير المناسبة في الإنتاج)
+# → يُرفض ولا يصل القناة أبدًا.
+# =====================================================================
+def make_execution_only_classifier():
+    """scripted AI يحاكي سلوك الـSYSTEM_PROMPT الجديد (v4.3.7 EXECUTION-ONLY):
+    علامات التدريس/الشرح → REJECT tutoring_only_request؛ علامات التنفيذ
+    «بدلاً عن الطالب» → ACCEPT homework_execution_request."""
+    EXEC_MARKERS = ("يحل لي", "بدالي", "يسوي لي", "يخلص", "ينجز لي", "يكتب لي", "عني")
+    TUTOR_MARKERS = ("يشرح", "يعلمني", "خصوصي", "يدرسني", "مراجعة معي", "مدرس", "دكتور")
+
+    async def transport(provider, payload):
+        user_msg = payload["messages"][1]["content"]
+        inner = user_msg.split('"""')[-2] if '"""' in user_msg else user_msg
+        if any(m in inner for m in TUTOR_MARKERS):
+            content = _ai_json("REJECT", 0.95, "tutoring_only_request",
+                               "طلب تدريس وشرح وليس تنفيذًا للعمل بدلاً عنه")
+        elif any(m in inner for m in EXEC_MARKERS):
+            content = _ai_json("ACCEPT", 0.95, "homework_execution_request",
+                               "طلب صريح أن يقوم أحد بالعمل بدلاً عنه")
+        else:
+            content = _ai_json("REJECT", 0.9, "other", "ليس طلبًا")
+        return 200, _json.dumps({"choices": [{"message": {"content": content}}]})
+
+    return _IC(providers=[{"key": "k", "url": "u", "model": "mock-exec", "name": "Exec"}],
+               transport=transport)
+
+
+async def test_21_execution_only_tutoring_rejected():
+    print("\n--- Test 21: [v4.3.7 EXECUTION-ONLY] execution ACCEPT / tutoring REJECT ---")
+    prod_db, db_path, conn = await make_test_db()
+    try:
+        fm = make_monitor(prod_db)
+        fm.request_classifier = make_execution_only_classifier()
+
+        # (أ) طلب تنفيذ صريح «يقوم بالعمل بدله» → ACCEPT ويُرسل
+        ev1 = FakeNewMessageEvent(
+            "ابغى احد يحل لي الواجب كامل ويسلمه بدالي وادفع اللي ينبغي",
+            -1003333009, 330009, chat=FakeMegagroupChat(), sender=None)
+        await fm._on_user_message(ev1, '+TEST_SOURCE')
+        await drain_request_tasks(fm)
+        sm = fm.bot_client.send_message
+        record("21: execution request «يحل لي بدالي» → alert sent",
+               sm.call_count == 1, f"send count={sm.call_count}")
+        if sm.called:
+            alert = sm.calls[0]['alert']
+            record("21: execution alert title '📝 طلب حل وإنجاز واجب'",
+                   '📝 <b>طلب حل وإنجاز واجب</b>' in alert,
+                   f"title missing — {alert[:120]!r}")
+
+        # (ب) طلب تدريس/شرح → REJECT: لا تنبيه أبدًا (المصدر الأول
+        # للرسائل غير المناسبة — 15 رسالة في ساعة واحدة قبل الإصلاح)
+        sm.reset_mock()
+        ev2 = FakeNewMessageEvent(
+            "مين يعرف دكتور يشرح رياضيات؟ محتاج احد يعلمني تفاضل",
+            -1003333010, 330010, chat=FakeMegagroupChat(), sender=None)
+        await fm._on_user_message(ev2, '+TEST_SOURCE')
+        await drain_request_tasks(fm)
+        record("21: tutoring request «مين يشرح لي» → NO alert (rejected)",
+               sm.call_count == 0,
+               f"send count={sm.call_count} (tutoring must be rejected)")
+    finally:
+        await conn.close()
+        try: os.remove(db_path)
+        except: pass
+
+
+# =====================================================================
+# Test 22: [v4.3.7 Bridge v2] الرسالة الأصلية محذوفة قبل الجسر (طالب/
+# بوت مضاد) → تخطٍّ واضح بدل تحذير غامض، وsurface النقر = text-mention
+# داخل التنبيه (لا زر ولا forward).
+# =====================================================================
+async def test_22_bridge_v2_deleted_message_skip():
+    print("\n--- Test 22: [v4.3.7 Bridge v2] original deleted → clean skip, no forward ---")
+    prod_db, db_path, conn = await make_test_db()
+    try:
+        fm = make_monitor(prod_db)
+        cap = FakeCaptureClient(msg_exists=False)  # الرسالة محذوفة
+        fm.user_clients = {'+TEST_SOURCE': cap}
+        fm.bot_client.get_me = AsyncMock(
+            return_value=types.SimpleNamespace(id=999))
+        fm.bot_client.forward_messages = AsyncMock(
+            return_value=types.SimpleNamespace(id=556002))
+
+        ev = FakeNewMessageEvent(
+            "مين يحل لي واجب رياضيات؟ محتاج مساعدة عاجلة",
+            -1003333011, 330011, sender_id=42,
+            chat=FakeMegagroupChat(), sender=None)
+        await fm._on_user_message(ev, '+TEST_SOURCE')
+        await drain_request_tasks(fm)
+
+        sm = fm.bot_client.send_message
+        record("22: alert still sent (bridge failure never blocks the alert)",
+               sm.called, "send_message not called")
+        record("22: deleted original → NO forward attempt (hop-1 skipped)",
+               len(cap.forwarded) == 0,
+               f"forwarded={cap.forwarded!r}")
+        _fw = fm.bot_client.forward_messages
+        _aw = getattr(_fw, 'await_args_list', [])
+        record("22: bot hop-2 never called (bridge cleanly skipped)",
+               len(_aw) == 0, f"bot forward count={len(_aw)}")
+        if sm.called:
+            alert = sm.calls[0]['alert']
+            record("22: text-mention contact surface present in alert",
+                   'tg://user?id=42' in alert,
+                   f"text-mention missing — {alert[:200]!r}")
+    finally:
+        await conn.close()
+        try: os.remove(db_path)
+        except: pass
+
+
 async def main():
     print("=" * 70)
     print("Request Channel Separation Hardening — Test Suite [CHANNEL-SEPARATION]")
@@ -1238,6 +1372,8 @@ async def main():
     await test_18_api_sender_resolution_fixes_username_and_button()
     await test_19_contact_bridge_forward_for_usernameless_sender()
     await test_20_quote_expandable_for_long_text()
+    await test_21_execution_only_tutoring_rejected()
+    await test_22_bridge_v2_deleted_message_skip()
     print("\n" + "=" * 70)
     passed = sum(1 for r in RESULTS if r['passed'])
     failed = sum(1 for r in RESULTS if not r['passed'])
