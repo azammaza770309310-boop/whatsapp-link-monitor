@@ -3130,25 +3130,40 @@ class Monitor:
         # (ONE consolidated message, not N individual alerts).
         self._quiet_alerted: Dict[str, Dict] = {}
         self._quiet_source_task: Optional[asyncio.Task] = None
-        # محلل الذكاء الاصطناعي
+        # محلل الذكاء الاصطناعي (مسار الروابط فقط — معطّل افتراضيًا
+        # عبر AI_BATCH_MODE=true؛ تصنيف الطلبات لم يععد يستخدمه إطلاقًا)
         self.ai_analyzer = AIAnalyzer()
-        # ===== [REQUEST-FILTER v4.0] AI Intent Classifier (القرار الأساسي) =====
-        # نفس مزوّدي AIAnalyzer (OPENAI_API_KEY / AI_KEY_2..8 / AI_URL_i / AI_MODEL_i)
-        # — صفر إعداد إضافي على المُشغّل. لو لا مفاتيح: enabled=False وكل
-        # الرسائل تُرفض (ai_classifier_not_configured) — لا keyword fallback.
-        self.request_classifier = IntentClassifier(
-            timeout_s=getattr(self.config, 'request_filter_ai_timeout_s', 10.0),
-            max_attempts=getattr(self.config, 'request_filter_ai_max_attempts', 2),
-            max_chars=getattr(self.config, 'request_filter_ai_max_chars', 1200),
-            # [v4.1] Provider Health Manager knobs:
-            min_interval_s=getattr(self.config, 'request_filter_ai_min_interval_s', 1.05),
-            retry_rounds=getattr(self.config, 'request_filter_ai_retry_rounds', 3),
-            total_budget_s=getattr(self.config, 'request_filter_ai_total_budget_s', 40.0),
-            max_pending=getattr(self.config, 'request_filter_ai_max_pending', 64),
-            # [v4.2] fail-fast pool wait (لا حرق ميزانية داخل اصطفام المزوّدين)
-            pool_wait_budget_s=getattr(
-                self.config, 'request_filter_ai_pool_wait_budget_s', 4.0),
-        )
+        # ===== [REQUEST-FILTER v4.4.0 — AI-OFF] المُصنّف الحتمي =====
+        # طلب المُشغّل (2026-09-04): إلغاء الذكاء الاصطناعي من تصنيف الطلبات
+        # وإرجاع الفلتر — بنتيجة أقوى. الافتراضي الآن: محرّك قواعدي حتمي
+        # (rule_intent_classifier.RuleBasedIntentClassifier) — نفس واجهة
+        # IntentClassifier.classify() بالضبط (analyze_request_v4 لم يُمس).
+        # أقوى من الـAI هنا لأنه: حتمي 100% (لا تناقض بين الصيغ المتشابهة)،
+        # زمن قرار 0ms (كان 440ms-50s)، صفر نداءات شبكة (لا 429/مفاتيح
+        # ميتة/overloaded — ولا egress يحرق باندودث Render)، ومعاير على
+        # قائمة المُشغّل الحقيقية 18/18 + 26 حالة رفض إنتاجية.
+        # إعادة تمكين الـAI (اختياري): REQUEST_AI_ENABLED=true.
+        _request_ai_on = os.getenv(
+            "REQUEST_AI_ENABLED", "false").lower() in ("true", "1", "yes")
+        if _request_ai_on:
+            self.request_classifier = IntentClassifier(
+                timeout_s=getattr(self.config, 'request_filter_ai_timeout_s', 10.0),
+                max_attempts=getattr(self.config, 'request_filter_ai_max_attempts', 2),
+                max_chars=getattr(self.config, 'request_filter_ai_max_chars', 1200),
+                min_interval_s=getattr(self.config, 'request_filter_ai_min_interval_s', 1.05),
+                retry_rounds=getattr(self.config, 'request_filter_ai_retry_rounds', 3),
+                total_budget_s=getattr(self.config, 'request_filter_ai_total_budget_s', 40.0),
+                max_pending=getattr(self.config, 'request_filter_ai_max_pending', 64),
+                pool_wait_budget_s=getattr(
+                    self.config, 'request_filter_ai_pool_wait_budget_s', 4.0),
+            )
+        else:
+            from rule_intent_classifier import RuleBasedIntentClassifier
+            self.request_classifier = RuleBasedIntentClassifier()
+            logging.info(
+                "[REQUEST-FILTER] AI classification OFF (operator request) — "
+                "deterministic rule engine active: rule-v4.4.0. "
+                "Re-enable AI: REQUEST_AI_ENABLED=true")
         # [STAGE 4/5] lazy-init في _handle_request_path (نمط lazy المتّبع هناك):
         #   self._request_semantic_deduper / self._request_decision_logger
         self._startup_scan_done: Set[str] = set()
@@ -4323,11 +4338,13 @@ class Monitor:
         asyncio.create_task(_runner())
 
     async def _reconcile_chat_after_delete_miss(self, chat_id: int, hint_phone: str = None):
-        """بعد DELETE-MISS: اسحب آخر 50 رسالة من الشات لالتقاط أي رسائل أخرى
+        """بعد DELETE-MISS: اسحب آخر رسائل الشات لالتقاط أي رسائل أخرى
         فاتتنا (فجوة أحداث). الرسالة المحذوفة نفسها لا يمكن استرجاعها
         (Telegram حذفها نهائيًا) — لكن الرسائل الأخوات الفائتة يمكن التقاطها.
-        [FIX-FAST-CAPTURE] رُفع الحد من 15 إلى 50 رسالة لالتقاط نطاق أوسع
-        من الرسائل الأخوات الفائتة تحت الضغط العالي (فجوات أحداث أطول)."""
+        [v4.4.0 BANDWIDTH] الحد عبر RECONCILE_LIMIT (افتراضي 15 — كان 50):
+        كل دورة reconcile هي نداء get_messages كبير (ردّه ingress مجاني
+        لكن الطلب نفسه egress) + معالجة. 15 كافية للفجوات النموذجية،
+        والفجوات الأعمق يغطيها PollingScheduler دوريًا بلا حاجة عاصفة."""
         reader = hint_phone
         client = self.user_clients.get(reader) if reader else None
         used_registry = False
@@ -4345,7 +4362,12 @@ class Monitor:
             logging.debug(f"[RECONCILE] no available reader for chat={chat_id}")
             return
         try:
-            messages = await client.get_messages(chat_id, limit=50)
+            # [v4.4.0 BANDWIDTH] سقف قابل للضبط — افتراضي 15 (كان 50)
+            try:
+                _reconcile_limit = max(1, int(os.getenv("RECONCILE_LIMIT", "15")))
+            except (ValueError, TypeError):
+                _reconcile_limit = 15
+            messages = await client.get_messages(chat_id, limit=_reconcile_limit)
             recovered = 0
             for msg in messages:
                 if not msg or not msg.raw_text or msg.out:
@@ -5614,14 +5636,25 @@ class Monitor:
                     # rows in unspecified order and a 500-row LIMIT could
                     # repeatedly snapshot the same NEW rows while OLD ones
                     # never make it.
+                    # [v4.4.0 BANDWIDTH — high-water mark] المشخّص الجذري
+                    # لتسريع الاستهلاك: الحلقة كانت تعيد POST نفس أقدم 500
+                    # صف pending كل 30 ثانية إلى الأبد (الصفوف لا تُنهى
+                    # حالتها) — مئات MB egress يوميًا بلا فائدة (Supabase
+                    # عنده النسخة أصلًا). الآن: علامة ماء عليا — كل دورة
+                    # ترسل الصفوف الجديدة فقط (received_at > آخر نقطة ناجحة).
+                    # إعادة التشغيل تعيد الإرسال مرة واحدة (idempotent —
+                    # INSERT OR IGNORE في الجهة الأخرى).
+                    _hw = getattr(self, '_journal_snapshot_hw', None)
                     cursor = await conn.execute(
                         """SELECT chat_id, msg_id, raw_text, source_phone, chat_title,
                                   chat_username, chat_link_type, sender_id, sender_name,
                                   state, received_at
                            FROM message_journal
                            WHERE state IN ('pending','no_text','delete_miss')
+                             AND (? IS NULL OR received_at > ?)
                            ORDER BY received_at ASC
-                           LIMIT 500""")
+                           LIMIT 500""",
+                        (_hw, _hw))
                     rows = await cursor.fetchall()
                     if not rows:
                         await asyncio.sleep(30)
@@ -5650,6 +5683,22 @@ class Monitor:
                         json=batch,
                         timeout=snap_timeout,
                     ) as resp:
+                        if resp.status in (200, 201, 204):
+                            # [v4.4.0] نجاح — قدّم علامة الماء العليا:
+                            # الدورة القادمة ترسل الجديد فقط.
+                            try:
+                                _max_ra = max((r['received_at'] or '') for r in batch)
+                                if _max_ra:
+                                    self._journal_snapshot_hw = _max_ra
+                                    self._journal_snapshot_sent = (
+                                        getattr(self, '_journal_snapshot_sent', 0)
+                                        + len(batch))
+                                    logging.debug(
+                                        f"[JOURNAL-SNAPSHOT] high-water → {_max_ra} "
+                                        f"(total sent this lifetime: "
+                                        f"{self._journal_snapshot_sent})")
+                            except Exception:
+                                pass
                         if resp.status not in (200, 201, 204):
                             body = await resp.text()
                             # [Task 3a / point 9] explicit 429 backoff (mirrors
@@ -6555,15 +6604,17 @@ class Monitor:
             internal_id = str(chat_id).replace('-100', '')
             message_link = f"https://t.me/c/{internal_id}/{msg_id}"
 
-        # --- [PREMIUM-FORMAT-v4.3.6] تصميم متقن لتنبيه قناة الطلبات ---
-        # البنية (من أعلى لأسفل):
-        #   1) عنوان من فئة الـAI (🎓 شرح/📝 واجب) — معلوماتي لكل رسالة
-        #   2) سطر سبب تحريري (سبب الـAI بالعربية — مختصر)
-        #   3) فاصل ━━━ + بطاقة معلومات: المرسل أولًا (الأهم للتواصل)
-        #   ثم المجموعة ثم التاريخ + فاصل
-        #   4) نص الطلب داخل اقتباس مستقل — قابل للتوسيع للنصوص الطويلة
-        #   5) ذيل: رابط الرسالة الأصلية + زر «مراسلة»
-        # حذف «الكلمات» — حقول legacy فارغة في وضع AI (كانت تظهر سطرًا فارغًا
+        # --- [PREMIUM-FORMAT-v4.4.0 — AI-TEXT REMOVED] طلب المُشغّل ---
+        # حُذف نهائيًا من أعلى التنبيه: (1) عنوان فئة التصنيف (📝/🛠️)
+        # و(2) سطر سبب الـAI المائل — «النص اللي يكتبه الذكاء الاصطناعي
+        # في أعلى الرسالة». البنية الآن تبدأ مباشرة ببطاقة المعلومات:
+        #   1) بطاقة معلومات: المرسل أولًا (الأهم للتواصل) ثم المجموعة
+        #   ثم التاريخ
+        #   2) نص الطلب داخل اقتباس مستقل — قابل للتوسيع للنصوص الطويلة
+        #   3) ذيل: رابط الرسالة الأصلية + زر «مراسلة»
+        # الفئة/السبب يبقيان في السجلات وfilter_decisions (تشخيص فقط) —
+        # لا مكان لهما في مظهر القناة.
+        # حذف «الكلمات» — حقول legacy فارغة (كانت تظهر سطرًا فارغًا
         # في الإنتاج). كل قيمة من المستخدم HTML-escaped لمنع الحقن.
         safe_text = html_module.escape(str(raw_text)[:1500])
         if len(raw_text) > 1500:
@@ -6584,26 +6635,6 @@ class Monitor:
             (analysis.matched_intents + analysis.matched_services
              + analysis.matched_patterns)[:5]
         )
-
-        # [v4.3.7 EXECUTION-ONLY / v4.3.9 فئتان] فئتا القبول بعد إصلاح
-        # المُشغّل: «الطالب يطلب أحدًا يقوم بالعمل بدله» (أكاديمي) أو
-        # «خدمة طلابية تنفَّذ بدله» (CV/جدول/عذر/فيديو). طلبات التدريس/
-        # الشرح تُرفض في المصنّف (tutoring_only_request) — لا تصل هنا أبدًا.
-        _cat = str(getattr(analysis, 'intent_type', '') or '')
-        if _cat == 'homework_execution_request':
-            title_line = '📝 <b>طلب حل وإنجاز واجب</b>'
-        elif _cat == 'student_service_execution_request':
-            # [v4.3.9] خدمات طلابية: CV/ATS، بناء جدول، عذر، فيديو/تصميم
-            title_line = '🛠️ <b>طلب خدمة طلابية</b>'
-        else:
-            title_line = '📩 <b>طلب أكاديمي</b>'
-
-        # السطر التحريري: سبب الـAI إن كان عربيًا ومختصرًا (فئات النظام
-        # مثل low_confidence إنجليزية → تُهمل — لا مكان لها في مظهر القناة)
-        _reason = str(getattr(analysis, 'reason', '') or '').strip()
-        _reason_ar = _reason if (_reason and any(
-            '\u0600' <= ch <= '\u06FF' for ch in _reason)
-            and len(_reason) <= 90) else ''
 
         # [STYLE-MATCH] التاريخ بنفس صيغة قناة الروابط: %Y-%m-%d %H:%M
         try:
@@ -6635,10 +6666,9 @@ class Monitor:
         _quote_open = ('blockquote expandable'
                       if len(raw_text) > 300 else 'blockquote')
 
-        alert = title_line + "\n"
-        if _reason_ar:
-            alert += f'<i>{html_module.escape(_reason_ar)}</i>\n'
-        alert += sender_line + "\n"
+        # [v4.4.0] التنبيه يبدأ مباشرة ببطاقة المعلومات — بلا عنوان
+        # فئة وبلا سطر سبب (طلبا المُشغّل معًا في نفس الرسالة).
+        alert = sender_line + "\n"
         alert += f"👥 <b>المجموعة:</b> {safe_chat}\n"
         alert += f"🕒 <b>التاريخ:</b> {html_module.escape(date_str)}\n"
         alert += "💬 <b>نص الطلب:</b>\n"

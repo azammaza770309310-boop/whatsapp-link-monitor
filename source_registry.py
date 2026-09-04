@@ -483,15 +483,18 @@ class PollingScheduler:
     - FloodWait handled dynamically: record_floodwait + delay next_poll_at
     """
 
-    # [SPEED-v4.3.4] طلب المُشغّل «أقصى سرعة التقاط — حتى لو مع مخاطرة»:
-    # الطبقات أسرع 2.5x (قابلة للضبط عبر POLL_TIER_*_S دون نشر جديد).
-    # الحماية الفعلية ليست هنا بل في RateLimiter('polling') + FloodWaitManager
-    # (أي تجاوز لحدود Telegram يُسجّل فلوّيت ويؤجّل الجدولة تلقائيًا).
+    # [v4.4.0 BANDWIDTH-LEAN] خُفّضت الفترات 10x تقريبًا (طلب بقاء Render):
+    # الالتقاط الأساسي للطلبات هو NewMessage events (لحظي — لا يعتمد على
+    # الـpolling إطلاقًا). الـpolling شبكة أمان للرسائل المحذوفة سريعًا فقط:
+    # hot 4s→45s / active 12s→120s / cool 45s→300s / cold 240s→900s.
+    # (قابلة للضبط عبر POLL_TIER_*_S دون نشر جديد — لو أراد المُشغّل
+    # استعادة سرعة v4.3.4: 4/12/45/240.)
+    # الحماية الفعلية تبقى في RateLimiter('polling') + FloodWaitManager.
     TIERS = {
-        'hot':    {'max_age_min': 5,    'poll_interval_s': float(os.getenv('POLL_TIER_HOT_S', '4'))},
-        'active': {'max_age_min': 60,   'poll_interval_s': float(os.getenv('POLL_TIER_ACTIVE_S', '12'))},
-        'cool':   {'max_age_min': 1440, 'poll_interval_s': float(os.getenv('POLL_TIER_COOL_S', '45'))},
-        'cold':   {'max_age_min': None, 'poll_interval_s': float(os.getenv('POLL_TIER_COLD_S', '240'))},
+        'hot':    {'max_age_min': 5,    'poll_interval_s': float(os.getenv('POLL_TIER_HOT_S', '45'))},
+        'active': {'max_age_min': 60,   'poll_interval_s': float(os.getenv('POLL_TIER_ACTIVE_S', '120'))},
+        'cool':   {'max_age_min': 1440, 'poll_interval_s': float(os.getenv('POLL_TIER_COOL_S', '300'))},
+        'cold':   {'max_age_min': None, 'poll_interval_s': float(os.getenv('POLL_TIER_COLD_S', '900'))},
     }
 
     BATCH_SIZE = int(os.getenv('POLL_BATCH_SIZE', '30'))

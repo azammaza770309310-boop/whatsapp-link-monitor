@@ -855,9 +855,11 @@ async def test_P():
         record(f"P: PollingScheduler.MAX_CONCURRENT_POLLS == {_exp_conc}",
                PollingScheduler.MAX_CONCURRENT_POLLS == _exp_conc,
                f"got {PollingScheduler.MAX_CONCURRENT_POLLS}")
-        # [SPEED-v4.3.4] الطبقات أسرع — الافتراضي الجديد
-        _exp_hot = float(_os.getenv('POLL_TIER_HOT_S', '4'))
-        record(f"P: hot tier interval == {_exp_hot}s (was 10s — max capture speed)",
+        # [v4.4.0 BANDWIDTH-LEAN] الطبقات أخف (بقاء على Render — الطلب يُلتقط
+        # لحظيًا عبر NewMessage؛ الـpolling مجرد شبكة أمان): hot 4s→45s
+        # (استعادة سرعة v4.3.4 عبر POLL_TIER_HOT_S=4)
+        _exp_hot = float(_os.getenv('POLL_TIER_HOT_S', '45'))
+        record(f"P: hot tier interval == {_exp_hot}s (v4.4.0 lean default)",
                PollingScheduler.TIERS['hot']['poll_interval_s'] == _exp_hot,
                f"got {PollingScheduler.TIERS['hot']['poll_interval_s']}")
     except Exception as e:

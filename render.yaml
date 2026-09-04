@@ -67,7 +67,25 @@ services:
       - key: OPENAI_API_KEY
         sync: false
       - key: AI_BATCH_MODE
-        value: "true"  # true = تخطّي AI للسرعة | false = فحص كامل
+        value: "true"
+      # === [AI-OFF-v4.4.0] طلب المُشغّل: إلغاء AI من تصنيف الطلبات —
+      # محرّك قواعدي حتمي (rule_intent_classifier) هو الافتراضي.
+      # إعادة تمكين AI للطلبات (اختياري): "true". ===
+      - key: REQUEST_AI_ENABLED
+        value: "false"
+      # === [v4.4.0 BANDWIDTH-LEAN] فترات polling أخف (بقاء على Render):
+      # الطلب يُلتقط لحظيًا عبر NewMessage؛ الـpolling شبكة أمان فقط.
+      # استعادة سرعة v4.3.4: 4 / 12 / 45 / 240 ===
+      - key: POLL_TIER_HOT_S
+        value: "45"
+      - key: POLL_TIER_ACTIVE_S
+        value: "120"
+      - key: POLL_TIER_COOL_S
+        value: "300"
+      - key: POLL_TIER_COLD_S
+        value: "900"
+      - key: RECONCILE_LIMIT
+        value: "15"  # true = تخطّي AI للسرعة | false = فحص كامل
       # === [N07] AI_DRAIN_ENABLED — opt-in background drainer for the
       # ai_pending backlog (26,475 pending links in production). Default
       # false: batch mode intentionally skips AI on the hot path; flipping

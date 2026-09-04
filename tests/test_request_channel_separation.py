@@ -595,16 +595,21 @@ async def test_10_alert_format_matches_link_channel_style():
             return
         alert = sm.calls[0]['alert']
 
-        # [PREMIUM-FORMAT-v4.3.6] العنوان من فئة الـAI (معلوماتي — ليس الهيدر
-        # القديم الثابت «طلب مساعدة» الذي حذفه المُشغّل):
-        # mock يرجع homework_execution_request → 📝 طلب حل وإنجاز واجب
-        record("10: title derived from AI category '📝 طلب حل وإنجاز واجب'",
-               '📝 <b>طلب حل وإنجاز واجب</b>' in alert,
-               f"title missing — alert head: {alert[:150]!r}")
-        # السطر التحريري: سبب الـAI بالعربية (italic) تحت العنوان
-        record("10: editorial reason line (italic) under the title",
-               '<i>طلب واجب صريح</i>' in alert,
-               "reason subtitle missing")
+        # [v4.4.0 AI-TEXT-REMOVED] طلب المُشغّل: نص التصنيف أعلى التنبيه
+        # (عنوان الفئة + سطر سبب الـAI المائل) حُذف نهائيًا — التنبيه
+        # يبدأ مباشرة ببطاقة المعلومات (المرسل أولًا).
+        record("10: [v4.4.0] NO AI title '📝 طلب حل وإنجاز واجب' (removed by operator)",
+               '📝 <b>طلب حل وإنجاز واجب</b>' not in alert,
+               f"AI title still present — alert head: {alert[:150]!r}")
+        record("10: [v4.4.0] NO AI category title '🛠️ طلب خدمة طلابية'",
+               '🛠️ <b>طلب خدمة طلابية</b>' not in alert,
+               "service title present")
+        record("10: [v4.4.0] NO AI reason line (italic editorial removed)",
+               '<i>طلب واجب صريح</i>' not in alert and not alert.lstrip().startswith('<i>'),
+               "AI reason subtitle still present")
+        record("10: [v4.4.0] alert starts directly with sender card (👤 first line)",
+               alert.startswith('👤 <b>المرسل:</b>'),
+               f"alert head: {alert[:80]!r}")
         # [v4.3.7] الفواصل الأفقية حُذفت نهائيًا (طلب المُشغّل الصريح)
         record("10: NO horizontal separators ━━━ (removed by operator request)",
                '━' not in alert,
@@ -1269,9 +1274,10 @@ async def test_21_execution_only_tutoring_rejected():
                sm.call_count == 1, f"send count={sm.call_count}")
         if sm.called:
             alert = sm.calls[0]['alert']
-            record("21: execution alert title '📝 طلب حل وإنجاز واجب'",
-                   '📝 <b>طلب حل وإنجاز واجب</b>' in alert,
-                   f"title missing — {alert[:120]!r}")
+            record("21: [v4.4.0] execution alert has NO AI title (clean card)",
+                   '📝 <b>طلب حل وإنجاز واجب</b>' not in alert
+                   and alert.startswith('👤 <b>المرسل:</b>'),
+                   f"AI title present / wrong head — {alert[:120]!r}")
 
         # (ب) طلب تدريس/شرح → REJECT: لا تنبيه أبدًا (المصدر الأول
         # للرسائل غير المناسبة — 15 رسالة في ساعة واحدة قبل الإصلاح)
@@ -1455,9 +1461,10 @@ async def test_24_delegation_dialect_and_student_services():
                sm.call_count == 1, f"send count={sm.call_count}")
         if sm.called:
             alert = sm.calls[0]['alert']
-            record("24: homework title '📝 طلب حل وإنجاز واجب'",
-                   '📝 <b>طلب حل وإنجاز واجب</b>' in alert,
-                   f"title missing — {alert[:120]!r}")
+            record("24: [v4.4.0] homework alert clean (NO AI title, sender first)",
+                   '📝 <b>طلب حل وإنجاز واجب</b>' not in alert
+                   and alert.startswith('👤 <b>المرسل:</b>'),
+                   f"AI title present / wrong head — {alert[:120]!r}")
 
         # (ب) خدمة طلابية (جدول) → فئة student_service + عنوانها الجديد
         sm.reset_mock()
@@ -1470,12 +1477,11 @@ async def test_24_delegation_dialect_and_student_services():
                sm.call_count == 1, f"send count={sm.call_count}")
         if sm.called:
             alert2 = sm.calls[0]['alert']
-            record("24: service title '🛠️ طلب خدمة طلابية' (new v4.3.9 category)",
-                   '🛠️ <b>طلب خدمة طلابية</b>' in alert2,
-                   f"title missing — {alert2[:120]!r}")
-            record("24: service alert NOT mislabeled as homework title",
-                   '📝 <b>طلب حل وإنجاز واجب</b>' not in alert2,
-                   f"wrong title — {alert2[:120]!r}")
+            record("24: [v4.4.0] service alert clean (NO titles, sender first)",
+                   '🛠️ <b>طلب خدمة طلابية</b>' not in alert2
+                   and '📝 <b>طلب حل وإنجاز واجب</b>' not in alert2
+                   and alert2.startswith('👤 <b>المرسل:</b>'),
+                   f"AI title present / wrong head — {alert2[:120]!r}")
 
         # (ج) CV بخدمة الطلاب (من قائمة المُشغّل الحقيقية)
         sm.reset_mock()
@@ -1487,9 +1493,9 @@ async def test_24_delegation_dialect_and_student_services():
         record("24: «يسوي cv» (operator list) → alert sent (student service)",
                sm.call_count == 1, f"send count={sm.call_count}")
         if sm.called:
-            record("24: cv alert has service title",
-                   '🛠️ <b>طلب خدمة طلابية</b>' in sm.calls[0]['alert'],
-                   f"title missing — {sm.calls[0]['alert'][:120]!r}")
+            record("24: [v4.4.0] cv alert clean (NO AI titles)",
+                   '🛠️ <b>طلب خدمة طلابية</b>' not in sm.calls[0]['alert'],
+                   f"AI title still present — {sm.calls[0]['alert'][:120]!r}")
 
         # (د) لا انحدار: التدريس/الشرح يُرفض رغم توسيع القبول
         sm.reset_mock()
