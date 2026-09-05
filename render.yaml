@@ -4,7 +4,10 @@
 # Render سيقرأ هذا الملف تلقائياً عند النشر.
 
 services:
-  - type: worker
+  # [RENDER-MIGRATION-v4.4.1] type: web (كان worker) — Web Service مثل
+  # النشر الأصلي: يمنح رابطًا عامًا /ready + RENDER_EXTERNAL_URL لنبض
+  # الإبقاء (خطة free تنام بعد 15 دقيقة بلا دخول — البوت ينبض كل 10 دقائق).
+  - type: web
     name: whatsapp-link-monitor
     runtime: python
     region: oregon  # أو frankfurt حسب الأقرب لمستخدميك
@@ -36,10 +39,11 @@ services:
       # يحلّ مشكلة الـ15,000 رسالة الكاذبة (الفلتر القديم بـ300 كلمة +
       # مطابقة substring ساذجة على «مشروع»/«واجب»/«بحث» وحدها).
       #
-      # KILL SWITCH (default false): لا يُرسل أي طلب إطلاقًا حتى يتأكد
-      # المُشغّل. مرّن بـtrue عند الجاهزية. مسار الروابط يستمر طبيعيًا.
+      # KILL SWITCH — افتراضي الكود false (أمان أول نشر). هنا في الـ
+      # Blueprint مضبوط true لأن المُشغّل أكّد الجاهزية منذ v4.3.6
+      # (التنبيهات هي الغرض الأساس من الأداة).
       - key: REQUEST_FILTER_ENABLED
-        value: "false"
+        value: "true"
       # RATE LIMIT (global): ACCEPT/minute. default محافظ 20.
       - key: REQUEST_FILTER_MAX_PER_MINUTE
         value: "20"
@@ -131,9 +135,7 @@ services:
       # in the background). Set to empty/None to disable.
       - key: STARTUP_SCAN_DAYS
         value: "7"
-      # === Render يضبط PORT تلقائياً ===
-      - key: PORT
-        value: "10000"
+      # === Render يضبط PORT تلقائياً لخدمات web — لا يُعرَّف هنا ===
       - key: PYTHON_VERSION
         value: "3.11.9"
       # === [B01] DATA_DIR — MUST point to a persistent Render Disk (attach a
