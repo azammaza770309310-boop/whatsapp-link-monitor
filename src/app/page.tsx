@@ -20,7 +20,8 @@ import {
   ExternalLink,
   Phone,
   MapPin,
-  Clock
+  Clock,
+  AlertCircle
 } from 'lucide-react'
 
 // أنواع البيانات
@@ -50,6 +51,8 @@ export default function Home() {
   const [loading, setLoading] = useState(true)
   const [searchQuery, setSearchQuery] = useState('')
   const [activeTab, setActiveTab] = useState('all')
+  // [v4.4.3] أخطاء الاتصال مرئية — بدل السقوط الصامت لبيانات تجريبية
+  const [connError, setConnError] = useState<string | null>(null)
 
   // جلب البيانات
   const fetchLinks = async () => {
@@ -60,7 +63,8 @@ export default function Home() {
       const supabaseKey = process.env.NEXT_PUBLIC_SUPABASE_KEY
       
       if (!supabaseUrl || !supabaseKey) {
-        // بيانات تجريبية للعرض
+        // بيانات تجريبية للعرض — مع تنبيه مرئي (كانت صامتة سابقًا)
+        setConnError('متغيرات البيئة ناقصة: NEXT_PUBLIC_SUPABASE_URL و NEXT_PUBLIC_SUPABASE_KEY — البيانات المعروضة الآن تجريبية وليست حقيقية')
         setLinks(mockLinks)
         setStats(mockStats)
         setLoading(false)
@@ -73,11 +77,16 @@ export default function Home() {
           'Authorization': `Bearer ${supabaseKey}`
         }
       })
+      if (!response.ok) {
+        throw new Error(`HTTP ${response.status}`)
+      }
       const data = await response.json()
       setLinks(data || [])
+      setConnError(null)
       setLoading(false)
     } catch (error) {
       console.error('Fetch error:', error)
+      setConnError('تعذّر الاتصال بقاعدة البيانات (Supabase) — تحقق من الرابط والمفتاح في متغيرات البيئة ثم أعد النشر')
       setLinks(mockLinks)
       setStats(mockStats)
       setLoading(false)
@@ -181,6 +190,23 @@ export default function Home() {
             نظام سحب روابط واتساب وتيليجرام من المجموعات الجامعية
           </p>
         </motion.div>
+
+        {/* [v4.4.3] تنبيه مرئي عند فقد الاتصال — بدل السقوط الصامت للبيانات التجريبية */}
+        {connError && (
+          <motion.div
+            initial={{ opacity: 0, y: -10 }}
+            animate={{ opacity: 1, y: 0 }}
+            className="mb-6 rounded-lg border border-amber-500/40 bg-amber-500/10 p-4 flex items-start gap-3"
+            role="alert"
+          >
+            <AlertCircle className="w-5 h-5 text-amber-400 shrink-0 mt-0.5" />
+            <div>
+              <p className="text-amber-300 font-semibold text-sm mb-1">تعذّر الاتصال بقاعدة البيانات</p>
+              <p className="text-amber-200/70 text-xs leading-relaxed">{connError}</p>
+              <p className="text-slate-400 text-xs mt-2">الإصلاح: Vercel ← Settings ← Environment Variables ← أضف NEXT_PUBLIC_SUPABASE_URL و NEXT_PUBLIC_SUPABASE_KEY (نفس قيم خدمة Render) ← ثم Redeploy</p>
+            </div>
+          </motion.div>
+        )}
 
         {/* بطاقات الإحصائيات */}
         <motion.div 
