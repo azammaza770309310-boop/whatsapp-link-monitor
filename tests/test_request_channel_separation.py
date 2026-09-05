@@ -257,6 +257,9 @@ def make_monitor(prod_db, channel_id=-1001234567890,
         '_dispatch_request_path',
         # [REQ-DELETED-MARK-v4.4.6] تسجيل التنبيهات للتعليم عند حذف الأصل
         '_register_request_alert', '_mark_request_alert_deleted',
+        # [MENTION-BRIDGE-v4.4.7] جسر التواصل للطلبات بلا username
+        '_mention_bridge_seed', '_mention_bridge_relay',
+        '_relay_and_register_request_alert',
     ):
         setattr(fm, method_name,
                 types.MethodType(getattr(bot.Monitor, method_name), fm))
@@ -1156,18 +1159,26 @@ async def test_19_usernameless_text_mention_only_no_bridge():
                f"text-mention missing — alert: {alert[:200]!r}")
 
         # [v4.3.8] الجسر محذوف: صفر توجيه من حساب الالتقاط (لا PM للبوت)
-        record("19: ZERO forwards from capture client (bridge removed v4.3.8)",
+        record("19: ZERO forwards from capture client (bot has no username → seed aborts)",
                len(cap.forwarded) == 0,
-               f"cap.forwarded={cap.forwarded!r} — bridge must be gone")
+               f"cap.forwarded={cap.forwarded!r}")
         # وصفر توجيه من البوت إلى القناة
         _aw = getattr(fm.bot_client.forward_messages, 'await_args_list', [])
-        record("19: ZERO bot forwards to channel (bridge removed v4.3.8)",
+        record("19: ZERO bot forwards to channel (bot has no username → seed aborts)",
                len(_aw) == 0,
                f"bot forward await count: {len(_aw)}")
-        # get_me كانت طلب الجسر الأول — لم تعد تُستدعى في مسار الطلب
-        record("19: bot_client.get_me not called (bridge-only call removed)",
-               fm.bot_client.get_me.await_count == 0,
-               f"get_me await count: {fm.bot_client.get_me.await_count}")
+        # [v4.3.8→v4.4.7] get_me مسموح الآن (جلب هوية البوت لوجهة الجسر
+        # الجديد MENTION-BRIDGE) — لكن الجسر القديم كان يجمع (get_me +
+        # get_messages + رد الترحيب): هذه الأخيرة محذوفة نهائيًا.
+        record("19: old-bridge get_messages probing never happens",
+               cap.get_messages_calls == 0,
+               f"get_messages calls: {cap.get_messages_calls}")
+        # [MENTION-BRIDGE-v4.4.7] بوت بلا username → الجسر يجهض بعد هوية
+        # البوت → التلميح الصادق (لا وعد ميت)
+        alert_tail = alert[-260:]
+        record("19: honest hint when bridge aborts (no bot username)",
+               'قد لا يستجيب للضغط' in alert_tail,
+               f"hint tail: {alert_tail!r}")
     finally:
         await conn.close()
         try: os.remove(db_path)
@@ -1620,11 +1631,13 @@ async def test_25_delete_marks_request_alert_with_contact_guidance():
                    'عرض الرسالة الأصلية' in str(entry.get('text')),
                    "original alert text not stored")
 
-        # (ب) [CONTACT-HINT] مرسل بلا username → تلميح التواصل في التنبيه
+        # (ب) [CONTACT-HINT→v4.4.7] مرسل بلا username وبلا جسر (user_clients
+        # فارغة) → تلميح صادق يشرح قيد تلغرام (لا وعد ميت باسم قابل للنقر)
         alert = send_id_mock.calls[0]['alert']
-        record("25: [CONTACT-HINT] usernameless alert carries contact guidance",
-               'للتواصل: اضغط اسم المُرسِل أعلاه' in alert,
-               f"hint missing — tail: {alert[-160:]!r}")
+        record("25: [CONTACT-HINT] usernameless+bridgeless alert carries honest hint",
+               'للتواصل: المُرسِل بلا username' in alert
+               and 'قد لا يستجيب للضغط' in alert,
+               f"honest hint missing — tail: {alert[-200:]!r}")
 
         # (ج) حذف الرسالة الأصلية → التعليم فورًا (⚠️ + توجيه التواصل)
         await fm._on_message_deleted(FakeDeleteEvent25([msg_id], chat),
@@ -1642,9 +1655,10 @@ async def test_25_delete_marks_request_alert_with_contact_guidance():
             record("25: marked text carries ⚠️ deletion notice",
                    'حُذفت الرسالة الأصلية' in marked,
                    f"no deletion marker — tail: {marked[-200:]!r}")
-            record("25: marked text redirects to contact path (اضغط اسمه)",
-                   'اضغط اسمه' in marked,
-                   f"no contact guidance — tail: {marked[-200:]!r}")
+            # [v4.4.7] بلا جسر وبلا username → نص صادق (لا وعد باسم ميت)
+            record("25: marked text honest about no contact path",
+                   'لم يبقَ مسار تواصل تلقائي' in marked,
+                   f"no honest guidance — tail: {marked[-200:]!r}")
             record("25: marked text preserves the full original alert",
                    'عرض الرسالة الأصلية' in marked and 'بربوينت' in marked,
                    "original alert content lost in edit")
@@ -1741,12 +1755,222 @@ async def main():
     await test_23_private_handler_ignores_forwards()
     await test_24_delegation_dialect_and_student_services()
     await test_25_delete_marks_request_alert_with_contact_guidance()
+    await test_26_mention_bridge_seed_relay_and_hint()
+    await test_27_mention_bridge_relay_failure_deletion_retry()
     print("\n" + "=" * 70)
     passed = sum(1 for r in RESULTS if r['passed'])
     failed = sum(1 for r in RESULTS if not r['passed'])
     print(f"RESULTS: {passed}/{passed + failed} passed, {failed} failed")
     print("=" * 70)
     return 0 if failed == 0 else 1
+
+
+# =====================================================================
+# Test 26: [MENTION-BRIDGE-v4.4.7] بلاغ المُشغّل (2026-09-05): «انظر إلى
+# الاسم ما ينضغط» — اسم المُرسِل في تنبيه الطلب نص عادي لا يستجيب للضغط.
+# الجذر: tg://user?id من بوت لا يعمل إلا إذا «رأى» البوت المستخدم —
+# والبوت ليس في مجموعات الطلاب → الخادم يجرّد الرابط. الحل الجذري:
+# (1) حساب الالتقاط يوجّه رسالة الطالب الأصلية إلى خاص البوت (seed —
+# يحمل كيان الطالب + نسخة تنجو من حذف الأصل)، (2) البوت يعيد توجيهها
+# لقناة الطلبات أسفل التنبيه (relay — رأس «مُحوّل من» قابل للنقر
+# دائمًا)، (3) التلميح يوجّه لرسالة التوجيه (مسار مضمون).
+# =====================================================================
+class FakeCapClient:
+    """يحاكي حساب الالتقاط: forward_messages إلى خاص البوت + get_entity
+    (بلا username → dm_mode text_mention) + get_me (معرّف الحساب)."""
+
+    def __init__(self, cap_user_id=555):
+        self.is_connected = MagicMock(return_value=True)
+        self.forward_calls = []
+        self._next_seed_id = 800100
+        self._me = types.SimpleNamespace(id=cap_user_id)
+        self.get_me = AsyncMock(return_value=self._me)
+        self.get_entity = AsyncMock(return_value=types.SimpleNamespace(
+            username=None, first_name='طالب', last_name=''))
+
+    async def forward_messages(self, entity, message_ids, from_peer=None):
+        self.forward_calls.append({
+            'entity': entity, 'message_ids': message_ids,
+            'from_peer': from_peer,
+        })
+        sent = FakeSentAlert(self._next_seed_id)
+        self._next_seed_id += 1
+        return sent
+
+
+class BotFwdMock:
+    """يحاكي bot_client.forward_messages (البوت يعيد التوجيه للقناة) —
+    اختياريًا يرمي استثناءً لمحاكاة فشل التوجيل (Test 27)."""
+
+    def __init__(self, raise_exc=None):
+        self.calls = []
+        self.raise_exc = raise_exc
+
+    async def __call__(self, *args, **kwargs):
+        if self.raise_exc is not None:
+            raise self.raise_exc
+        self.calls.append({'args': args, 'kwargs': kwargs})
+        return FakeSentAlert(810000 + len(self.calls))
+
+
+async def test_26_mention_bridge_seed_relay_and_hint():
+    print("\n--- Test 26: [MENTION-BRIDGE] seed → خاص البوت + relay → القناة + تلميح مضمون ---")
+    prod_db, db_path, conn = await make_test_db()
+    try:
+        fm = make_monitor(prod_db)
+        send_id_mock = SendIdMock()
+        edit_mock = EditMock()
+        bot_fwd_mock = BotFwdMock()
+        fm.bot_client.send_message = send_id_mock
+        fm.bot_client.edit_message = edit_mock
+        fm.bot_client.forward_messages = bot_fwd_mock
+        # هوية البوت (مخزّنة — get_me مكلفة) + حساب الالتقاط المتصل
+        fm._bot_identity = types.SimpleNamespace(id=999, username='reqbot')
+        cap_client = FakeCapClient(cap_user_id=555)
+        fm.user_clients = {'+CAP1': cap_client}
+
+        chat = -1006666001
+        msg_id = 660001
+        ev = FakeNewMessageEvent(
+            "مين يحل لي واجب تفاضل؟ محتاج مساعدة",
+            chat, msg_id, sender_id=88, chat=FakeMegagroupChat(), sender=None)
+        await fm._on_user_message(ev, '+CAP1')
+        await drain_request_tasks(fm)
+
+        # (أ) seed: حساب الالتقاط وجّه الأصل إلى خاص البوت (yوزر البوت)
+        record("26: seed forward sent to bot's PM (@reqbot)",
+               len(cap_client.forward_calls) == 1
+               and cap_client.forward_calls[0]['entity'] == '@reqbot',
+               f"forward calls: {cap_client.forward_calls!r}")
+        if cap_client.forward_calls:
+            fc = cap_client.forward_calls[0]
+            record("26: seed forward carries original msg_id + from_peer=chat",
+                   fc['message_ids'] == msg_id and fc['from_peer'] == chat,
+                   f"forward params: {fc!r}")
+
+        # (ب) relay: البوت أعاد توجيه النسخة إلى قناة الطلبات
+        record("26: bot relayed the seeded copy to requests channel",
+               len(bot_fwd_mock.calls) == 1
+               and bot_fwd_mock.calls[0]['args'][0] == '@dhkskwksjskwk',
+               f"bot forward calls: {len(bot_fwd_mock.calls)}")
+        if bot_fwd_mock.calls:
+            from telethon.tl.types import PeerUser as _PU26
+            _call = bot_fwd_mock.calls[0]
+            record("26: relay targets seed_msg_id from capture account's PM",
+                   _call['args'][1] == 800100
+                   and _call['kwargs'].get('from_peer') == _PU26(555),
+                   f"relay call: args={_call['args']!r} kwargs={_call['kwargs']!r}")
+
+        # (ج) التلميح يوجّه لرسالة التوجيه (مسار مضمون — لا وعد ميت)
+        alert = send_id_mock.calls[0]['alert']
+        record("26: hint points to the forwarded message below (guaranteed path)",
+               'للتواصل: اضغط اسم المُرسِل في رسالة التوجيه أسفل هذا التنبيه' in alert,
+               f"hint missing — tail: {alert[-220:]!r}")
+        record("26: no dead promise (old hint absent)",
+               'اضغط اسم المُرسِل أعلاه' not in alert,
+               f"dead promise still present: {alert[-220:]!r}")
+
+        # (د) السجل يحمل حالة الجسر (relay done) للتعليم عند الحذف
+        reg = getattr(fm, '_request_alerts', None) or {}
+        entry = reg.get((chat, msg_id))
+        record("26: registry stores relay state (done=True)",
+               entry is not None
+               and isinstance(entry.get('relay'), dict)
+               and entry['relay'].get('done') is True
+               and entry['relay'].get('seed_msg_id') == 800100
+               and entry['relay'].get('cap_user_id') == 555,
+               f"relay state: {entry.get('relay')!r}")
+
+        # (هـ) الحذف → العلامة توجّه لرسالة التوجيه (تنجو من الحذف)
+        # ولا إعادة توجيل إضافية (تمت أول مرة)
+        await fm._on_message_deleted(FakeDeleteEvent25([msg_id], chat),
+                                     '+CAP1')
+        record("26: deletion → edit_message exactly once",
+               len(edit_mock.calls) == 1,
+               f"edit calls={len(edit_mock.calls)}")
+        if edit_mock.calls:
+            marked = edit_mock.calls[0]['args'][2]
+            record("26: deletion mark points to the forwarded message (survives)",
+                   'اضغط اسمه في رسالة التوجيه أسفل التنبيه' in marked
+                   and 'تعمل حتى بعد حذف الأصل' in marked,
+                   f"mark tail: {marked[-220:]!r}")
+        record("26: no re-relay after deletion (already done)",
+               len(bot_fwd_mock.calls) == 1,
+               f"bot forward calls after delete: {len(bot_fwd_mock.calls)}")
+    finally:
+        await conn.close()
+        try: os.remove(db_path)
+        except: pass
+
+
+# =====================================================================
+# Test 27: [MENTION-BRIDGE-v4.4.7] فشل توجيل البوت أول مرة (خطأ عابر) →
+# الحذف يعيد المحاولة (نسخة الأصل في خاص البوت ما زالت حية — التوجيه
+# مستقل عن حذف المجموعة) → إن نجحت: العلامة توجّه لرسالة التوجيه.
+# =====================================================================
+async def test_27_mention_bridge_relay_failure_deletion_retry():
+    print("\n--- Test 27: [MENTION-BRIDGE] فشل relay أول مرة → إعادة المحاولة عند الحذف ---")
+    prod_db, db_path, conn = await make_test_db()
+    try:
+        fm = make_monitor(prod_db)
+        send_id_mock = SendIdMock()
+        edit_mock = EditMock()
+        # التوجيل الأول (relay عند الإرسال) يفشل بخطأ عابر — ثم ينجح
+        # عند إعادة المحاولة بعد الحذف (raise_exc يُصفَّر قبل الحذف)
+        bot_fwd_mock = BotFwdMock(raise_exc=RuntimeError('transient network glitch'))
+        fm.bot_client.send_message = send_id_mock
+        fm.bot_client.edit_message = edit_mock
+        fm.bot_client.forward_messages = bot_fwd_mock
+        fm._bot_identity = types.SimpleNamespace(id=999, username='reqbot')
+        cap_client = FakeCapClient(cap_user_id=556)
+        fm.user_clients = {'+CAP2': cap_client}
+
+        chat = -1007777001
+        msg_id = 770001
+        ev = FakeNewMessageEvent(
+            "محتاج احد يسوي لي بحث محتاج مساعدة",
+            chat, msg_id, sender_id=99, chat=FakeMegagroupChat(), sender=None)
+        await fm._on_user_message(ev, '+CAP2')
+        await drain_request_tasks(fm)
+
+        # (أ) التلميح وَعَدَ برسالة التوجية (الجسر مزروع) لكن التوجيل فشل
+        alert = send_id_mock.calls[0]['alert']
+        record("27: hint promised forwarded message (bridge seeded)",
+               'رسالة التوجيه أسفل هذا التنبيه' in alert,
+               f"hint missing — tail: {alert[-200:]!r}")
+        record("27: bot relay FAILED (transient) — zero bot forwards",
+               len(bot_fwd_mock.calls) == 0,
+               f"bot forward calls: {len(bot_fwd_mock.calls)}")
+
+        # (ب) السجل: relay موجود لكن done=False
+        reg = getattr(fm, '_request_alerts', None) or {}
+        entry = reg.get((chat, msg_id))
+        record("27: registry stores relay not-done state",
+               entry is not None
+               and isinstance(entry.get('relay'), dict)
+               and entry['relay'].get('done') is False,
+               f"relay state: {entry.get('relay')!r}")
+
+        # (ج) الحذف → إعادة محاولة التوجيل (النسخة في خاص البوت حية)
+        # → نجاح → العلامة توجّه لرسالة التوجيه
+        bot_fwd_mock.raise_exc = None
+        await fm._on_message_deleted(FakeDeleteEvent25([msg_id], chat),
+                                     '+CAP2')
+        record("27: deletion retried the relay (copy survives deletion)",
+               len(bot_fwd_mock.calls) == 1,
+               f"bot forward calls after delete: {len(bot_fwd_mock.calls)}")
+        if edit_mock.calls:
+            marked = edit_mock.calls[0]['args'][2]
+            record("27: mark points to forwarded message after retry success",
+                   'اضغط اسمه في رسالة التوجيه أسفل التنبيه' in marked,
+                   f"mark tail: {marked[-220:]!r}")
+        else:
+            record("27: mark points to forwarded message after retry success",
+                   False, "edit_message never called")
+    finally:
+        await conn.close()
+        try: os.remove(db_path)
+        except: pass
 
 
 if __name__ == '__main__':

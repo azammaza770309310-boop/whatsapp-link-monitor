@@ -6756,14 +6756,39 @@ class Monitor:
             dm_buttons = None  # فشل بناء الزر لا يمنع إرسال التنبيه
             dm_mode = 'none'
 
-        # [CONTACT-HINT-v4.4.6] مرسل بلا username (لا زر «مراسلة»):
-        # المُشغّل يحتاج أن يعرف أن اسم المُرسِل في سطر «المرسل» قابل
-        # للنقر (يفتح ملفه → مراسلة) — خصوصًا بعد حذف الرسالة الأصلية
-        # حيث يصبح اسم المُرسِل مسار التواصل الوحيد. بلاغ 2026-09-05:
-        # «🔗 عرض الرسالة الأصلية — نفس هذا كيف أدخله؟ تم حذف الرسالة
-        # كما سحب اليوزر» — رابط ميت + المُشغّل لا يعرف البديل.
+        # [MENTION-BRIDGE-v4.4.7] مرسل بلا username: ازرع الجسر قبل بناء
+        # التلميح — حساب الالتقاط يوجّه رسالة الطالب الأصلية إلى خاص
+        # البوت (يحمل كيان الطالب + نسخة تنجو من حذف الأصل). الجسر
+        # هو ما يجعل التواصل ممكنًا هنا: رابط tg://user?id من البوت
+        # مقيد بمنصة تلغرام (البوت لم يرَ الطالب) — بلاغ المُشغّل
+        # 2026-09-05 «الاسم ما ينضغط».
+        _bridge = None
         if dm_mode == 'text_mention':
-            alert += "\n💡 <i>للتواصل: اضغط اسم المُرسِل أعلاه</i>"
+            try:
+                _seed_fn = getattr(self, '_mention_bridge_seed', None)
+                if callable(_seed_fn):
+                    _bridge = await _seed_fn(chat_id, msg_id, source_phone,
+                                             sender_id)
+            except Exception as _bridge_e:
+                logging.warning(
+                    f"[MENTION-BRIDGE] seed dispatch failed (non-fatal): {_bridge_e}")
+                _bridge = None
+
+        # [CONTACT-HINT-v4.4.6→v4.4.7] مرسل بلا username (لا زر «مراسلة»):
+        # المُشغّل يحتاج تلميح تواصل صادقًا — لا وعدًا ميتًا. بلاغ
+        # 2026-09-05 «الاسم ما ينضغط»: الاسم النصي لا يفتح شيئًا (قيد
+        # تلغرام على mentions من البوتات التي لم ترَ المستخدم).
+        #   - جسر مزروع → رسالة التوجيه أسفل التنبيه (رأسها قابل للنقر
+        #     دائمًا — مسار مضمون).
+        #   - بلا جسر → قول الحقيقة: الاسم قد لا يستجيب + السبب.
+        if dm_mode == 'text_mention':
+            if _bridge:
+                alert += ("\n💡 <i>للتواصل: اضغط اسم المُرسِل في رسالة التوجيه "
+                          "أسفل هذا التنبيه</i>")
+            else:
+                alert += ("\n💡 <i>للتواصل: المُرسِل بلا username — اسمه أعلاه "
+                          "قد لا يستجيب للضغط (قيد تلغرام على رسائل "
+                          "البوتات)</i>")
 
         # --- الإرسال لقناة الطلبات (retry + FloodWait handling) ---
         # getattr دفاعي لـbot_client: لو fake namespace (اختبارات) بلا bot_client،
@@ -6791,24 +6816,27 @@ class Monitor:
                 f"keywords={keywords_found} source={source_phone} "
                 f"dm={dm_mode}"
             )
-            # [REQ-DELETED-MARK-v4.4.6] سجّل التنبيه للتعليم عند حذف
-            # الأصل من المجموعة (رابط التنبيه يموت عند الحذف — نحتاج
-            # معرّف رسالة التنبيه كي نُعدّلها لاحقًا بعلامة ⚠️).
+            # [REQ-DELETED-MARK-v4.4.6 + MENTION-BRIDGE-v4.4.7] سجّل
+            # التنبيه للتعليم عند حذف الأصل (رابط التنبيه يموت عند الحذف
+            # — نحتاج معرّف رسالة التنبيه كي نُعدّلها لاحقًا بعلامة ⚠️)
+            # وأعد توجيه نسخة الأصل للقناة (مسار التواصل المضمون:
+            # رأس «مُحوّل من» قابل للنقر دائمًا + ينقذ الوضع بعد الحذف).
             # تحسيني غير قاتل: بلا معرّف (عميل مُحاكى/فشل) → لا تسجيل.
             # getattr دفاعي (نمط الكود): fake namespace بلا الدالة → تخطٍ صامت.
-            _reg_alert_fn = getattr(self, '_register_request_alert', None)
-            if callable(_reg_alert_fn):
-                _reg_alert_fn(chat_id, msg_id, target, sent_alert,
-                              alert, dm_buttons)
+            _post_send_fn = getattr(self, '_relay_and_register_request_alert', None)
+            if callable(_post_send_fn):
+                await _post_send_fn(target, _bridge, sent_alert,
+                                    chat_id, msg_id, alert, dm_buttons)
+            else:
+                _reg_alert_fn = getattr(self, '_register_request_alert', None)
+                if callable(_reg_alert_fn):
+                    _reg_alert_fn(chat_id, msg_id, target, sent_alert,
+                                  alert, dm_buttons)
 
-            # [v4.3.8] حُذف «جسر التواصل» (contact bridge) نهائيًا:
-            # تشخيص الإنتاج أثبت أنه ضجيج بلا قيمة — القفزة 1 (توجيه الرسالة
-            # إلى PM البوت) تولّد ردّ قائمة الأوامر المحيّر في محادثة البوت
-            # (بلاغ المُشغّل 2026-09-03)، والقفزة 2 (PM البوت → القناة)
-            # فشلت 100% (from_peer='me' لا يشير لشات حساب الالتقاط)،
-            # بينما القناة تستلم أصلًا التنبيه الكامل مع text-mention
-            # قابل للنقر للمرسل بلا username. مسار التواصل الوحيد الآن:
-            # زر t.me (مع username) أو text-mention (بلا username).
+            # [v4.3.8→v4.4.7] جسر التواصل القديم (contact bridge)
+            # بقي محذوفًا — لكن رؤية الأفق تغيرت: التوجيه عبر خاص البوت
+            # عاد الآن بتصميم مختلف جذريًا (MENTION-BRIDGE أعلاه) يصلح
+            # العطب الجذري الذي شُخّص 2026-09-05 (mention ميت من البوت).
         except FloodWaitError as e:
             # أعد المحاولة بعد الانتظار (محدود لتجنب التعليق)
             wait_s = min(getattr(e, 'seconds', 30), 60)
@@ -6820,11 +6848,16 @@ class Monitor:
                     buttons=dm_buttons,
                 )
                 logging.info(f"[REQUEST-PATH] ✅ sent after FloodWait chat_id={chat_id} msg_id={msg_id}")
-                # [REQ-DELETED-MARK-v4.4.6] نفس التسجيل بعد إعادة المحاولة
-                _reg_alert_fn2 = getattr(self, '_register_request_alert', None)
-                if callable(_reg_alert_fn2):
-                    _reg_alert_fn2(chat_id, msg_id, target, sent_alert,
-                                   alert, dm_buttons)
+                # [REQ-DELETED-MARK + MENTION-BRIDGE] نفس الإجراء بعد إعادة المحاولة
+                _post_send_fn2 = getattr(self, '_relay_and_register_request_alert', None)
+                if callable(_post_send_fn2):
+                    await _post_send_fn2(target, _bridge, sent_alert,
+                                         chat_id, msg_id, alert, dm_buttons)
+                else:
+                    _reg_alert_fn2 = getattr(self, '_register_request_alert', None)
+                    if callable(_reg_alert_fn2):
+                        _reg_alert_fn2(chat_id, msg_id, target, sent_alert,
+                                       alert, dm_buttons)
             except Exception as e2:
                 logging.error(f"[REQUEST-PATH] send failed after FloodWait retry: {e2}")
         except Exception as e:
@@ -6845,10 +6878,178 @@ class Monitor:
     # السجل في الذاكرة فقط (TTL 24h، سقف 1000، يُفقد عند إعادة التشغيل
     # — أفضل جهد: الحذف يحدث عادة خلال دقائق/ساعات من النشر).
 
+    # ------------------------------------------------------------------
+    # [MENTION-BRIDGE-v4.4.7] جسر التواصل للطلبات بلا username
+    # ------------------------------------------------------------------
+    # بلاغ المُشغّل (2026-09-05): «انظر إلى الاسم ما ينضغط» — اسم المُرسِل
+    # في تنبيه الطلب يظهر نصًا عاديًا لا يستجيب للضغط رغم أن الكود يرسله
+    # كرابط <a href="tg://user?id=…">. الجذر (قيد منصة تلغرام): روابط
+    # tg://user?id في رسائل البوتات لا تعمل إلا إذا «رأى» البوت المستخدم
+    # نفسه — والبوت ليس عضوًا في مجموعات الطلاب أبدًا (حسابات الالتقاط
+    # وحدها هناك) → الخادم يجرّد الرابط من كيانه → الاسم نص ميت. التلميح
+    # v4.4.6 «اضغط اسم المُرسِل أعلاه» صار وعدًا ميتًا — نفس مشكلة الرابط
+    # الميت التي أُبلغ عنها من قبل، بصيغة أخرى.
+    # الحل الجذري (جسر عبر حساب الالتقاط — «رأى» الطالب ويعرف كيانه
+    # الكامل): حساب الالتقاط يوجّه رسالة الطالب الأصلية إلى خاص البوت:
+    #   (أ) التوجيه يحمل كيان الطالب (User object) → يصبح «مرئيًا»
+    #       للبوت → ذكر tg://user?id داخل التنبيه قد يتحول لذكر حقيقي.
+    #   (ب) البوت يعيد توجيه النسخة إلى قناة الطلبات أسفل التنبيه — رأس
+    #       «مُحوَّل من: <اسم الطالب>» قابل للنقر دائمًا لدى كل المشتركين
+    #       (كائن المستخدم مضمّن في بنية التوجيه نفسها — لا يعتمد على
+    #       معرفة العارض) → يفتح ملف الطالب → «مراسلة».
+    #   (ج) النسخة المُوجَّهة مستقلة عن الأصل — تنجو من حذف الطالب
+    #       رسالته (سيناريو v4.4.6) وتبقى مسار التواصل الوحيد الباقي.
+    # غير قاتل تمامًا: أي فشل في أي طبقة → التنبيه يكمل بلا جسر مع
+    # تلميح صادق يشرح قيد تلغرام (بدل وعد ميت).
+    # ملاحظات: (1) خاص البوت يتجاهل الرسائل المُحوَّلة بصمت (v4.3.8)
+    # فلا آثار جانبية. (2) إيقاع الطلبات المقبولة ~1-3/يوم → لا خطر
+    # سبام على حسابات الالتقاط. (3) مجموعات «حماية المحتوى» يفشل فيها
+    # التوجيل → جسر بلا نسخة → التلميح الصادق.
+
+    async def _mention_bridge_seed(self, chat_id, msg_id, source_phone, sender_id):
+        """[MENTION-BRIDGE-v4.4.7] يوجّه الرسالة الأصلية من حساب الالتقاط
+        إلى خاص البوت — يزرع كيان المُرسِل لدى البوت ويحفظ نسخة تنجو من
+        حذف الأصل. يعيد {'seed_msg_id', 'cap_user_id', 'done': False}
+        أو None (غير قاتل)."""
+        try:
+            _sid = int(sender_id or 0)
+            if _sid <= 0:
+                return None
+            _bot_client = getattr(self, 'bot_client', None)
+            if not _bot_client or not _bot_client.is_connected():
+                return None
+            # (1) عميل الالتقاط المتصل: حساب المصدر أولًا ثم أي حساب متصل
+            # (حساب الالتقاط عضو المجموعة → يستطيع التوجيه منها)
+            # [ترتيب مقصود] قبل جلب هوية البوت: بلا عميل التقاط لا جسر
+            # أصلًا — لا نداء API إطلاقًا (get_me) في هذا المسار.
+            _uc = getattr(self, 'user_clients', None) or {}
+            _cap = _uc.get(source_phone)
+            _cap_phone = source_phone
+            if _cap is None or not getattr(_cap, 'is_connected', lambda: False)():
+                _cap, _cap_phone = None, None
+                for _ph, _c in _uc.items():
+                    if _c is not None and getattr(_c, 'is_connected', lambda: False)():
+                        _cap, _cap_phone = _c, _ph
+                        break
+            if _cap is None:
+                logging.debug("[MENTION-BRIDGE] no connected capture client — no bridge")
+                return None
+            # (2) هوية البوت (مخزّنة مؤقتًا): يوزرنيم البوت = وجهة التوجيه
+            _bot_me = getattr(self, '_bot_identity', None)
+            if _bot_me is None:
+                try:
+                    _bot_me = await asyncio.wait_for(_bot_client.get_me(), timeout=5)
+                    self._bot_identity = _bot_me
+                except Exception:
+                    return None
+            _bot_uname = str(getattr(_bot_me, 'username', '') or '').strip()
+            if not _bot_uname:
+                return None  # بوت بلا يوزرنيم (نادر جدًا) — لا وجهة للجسر
+            # (3) التوجيه: الأصل من المجموعة → خاص البوت
+            _fwd = await asyncio.wait_for(
+                _cap.forward_messages(f"@{_bot_uname}", int(msg_id),
+                                      from_peer=chat_id),
+                timeout=10)
+            _seed_id = getattr(_fwd, 'id', None)
+            if not isinstance(_seed_id, int):
+                try:  # forward_messages أعاد قائمة (نادر) — خذ الأول
+                    _seed_id = int(_fwd[0].id)
+                except Exception:
+                    _seed_id = None
+            if _seed_id is None:
+                logging.warning(
+                    f"[MENTION-BRIDGE] seed forward returned no id "
+                    f"chat_id={chat_id} msg_id={msg_id}")
+                return None
+            # (4) معرّف حساب الالتقاط (from_peer للبوت عند إعادة التوجيه) —
+            # مخزّن مؤقتًا لكل حساب (get_me مكلفة أول مرة فقط)
+            _cap_ids = getattr(self, '_bridge_cap_ids', None)
+            if not isinstance(_cap_ids, dict):
+                _cap_ids = {}
+                try:
+                    self._bridge_cap_ids = _cap_ids
+                except Exception:
+                    pass
+            _cap_id = _cap_ids.get(_cap_phone)
+            if not _cap_id:
+                try:
+                    _cap_me = await asyncio.wait_for(_cap.get_me(), timeout=5)
+                    _cap_id = int(getattr(_cap_me, 'id', 0) or 0)
+                    if _cap_id > 0:
+                        _cap_ids[_cap_phone] = _cap_id
+                except Exception:
+                    _cap_id = 0
+            if not _cap_id or _cap_id <= 0:
+                logging.warning("[MENTION-BRIDGE] capture account id unavailable")
+                return None
+            logging.info(
+                f"[MENTION-BRIDGE] ✅ seeded chat_id={chat_id} msg_id={msg_id} "
+                f"seed_msg_id={_seed_id} via={_cap_phone} bot=@{_bot_uname} "
+                f"cap_user_id={_cap_id}"
+            )
+            return {'seed_msg_id': _seed_id, 'cap_user_id': _cap_id,
+                    'done': False}
+        except Exception as e:
+            logging.warning(
+                f"[MENTION-BRIDGE] seed failed (non-fatal, chat_id={chat_id} "
+                f"msg_id={msg_id}): {e}")
+            return None
+
+    async def _mention_bridge_relay(self, target, seed_msg_id, cap_user_id):
+        """[MENTION-BRIDGE-v4.4.7] البوت يعيد توجيه نسخة الأصل من خاصِه
+        إلى قناة الطلبات — رأس «مُحوَّل من: الطالب» قابل للنقر دائمًا
+        لدى كل المشتركين (كائن المستخدم مضمّن في التوجيل). يعيد True
+        عند النجاح. غير قاتل."""
+        try:
+            if not seed_msg_id or not cap_user_id:
+                return False
+            _bot_client = getattr(self, 'bot_client', None)
+            if not _bot_client or not _bot_client.is_connected():
+                return False
+            from telethon.tl.types import PeerUser as _BridgePeerUser
+            _fwd = await asyncio.wait_for(
+                _bot_client.forward_messages(
+                    target, int(seed_msg_id),
+                    from_peer=_BridgePeerUser(int(cap_user_id))),
+                timeout=10)
+            _ok = _fwd is not None
+            logging.info(
+                f"[MENTION-BRIDGE] {'✅' if _ok else '❌'} relayed to {target} "
+                f"seed_msg_id={seed_msg_id} cap_user_id={cap_user_id}"
+            )
+            return bool(_ok)
+        except Exception as e:
+            logging.warning(
+                f"[MENTION-BRIDGE] relay failed (non-fatal): {e}")
+            return False
+
+    async def _relay_and_register_request_alert(self, target, bridge, sent_alert,
+                                                chat_id, msg_id, alert, dm_buttons):
+        """[MENTION-BRIDGE-v4.4.7] بعد نجاح إرسال التنبيه: أعد توجيه نسخة
+        الأصل إلى القناة (مسار التواصل المضمون) ثم سجّل التنبيه للتعليم
+        عند حذف الأصل (مع حالة الجسر). يجمع الخطوتين ليعمل المساران
+        (الإرسال الأول + إعادة FloodWait) بنفس المنطق دون تكرار."""
+        if isinstance(bridge, dict):
+            try:
+                bridge['done'] = await self._mention_bridge_relay(
+                    target, bridge.get('seed_msg_id'),
+                    bridge.get('cap_user_id'))
+            except Exception:
+                bridge['done'] = False
+        try:
+            _reg_fn = getattr(self, '_register_request_alert', None)
+            if callable(_reg_fn):
+                _reg_fn(chat_id, msg_id, target, sent_alert, alert,
+                        dm_buttons, relay=bridge)
+        except Exception:
+            pass  # التسجيل تحسيني — لا يعطّل المسار أبدًا
+
     def _register_request_alert(self, chat_id, msg_id, target, sent_alert,
-                                alert_html, dm_buttons):
+                                alert_html, dm_buttons, relay=None):
         """يسجّل تنبيه طلب مُرسَلًا: (chat_id, msg_id) → معرّف رسالة
-        التنبيه في قناة الطلبات، لكي يُعلَّم لاحقًا عند حذف الأصل.
+        التنبيه في قناة الطلبات، لكي يُعلّم لاحقًا عند حذف الأصل.
+        [MENTION-BRIDGE-v4.4.7] يحفظ كذلك حالة جسر التوجيه (نسخة الأصل
+        في خاص البوت) لإعادة المحاولة عند الحذف لو فشلت أول مرة.
         غير قاتل تمامًا: أي فشل يُهمل (التسجيل تحسيني — لا يمنع الإرسال)."""
         try:
             alert_id = getattr(sent_alert, 'id', None)
@@ -6880,6 +7081,10 @@ class Monitor:
                 'text': alert_html,
                 'buttons': dm_buttons,
                 'ts': now,
+                # [MENTION-BRIDGE-v4.4.7] نسخة الأصل المُوجَّهة في خاص البوت
+                # (seed_msg_id + cap_user_id + done) — لإعادة المحاولة عند
+                # الحذف لو فشل التوجيل للقناة أول مرة.
+                'relay': (dict(relay) if isinstance(relay, dict) else None),
             }
             logging.info(
                 f"[REQUEST-PATH] 📌 delete-mark registry +1 "
@@ -6922,12 +7127,45 @@ class Monitor:
                     f"(alert_id={entry.get('alert_id')})"
                 )
                 return False
+            # [MENTION-BRIDGE-v4.4.7] حالة جسر التوجيه: النسخة المُوجَّهة
+            # في خاص البوت تنجو من حذف الأصل — لو فشل توجيلها للقناة
+            # أول مرة (خطأ عابر)، أعد المحاولة الآن: بعد الحذف تصبح
+            # هذه النسخة مسار التواصل الوحيد الباقي للطالب.
+            _relay = entry.get('relay')
+            _relay = _relay if isinstance(_relay, dict) else None
+            _relay_done = bool(_relay and _relay.get('done'))
+            if _relay and not _relay_done:
+                try:
+                    _relay_done = await self._mention_bridge_relay(
+                        entry.get('target'),
+                        _relay.get('seed_msg_id'),
+                        _relay.get('cap_user_id'))
+                except Exception:
+                    _relay_done = False
             marked = (
                 str(entry.get('text') or '')
                 + "\n\n⚠️ <b>حُذفت الرسالة الأصلية من المجموعة</b>\n"
-                "🔗 الرابط أعلاه لن يفتح شيئًا — للتواصل مع المُرسِل: "
-                "اضغط اسمه في سطر «المرسل» أعلاه أو زر «مراسلة»."
             )
+            # توجيه التواصل حسب المسارات الباقية فعليًا (لا وعود ميتة):
+            #   relay   → رأس «مُحوَّل من: الطالب» قابل للنقر دائمًا
+            #   buttons → زر «مراسلة» (username — يعمل دائمًا)
+            #   غير ذلك → بلا مسار تلقائي — قولها بصدق
+            if _relay_done:
+                marked += (
+                    "🔗 الرابط أعلاه لن يفتح شيئًا — للتواصل مع المُرسِل: "
+                    "اضغط اسمه في رسالة التوجيه أسفل التنبيه "
+                    "(تعمل حتى بعد حذف الأصل)."
+                )
+            elif entry.get('buttons'):
+                marked += (
+                    "🔗 الرابط أعلاه لن يفتح شيئًا — للتواصل مع المُرسِل: "
+                    "اضغط زر «مراسلة» أو الـ@username في سطر «المرسل» أعلاه."
+                )
+            else:
+                marked += (
+                    "🔗 الرابط أعلاه لن يفتح شيئًا — المُرسِل بلا username "
+                    "ولا نسخة توجيه متاحة: لم يبقَ مسار تواصل تلقائي."
+                )
             await _bot_client.edit_message(
                 entry.get('target'), int(entry.get('alert_id')), marked,
                 parse_mode='html', link_preview=False,
