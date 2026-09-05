@@ -798,7 +798,35 @@ class Config:
         self.api_id = int(os.getenv("API_ID", "0"))
         self.api_hash = os.getenv("API_HASH", "")
         self.bot_token = os.getenv("BOT_TOKEN", "")
-        self.channel_id = int(os.getenv("CHANNEL_ID", "0"))
+        _raw_cid = os.getenv("CHANNEL_ID", "").strip()
+        # [CHANNEL-NORMALIZE-v4.4.2] جذر عطل نشر الروابط: معرف قناة صادر بلا
+        # بادئة -100 (مثل 1004402529305) يفسّره Telethon PeerUser(user_id)
+        # → "Could not find the input entity for PeerUser(...)" — كل عمليات
+        # النشر تفشل والروابط تتراكم بلا نشر. قنوات تيليجرام الصحيحة:
+        #   -100XXXXXXXXXX (بادئة -100). نطبّع: موجب بلا -100 → نضيف
+        # البادئة (دون مضاعفتها لو موجودة). السالب الصحيح يمر كما هو.
+        # ملاحظة: معرف القناة نفسه (بدون -100) هو أول 10+ خانات بعد
+        # البادئة — نتحقق ألا يبدأ الرقم الأصلي بـ100 بالفعل (تكرار).
+        try:
+            _cid_val = int(_raw_cid)
+        except (TypeError, ValueError):
+            _cid_val = 0
+        if _cid_val > 0:
+            _digits = _raw_cid.lstrip('+')
+            # معرف قناة مجرد: طوله ≥10 (4 ثوابت markov + id) ولا يبدأ بـ100
+            # (وإلا فالمعرف يشمل البادئة مسبقًا كـ 100xxxxxxxxxx)
+            if len(_digits) >= 10 and not _digits.startswith('100'):
+                _cid_val = int(f"-100{_digits}")
+                logging.warning(
+                    f"[CONFIG] CHANNEL_ID={_raw_cid} bare channel id "
+                    f"→ normalized to {_cid_val} (-100 prefix added)")
+            elif len(_digits) >= 13 and _digits.startswith('100'):
+                # صيغة شائعة: الرقم يشمل البادئة بلا شرطة (1004402529305)
+                _cid_val = int(f"-{_digits}")
+                logging.warning(
+                    f"[CONFIG] CHANNEL_ID={_raw_cid} includes the 100 prefix "
+                    f"without minus → normalized to {_cid_val}")
+        self.channel_id = _cid_val
         # === Request Filter target channel ===
         # قناة الطلبات — مسار مستقل لاكتشاف طلبات العملاء وإرسالها.
         # يقبل صيغتين:
