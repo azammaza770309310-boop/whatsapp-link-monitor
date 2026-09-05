@@ -339,6 +339,80 @@ async def test_extractor_coverage():
            'tg:user:somechannel' in norms and not any('456' in n for n in norms),
            f"got {norms}")
 
+    # ---- [LINK-JUNK-v4.4.5] استبعاد روابط المعاينة/الرسائل الخاصة ----
+    # t.me/c/<id>/<msg> = رابط رسالة دردشة خاصة (غير قابل للانضمام) —
+    # كان يُستخرج كـ username='c'. t.me/s/<name> = معاينة قناة → 's'.
+    priv = LinkNormalizer.extract_links("شوف https://t.me/c/2193633095/19 والقناة https://t.me/s/studygroup")
+    priv_norms = {l['normalized'] for l in priv}
+    record("EXTRACT: t.me/c/ private msg permalink → skipped (no 'c' junk)",
+           'tg:user:c' not in priv_norms and not priv_norms,
+           f"got {priv_norms}")
+    s_prev = LinkNormalizer.extract_links("معاينة https://t.me/s/unichannel")
+    record("EXTRACT: t.me/s/ channel preview → skipped (no 's' junk)",
+           'tg:user:s' not in {l['normalized'] for l in s_prev},
+           f"got {[l['normalized'] for l in s_prev]}")
+    short = LinkNormalizer.extract_links("https://t.me/abc")
+    record("EXTRACT: username < 5 chars → skipped",
+           not any(l['username'] == 'abc' for l in short),
+           f"got {[l['normalized'] for l in short]}")
+
+
+# =====================================================================
+# [LINK-JUNK-v4.4.5] بوابة قمامة نص الرسالة (بوتات الإدارة/الترحيل)
+# =====================================================================
+async def test_link_junk_gate():
+    print("\n--- Test LINK-JUNK: moderation/relay-bot text gate ---")
+    from link_system import link_junk_reason
+
+    # قمامة بوتات الترحيل (بلاغ الإنتاج: S_boot/Doody/QxQbot)
+    record("JUNK: relay-bot format (ID المرسل) → relay_bot",
+           link_junk_reason("👤 Doody ID المرسل : 1993526588 نص الرساله : السلام عليكم ابغى كتاب") == 'relay_bot')
+    record("JUNK: relay-bot (نص الرسالة) → relay_bot",
+           link_junk_reason("العضو المجهول نص الرسالة : ابا قروب برمجة") == 'relay_bot')
+    # إشعارات إدارة المجموعات
+    record("JUNK: ban notice (تم حظر العضو) → moderation_notice",
+           link_junk_reason("⛔️ تم حظر العضو (ID: 8730187711) بسبب المخالفة https://t.me/UQU_Medicine") == 'moderation_notice')
+    record("JUNK: mute notice (تم كتم) → moderation_notice",
+           link_junk_reason("تم كتم العضو لمدة ساعة") == 'moderation_notice')
+    # نصوص نظيفة → None (لا تُرفض)
+    record("JUNK: clean student request → None",
+           link_junk_reason("ابغى وكالة لمادة الرياضيات من عنده الرابط يرسله https://chat.whatsapp.com/AbCdEf") is None)
+    record("JUNK: clean group promo → None",
+           link_junk_reason("قروب مناقشة طلاب جامعة الملك فيصل https://chat.whatsapp.com/XyZ987") is None)
+    record("JUNK: empty text → None",
+           link_junk_reason("") is None and link_junk_reason(None) is None)
+
+    # البوابة داخل enqueue_link — قمامة تُرفض قبل أي كتابة في الطابور
+    prod_j, db_path_j, conn_j = await make_test_db()
+    try:
+        ok = await prod_j.enqueue_link({
+            'raw': 'https://t.me/RelayJunk', 'normalized': 'tg:user:relayjunk',
+            'link_type': 'telegram', 'username': 'relayjunk', 'invite_hash': None,
+            'msg_id': None, 'group_name': 'S_boot', 'sender_name': 'bot',
+            'sender_contact': '', 'source_phone': '+999',
+            'message_text': "👤 @QxQbot ID المرسل : 123 نص الرساله : ⛔️ تم حظر العضو",
+            'message_link': None,
+        })
+        record("JUNK: enqueue_link rejects relay-bot text (returns False)", ok is False, f"got {ok}")
+        queued_j = await prod_j.get_queued_links(limit=10)
+        record("JUNK: junk link never enters the queue",
+               all(l['raw_link'] != 'https://t.me/RelayJunk' for l in queued_j),
+               f"queue={[l['raw_link'] for l in queued_j]}")
+        # نص نظيف يمر طبيعيًا
+        ok_clean = await prod_j.enqueue_link({
+            'raw': 'https://chat.whatsapp.com/CleanOK123', 'normalized': 'wa:invite:cleanok123',
+            'link_type': 'whatsapp', 'username': None, 'invite_hash': 'cleanok123',
+            'msg_id': None, 'group_name': 'فيزياء TU', 'sender_name': 'طالب',
+            'sender_contact': '', 'source_phone': '+999',
+            'message_text': 'قروب الفيزياء العام تفضلوا',
+            'message_link': None,
+        })
+        record("JUNK: clean link still enqueues (True)", ok_clean is True, f"got {ok_clean}")
+    finally:
+        await conn_j.close()
+        try: os.remove(db_path_j)
+        except: pass
+
 
 # =====================================================================
 # Main runner
@@ -354,6 +428,7 @@ async def main():
     await test_lrb_cap_eviction()
     await test_is_link_known()
     await test_extractor_coverage()
+    await test_link_junk_gate()
 
     print("\n" + "=" * 70)
     passed = sum(1 for r in RESULTS if r['passed'])

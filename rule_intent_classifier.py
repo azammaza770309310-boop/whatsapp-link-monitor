@@ -24,13 +24,22 @@ rule_intent_classifier.py — محرّك نوايا قواعدي حتمي (بد�
 الموجودة (transport injection tests تستهدف IntentClassifier نفسه — لم يُمس).
 
 المعمارية — شلال قرارات حتمي (الترتيب مقصود ويحاكي عقد الـprompt السابق):
+  0. بوابات ما قبل الشلال (القمامة):
+     ج) نفي/منع = قاعدة إدارية (ممنوع هنا.. لا احد يطلب)
+     د) ذيل نعم/لا (ولا مافيه؟/صح؟) = سؤال معلوماتي لا طلب
+        [REQ-ACADEMIC-v4.4.5] — يُستثنى رغبة صريحة أو سؤال-مجهول
+     أ) إحالة تواصل + رغبة طرف ثالث = إعلان مزوّد
+     ب) لا رغبة ولا استفهام = سرد/تعليمات
   1. تبييض/توحيد النص (همزات/تاء مربوطة/تشكيل/تطويل)
   2. REJECT service_offer/advertisement — المرسل يعرض خدمة (نقدم/برسوم/...)
   3. REJECT tutoring_only_request — فعل تعليم (يشرح/خصوصي/مدرس/...)
   4. REJECT non_academic_request — أكواد ألعاب/كوبونات/تفعيلات
   5. ACCEPT (شرط ثلاثي): فعل تنفيذ (يـ صيغة: يسوي/يحل/يكتب/...)
      + (طالب: احد/مين/من/اللي | رغبة: ابي/ابغا/اريد/محتاج)
-     + (مفعول: سكليف/بحث/كويز/cv/جدول/عذر | مفعولية: لي/بدالي/رقم احد)
+     + (مفعول أكاديمي/خدمي)
+     → التفويض المجرد (بلا مفعول) يتطلب علامة قوية:
+       بدالي/نيابة/عني/رقم-مجهول + استفهام [REQ-ACADEMIC-v4.4.5]
+       — «من تزوجت صار لي 3 سنوات هو يخلص سريع» ليست طلبًا
      → الفئة من المفعول (أكاديمي/خدمة طلابية)
   6. REJECT resource_request — ملكية جاهزة بلا فعل تنفيذ
      (عنده كويزات ≠ احد يحل كويزات)
@@ -54,7 +63,7 @@ from intent_classifier import IntentDecision
 
 __all__ = ["RuleBasedIntentClassifier", "RULE_ENGINE_VERSION"]
 
-RULE_ENGINE_VERSION = "rule-v4.4.3"
+RULE_ENGINE_VERSION = "rule-v4.4.5"
 
 # ============================================================
 # [GENIUS-PLAN-v4.4.2] طبقة ما قبل الشلال — أنماط القمامة الإنتاجية
@@ -116,6 +125,17 @@ PROHIBITION_MARKERS = (
 # «مافيه احد يقدر..» (بلا ؟ — الاستفهام الحقيقي يهرب من البوابة)
 NEG_DIRECTIVE_RE = re.compile(
     r'\b(لا|ما|مافي|مافيه)\s+(احد|حدا|حد|شخص|واحد)\s+ي\w+')
+
+# [REQ-ACADEMIC-v4.4.5] سؤال نعم/لا معلوماتي — بلاغ الإنتاج 2026-09-05
+# (~06:00): «اللي اعرفه ايهاب يسوي اختبار بعد كل نموذج ولا مافيه ؟»
+# ACCEPT 0.96! الجذر: «يسوي» + «اختبار» + «اللي» تجاوزوا الشرط الثلاثي
+# رغم أن الرسالة سؤال معلوماتي عن عادة دكتور (هل يفعل كذا أم لا)،
+# لا طلب تنفيذ. البصمة المميزة: ذيل نعم/لا «ولا مافيه؟/ولا لا؟/
+# ولا كذا؟/صح؟» — بنية استفهام تأكيد، لا تظهر في الطلبات الحقيقية.
+# الاستثناءات تحفظ الطلبات: رغبة صريحة (ابي) أو سؤال-مجهول حقيقي
+# (احد/مين/تعرفون...) — «فيه احد يسوي سكليف ولا لا؟» يبقى طلبًا.
+YESNO_TAIL_RE = re.compile(
+    r'\b(ولا|صح)\b[^؟?\n]{0,35}[؟?]\s*$')
 
 
 # ============================================================
@@ -427,9 +447,18 @@ class RuleBasedIntentClassifier:
                 and ('؟' not in text and '?' not in text):
             return _dec("REJECT", 0.95, "admin_notice_or_rule",
                         "تحذير/قاعدة إدارية للمجموعة (نفي/منع) — ليس طلبًا")
+        # ---- 0-د) [REQ-ACADEMIC-v4.4.5] سؤال نعم/لا معلوماتي ----
+        # «الدكتور يسوي اختبار بعد كل نموذج ولا مافيه؟» — استفهام تأكيد
+        # عن واقعة/شخص، لا طلب تنفيذ. يُستثنى: رغبة صريحة (ابي/محتاج)
+        # أو سؤال-مجهول (احد/مين/تعرفون) — «فيه احد يسوي سكليف
+        # ولا لا؟» طلب حقيقي يمر.
+        _seekq = _has_any(t, FIRST_PERSON_QUESTION_WORDS) or \
+            _has_sub(t, FIRST_PERSON_QUESTION_PATTERNS)
+        if YESNO_TAIL_RE.search(t) and not _fwant and not _seekq:
+            return _dec("REJECT", 0.92, "factual_yesno_question",
+                        "سؤال نعم/لا عن واقعة/طرف ثالث — ليس طلب تنفيذ")
         # (أ) إعادة توجيه مزوّد: رغبة طرف ثالث + إحالة تواصل للمرسل
-        _q = _has_any(t, FIRST_PERSON_QUESTION_WORDS) or \
-            _has_sub(t, FIRST_PERSON_QUESTION_PATTERNS) or ('؟' in text or '?' in text)
+        _q = _seekq or ('؟' in text or '?' in text)
         _relwant = _has_sub(t, EMBEDDED_THIRD_PARTY_WANT)
         _contact = _has_sub(t, CONTACT_REDIRECT_MARKERS)
         if _contact and (_relwant or not _fwant):
@@ -483,19 +512,24 @@ class RuleBasedIntentClassifier:
             want = _has_any(t, WANT_WORDS)
             hw_noun = _has_sub(t, HOMEWORK_NOUNS)
             svc_noun = _has_sub(t, SERVICE_NOUNS)
-            # مفعولية: «لي» مستقلة أو بدالي/رقم احد (تتحقق على الكلمات فقط
-            # حتى لا تلتقط «اللي» و«ليش»)
-            deleg = _has_word(t_words_only, 'لي') or \
-                _has_any(t, ('بدالي', 'بدلا', 'نيابة', 'عني', 'رقم', 'معي'))
+            # [REQ-ACADEMIC-v4.4.5] التفويض المجرد يتطلب علامة قوية:
+            # بدالي/نيابة/عني/رقم-مجهول. الضعيفة (لي/معي) حروف جر تظهر
+            # في كل سرد عائلي — بلاغ الإنتاج: «من تزوجت صار لي 3 سنوات
+            # هو يخلص سريع» = من(طالب!) + لي(تفويض!) + يخلص(تنفيذ!)
+            # → ACCEPT 0.93 بلا أي محتوى أكاديمي. الآن: بلا مفعول
+            # أكاديمي/خدمي، لا قبول إلا بعلامة تفويض صريحة + استفهام.
+            deleg_strong = _has_any(t, ('بدالي', 'بدلا', 'نيابه', 'نيابة', 'عني')) \
+                or _has_word(t_words_only, 'رقم')
 
-            if (seeker or want) and (hw_noun or svc_noun or deleg):
+            if (seeker or want) and (hw_noun or svc_noun):
                 if hw_noun:
                     return _dec("ACCEPT", 0.96, "homework_execution_request",
                                 "طلب تنفيذ عمل أكاديمي بدلاً عن المرسل")
-                if svc_noun:
-                    return _dec("ACCEPT", 0.95, "student_service_execution_request",
-                                "طلب تنفيذ خدمة طلابية بدلاً عن المرسل")
-                # مفعولية بلا اسم مفعول («من عنده رقم احد يسويها؟»)
+                return _dec("ACCEPT", 0.95, "student_service_execution_request",
+                            "طلب تنفيذ خدمة طلابية بدلاً عن المرسل")
+            # مفعولية صريحة بلا اسم مفعول: «مين عنده رقم احد مضمون
+            # يسويها؟» — تفويض قوي + استفهام مجهول فقط.
+            if deleg_strong and (seeker or want) and _q:
                 return _dec("ACCEPT", 0.93, "student_service_execution_request",
                             "طلب الوصول لمن ينفّذ العمل بدلاً عن المرسل")
 

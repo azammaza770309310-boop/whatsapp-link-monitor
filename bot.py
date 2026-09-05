@@ -47,7 +47,8 @@ import html as html_module
 # Production Link Management System
 from link_system import (
     LinkNormalizer, GroupState, RateLimiter, FloodWaitManager,
-    MembershipCache, Metrics, ProductionDB, init_production_tables
+    MembershipCache, Metrics, ProductionDB, init_production_tables,
+    link_junk_reason
 )
 
 # Source Registry + Polling Scheduler + Message Claim (unified dedup layer)
@@ -2342,9 +2343,13 @@ class GulfFilter:
     ]
 
     # مؤشرات أن الرابط لقناة (وليس مجموعة)
+    # [LINK-JUNK-v4.4.5] أُضيفت الإملاءات الخليجية (قناه/قنوات/اذاعه)
+    # — إعلانات القنوات الحية كانت تكتب «رابط القناه» بالهاء فتفلت
+    # من المؤشر القديم «قناة» بالتاء المربوطة.
     CHANNEL_INDICATORS = [
-        'قناة', 'channel', 'telegram channel', 'قناة تيليجرام',
-        'اخبار', 'news', 'إعلام', 'broadcast', 'اذاعة',
+        'قناة', 'قناه', 'قنوات', 'قناتي', 'قناتنا',
+        'channel', 'telegram channel', 'قناة تيليجرام', 'قناه تلجرام',
+        'اخبار', 'news', 'إعلام', 'اعلام', 'broadcast', 'اذاعة', 'اذاعه',
     ]
 
     # ==================================================================
@@ -2932,6 +2937,29 @@ class HistoryScanner:
                         sender = await msg.get_sender()
                         sn = Monitor._get_sender_name(sender)
                     except Exception: sn = "Unknown"
+
+                    # [BOT-FILTER] [LINK-JUNK-v4.4.5] فحص مُرسِل-بوت في
+                    # السكانر — توازيًا مع مسار NewMessage (_on_user_message
+                    # يتجاهل البوتات من الجذر بينما السكانر كان يسحب روابط
+                    # بوتات الترحيل/الإدارة: «ID المرسل/تم حظر العضو» →
+                    # قناة الروابط). get_sender هنا لا يكلف شيئًا (كيان
+                    # من كاش الرسالة نفسها).
+                    _scan_bot_check = getattr(self, '_sender_is_bot', None)
+                    if callable(_scan_bot_check) and _scan_bot_check(sender):
+                        logging.info(
+                            f"[SCAN {self.source_phone}] [BOT-FILTER] ignored bot message "
+                            f"chat={name[:30]} msg_id={msg.id} sender={sn[:30]}"
+                        )
+                        # علّمها معالجة حتى لا يعاد فحصها في الدورة القادمة
+                        if self.message_claim and claim_token:
+                            try:
+                                await self.message_claim.mark_processed(
+                                    dialog.id, msg.id, claim_token
+                                )
+                            except Exception:
+                                pass
+                        self.total_found -= len(links_info)
+                        continue
 
                     # استخراج بيانات تواصل المرسل
                     contact = extract_sender_contact(msg.text)
@@ -9719,6 +9747,23 @@ class Monitor:
                     await self.metrics.record_skip('banned')
                     continue
 
+                # [LINK-JUNK-v4.4.5] بوابة دفاع النشر — أي رابط تخطى بوابة
+                # الالتقاط (كان في الطابور قبل التحديث، أو جُلب من مسار
+                # قديم) يُرفض هنا قبل النشر للقناة. القمامة النصية
+                # (بوتات ترحيل/إشعارات إدارة) لا مكان لها في قناة الروابط.
+                _pub_junk = link_junk_reason(link_data.get('message_text', ''))
+                if _pub_junk:
+                    logging.info(
+                        f"[LINK id={link_id}] [PIPELINE-4] 🚫 LINK-JUNK ({_pub_junk}) "
+                        f"— rejecting before publish: {raw_link[:60]}"
+                    )
+                    await self.prod_db.set_group_state(
+                        normalized, GroupState.BANNED, raw_link,
+                        error=f'link_junk_{_pub_junk}')
+                    await self.prod_db.update_queue_status(link_data['id'], 'DONE')
+                    await self.metrics.record_skip(f'link_junk_{_pub_junk}')
+                    continue
+
                 # 3. AI فحص الرابط — يخضع لمتغير البيئة AI_BATCH_MODE
                 # AI_BATCH_MODE=true  (افتراضي): يتخطى الذكاء الاصطناعي لمعالجة قائمة الانتظار المتراكمة بسرعة
                 # AI_BATCH_MODE=false         : يعيد تفعيل فحص الذكاء الاصطناعي لكل رابط
@@ -9766,13 +9811,59 @@ class Monitor:
                     # pipeline isn't blocked (the scorer + join-time check catch
                     # it later). Private invite links (+hash/joinchat) and WhatsApp
                     # links are skipped here (can't resolve without joining / N/A).
-                    if link_type == 'telegram':
+                    # [LINK-JUNK-v4.4.5] طبقتان جديدتان قبل الحل:
+                    #   (1) بوابة نصية: الرسالة نفسها تقول «رابط القناه» →
+                    #       بثّ حتمي — لا حاجة لنداء شبكة (إعلانات القنوات
+                    #       كانت تُنشر لأن الحل يفشل أحيانًا).
+                    #   (2) الحل عبر كل العملاء المتصلين وبصيغة @username
+                    #       (لا أول عميل فقط) — رفض الحل من عميل واحد كان
+                    #       ينشر إعلانات قنوات لم تُحل (Bolt_Bo/wthker8/deheeh12).
+                    if link_type in ('telegram', 'telegram_private'):
+                        # (1) بوابة نص القناة — كلمات «قناة» الصريحة فقط
+                        # (لا «اخبار»: قروبات «اخبار الجامعة» موجودة فعلًا).
+                        # «رابط القناه/قناتي/القنوات» + رابط t.me (عام أو
+                        # دعوة خاصة +hash) = بث شبه حتمي — القنوات لا
+                        # تُولّد طلبات وكالة أصلًا (بث واحد فقط) فلا
+                        # قيمة لالتقاطها.
+                        _chan_low = f"{(link_data.get('message_text') or '')} {(link_data.get('username') or '')}".lower()
+                        _chan_txt = any(
+                            _cw in _chan_low for _cw in (
+                                'قناه', 'قناة', 'قنوات', 'قناتي', 'قناتنا',
+                                'channel', 'اذاعه', 'اذاعة',
+                            ))
+                        if _chan_txt:
+                            logging.info(
+                                f"[LINK id={link_id}] [PIPELINE-5] ⏭️ excluded "
+                                f"(likely_channel_text) before publish — text says channel"
+                            )
+                            await self.prod_db.set_group_state(
+                                normalized, GroupState.BANNED, raw_link,
+                                error='likely_channel_text')
+                            await self.prod_db.update_queue_status(link_data['id'], 'DONE')
+                            await self.metrics.record_skip('likely_channel_text')
+                            continue
+                        # (2) حل الكيان عبر كل العملاء المتصلين
                         try:
-                            _pp_client = next((c for c in self.user_clients.values() if c and c.is_connected()), None)
-                            if _pp_client:
+                            _pp_clients = [c for c in self.user_clients.values()
+                                           if c and c.is_connected()][:3]
+                            if _pp_clients:
                                 from telethon.tl.types import Channel as _PPCh, Chat as _PPCt, User as _PPUs
-                                try:
-                                    _ent = await asyncio.wait_for(_pp_client.get_entity(raw_link), timeout=15)
+                                _ent = None
+                                _resolve_targets = []
+                                if link_data.get('username'):
+                                    _resolve_targets.append('@' + str(link_data['username']))
+                                _resolve_targets.append(raw_link)
+                                for _pp_client in _pp_clients:
+                                    for _rt in _resolve_targets:
+                                        try:
+                                            _ent = await asyncio.wait_for(
+                                                _pp_client.get_entity(_rt), timeout=12)
+                                            break
+                                        except Exception:
+                                            continue
+                                    if _ent is not None:
+                                        break
+                                if _ent is not None:
                                     _is_broadcast = bool(getattr(_ent, 'broadcast', False))
                                     _is_user = isinstance(_ent, _PPUs) or (not isinstance(_ent, (_PPCh, _PPCt)) and hasattr(_ent, 'first_name'))
                                     if _is_broadcast or _is_user:
@@ -9782,10 +9873,9 @@ class Monitor:
                                         logging.info(f"[LINK id={link_id}] [PIPELINE-5] ⏭️ excluded ({_ban_reason}) before publish — not a student group")
                                         await self.metrics.record_skip(_ban_reason)
                                         continue
-                                except asyncio.TimeoutError:
-                                    logging.debug(f"[LINK id={link_id}] [PIPELINE-5] pre-publish entity resolve timed out — proceeding with publish")
-                                except Exception as _pp_e:
-                                    logging.debug(f"[LINK id={link_id}] [PIPELINE-5] pre-publish entity resolve failed ({type(_pp_e).__name__}) — proceeding with publish")
+                                    logging.debug(f"[LINK id={link_id}] [PIPELINE-5] entity resolved as group — proceeding with publish")
+                                else:
+                                    logging.debug(f"[LINK id={link_id}] [PIPELINE-5] entity unresolved across {len(_pp_clients)} client(s) — proceeding with publish")
                         except Exception as _ppc_e:
                             logging.debug(f"[LINK id={link_id}] [PIPELINE-5] pre-publish channel check skipped: {_ppc_e}")
 

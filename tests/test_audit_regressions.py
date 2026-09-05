@@ -4434,16 +4434,26 @@ async def test_req3_pre_publish_channel_exclusion_present():
     """[Req-3/Link-type] The publish pipeline (PIPELINE-5) must resolve the
     entity for public telegram username links and SKIP publish+join if it's
     a broadcast channel or a User/Bot — the user wants student GROUPS only,
-    not channels or profile links in the published feed."""
+    not channels or profile links in the published feed.
+    [LINK-JUNK-v4.4.5] العقد طُوّر: الحل الآن عبر كل العملاء المتصلين
+    وبصيغتي @username والرابط الخام (طبقتان: بوابة نص قناة ثم حل
+    كيان متعدد العملاء) — كان عميلًا واحدًا فقط فكانت إعلانات القنوات
+    تُنشر عند فشل الحل."""
     try:
         src = (PROJECT_ROOT / "bot.py").read_text(encoding="utf-8")
         has_block = "PRE-PUBLISH channel/user exclusion" in src
         has_broadcast = "is_channel_broadcast" in src
         has_user = "'not_a_group'" in src
-        has_timeout = "asyncio.wait_for(_pp_client.get_entity(raw_link), timeout=15)" in src
+        # v4.4.5: resolution loop over ALL clients with per-call timeout
+        has_timeout = "_pp_client.get_entity(_rt), timeout=" in src
+        has_multi_client = "for _pp_client in _pp_clients" in src
+        # v4.4.5: text gate for explicit «قناه/قناة» mentions (no network call)
+        has_chan_text = "likely_channel_text" in src
         record("Req3-1: pre-publish channel/user exclusion in PIPELINE-5",
-               has_block and has_broadcast and has_user and has_timeout,
-               f"block={has_block} broadcast={has_broadcast} user={has_user} timeout={has_timeout}")
+               has_block and has_broadcast and has_user and has_timeout
+               and has_multi_client and has_chan_text,
+               f"block={has_block} broadcast={has_broadcast} user={has_user} "
+               f"timeout={has_timeout} multi={has_multi_client} chantxt={has_chan_text}")
     except Exception as e:
         record("Req3-1: exception", False, str(e))
 

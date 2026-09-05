@@ -45,6 +45,49 @@ import aiosqlite
 # 1. Link Normalizer — unified format for all link variants
 # -------------------------------------------------------------------
 
+# [LINK-JUNK-v4.4.5] بوابة قمامة نص الرسالة قبل الالتقاط/النشر.
+# بلاغ الإنتاج 2026-09-05 (~06:15): «أغلب الطلبات ترسل لقناة الروابط
+# والفلتر زبالة» — آخر 200 رابط منشور: 13 بوت-ترحيل + إشعارات إدارة
+# + إعلانات قنوات. الجذر: مسار السكانر (المسح التاريخي) لا يفحص
+# هل المُرسِل بوت (بعكس NewMessage) فتتسرب رسائل بوتات الترحيل
+# «👤 فلان ID المرسل : رقم نص الرساله : ...» وإشعارات الحظر/الكتم
+# إلى قناة الروابط. البوابة نصية (تلتقط حتى الـuserbots التي تعمل
+# بحساب بشري) وتُطبّق في enqueue_link — نقطة الخنق التي تمر بها
+# كل مسارات الالتقاط (سكانر/NewMessage/reconcile/انقاذ الحذف/
+# دفتر اليومية) دفعة واحدة.
+MODERATION_NOTICE_MARKERS = (
+    'تم حظر', 'حظر العضو', 'تم كتم', 'كتم العضو', 'تم تقييد',
+    'تقييد العضو', 'تم طرد', 'طرد العضو', 'تم تحذير', 'تحذير نهائي',
+    'تم تنظيف', 'تنظيف المجموعه', 'تنظيف المجموعة',
+    'انضم عبر رابط', 'تمت إزالة', 'تمت ازالة',
+)
+RELAY_BOT_MARKERS = (
+    'id المرسل', 'id المرسلة', 'اسم المرسل', 'نص الرساله', 'نص الرسالة',
+    'الرساله وصلت', 'الرسالة وصلت', 'تم التسليم عبر',
+    'العضو المجهول', 'نشر مجهول', 'بواسطة البوت', 'بواسطه البوت',
+)
+
+
+def link_junk_reason(message_text: str) -> Optional[str]:
+    """[LINK-JUNK-v4.4.5] سبب رفض نص رسالة الروابط، أو None لو نظيف.
+
+    يُطبق على message_text قبل إدخال الرابط للطابور (enqueue_link)
+    وقبل النشر (دفاع ثانٍ) — يمنع قمامة بوتات الإدارة/الترحيل من
+    الوصول لقناة الروابط والداشبورد إطلاقًا. النصوص النظيفة (طلبات
+    الطلاب الحقيقية التي تحمل روابط واتساب) لا تحتوي هذه الأنماط.
+    """
+    if not message_text:
+        return None
+    low = message_text.lower()
+    for m in MODERATION_NOTICE_MARKERS:
+        if m in low:
+            return 'moderation_notice'
+    for m in RELAY_BOT_MARKERS:
+        if m in low:
+            return 'relay_bot'
+    return None
+
+
 class LinkNormalizer:
     """يوحد جميع صيغ الروابط في صيغة واحدة قابلة للمقارنة."""
 
@@ -83,6 +126,12 @@ class LinkNormalizer:
                 # هذه روابط رسائل في قنوات، مو دعوات انضمام
                 # لكن نستخرج username وننسخ الرابط بدون /msg_id
                 if msg_id is not None:
+                    # [LINK-JUNK-v4.4.5] t.me/c/<id>/<msg> = رابط رسالة
+                    # دردشة خاصة (غير قابل للانضمام) — كان يُستخرج
+                    # كـ username='c' قمامة نقائية. t.me/s/<name> =
+                    # معاينة قناة (broadcast حتميًا) — كان يصير 's'.
+                    if identifier.lower() in ('c', 's'):
+                        continue
                     # نظّف الرابط من /msg_id
                     raw = re.sub(r'/\d+$', '', raw)
                     # أعد استخراج identifier بدون msg_id
@@ -99,6 +148,11 @@ class LinkNormalizer:
                     username = None
                 else:
                     username = identifier.lower()
+                    # [LINK-JUNK-v4.4.5] يوزرنيمات تلغرام الحقيقية ≥٥
+                    # محارف — الأقصر ('c'/'s'/'x') قطع URL ملتبسة
+                    # (روابط رسائل/معاينات) وليست كيانات قابلة للانضمام.
+                    if len(username) < 5:
+                        continue
                     normalized = f"tg:user:{username}"
                     link_type = "telegram"
                     invite_hash = None
@@ -1038,8 +1092,20 @@ class ProductionDB:
 
         Returns:
             True لو انضاف جديد أو أُعيد لـ QUEUED
-            False لو مكرر وباقي QUEUED (ما يحتاج إعادة)
+            False لو مكرر وباقي QUEUED (ما يحتاج إعادة) أو [LINK-JUNK-v4.4.5]
+            قمامة بوت/إدارة (يُرفض من الجذر — لا طابور ولا نشر)
         """
+        # [LINK-JUNK-v4.4.5] نقطة الخنق الموحدة: كل مسارات الالتقاط
+        # (سكانر/NewMessage/reconcile/انقاذ الحذف/دفتر اليومية) تمر
+        # من هنا — نص قمامة الإدارة/الترحيل يُرفض قبل أي كتابة.
+        # سكانر يفحص المُرسِل-البوت إضافيًا (bot.py) كطبقة ثانية.
+        _junk = link_junk_reason(link_data.get('message_text', ''))
+        if _junk:
+            logging.info(
+                f"[LINK-JUNK] rejected at enqueue ({_junk}): "
+                f"{link_data.get('raw', '')[:60]}"
+            )
+            return False
         conn = await self._conn()
         try:
             # محاولة إدخال جديد
