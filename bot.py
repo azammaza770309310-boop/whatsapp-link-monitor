@@ -6756,6 +6756,15 @@ class Monitor:
             dm_buttons = None  # فشل بناء الزر لا يمنع إرسال التنبيه
             dm_mode = 'none'
 
+        # [CONTACT-HINT-v4.4.6] مرسل بلا username (لا زر «مراسلة»):
+        # المُشغّل يحتاج أن يعرف أن اسم المُرسِل في سطر «المرسل» قابل
+        # للنقر (يفتح ملفه → مراسلة) — خصوصًا بعد حذف الرسالة الأصلية
+        # حيث يصبح اسم المُرسِل مسار التواصل الوحيد. بلاغ 2026-09-05:
+        # «🔗 عرض الرسالة الأصلية — نفس هذا كيف أدخله؟ تم حذف الرسالة
+        # كما سحب اليوزر» — رابط ميت + المُشغّل لا يعرف البديل.
+        if dm_mode == 'text_mention':
+            alert += "\n💡 <i>للتواصل: اضغط اسم المُرسِل أعلاه</i>"
+
         # --- الإرسال لقناة الطلبات (retry + FloodWait handling) ---
         # getattr دفاعي لـbot_client: لو fake namespace (اختبارات) بلا bot_client،
         # getattr يُرجع None → نتخطّى الإرسال بصمت بدل AttributeError.
@@ -6772,7 +6781,7 @@ class Monitor:
             logging.info(
                 f"  (chat_id={chat_id} msg_id={msg_id} source={source_phone})"
             )
-            await _bot_client.send_message(
+            sent_alert = await _bot_client.send_message(
                 target, alert, parse_mode='html', link_preview=False,
                 buttons=dm_buttons,
             )
@@ -6782,6 +6791,15 @@ class Monitor:
                 f"keywords={keywords_found} source={source_phone} "
                 f"dm={dm_mode}"
             )
+            # [REQ-DELETED-MARK-v4.4.6] سجّل التنبيه للتعليم عند حذف
+            # الأصل من المجموعة (رابط التنبيه يموت عند الحذف — نحتاج
+            # معرّف رسالة التنبيه كي نُعدّلها لاحقًا بعلامة ⚠️).
+            # تحسيني غير قاتل: بلا معرّف (عميل مُحاكى/فشل) → لا تسجيل.
+            # getattr دفاعي (نمط الكود): fake namespace بلا الدالة → تخطٍ صامت.
+            _reg_alert_fn = getattr(self, '_register_request_alert', None)
+            if callable(_reg_alert_fn):
+                _reg_alert_fn(chat_id, msg_id, target, sent_alert,
+                              alert, dm_buttons)
 
             # [v4.3.8] حُذف «جسر التواصل» (contact bridge) نهائيًا:
             # تشخيص الإنتاج أثبت أنه ضجيج بلا قيمة — القفزة 1 (توجيه الرسالة
@@ -6797,15 +6815,135 @@ class Monitor:
             logging.warning(f"[REQUEST-PATH] FloodWait {wait_s}s — retrying")
             try:
                 await asyncio.sleep(wait_s)
-                await _bot_client.send_message(
+                sent_alert = await _bot_client.send_message(
                     target, alert, parse_mode='html', link_preview=False,
                     buttons=dm_buttons,
                 )
                 logging.info(f"[REQUEST-PATH] ✅ sent after FloodWait chat_id={chat_id} msg_id={msg_id}")
+                # [REQ-DELETED-MARK-v4.4.6] نفس التسجيل بعد إعادة المحاولة
+                _reg_alert_fn2 = getattr(self, '_register_request_alert', None)
+                if callable(_reg_alert_fn2):
+                    _reg_alert_fn2(chat_id, msg_id, target, sent_alert,
+                                   alert, dm_buttons)
             except Exception as e2:
                 logging.error(f"[REQUEST-PATH] send failed after FloodWait retry: {e2}")
         except Exception as e:
             logging.error(f"[REQUEST-PATH] send failed: {e}")
+
+    # ------------------------------------------------------------------
+    # [REQ-DELETED-MARK-v4.4.6] تعليم تنبيه الطلب عند حذف الرسالة الأصلية
+    # ------------------------------------------------------------------
+    # بلاغ المُشغّل (2026-09-05): «🔗 عرض الرسالة الأصلية — نفس هذا كيف
+    # أدخله؟ تم حذف الرسالة كما سحب اليوزر» — الطالب ينشر طلبه ثم يسحبه
+    # (أو يحذفه مشرف المجموعة)، فيصبح رابط التنبيه ميتًا بلا تفسير: يضغطه
+    # المُشغّل فلا يفتح شيئًا. الحذف في تلغرام نهائي للجميع — استرجاع
+    # الرسالة نفسها مستحيل — لكن نسخة النص كاملة داخل التنبيه، ومسار
+    # التواصل مع صاحبها (اسم المُرسِل القابل للنقر / زر «مراسلة») يبقى
+    # حيًّا. الحل: عند وصول حدث الحذف (MessageDeleted) من أي حساب مراقبة
+    # في نفس المجموعة، نُعدّل رسالة التنبيه نفسها في قناة الطلبات: علامة
+    # ⚠️ واضحة + توجيه لمسار التواصل البديل — بدل رابط ميت صامت.
+    # السجل في الذاكرة فقط (TTL 24h، سقف 1000، يُفقد عند إعادة التشغيل
+    # — أفضل جهد: الحذف يحدث عادة خلال دقائق/ساعات من النشر).
+
+    def _register_request_alert(self, chat_id, msg_id, target, sent_alert,
+                                alert_html, dm_buttons):
+        """يسجّل تنبيه طلب مُرسَلًا: (chat_id, msg_id) → معرّف رسالة
+        التنبيه في قناة الطلبات، لكي يُعلَّم لاحقًا عند حذف الأصل.
+        غير قاتل تمامًا: أي فشل يُهمل (التسجيل تحسيني — لا يمنع الإرسال)."""
+        try:
+            alert_id = getattr(sent_alert, 'id', None)
+            if not isinstance(alert_id, int):
+                # عميل مُحاكى/فشل شبكي بلا معرّف → لا تسجيل
+                return
+            reg = getattr(self, '_request_alerts', None)
+            if reg is None:
+                try:
+                    reg = self._request_alerts = {}
+                except Exception:
+                    return  # namespace لا يقبل setattr (اختبارات قديمة)
+            now = time.time()
+            # سقف + TTL: نظّف المنتهية أولًا ثم الأقدم عند الحاجة
+            if len(reg) >= 1000:
+                expired = [k for k, v in reg.items()
+                           if now - float(v.get('ts', 0.0)) > 86400.0]
+                for k in expired:
+                    del reg[k]
+                if len(reg) >= 1000:
+                    _oldest = sorted(
+                        reg.items(),
+                        key=lambda kv: float(kv[1].get('ts', 0.0)))
+                    for k, _ in _oldest[:len(reg) - 900]:
+                        del reg[k]
+            reg[(int(chat_id), int(msg_id))] = {
+                'alert_id': alert_id,
+                'target': target,
+                'text': alert_html,
+                'buttons': dm_buttons,
+                'ts': now,
+            }
+            logging.info(
+                f"[REQUEST-PATH] 📌 delete-mark registry +1 "
+                f"chat_id={chat_id} msg_id={msg_id} alert_id={alert_id} "
+                f"(total={len(reg)})"
+            )
+        except Exception:
+            pass  # التسجيل تحسيني — لا يعطّل المسار أبدًا
+
+    async def _mark_request_alert_deleted(self, chat_id, msg_id) -> bool:
+        """يعلّم تنبيه الطلب بأن الرسالة الأصلية حُذفت من المجموعة.
+
+        يُستدعى من _on_message_deleted (أي حساب مراقبة استلم الحدث).
+        يُعدّل رسالة التنبيه في قناة الطلبات: يضيف ⚠️ + توجيه التواصل.
+        idempotent: pop من السجل — أول حساب يستلم الحدث يعلّم، والبقية
+        لا يجدون شيئًا (لا تعديل مزدوج). يعيد True لو تم التعليم."""
+        reg = getattr(self, '_request_alerts', None)
+        if not reg:
+            return False
+        entry = None
+        try:
+            if chat_id is not None:
+                entry = reg.pop((int(chat_id), int(msg_id)), None)
+            if entry is None:
+                # حذف بلا chat_id (مجموعة عادية): ابحث بالمعرّف وحده —
+                # تصادم msg_id بين مجموعات خلال TTL نادر ومقبول لعلامة.
+                for k in list(reg.keys()):
+                    if k[1] == int(msg_id):
+                        entry = reg.pop(k)
+                        break
+        except Exception:
+            return False
+        if not entry:
+            return False
+        _bot_client = getattr(self, 'bot_client', None)
+        try:
+            if not _bot_client or not _bot_client.is_connected():
+                logging.warning(
+                    "[REQUEST-PATH] bot_client غير متصل — التنبيه لم يُعلَّم "
+                    f"(alert_id={entry.get('alert_id')})"
+                )
+                return False
+            marked = (
+                str(entry.get('text') or '')
+                + "\n\n⚠️ <b>حُذفت الرسالة الأصلية من المجموعة</b>\n"
+                "🔗 الرابط أعلاه لن يفتح شيئًا — للتواصل مع المُرسِل: "
+                "اضغط اسمه في سطر «المرسل» أعلاه أو زر «مراسلة»."
+            )
+            await _bot_client.edit_message(
+                entry.get('target'), int(entry.get('alert_id')), marked,
+                parse_mode='html', link_preview=False,
+                buttons=entry.get('buttons'),
+            )
+            logging.info(
+                f"[REQUEST-PATH] ⚠️ delete-marked alert "
+                f"chat_id={chat_id} msg_id={msg_id} "
+                f"alert_id={entry.get('alert_id')}"
+            )
+            return True
+        except Exception as e:
+            logging.warning(
+                f"[REQUEST-PATH] تعليم الحذف فشل (تحسيني — الرسالة تبقى): {e}"
+            )
+            return False
 
     def _normalized_to_link_data(self, normalized: str, source_phone: str,
                                  chat_id, msg_id, group_name: str = '') -> Optional[dict]:
@@ -6937,6 +7075,20 @@ class Monitor:
                 # this, one bad row silently skipped processing for 49 messages
                 # that were never rescued.
                 try:
+                    # === [REQ-DELETED-MARK-v4.4.6] طلب مُنشر في قناة الطلبات؟ ===
+                    # علّم تنبيهه فورًا (⚠️ + توجيه التواصل) قبل أي منطق
+                    # إنقاذ: رسالة الطلب نصية بلا روابط غالبًا، ومسارات
+                    # الإنقاذ أدناه لا تفعل لها شيئًا — التعليم هو المعالجة
+                    # الصحيحة لها. غير قاتل: فشله لا يوقف بقية الحدث.
+                    # getattr دفاعي (نمط الكود): fake namespace قديم بلا
+                    # الدالة → تخطٍ صامت بدل AttributeError.
+                    _mark_fn = getattr(self, '_mark_request_alert_deleted', None)
+                    if callable(_mark_fn):
+                        try:
+                            await _mark_fn(chat_id, deleted_msg_id)
+                        except Exception:
+                            pass
+
                     # === المصدر 1: Link Ring Buffer (LRB — أسرع مسار، روابط فقط) ===
                     # [PR-2] لو NewMessage وصل لطبقة extract (Step 0) قبل الحذف،
                     # LRB عنده الروابط. نُنقذها (link-only) عبر مسار موحّد:

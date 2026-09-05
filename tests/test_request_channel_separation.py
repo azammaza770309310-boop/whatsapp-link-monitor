@@ -255,6 +255,8 @@ def make_monitor(prod_db, channel_id=-1001234567890,
         # [SPEED-v4.3.4] مسار الطلبات أصبح خلفية غير حاجبة — الاختبارات تُربط
         # الجسر الحقيقي وتُصفّي المهام الخلفية قبل التحقق من الإرسال.
         '_dispatch_request_path',
+        # [REQ-DELETED-MARK-v4.4.6] تسجيل التنبيهات للتعليم عند حذف الأصل
+        '_register_request_alert', '_mark_request_alert_deleted',
     ):
         setattr(fm, method_name,
                 types.MethodType(getattr(bot.Monitor, method_name), fm))
@@ -1513,6 +1515,196 @@ async def test_24_delegation_dialect_and_student_services():
         except: pass
 
 
+# =====================================================================
+# Test 25: [REQ-DELETED-MARK-v4.4.6] بلاغ المُشغّل (2026-09-05): «🔗 عرض
+# الرسالة الأصلية — نفس هذا كيف أدخله؟ تم حذف الرسالة كما سحب اليوزر» —
+# الطالب ينشر طلبه ثم يسحبه فيصبح رابط التنبيه ميتًا بلا تفسير.
+# الحل: عند وصول MessageDeleted لأي حساب مراقبة → نُعدّل رسالة التنبيه
+# نفسها في قناة الطلبات (⚠️ + توجيه لمسار التواصل البديل) بدل رابط
+# ميت صامت. كما نضيف [CONTACT-HINT]: مرسل بلا username → سطر تلميح
+# «للتواصل: اضغط اسم المُرسِل أعلاه» (text-mention هو مسار التواصل).
+# =====================================================================
+class FakeSentAlert:
+    """يحاكي رسالة التنبيه المُرسَلة (send_message return) — يحمل .id."""
+
+    def __init__(self, id):
+        self.id = id
+
+
+class SendIdMock:
+    """send_message يسجّل الاستدعاءات ويعيد FakeSentAlert(id متزايد)
+    — كما في الإنتاج (Telethon يُعيد رسالة بمعرّف قابل للتعديل لاحقًا)."""
+
+    def __init__(self):
+        self.calls = []
+        self._next = 700100
+
+    async def __call__(self, *args, **kwargs):
+        self.calls.append({
+            'target': args[0] if args else kwargs.get('entity'),
+            'alert': args[1] if len(args) > 1 else kwargs.get('message', ''),
+            'kwargs': kwargs,
+        })
+        sent = FakeSentAlert(self._next)
+        self._next += 1
+        return sent
+
+    @property
+    def called(self):
+        return len(self.calls) > 0
+
+    @property
+    def call_count(self):
+        return len(self.calls)
+
+
+class EditMock:
+    """edit_message يسجّل الاستدعاءات (target, alert_id, marked, kwargs)
+    — اختياريًا يرمي استثناءً لمحاكاة فشل الشبكة."""
+
+    def __init__(self, raise_exc=None):
+        self.calls = []
+        self.raise_exc = raise_exc
+
+    async def __call__(self, *args, **kwargs):
+        if self.raise_exc is not None:
+            raise self.raise_exc
+        self.calls.append({'args': args, 'kwargs': kwargs})
+        return types.SimpleNamespace(
+            id=args[1] if len(args) > 1 else 0)
+
+
+class FakeDeleteEvent25:
+    """يحاكي MessageDeleted: deleted_ids + chat_id (None لمجموعة عادية
+    — حدث الحذف بلا سياق المجموعة)."""
+
+    def __init__(self, ids, chat_id):
+        self.deleted_ids = list(ids)
+        self.chat_id = chat_id
+
+
+async def test_25_delete_marks_request_alert_with_contact_guidance():
+    print("\n--- Test 25: [REQ-DELETED-MARK] حذف الأصل → ⚠️ على التنبيه + توجيه التواصل ---")
+    prod_db, db_path, conn = await make_test_db()
+    try:
+        fm = make_monitor(prod_db)
+        # send_message يعيد معرّفًا (كالإنتاج) + edit_message يُسجَّل
+        send_id_mock = SendIdMock()
+        edit_mock = EditMock()
+        fm.bot_client.send_message = send_id_mock
+        fm.bot_client.edit_message = edit_mock
+
+        chat = -1004444001
+        msg_id = 440001
+        # سيناريو رهف (طلب عرض بوربوينت) بقالب مقبول من المصنّف الوهمي
+        ev = FakeNewMessageEvent(
+            "مين يحل لي واجب عرض بربوينت؟ محتاج مساعدة",
+            chat, msg_id, sender_id=77, chat=FakeMegagroupChat(), sender=None)
+        await fm._on_user_message(ev, '+TEST_SOURCE')
+        await drain_request_tasks(fm)
+
+        # (أ) التنبيه أُرسل وسُجّل للتعليم عند الحذف
+        record("25: alert sent (request accepted)",
+               send_id_mock.call_count == 1,
+               f"sends={send_id_mock.call_count}")
+        reg = getattr(fm, '_request_alerts', None) or {}
+        entry = reg.get((chat, msg_id))
+        record("25: delete-mark registry populated ((chat,msg) → alert_id)",
+               entry is not None and entry.get('alert_id') == 700100,
+               f"registry entry: {entry!r}")
+        if entry:
+            record("25: registry target is the requests channel",
+                   entry.get('target') == '@dhkskwksjskwk',
+                   f"target={entry.get('target')!r}")
+            record("25: registry stores original alert (🔗 line preserved)",
+                   'عرض الرسالة الأصلية' in str(entry.get('text')),
+                   "original alert text not stored")
+
+        # (ب) [CONTACT-HINT] مرسل بلا username → تلميح التواصل في التنبيه
+        alert = send_id_mock.calls[0]['alert']
+        record("25: [CONTACT-HINT] usernameless alert carries contact guidance",
+               'للتواصل: اضغط اسم المُرسِل أعلاه' in alert,
+               f"hint missing — tail: {alert[-160:]!r}")
+
+        # (ج) حذف الرسالة الأصلية → التعليم فورًا (⚠️ + توجيه التواصل)
+        await fm._on_message_deleted(FakeDeleteEvent25([msg_id], chat),
+                                     '+TEST_SOURCE')
+        record("25: deletion → edit_message called exactly once",
+               len(edit_mock.calls) == 1,
+               f"edit calls={len(edit_mock.calls)}")
+        if edit_mock.calls:
+            e = edit_mock.calls[0]
+            _args = e['args']
+            marked = _args[2] if len(_args) > 2 else ''
+            record("25: edit targets the registered alert (target, alert_id)",
+                   _args[0] == '@dhkskwksjskwk' and _args[1] == 700100,
+                   f"edit args: {_args[:2]!r}")
+            record("25: marked text carries ⚠️ deletion notice",
+                   'حُذفت الرسالة الأصلية' in marked,
+                   f"no deletion marker — tail: {marked[-200:]!r}")
+            record("25: marked text redirects to contact path (اضغط اسمه)",
+                   'اضغط اسمه' in marked,
+                   f"no contact guidance — tail: {marked[-200:]!r}")
+            record("25: marked text preserves the full original alert",
+                   'عرض الرسالة الأصلية' in marked and 'بربوينت' in marked,
+                   "original alert content lost in edit")
+            record("25: edit passes buttons kwarg (None — usernameless)",
+                   e['kwargs'].get('buttons') is None,
+                   f"buttons kwarg: {e['kwargs'].get('buttons')!r}")
+
+        # (د) idempotent: حدث حذف ثانٍ (حساب مراقبة آخر) → لا تعديل مزدوج
+        await fm._on_message_deleted(FakeDeleteEvent25([msg_id], chat),
+                                     '+TEST_OTHER_MONITOR')
+        record("25: second delete event → NO double edit (idempotent pop)",
+               len(edit_mock.calls) == 1,
+               f"edit calls after 2nd delete: {len(edit_mock.calls)}")
+
+        # (هـ) حذف بلا chat_id (مجموعة عادية) → البحث بالمعرّف وحده
+        # (ملاحظة: `or {}` كانت تنشئ قاموسًا مهملًا عندما يكون السجل فارغًا
+        # بعد الـpop — نربط السجل الحقيقي مباشرة.)
+        if getattr(fm, '_request_alerts', None) is None:
+            fm._request_alerts = {}
+        reg = fm._request_alerts
+        reg[(-1004444002, 440002)] = {
+            'alert_id': 700105, 'target': '@dhkskwksjskwk',
+            'text': '👤 <b>المرسل:</b> تجربة', 'buttons': None,
+            'ts': time.time(),
+        }
+        ok = await fm._mark_request_alert_deleted(None, 440002)
+        record("25: chat_id=None delete → found by msg_id alone",
+               ok is True and len(edit_mock.calls) == 2,
+               f"ok={ok}, edit calls={len(edit_mock.calls)}")
+
+        # (و) فشل التعديل (شبكة) → لا استثناء يهرب (تحسيني غير قاتل)
+        if getattr(fm, '_request_alerts', None) is None:
+            fm._request_alerts = {}
+        reg = fm._request_alerts
+        reg[(-1004444003, 440003)] = {
+            'alert_id': 700110, 'target': '@dhkskwksjskwk',
+            'text': 'x', 'buttons': None, 'ts': time.time(),
+        }
+        edit_mock.raise_exc = RuntimeError('network down')
+        try:
+            ok2 = await fm._mark_request_alert_deleted(-1004444003, 440003)
+            record("25: edit failure → False, no exception escapes",
+                   ok2 is False, f"ok2={ok2!r}")
+        except Exception as exc:
+            record("25: edit failure → False, no exception escapes",
+                   False, f"exception escaped: {exc!r}")
+        edit_mock.raise_exc = None
+
+        # (ز) لا سجل → لا تعديل ولا استثناء
+        n_before = len(edit_mock.calls)
+        ok3 = await fm._mark_request_alert_deleted(-999999, 1)
+        record("25: registry miss → False, zero edits",
+               ok3 is False and len(edit_mock.calls) == n_before,
+               f"ok3={ok3!r}, edits={len(edit_mock.calls)}")
+    finally:
+        await conn.close()
+        try: os.remove(db_path)
+        except: pass
+
+
 async def main():
     print("=" * 70)
     print("Request Channel Separation Hardening — Test Suite [CHANNEL-SEPARATION]")
@@ -1548,6 +1740,7 @@ async def main():
     await test_22_bridge_fully_removed_no_pm_traffic()
     await test_23_private_handler_ignores_forwards()
     await test_24_delegation_dialect_and_student_services()
+    await test_25_delete_marks_request_alert_with_contact_guidance()
     print("\n" + "=" * 70)
     passed = sum(1 for r in RESULTS if r['passed'])
     failed = sum(1 for r in RESULTS if not r['passed'])
