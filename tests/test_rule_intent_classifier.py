@@ -166,6 +166,45 @@ async def main():
     except Exception as e:
         record("E: bot import", False, str(e))
 
+    print("\n--- F: [STATS-CONTRACT-v4.4.1] full bot-facing interface ---")
+    # /api/filter_stats (bot.py classifier.stats()) وإيقاف bot.py
+    # (classifier.close()) — الانكسار الذي كبّر اللوحة بـ500 على v4.4.0
+    # الإنتاجي لا يتكرر: العقد مجمّد هنا.
+    s0 = clf.stats()
+    record("F: stats() callable → dict", isinstance(s0, dict))
+    _required_keys = ["enabled", "engine", "providers", "calls", "accepts",
+                      "rejects", "errors", "timeouts", "parse_failures",
+                      "rotations", "total_latency_ms", "avg_latency_ms",
+                      "retry_rounds", "total_budget_s", "min_interval_s",
+                      "max_pending", "by_category"]
+    _missing = [k for k in _required_keys if k not in s0]
+    record("F: stats() carries every key /api/filter_stats renders",
+           not _missing, f"missing: {_missing}")
+    _int_keys = ["calls", "accepts", "rejects", "errors", "timeouts",
+                 "parse_failures", "rotations"]
+    record("F: numeric counters are ints (JSON-safe)",
+           all(isinstance(s0.get(k), int) for k in _int_keys))
+    _before_calls = s0["calls"]
+    _before_accepts = s0["accepts"]
+    d3 = await clf.classify("مين يسوي تقرير ؟؟")
+    s1 = clf.stats()
+    record("F: counters track live classify() (delta=+1 call, +1 accept)",
+           s1["calls"] == _before_calls + 1
+           and s1["accepts"] == _before_accepts + (1 if d3.decision == "ACCEPT" else 0))
+    record("F: by_category counters increment",
+           s1["by_category"].get("homework_execution_request", 0) >= 1)
+    ph = clf.provider_health()
+    record("F: provider_health() → non-empty list (dashboard renders it)",
+           isinstance(ph, list) and len(ph) >= 1)
+    try:
+        import inspect
+        _close = clf.close()
+        record("F: close() is awaitable coroutine (shutdown path bot.py)",
+            inspect.iscoroutine(_close))
+        await _close
+    except Exception as e:
+        record("F: close() contract", False, str(e))
+
     print("\n" + "=" * 70)
     print(f"RULE-ENGINE RESULTS: {PASS}/{PASS + FAIL} assertions passed")
     print("=" * 70)

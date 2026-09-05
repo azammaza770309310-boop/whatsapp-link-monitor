@@ -296,6 +296,16 @@ class RuleBasedIntentClassifier:
         # (timeout_s/ max_attempts/ ... تُهمل: لا معنى لها هنا).
         self.enabled = True
         self.version = RULE_ENGINE_VERSION
+        # [STATS-CONTRACT-v4.4.1] عدّادات حية — عقد stats() الذي تقرأه
+        # /api/filter_stats (كان خاصًا بـIntentClassifier؛ إغفاله عند
+        # الاستبدال كسر اللوحة بـ500: 'RuleBasedIntentClassifier' object
+        # has no attribute 'stats'). تُحدَّث في classify() (المسار الإنتاجي).
+        self.counters: Dict[str, int] = {
+            "calls": 0, "accepts": 0, "rejects": 0,
+            "errors": 0, "timeouts": 0, "parse_failures": 0,
+            "rotations": 0, "total_latency_ms": 0,
+        }
+        self._by_category: Dict[str, int] = {}
 
     # --------------------------------------------------------
     # الواجهة الرئيسية (async — نفس توقيع IntentClassifier)
@@ -308,6 +318,18 @@ class RuleBasedIntentClassifier:
         t0 = time.monotonic()
         decision = self.classify_sync(text)
         decision.latency_ms = int((time.monotonic() - t0) * 1000)
+        # [STATS-CONTRACT-v4.4.1] عدّادات حية — تقرأها /api/filter_stats
+        self.counters["calls"] += 1
+        self.counters["total_latency_ms"] += decision.latency_ms
+        if decision.ok:
+            if decision.decision == "ACCEPT":
+                self.counters["accepts"] += 1
+            else:
+                self.counters["rejects"] += 1
+        else:
+            self.counters["errors"] += 1
+        _cat = decision.category or "unknown"
+        self._by_category[_cat] = self._by_category.get(_cat, 0) + 1
         return decision
 
     # --------------------------------------------------------
@@ -428,3 +450,45 @@ class RuleBasedIntentClassifier:
             "version": RULE_ENGINE_VERSION,
             "note": "deterministic — no network calls",
         }]
+
+    # --------------------------------------------------------
+    # [STATS-CONTRACT-v4.4.1] تكملة عقد IntentClassifier الذي يستدعيه
+    # bot.py: stats() تقرأها /api/filter_stats (سطر classifier.stats())،
+    # وclose() يستدعيه إيقاف bot.py (aiohttp session للـAI — هنا لا
+    # موارد فلا-op، لكن الدالة موجودة كي لا يُبتلع AttributeError
+    # عند الإيقاف). أي استبدال مستقبلي للمصنّف يجب أن يحقق العقد نفسه —
+    # يفرضه tests/test_rule_intent_classifier.py قسم F.
+    # --------------------------------------------------------
+    def stats(self) -> dict:
+        calls = max(1, self.counters["calls"])
+        return {
+            "enabled": self.enabled,
+            "engine": RULE_ENGINE_VERSION,
+            "providers": 1,               # المحرك الحتمي نفسه (طول provider_health)
+            "timeout_s": 0,               # لا شبكة — لا مهلة
+            "max_attempts": 1,            # قرار واحد حتمي — لا إعادة محاولة
+            "max_concurrent": 0,          # لا I/O — لا معنى له
+            "retry_rounds": 1,
+            "total_budget_s": 0,
+            "min_interval_s": 0,
+            "max_pending": 0,
+            "pool_wait_budget_s": 0,
+            # knobs محايدة (لا معنى لها بلا شبكة — تُعرض أصفارًا):
+            "cooldown_waits": 0,
+            "pace_waits": 0,
+            "budget_exhausted": 0,
+            "overload_rejects": 0,
+            "health_probes": 0,
+            "pool_dead_fasts": 0,
+            "busy_skips": 0,
+            "aimd_grow": 0,
+            "aimd_shrink": 0,
+            "dead_key_latches": 0,
+            **dict(self.counters),
+            "avg_latency_ms": round(self.counters["total_latency_ms"] / calls, 1),
+            "by_category": dict(self._by_category),
+        }
+
+    async def close(self) -> None:
+        """no-op — المحرك لا يملك موارد (عقد IntentClassifier.close)."""
+        return None
