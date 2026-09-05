@@ -4952,26 +4952,43 @@ async def test_reqaudit3_fleet_health_task_supervised():
 
 
 async def test_reqaudit3_joiner_worker_fleet_backoff():
-    """ReqAudit3-6: _joiner_worker must check self._fleet_health's
-    connected_joiners count BEFORE picking a link, and skip the cycle
-    (sleep 60s + continue) when ALL joiners are unavailable. Without
-    this, the scheduler burns cycles re-enqueueing every stuck link
-    every 5 min (96+ links × every 5 min = wasted storm)."""
+    """ReqAudit3-6 [FLEET-PUBLISH-v4.4.4]: _joiner_worker must check
+    self._fleet_health's connected_joiners count and, when ALL joiners
+    are unavailable, switch to PUBLISH-ONLY mode — links keep publishing
+    (PIPELINE-5 needs the bot, not joiners) while the JOIN phase defers
+    (+30min next_retry — get_queued_links respects next_retry_at so no
+    5-min requeue storm, the original ReqAudit3 concern). The v≤4.4.3
+    behavior (skip the whole cycle → link publishing froze 86 minutes,
+    link_queue_pending=81, operator report 2026-09-05) must NOT return."""
     try:
         src = (PROJECT_ROOT / "bot.py").read_text(encoding="utf-8")
         start = src.find("async def _joiner_worker(self):")
-        end = src.find("async def _alert_terminal_failure", start)
-        body = src[start:end] if (start >= 0 and end > 0) else src[start:start+15000]
+        # [v4.4.4] _alert_terminal_failure انتقل قبل الدالة عبر الإصدارات؛
+        # نهاية الدالة الآن = أول async def تالٍ داخل الصنف.
+        import re as _re
+        _m = _re.search(r"\n    async def \w+", src[start + 100:])
+        end = start + 100 + _m.start() if _m else -1
+        body = src[start:end] if (start >= 0 and end > 0) else src[start:start + 45000]
         has_fleet_get = "fleet = getattr(self, '_fleet_health', None) or {}" in body
         has_zero_check = "fleet.get('connected_joiners', 0) == 0" in body
-        # The log message is an f-string split across lines, so check the
-        # two distinguishing components separately.
-        has_skip_log = "[FLEET]" in body and "all joiners" in body and "unavailable" in body
-        has_sleep_continue = "await asyncio.sleep(60)\n                    continue" in body
-        record("ReqAudit3-6: _joiner_worker fleet backoff gate",
-               has_fleet_get and has_zero_check and has_skip_log and has_sleep_continue,
+        # Publish-only gate: logs PUBLISH-ONLY and does NOT skip the cycle.
+        has_publish_only = "PUBLISH-ONLY mode" in body
+        # Join defer: +30min retry, skip metric, natural 10s pacing.
+        has_join_defer = ("fleet_down_join_deferred" in body
+                          and "timedelta(minutes=30)" in body)
+        # The old whole-cycle freeze is gone: no gate-level sleep(60)+continue
+        # statement right after the fleet log (Join-PAUSED branch is separate,
+        # above). NOTE: regex word-statement match — the log text itself says
+        # «publishing continues» which contains the substring 'continue'.
+        gate_zone = body[body.find("PUBLISH-ONLY mode"):]
+        gate_zone = gate_zone[:gate_zone.find("get_queued_links")] if gate_zone else ""
+        has_no_cycle_freeze = not _re.search(r"^\s*continue\s*$", gate_zone, _re.M)
+        record("ReqAudit3-6: _joiner_worker fleet publish-only (no freeze)",
+               has_fleet_get and has_zero_check and has_publish_only
+               and has_join_defer and has_no_cycle_freeze,
                f"fleet_get={has_fleet_get} zero_check={has_zero_check} "
-               f"skip_log={has_skip_log} sleep_continue={has_sleep_continue}")
+               f"publish_only={has_publish_only} join_defer={has_join_defer} "
+               f"no_cycle_freeze={has_no_cycle_freeze}")
     except Exception as e:
         record("ReqAudit3-6: exception", False, str(e))
 

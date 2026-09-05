@@ -9661,27 +9661,25 @@ class Monitor:
                     await asyncio.sleep(60)
                     continue
 
-                # [REQAUDIT-3] Fleet-health backoff gate — if ALL joiners
-                # are unavailable (FloodWait / disconnected / safety-guard
-                # blocked), DON'T pick a link. Previously the scheduler
-                # picked a link every cycle, ran PIPELINE-6 joiner
-                # iteration, found no eligible joiner, marked the link
-                # QUEUED+5min, and re-enqueued it 5 min later — burning
-                # cycles on every stuck link in the queue (96+ links ×
-                # every 5 min = wasted storm). Now we skip the cycle
-                # entirely; when a joiner comes back (detected by
-                # _joiner_fleet_health_loop), the next cycle resumes.
+                # [FLEET-PUBLISH-v4.4.4] نشرٌ بلا انضمام — بلاغ المُشغّل
+                # (2026-09-05 ~04:30): «السحب واقف» + link_queue_pending=81
+                # وآخر رابط منشور 03:22 (86 دقيقة تجمّد). الجذر: هذه
+                # البوابة كانت تتخطى الدورة كاملة عند سقوط كل الـjoiners
+                # (FloodWait/disconnect/safety-guard) — فتتجمد كل الروابط
+                # بلا نشر (PIPELINE-5) رغم أن النشر يستخدم البوت لا
+                # الـjoiners. الآن: نواصل السحب والنشر (publish-only)
+                # ونؤجل الانضمام فقط — fleet_down يُفحص عند اختيار
+                # الفدائي (لا عاصفة: get_queued_links يحترم next_retry_at).
                 fleet = getattr(self, '_fleet_health', None) or {}
-                if fleet.get('connected_joiners', 0) == 0:
+                fleet_down = fleet.get('connected_joiners', 0) == 0
+                if fleet_down:
                     logging.info(
-                        f"[SCHED] cycle={cycle} 🛑 [FLEET] all joiners "
+                        f"[SCHED] cycle={cycle} ⚠️ [FLEET] all joiners "
                         f"unavailable (floodwait={len(fleet.get('floodwait_joiners', []))}, "
                         f"disconnected={len(fleet.get('disconnected_joiners', []))}, "
                         f"safety_guard={fleet.get('safety_guard_blocked_joiners', 0)}) "
-                        f"— skipping cycle, sleeping 60s"
+                        f"— PUBLISH-ONLY mode: publishing continues, joining deferred"
                     )
-                    await asyncio.sleep(60)
-                    continue
 
                 # تحديث حجم القائمة في الإحصائيات
                 queue_size = await self.prod_db.get_queue_size()
@@ -9920,6 +9918,24 @@ class Monitor:
                     logging.info(
                         f"[LINK id={link_id}] [PIPELINE-6] 👥 Member count: {member_count if member_count else 'unknown'}"
                     )
+
+                # [FLEET-PUBLISH-v4.4.4] الأسطول ساقط: كل ما لا يحتاج
+                # joiners تم أعلاه (نشر/فلتر خليجي/عدد أعضاء) — أجّل
+                # الانضمام 30د. get_queued_links يحترم next_retry_at →
+                # لا عاصفة إعادة محاولات (خوف REQAUDIT-3 محفوظ).
+                # استعادة الأسطول (health-loop يحدّث _fleet_health)
+                # تُرجع الانضمام تلقائيًا في الدورة التالية.
+                if fleet_down:
+                    logging.info(
+                        f"[LINK id={link_id}] [PIPELINE-6] ⏸️ [FLEET-DOWN] "
+                        f"join deferred +30min — publish/filtering already done"
+                    )
+                    await self.prod_db.update_queue_status(
+                        link_data['id'], 'QUEUED',
+                        next_retry=datetime.now() + timedelta(minutes=30))
+                    await self.metrics.record_skip('fleet_down_join_deferred')
+                    await asyncio.sleep(10)  # إيقاع الدورة الطبيعي — يحمي البوت من تتابع نشر سريع
+                    continue
 
                 joiners = await self.db.get_watchers_by_role("joiner")
                 if not joiners:
@@ -13264,8 +13280,22 @@ async def api_stats_handler(request):
                 # لو ai_description فاضي → ما تم فحصها (pending) — لا ت counted كـ rejected
                 ai_rejected_count = await _count(f"{db.supabase_url}/rest/v1/links?ai_approved=eq.false&ai_description=not.is.null&select=id")
                 ai_ads_count = await _count(f"{db.supabase_url}/rest/v1/links?ai_is_ad=eq.true&select=id")
-                # Pending = total - (approved + rejected)
-                ai_pending_count = max(0, total_links - ai_approved_count - ai_rejected_count)
+                # [AI-PENDING-FIX-v4.4.4] بلاغ المُشغّل: «الداشبورد يقول
+                # الطلبات والروابط معلقه بانتضار فحص الذكاء الاصطناعي» —
+                # العدّاد القديم (total - approved - rejected) عدّاد
+                # زومبي منذ v4.4.0 (أُزيل الـAI): الروابط الجديدة لا
+                # تُعلَّم ai_approved أبدًا فتكبر «المعلقة» للأبد (27098!)
+                # رغم أن كل رابط يُعالَج فوريًا بالمسار الحتمي، والواجهة
+                # تحذّر «فعّل AI_DRAIN_ENABLED» — توصية عهد AI منتهي.
+                # عندما الـAI معطّل (batch mode — الوضع الافتراضي) لا
+                # شيء ينتظر فحصًا → 0. عند إعادة تفعيل الـAI يدويًا
+                # (AI_BATCH_MODE=false) يرجع الحساب القديم كما كان.
+                _ai_links_off = os.getenv("AI_BATCH_MODE", "true").lower() in ("true", "1", "yes")
+                if _ai_links_off:
+                    ai_pending_count = 0
+                else:
+                    # Pending = total - (approved + rejected)
+                    ai_pending_count = max(0, total_links - ai_approved_count - ai_rejected_count)
             except Exception as e:
                 logging.warning(f"[API] ai stats fetch failed: {e}")
 
@@ -13285,6 +13315,9 @@ async def api_stats_handler(request):
                 "ai_ads": ai_ads_count,
                 "ai_pending": ai_pending_count,
                 "ai_batch_mode": ai_batch_mode,
+                # [AI-PENDING-FIX-v4.4.4] توضيح صريح للواجهة: المسار
+                # حتمي (لا AI) — «بانتظار الفحص» بلا معنى هنا.
+                "ai_status": "disabled" if ai_batch_mode else "enabled",
             },
         }, status=200, headers={"Access-Control-Allow-Origin": "*"})
 

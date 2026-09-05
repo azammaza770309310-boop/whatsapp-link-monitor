@@ -43,7 +43,7 @@ import re
 from dataclasses import dataclass, field
 from typing import List, Tuple, Dict, Any, Optional
 
-FILTER_VERSION = "v4.4.3"
+FILTER_VERSION = "v4.4.4"
 FILTER_MODE = "ai_intent_classifier"
 
 

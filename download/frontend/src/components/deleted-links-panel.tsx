@@ -30,8 +30,9 @@ import { cn } from '@/lib/utils'
 // Constants & helpers
 // ---------------------------------------------------------------------------
 
+// [DASHBOARD-URL-v4.4.4] متوافق مع page.tsx — الخدمة الجديدة (القديمة معلّقة 503)
 const API_URL: string =
-  process.env.NEXT_PUBLIC_API_URL || 'https://whatsapp-userbot-yzm7.onrender.com'
+  process.env.NEXT_PUBLIC_API_URL || 'https://whatsapp-userbot-alwh.onrender.com'
 
 type DeletedReason =
   | 'spam'

@@ -331,8 +331,12 @@ const NAV_SECTIONS: { id: string; label: string }[] = [
 ]
 
 // ===== Constants =====
+// [DASHBOARD-URL-v4.4.4] بلاغ المُشغّل «فرسال لا يستطيع الوصول بعد تغيير
+// الحساب»: الافتراضي كان يشير للخدمة القديمة المعلّقة (yzm7 → 503).
+// الافتراضي الآن الخدمة الجديدة. يمكن دائمًا التجاوز بمتغير البيئة
+// NEXT_PUBLIC_API_URL في Vercel.
 const API_URL: string =
-  process.env.NEXT_PUBLIC_API_URL || 'https://whatsapp-userbot-yzm7.onrender.com'
+  process.env.NEXT_PUBLIC_API_URL || 'https://whatsapp-userbot-alwh.onrender.com'
 
 // [DASHBOARD-RESTORE] Optional shared-secret — if the operator sets
 // DASHBOARD_API_KEY on Render AND mirrors it here as
