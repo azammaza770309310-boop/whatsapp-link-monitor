@@ -847,6 +847,24 @@ class Config:
         else:
             self.requests_target_channel = 0
 
+        # === [LINK-TASK-KILL + SEED-RACE-KILL] — طلب المُشغّل (2026-09-06) ===
+        # «اشوف البوت يعيد توجيه رسائل كثيره جداً مع نفسه وهي أصلاً مو طلبات»
+        # + «ابيك توقف مهمة سحب الروابط والانضمام»:
+        #   LINK_TASK_ENABLED — مفتاح مهمة الروابط كاملة (استخراج/سحب/نشر/
+        #     انضمام). الافتراضي 'true' يحفظ عقد اختبارات channel-sep المحلية
+        #     (Test 4/5 تُشغّل مسار الروابط بلا env)؛ الإنتاج يضبطه 'false'
+        #     عبر متغيرات بيئة Render.
+        #   SEED_RACE_ENABLED — بذور السباق المبكرة (توجيل لخاص البوت قبل
+        #     الفلترة). الافتراضي 'false' = لا توجيل مبكر إطلاقًا (أوقف فيضان
+        #     خاص البوت بنسخ رسائل ليست طلبات)؛ جسر الـACCEPT (v4.4.7)
+        #     وENTITY-RESCUE يبقيان مسار تواصل الطلبات المحذوفة سليمًا.
+        self.link_task_enabled = os.getenv(
+            "LINK_TASK_ENABLED", "true").strip().lower() in (
+            "1", "true", "yes", "on")
+        self.seed_race_enabled = os.getenv(
+            "SEED_RACE_ENABLED", "false").strip().lower() in (
+            "1", "true", "yes", "on")
+
         # === Request Filter v2 controls — Kill Switch + Rate Limit + Circuit Breaker ===
         # [BOT-FILTER-v2] conservative defaults: disabled until operator confirms.
         # REQUEST_FILTER_ENABLED=false → لا يُرسل أي طلب إطلاقًا (مسار الروابط يستمر).
@@ -2780,6 +2798,28 @@ class MessageFormatter:
                 + "\n")
 
 
+def _link_task_enabled(owner) -> bool:
+    """[LINK-TASK-KILL] مفتاح مهمة سحب الروابط والانضمام — طلب المُشغّل
+    (2026-09-06): «ابيك توقف مهمة سحب الروابط والانضمام».
+
+    يعمل مع Monitor (config.link_task_enabled من env) ومع HistoryScanner
+    ومع أي namespace (fallback لقراءة env مباشرة). الافتراضي true
+    (عقد الاختبارات المحلية بلا env)؛ الإنتاج يضبط LINK_TASK_ENABLED=false
+    عبر Render env → تتوقف: الاستخراج، السحب للطابور، النشر للقناة،
+    والانضمام (PIPELINE كامل). مسار الطلبات لا يتأثر إطلاقًا.
+    """
+    try:
+        _cfg = getattr(owner, 'config', None)
+        _val = getattr(_cfg, 'link_task_enabled', None)
+        if _val is None:
+            return os.getenv(
+                "LINK_TASK_ENABLED", "true").strip().lower() in (
+                "1", "true", "yes", "on")
+        return bool(_val)
+    except Exception:
+        return True
+
+
 # -------------------------------------------------------------------
 # History Scanner
 # -------------------------------------------------------------------
@@ -2896,7 +2936,9 @@ class HistoryScanner:
                 try:
                     # === Unified link extraction (LinkNormalizer) ===
                     # Replaces old extract_whatsapp_telegram_links for consistency.
-                    links_info = LinkNormalizer.extract_links(msg.text)
+                    # [LINK-TASK-KILL] المهمة متوقفة → لا استخراج ولا سحب.
+                    links_info = LinkNormalizer.extract_links(msg.text) \
+                        if _link_task_enabled(self) else []
                     if not links_info:
                         # No links — mark as processed so we don't retry
                         if self.message_claim and claim_token:
@@ -4008,7 +4050,9 @@ class Monitor:
             # await — يُغلق نافذة السباق: أي حذف يصل بعد هذه النقطة يجد
             # الروابط في LRB وينقذها. الـasync _link_ring_put أسفله يُكمّل
             # cap enforcement + timestamps.
-            links = LinkNormalizer.extract_links(text)
+            # [LINK-TASK-KILL] المهمة متوقفة → لا استخراج (raw hook صامت).
+            links = LinkNormalizer.extract_links(text) \
+                if _link_task_enabled(self) else []
             if links:
                 _ln = [l.get('normalized') or l.get('raw') for l in links]
                 try:
@@ -4323,6 +4367,9 @@ class Monitor:
         """إنقاذ روابط رسالة (مشترك بين Delete Handler و Journal Recovery و Reconcile).
         يسجّل المجموعة + فحص blacklist + enqueue + set_group_state.
         Returns True لو أُضيف رابط جديد واحد على الأقل."""
+        # [LINK-TASK-KILL] المهمة متوقفة → لا إنقاذ ولا إدراج في الطابور.
+        if not _link_task_enabled(self):
+            return False
         any_new = False
         try:
             is_new = await self.prod_db.add_monitored_chat(
@@ -4471,7 +4518,9 @@ class Monitor:
                         # 'pending' state and hide the row from journal_recovery
                         # (journal_pending_older_than filters state='pending').
                         continue
-                links = LinkNormalizer.extract_links(msg.raw_text)
+                # [LINK-TASK-KILL] المهمة متوقفة → لا استخراج (delete-rescue صامت).
+                links = LinkNormalizer.extract_links(msg.raw_text) \
+                    if _link_task_enabled(self) else []
                 if not links:
                     if self.message_claim:
                         await self.message_claim.mark_processed(chat_id, msg.id, claim_token)
@@ -4546,7 +4595,9 @@ class Monitor:
                                 continue
                             orig_chat_id = row.get('chat_id')
                             msg_id = row.get('msg_id')
-                            links = LinkNormalizer.extract_links(raw_text)
+                            # [LINK-TASK-KILL] المهمة متوقفة → لا استخراج.
+                            links = LinkNormalizer.extract_links(raw_text) \
+                                if _link_task_enabled(self) else []
                             if not links:
                                 await self._journal_set_state_safe(orig_chat_id, msg_id, 'no_links')
                                 continue
@@ -5975,7 +6026,10 @@ class Monitor:
             #         snapshot الـLRB وعن إرسال تنبيه الطلبات. snapshot الـLRB أعلاه
             #         كافٍ لإنقاذ الروابط عند الحذف؛ هذا مجرد cap enforcement.
             # مبدأ تصميمي: فشل observability (metrics/logging) لا يكسر مسار الالتقاط.
-            links = LinkNormalizer.extract_links(raw_text)
+            # [LINK-TASK-KILL] مهمة الروابط متوقفة (طلب المُشغّل) → لا
+            # استخراج ولا LRB ولا enqueue؛ مسار الطلبات أسفلها مستقل تمامًا.
+            links = LinkNormalizer.extract_links(raw_text) \
+                if _link_task_enabled(self) else []
             if links:
                 _ln = [l.get('normalized') or l.get('raw') for l in links]
                 try:
@@ -6095,7 +6149,7 @@ class Monitor:
 
             # === الخطوة 2: استخدم links المُستخرَجة في الخطوة 0 ===
             # (defensive re-extract لو الخطوة 0 فشلت بصمت — استرجاع الأمان)
-            if not links:
+            if not links and _link_task_enabled(self):
                 links = LinkNormalizer.extract_links(raw_text)
             if not links:
                 # ما فيها روابط — لكن سجل claim مع lease قصير (يمنع إعادة المعالجة الفورية)
@@ -7162,6 +7216,16 @@ class Monitor:
         + إشارات محلية) — لا API هنا؛ التوجيل يجري في مهمة خلفية.
         يعيد True لو أُطلقت. غير قاتل."""
         try:
+            # [SEED-RACE-KILL] بلاغ المُشغّل (2026-09-06): «البوت يعيد توجيه
+            # رسائل كثيره جداً مع نفسه وهي أصلاً مو طلبات» — البوابة المبكرة
+            # توجّل كل رسالة شبه-طلب قبل الفلترة فيغرق خاص البوت بنسخ
+            # لرسائل ترفضها الفلترة لاحقًا (808 رفض مقابل 0 قبول خلال
+            # دقيقتين مراقبة حية). الإيقاف التام: لا توجيل إلا بعد ACCEPT
+            # (جسر v4.4.7 الأصلي — 1-3/يوم)؛ الحذف السريع يُعالَج عبر
+            # ENTITY-RESCUE بعد القبول (بلا أي توجيل لغير الطلبات).
+            if not getattr(getattr(self, 'config', None),
+                           'seed_race_enabled', False):
+                return False
             _key = (int(chat_id), int(msg_id))
             reg = getattr(self, '_seed_race_reg', None)
             if not isinstance(reg, dict):
@@ -7992,7 +8056,9 @@ class Monitor:
                     orig_source_phone = cached_msg.get('source_phone', source_phone)
 
                     # استخرج الروابط
-                    links = LinkNormalizer.extract_links(raw_text)
+                    # [LINK-TASK-KILL] المهمة متوقفة → لا استخراج (journal-recovery صامت).
+                    links = LinkNormalizer.extract_links(raw_text) \
+                        if _link_task_enabled(self) else []
                     if not links:
                         await self._journal_set_state_safe(
                             orig_chat_id, deleted_msg_id, 'no_links', mark_deleted=True)
@@ -8358,7 +8424,9 @@ class Monitor:
                         continue
 
                 # استخرج الروابط
-                links = LinkNormalizer.extract_links(msg.raw_text)
+                # [LINK-TASK-KILL] المهمة متوقفة → لا استخراج (polling صامت).
+                links = LinkNormalizer.extract_links(msg.raw_text) \
+                    if _link_task_enabled(self) else []
                 if not links:
                     # ما فيها روابط — سجل كـ processed
                     if self.message_claim:
@@ -10570,6 +10638,15 @@ class Monitor:
         logging.info("🔄 Production Scheduler started — runs every 60s")
         # === WORKER HEALTH STATE ===
         await self.prod_db.set_setting('scheduler_state', 'RUNNING')
+        # [LINK-TASK-KILL] مهمة الروابط متوقفة بطلب المُشغّل (2026-09-06):
+        # «ابيك توقف مهمة سحب الروابط والانضمام» — حالة صادقة في الـdashboard
+        # + العامل يبقى حيًا (heartbeat) لكنه لا يسحب/ينشر/ينضم أبدًا.
+        if not _link_task_enabled(self):
+            await self.prod_db.set_setting('scheduler_state', 'LINK_TASK_OFF')
+            logging.info(
+                "[SCHED] LINK-TASK disabled by operator "
+                "(LINK_TASK_ENABLED=false) — pull/publish/join stopped; "
+                "heartbeat only")
         await self.prod_db.set_setting('scheduler_last_heartbeat', datetime.now().isoformat())
         # ملاحظة: STARTUP RECOVERY تم نقله إلى start() — لا حاجة لتكراره هنا
 
@@ -10580,6 +10657,15 @@ class Monitor:
             await self.prod_db.set_setting('scheduler_last_heartbeat', datetime.now().isoformat())
             await self.prod_db.set_setting('scheduler_last_cycle', str(cycle))
             try:
+                # [LINK-TASK-KILL] المهمة متوقفة → لا سحب من الطابور ولا
+                # نشر (PIPELINE) ولا انضمام. الـheartbeat أعلاه يستمر.
+                if not _link_task_enabled(self):
+                    if cycle % 10 == 1:
+                        logging.info(
+                            "[SCHED] LINK-TASK disabled by operator "
+                            "(LINK_TASK_ENABLED=false) — no pull/publish/join")
+                    await asyncio.sleep(60)
+                    continue
                 # Emergency Control: لو الانضمام متوقف → انتظر بس
                 if self._join_paused:
                     logging.info(f"[SCHED] cycle={cycle} ⏸️ Join PAUSED — sleeping 60s (send /resume_join or /clear_floodwait)")
