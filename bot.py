@@ -6467,6 +6467,28 @@ class Monitor:
             )
             return
 
+        # [FAST-REQUEST] قياس زمن المسار (للتحقق الحي من السرعة في السجلات)
+        _req_t0 = time.time()
+        # [PENDING-DELETE] الطلب قيد المعالجة من هذه اللحظة (قبل القرار):
+        # أي حذف يصل قبل تسجيل التنبيه (بوتات الحماية تحذف خلال أجزاء
+        # الثانية بينما المعالجة تستغرق ~0.3-0.7s) → يُدوَّن في
+        # _pending_request_deletes ويُعلَّم التنبيه ⚠️ فور اكتمال نشره —
+        # بلا نافذة «رابط ميت بلا علامة». المفتاح يُزال تلقائيًا عند
+        # انتهاء المهمة (done-callback — كل مخارج المسار مغطاة).
+        try:
+            _infl = getattr(self, '_request_inflight', None)
+            if not isinstance(_infl, set):
+                _infl = self._request_inflight = set()
+            _infl_key = (int(chat_id), int(msg_id))
+            if _infl_key not in _infl:
+                _infl.add(_infl_key)
+                _ct = asyncio.current_task()
+                if _ct is not None:
+                    _ct.add_done_callback(
+                        lambda _t, _k=_infl_key, _s=_infl: _s.discard(_k))
+        except Exception:
+            pass
+
         # === [SEED-RACE] بذرة الجسر قبل الفلترة — تسبق حذف بوتات الحماية ===
         # بلاغ المُشغّل (2026-09-06 05:23، Rewa Ali — «اليوزر لا يستجيب
         # والزر غير موجود»): بوتات الحماية (جبل/صقير…) تحذف الطلب خلال
@@ -6642,76 +6664,95 @@ class Monitor:
         except Exception:
             sender_id = 0
 
-        # [DM-FIX-v4.3.5] جلب بيانات المرسل الكاملة عبر API — إصلاح عطلين
-        # رصدهما المُشغّل في الإنتاج:
-        #   (1) «اليوزر غير موجود أمام المرسل»: event.sender خاصية تزامنية
-        #       تعيد min-entity من التحديث (أو None) — كثيرًا بلا @username
-        #       رغم وجوده فعليًا عند المستخدم.
-        #   (2) «تنسيق الرابط غير معروف» عند ضغط زر المراسلة: غياب username
-        #       كان يُهبط الزر إلى tg://user?id=<uid> وهو deep-link غير مدعوم
-        #       في عملاء الموبايل (iOS/بعض أندرويد).
-        # الحل: نحلّ كيان المرسل عبر API من حساب الالتقاط (هو عضو المجموعة
-        # → الحل ينجح) → username حقيقي → سطر المرسل يحمله + الزر يصبح
-        # https://t.me/<username> (رسمي — يعمل في كل العملاء).
+        # [FAST-REQUEST] أقصى سرعة مسموح بها من تلجرام (طلب المُشغّل
+        # 2026-09-06): كل طبقات حلّ المرسل + بذرة الجسر بالتوازي.
+        # كانت تسلسلية: get_sender(≤4s) → capture get_entity(≤4s) →
+        # حسابان آخران(≤6s) → بذرة الجسر → استخراج ≈1-2s نموذجيًا
+        # (أسوأ 13s+). الآن: (أ) البذرة تُطلق فور القبول (تسابق الحذف)،
+        # (ب) get_sender + get_entity من حساب الالتقاط معًا (gather)،
+        # (ج) الطبقات البطيئة (حسابات أخرى/استخراج البذرة) انتقلت لما
+        # بعد الإرسال. النتيجة: التنبيه يصل القناة خلال ~0.3-0.7s من
+        # استلام الحدث (الأرضية الفعلية: قرارات محلية 0ms + جولة API
+        # واحدة للحل + جولة إرسال واحدة).
+        # [DM-FIX-v4.3.5] يبقى العقد نفسه: username حقيقي → سطر المرسل
+        # يحمله + الزر https://t.me/<username> (يعمل في كل العملاء).
         sender_obj = None
         _resolve_via = ''
+        _seed_task = None
+        # (أ) بذرة الجسر فورًا: بلا username في min-entity → الجسر قد
+        # يفيد (يسبق الحذف). username توفر لاحقًا؟ cleanup يمسح النسخة
+        # ('username-resolved') — لا يتامى.
         try:
-            _gs = getattr(event, 'get_sender', None)
-            if callable(_gs):
-                # wait_for: get_entity قد يعلق على حساب بطيء — لا يعطّل الإرسال
-                try:
-                    sender_obj = await asyncio.wait_for(_gs(), timeout=4)
-                    if sender_obj is not None:
-                        _resolve_via = 'get_sender'
-                except Exception:
-                    sender_obj = None
+            _min_ent = getattr(event, 'sender', None)
+            _min_un = getattr(_min_ent, 'username', None) \
+                if _min_ent is not None else None
         except Exception:
-            sender_obj = None
+            _min_un = None
+        if sender_id > 0 and not _min_un:
+            _seed_fn_p = getattr(self, '_mention_bridge_seed', None)
+            if callable(_seed_fn_p):
+                try:
+                    _seed_task = asyncio.create_task(
+                        _seed_fn_p(chat_id, msg_id, source_phone, sender_id))
+                except Exception:
+                    _seed_task = None
+
+        # (ب) طبقتا الحل بالتوازي: get_sender (API من الحدث) + كيان
+        # كامل من حساب الالتقاط (get_entity — يعمل حتى بعد حذف الرسالة:
+        # الكيان مستقل عن الرسالة).
+        async def _fr_get_sender():
+            try:
+                _gs = getattr(event, 'get_sender', None)
+                if callable(_gs):
+                    # wait_for: حساب بطيء لا يعطّل الإرسال
+                    return await asyncio.wait_for(_gs(), timeout=2.5)
+            except Exception:
+                return None
+            return None
+
+        async def _fr_capture_entity():
+            try:
+                if sender_id <= 0:
+                    return None
+                _capc = (getattr(self, 'user_clients', None) or {}).get(
+                    source_phone)
+                if _capc is None or not getattr(
+                        _capc, 'is_connected', lambda: False)():
+                    return None
+                from telethon.tl.types import PeerUser as _FrPeerUser
+                return await asyncio.wait_for(
+                    _capc.get_entity(_FrPeerUser(int(sender_id))),
+                    timeout=2.5)
+            except Exception:
+                return None
+
+        _g_sender, _g_capture = await asyncio.gather(
+            _fr_get_sender(), _fr_capture_entity())
+        # (ج) اختر الأفضل: get_sender أولًا (يحمل الاسم/الكيان من
+        # الحدث نفسه)؛ ترقية كيان الالتقاط لو حمل username وذاك لم يحمله.
+        if _g_sender is not None:
+            sender_obj = _g_sender
+            _resolve_via = 'get_sender'
         if sender_obj is None:
             # fallback 1: الخاصية التزامنية (min-entity أفضل من لا شيء)
             try:
-                sender_obj = event.sender
+                sender_obj = getattr(event, 'sender', None)
                 if sender_obj is not None:
                     _resolve_via = 'sync_attr'
             except Exception:
                 sender_obj = None
-        if sender_id > 0 and not (getattr(sender_obj, 'username', None)):
-            # fallback 2 [DM-FIX]: min-entity بلا username → حلّ كامل عبر
-            # عميل الالتقاط مباشرة (user_clients[source_phone] عضو المجموعة
-            # → get_entity يعيد الحساب الكامل مع username لو موجود).
-            try:
-                _cap_client = (getattr(self, 'user_clients', None) or {}).get(source_phone)
-                if _cap_client is not None and _cap_client.is_connected():
-                    from telethon.tl.types import PeerUser as _PeerUser
-                    _full = await asyncio.wait_for(
-                        _cap_client.get_entity(_PeerUser(sender_id)), timeout=4)
-                    if _full is not None:
-                        sender_obj = _full
-                        _resolve_via = f'capture_client:{source_phone}'
-            except Exception:
-                pass
-        # fallback 3 [v4.3.9]: ما زال بلا username؟ جرّب حسابات الالتقاط
-        # الأخرى المتصلة (قد يكون لديها الكيان الكامل في ذاكرة/ذاكرة جلسة
-        # مختلفة). بلاغ المُشغّل: «طلبات في القناة بلا يوزر مع أنه موجود
-        # عند المرسل» — تعزيز الاحتمال بأن الحل ينجح عبر حساب آخر عضو
-        # في نفس المجموعة. حد أقصى حسابان إضافيان × 3s (لا يبطئ المسار
-        # إلا في أسوأ الحالات، والأغلب ينجح من الطبقات الثلاث الأولى).
-        if sender_id > 0 and not (getattr(sender_obj, 'username', None)):
-            _others = [ph for ph in (getattr(self, 'user_clients', None) or {})
-                       if ph != source_phone]
-            for _ph in _others[:2]:
-                try:
-                    _oc = (getattr(self, 'user_clients', None) or {}).get(_ph)
-                    if _oc is None or not _oc.is_connected():
-                        continue
-                    _full2 = await asyncio.wait_for(
-                        _oc.get_entity(int(sender_id)), timeout=3)
-                    if _full2 is not None and getattr(_full2, 'username', None):
-                        sender_obj = _full2
-                        _resolve_via = f'other_client:{_ph}'
-                        break
-                except Exception:
-                    continue
+        if (sender_id > 0 and _g_capture is not None
+                and getattr(_g_capture, 'username', None)
+                and not getattr(sender_obj, 'username', None)):
+            sender_obj = _g_capture
+            _resolve_via = f'capture_client:{source_phone}'
+        elif sender_obj is None and _g_capture is not None:
+            sender_obj = _g_capture
+            _resolve_via = f'capture_client:{source_phone}'
+        # [v4.3.9→FAST] fallback «حسابات التقاط أخرى» غادر مسار ما قبل
+        # الإرسال (كان يكلف حتى 6s تسلسلية في أسوأ حالة) — تغطية username
+        # البديلة صارت مسؤولية ما بعد الإرسال: ترقية البذرة + ENTITY-RESCUE
+        # (كلاهما يعمل حتى بعد الحذف — الكيان مستقل عن الرسالة).
         # [v4.3.9] سجل تشخيصي INFO: يوثّق الطبقة التي حُلّ بها المرسل
         # وهل وُجد username — لتشخيص بلاغات «بلا يوزر» من السجلات مباشرة
         # بدل التخمين (لا يظهر في القناة — سجل فقط).
@@ -6799,53 +6840,21 @@ class Monitor:
                 _bridge = await _aw_fn(chat_id, msg_id)
         except Exception:
             _bridge = None
-        if _bridge is None and sender_id > 0 and not _uname_clean:
+        # [FAST-REQUEST] البذرة أُطلقت قبل حلّ المرسل (بالتوازي — أعلاه)
+        # لتسابق حذف بوتات الحماية. هنا نجمع نتيجتها بسقف 1.5s فقط:
+        # الأغلب يكتمل خلال 200-600ms (توجيل واحد). تأخرت؟ التنبيه
+        # يُرسل بلا انتظار إضافي، وتُجمَع البذرة بعد الإرسال (shield —
+        # المهمة تستمر، لا إلغاء) ويُوجَّه توجيلها أسفل التنبيه حينها.
+        if _bridge is None and _seed_task is not None:
             try:
-                _seed_fn = getattr(self, '_mention_bridge_seed', None)
-                if callable(_seed_fn):
-                    _bridge = await _seed_fn(chat_id, msg_id, source_phone,
-                                             sender_id)
-            except Exception as _bridge_e:
-                logging.warning(
-                    f"[MENTION-BRIDGE] seed dispatch failed (non-fatal): {_bridge_e}")
-                _bridge = None
-        if _bridge and not _uname_clean:
-            # التوجيل زرع كيان الطالب لدى البوت → get_entity يعيد الحساب
-            # الكامل مع username لو موجود فعلاً (ليست ترقية وهمية: فشل
-            # الاستخراج = لا يوجد username فعلًا).
-            try:
-                _bot_client_pre = getattr(self, 'bot_client', None)
-                if _bot_client_pre and _bot_client_pre.is_connected():
-                    from telethon.tl.types import PeerUser as _PrePeerUser
-                    _seed_copy = await asyncio.wait_for(
-                        _bot_client_pre.get_messages(
-                            _PrePeerUser(int(_bridge.get('cap_user_id') or 0)),
-                            ids=int(_bridge.get('seed_msg_id') or 0)),
-                        timeout=6)
-                    if isinstance(_seed_copy, list):
-                        _seed_copy = _seed_copy[0] if _seed_copy else None
-                    _fwd_hdr = getattr(_seed_copy, 'fwd_from', None)
-                    _orig_peer = getattr(_fwd_hdr, 'from_id', None)
-                    _orig_uid = int(getattr(_orig_peer, 'user_id', 0) or 0) \
-                        if _orig_peer is not None else 0
-                    if _orig_uid <= 0:
-                        _orig_uid = int(sender_id or 0)
-                    if _orig_uid > 0:
-                        _seen_obj = await asyncio.wait_for(
-                            _bot_client_pre.get_entity(int(_orig_uid)),
-                            timeout=6)
-                        _uname_seen = re.sub(
-                            r'[^A-Za-z0-9_]', '',
-                            str(getattr(_seen_obj, 'username', '') or '').lstrip('@'))
-                        if len(_uname_seen) >= 4:
-                            _uname_clean = _uname_seen
-                            sender_username = f"@{_uname_seen}"
-                            logging.info(
-                                f"[REQUEST-PATH] sender username rescued "
-                                f"via bridge seed id={sender_id} "
-                                f"username=@{_uname_seen}")
+                _bridge = await asyncio.wait_for(
+                    asyncio.shield(_seed_task), timeout=1.5)
             except Exception:
-                pass  # فشل الاستخراج = لا username — التنبيه يكمل كالمعتاد
+                _bridge = None
+        # [FAST-REQUEST] استخراج username من كيان البذرة انتقل لما بعد
+        # الإرسال (_seed_username_upgrade_edit): كان يكلف 300-700ms على
+        # المسار الحرج؛ التنبيه يصل الآن بأقصى سرعة والزر يُضاف بتعديل
+        # خلال ~1s من النشر (آلية edit مُجرَّبة إنتاجيًا من v4.4.6/v4.4.7).
         if _bridge and _uname_clean:
             # username متوفر (من الطبقات أو من الجسر) → زر t.me يعمل بلا
             # جسر — نظّف نسخة البذرة من خاص البوت (لا يتامى).
@@ -6960,7 +6969,8 @@ class Monitor:
                 f"[REQUEST-PATH] ✅ sent request alert "
                 f"chat_id={chat_id} msg_id={msg_id} "
                 f"keywords={keywords_found} source={source_phone} "
-                f"dm={dm_mode}"
+                f"dm={dm_mode} "
+                f"elapsed={int((time.time() - _req_t0) * 1000)}ms"
             )
             # [REQ-DELETED-MARK-v4.4.6 + MENTION-BRIDGE-v4.4.7] سجّل
             # التنبيه للتعليم عند حذف الأصل (رابط التنبيه يموت عند الحذف
@@ -6997,6 +7007,65 @@ class Monitor:
                 except Exception:
                     pass
 
+            # === [FAST-REQUEST] بذرة تأخرت عن سقف ما قبل الإرسال؟ ===
+            # التنبيه وصل القناة بأقصى سرعة — اجمع البذرة الآن (≤3s)
+            # ووجّه نسختها أسفل التنبيه + سجّل حالة الجسر (تعليم الحذف
+            # يملك إعادة المحاولة). username حلّ لاحقًا؟ نظّف نسخة البذرة
+            # (لا يتامى).
+            if _seed_task is not None and _bridge is None:
+                try:
+                    _late_b = await asyncio.wait_for(
+                        asyncio.shield(_seed_task), timeout=3.0)
+                except Exception:
+                    _late_b = None
+                if isinstance(_late_b, dict):
+                    if _uname_clean:
+                        try:
+                            asyncio.create_task(
+                                self._seed_copy_delete(
+                                    _late_b, 'username-resolved'))
+                        except Exception:
+                            pass
+                    else:
+                        _bridge = _late_b
+                        _psf = getattr(
+                            self, '_relay_and_register_request_alert', None)
+                        if callable(_psf):
+                            await _psf(target, _bridge, sent_alert,
+                                       chat_id, msg_id, alert, dm_buttons)
+
+            # === [FAST-REQUEST] ترقية username بعد الإرسال ===
+            # بذرة بلا يوزر وقت الإرسال (dm=text_mention): كيان الطالب
+            # صار معروفًا للبوت → استخراج username (يعمل حتى بعد حذف
+            # الأصل — الكيان مستقل عن الرسالة) → تعديل التنبيه: (@يوزر)
+            # في سطر المرسل + زر «✉️ مراسلة». مهمة خلفية مُتعقَّبة.
+            if _bridge and dm_mode == 'text_mention':
+                try:
+                    _tu = asyncio.create_task(
+                        self._seed_username_upgrade_edit(
+                            sent_alert, target, _bridge, chat_id, msg_id,
+                            safe_sender, sender_id))
+                    _tasks_u = getattr(self, '_request_bg_tasks', None)
+                    if isinstance(_tasks_u, set):
+                        _tasks_u.add(_tu)
+                        _tu.add_done_callback(_tasks_u.discard)
+                except Exception:
+                    pass
+
+            # === [PENDING-DELETE] الحذف وصل أثناء المعالجة؟ ===
+            # (قبل تسجيل التنبيه في السجل): علّم التنبيه فورًا ⚠️ +
+            # مسار التواصل — بدل رابط ميت بلا علامة.
+            try:
+                _pd = getattr(self, '_pending_request_deletes', None)
+                if isinstance(_pd, dict) and _pd.pop(
+                        (int(chat_id), int(msg_id)), None) is not None:
+                    _mk_late = getattr(
+                        self, '_mark_request_alert_deleted', None)
+                    if callable(_mk_late):
+                        await _mk_late(chat_id, msg_id)
+            except Exception:
+                pass
+
             # [v4.3.8→v4.4.7] جسر التواصل القديم (contact bridge)
             # بقي محذوفًا — لكن رؤية الأفق تغيرت: التوجيه عبر خاص البوت
             # عاد الآن بتصميم مختلف جذريًا (MENTION-BRIDGE أعلاه) يصلح
@@ -7022,6 +7091,18 @@ class Monitor:
                     if callable(_reg_alert_fn2):
                         _reg_alert_fn2(chat_id, msg_id, target, sent_alert,
                                        alert, dm_buttons)
+                # [PENDING-DELETE] نفس فحص ما بعد الإرسال (إعادة FloodWait:
+                # الحذف يصل غالبًا خلال انتظار الفلو — التسجيل تم للتو)
+                try:
+                    _pd2 = getattr(self, '_pending_request_deletes', None)
+                    if isinstance(_pd2, dict) and _pd2.pop(
+                            (int(chat_id), int(msg_id)), None) is not None:
+                        _mk2 = getattr(
+                            self, '_mark_request_alert_deleted', None)
+                        if callable(_mk2):
+                            await _mk2(chat_id, msg_id)
+                except Exception:
+                    pass
             except Exception as e2:
                 logging.error(f"[REQUEST-PATH] send failed after FloodWait retry: {e2}")
                 # [SEED-RACE] فشل الإرسال النهائي → نظّف نسخة البذرة
@@ -7594,6 +7675,101 @@ class Monitor:
         except Exception as _er_e:
             logging.debug(f"[ENTITY-RESCUE] error (non-fatal): {_er_e}")
 
+    async def _seed_username_upgrade_edit(self, sent_alert, target, bridge,
+                                           chat_id, msg_id, safe_sender,
+                                           sender_id):
+        """[FAST-REQUEST] ترقية ما بعد الإرسال: استخراج username من كيان
+        البذرة (البوت «رأى» الطالب عبر التوجيل) ولو وُجد → تعديل التنبيه:
+        (@username) في سطر المرسل + زر «✉️ مراسلة». التنبيه وصل القناة
+        بأقصى سرعة؛ هذه الترقية تُكمل معلومات التواصل خلال ~1s من النشر
+        (آلية edit_message نفسها المُجرَّبة إنتاجيًا في v4.4.6/v4.4.7).
+        بلا username → التوجيل أسفل التنبيه هو مسار التواصل (يكفي).
+        غير قاتل تمامًا."""
+        try:
+            _alert_id = getattr(sent_alert, 'id', None)
+            if not isinstance(_alert_id, int):
+                return
+            _bot_client = getattr(self, 'bot_client', None)
+            if not _bot_client or not _bot_client.is_connected():
+                return
+            _seed_msg_id = int((bridge or {}).get('seed_msg_id') or 0)
+            _cap_user_id = int((bridge or {}).get('cap_user_id') or 0)
+            if _seed_msg_id <= 0 or _cap_user_id <= 0:
+                return
+            # (1) استخراج username من الكيان الذي زرعته البذرة لدى البوت
+            _uname = ''
+            try:
+                from telethon.tl.types import PeerUser as _UpPeerUser
+                _seed_copy = await asyncio.wait_for(
+                    _bot_client.get_messages(
+                        _UpPeerUser(_cap_user_id), ids=_seed_msg_id),
+                    timeout=6)
+                if isinstance(_seed_copy, list):
+                    _seed_copy = _seed_copy[0] if _seed_copy else None
+                _fwd_hdr = getattr(_seed_copy, 'fwd_from', None)
+                _orig_peer = getattr(_fwd_hdr, 'from_id', None)
+                _orig_uid = int(getattr(_orig_peer, 'user_id', 0) or 0) \
+                    if _orig_peer is not None else 0
+                if _orig_uid <= 0:
+                    _orig_uid = int(sender_id or 0)
+                if _orig_uid > 0:
+                    _seen = await asyncio.wait_for(
+                        _bot_client.get_entity(int(_orig_uid)), timeout=6)
+                    _uname = re.sub(
+                        r'[^A-Za-z0-9_]', '',
+                        str(getattr(_seen, 'username', '') or '').lstrip('@'))
+            except Exception:
+                _uname = ''
+            if len(_uname) < 4:
+                return  # لا username فعليًا — التوجيل أسفل التنبيه يكفي
+            # (2) نص التنبيه من السجل + الترقية (سطر المرسل + التلميح)
+            _reg = getattr(self, '_request_alerts', None)
+            _entry = None
+            _old_text = ''
+            if isinstance(_reg, dict):
+                _entry = _reg.get((int(chat_id), int(msg_id)))
+                _old_text = str((_entry or {}).get('text') or '')
+            if not _old_text:
+                return
+            _old_mention = (f'<a href="tg://user?id={int(sender_id or 0)}">'
+                            f'{safe_sender}</a>')
+            _new_mention = (f'{safe_sender} '
+                            f'<a href="https://t.me/{_uname}">(@{_uname})</a>')
+            _new_text = _old_text.replace(_old_mention, _new_mention)
+            for _hint_old in (
+                    "للتواصل: اضغط اسم المُرسِل في رسالة التوجيل أسفل هذا التنبيه",
+                    "للتواصل: المُرسِل بلا username — اسمه أعلاه "
+                    "قد لا يستجيب للضغط (قيد تلغرام على رسائل البوتات)"):
+                _new_text = _new_text.replace(
+                    _hint_old,
+                    f"للتواصل: زر «مراسلة» أدناه أو @{_uname} في سطر المُرسِل")
+            if _new_text == _old_text:
+                return
+            _btns = [[Button.url("✉️ مراسلة", f"https://t.me/{_uname}")]]
+            # (3) عدّل التنبيه (إعادة الإرسال تُقيّم ذكر tg://user?id —
+            # الكيان الآن معروف للبوت → الاسم يصير ذكرًا حيًّا أيضًا)
+            try:
+                await _bot_client.edit_message(
+                    target, _alert_id, _new_text,
+                    parse_mode='html', link_preview=False, buttons=_btns)
+            except Exception as _up_e:
+                logging.debug(
+                    f"[FAST-REQUEST] upgrade edit failed (non-fatal): {_up_e}")
+                return
+            logging.info(
+                f"[FAST-REQUEST] ✅ alert upgraded with @username "
+                f"chat_id={chat_id} msg_id={msg_id} alert_id={_alert_id}"
+            )
+            # (4) حدّث السجل (علامة الحذف اللاحقة تحمل النص/الزر الجديدين)
+            try:
+                if _entry is not None:
+                    _entry['text'] = _new_text
+                    _entry['buttons'] = _btns
+            except Exception:
+                pass
+        except Exception as _fu_e:
+            logging.debug(f"[FAST-REQUEST] upgrade error (non-fatal): {_fu_e}")
+
     async def _relay_and_register_request_alert(self, target, bridge, sent_alert,
                                                 chat_id, msg_id, alert, dm_buttons):
         """[MENTION-BRIDGE-v4.4.7] بعد نجاح إرسال التنبيه: أعد توجيه نسخة
@@ -7892,9 +8068,40 @@ class Monitor:
                     # getattr دفاعي (نمط الكود): fake namespace قديم بلا
                     # الدالة → تخطٍ صامت بدل AttributeError.
                     _mark_fn = getattr(self, '_mark_request_alert_deleted', None)
+                    _marked_ok = False
                     if callable(_mark_fn):
                         try:
-                            await _mark_fn(chat_id, deleted_msg_id)
+                            _marked_ok = await _mark_fn(chat_id, deleted_msg_id)
+                        except Exception:
+                            _marked_ok = False
+                    # [PENDING-DELETE] التنبيه لم يُنشر بعد (مسار الطلب
+                    # جارٍ: تصنيف/حل/إرسال) — الحذف سبق التسجيل: دوّنه
+                    # ليُعلَّم التنبيه لحظة نشره (نفس آلية التعليم ⚠️).
+                    if not _marked_ok:
+                        try:
+                            _infl = getattr(self, '_request_inflight', None)
+                            if isinstance(_infl, set) and _infl:
+                                _hit = None
+                                if chat_id is not None:
+                                    _ik = (int(chat_id), int(deleted_msg_id))
+                                    if _ik in _infl:
+                                        _hit = _ik
+                                if _hit is None:
+                                    for _ik in list(_infl):
+                                        if _ik[1] == int(deleted_msg_id):
+                                            _hit = _ik
+                                            break
+                                if _hit is not None:
+                                    _pd = getattr(
+                                        self, '_pending_request_deletes', None)
+                                    if not isinstance(_pd, dict):
+                                        _pd = self._pending_request_deletes = {}
+                                    _pd[_hit] = time.time()
+                                    if len(_pd) > 1000:
+                                        _now = time.time()
+                                        for _pk in [k for k, v in _pd.items()
+                                                    if _now - v > 120.0]:
+                                            _pd.pop(_pk, None)
                         except Exception:
                             pass
 
