@@ -1206,17 +1206,15 @@ async def test_20_quote_expandable_for_long_text():
         assert len(long_text) > 300
         ev = FakeNewMessageEvent(long_text, -1003333007, 330007,
                                  chat=FakeMegagroupChat(), sender=None)
+        # [v4.4.9b — عقد محدّث بأمر المُشغّل 2026-09-08]: «اي رسالة اكثر من
+        # ١٢ كلمه يستبعدها مباشرة» — النص الطويل (~60 كلمة) يُرفض الآن
+        # ببوابة حد الكلمات: لا تنبيه إطلاقًا. مسار expandable-quote لم يعد
+        # قابلًا للوصول (تنبيهات الطلبات الآن ≤12 كلمة مضمون → اقتباس عادي).
         await fm._on_user_message(ev, '+TEST_SOURCE')
         await drain_request_tasks(fm)
         sm = fm.bot_client.send_message
-        record("20: long-text alert sent", sm.called, "send_message not called")
-        if sm.called:
-            alert = sm.calls[0]['alert']
-            record("20: long text wrapped in EXPANDABLE quote (collapsed in app)",
-                   '<blockquote expandable>' in alert,
-                   f"expandable quote missing — snippet: {alert[:200]!r}")
-            record("20: expandable closes with </blockquote>",
-                   '</blockquote>' in alert, "closing tag missing")
+        record("20: [v4.4.9b] long text (>12 words) rejected by word gate — NO alert",
+               not sm.called, "word gate failed to reject the ~60-word text")
 
         # نص قصير → اقتباس عادي (بلا expandable — يظهر كاملًا دائمًا)
         send_mock_reset = sm

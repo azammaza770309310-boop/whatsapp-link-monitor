@@ -390,14 +390,21 @@ async def test_section_G():
         "تكفون تساعدوني"
     )
     r4 = analyze_request(genuine_multi)
-    # v4: القرار عبر الـAI — نمرّر النص نفسه عبر pipeline بمصنّف مُبرمَج
-    # (قرار الـLLM الصحيح: طلب حقيقي) ونتأكد أن الإشارات متعددة الأسطر
-    # (weak hint) لا تمنع القبول.
+    # [v4.4.9b — عقد محدّث بأمر المُشغّل 2026-09-08]: «اي رسالة اكثر من
+    # ١٢ كلمه يستبعدها مباشرة» — النص متعدد الأسطر مضمونه 17 كلمة →
+    # يُرفض ببوابة حد الكلمات حتى مع مصنّف ACCEPT (الأمر حرفي).
     cl_g = make_scripted_v4_classifier([genuine_multi])
 
-    record("multi-line genuine: still ACCEPT (v4 pipeline)",
-           (await analyze_request_v4(genuine_multi, cl_g)).is_request,
-           f"signals: provider={r4.provider_confidence}")
+    record("multi-line genuine (17 words): REJECT by word gate [v4.4.9b]",
+           not (await analyze_request_v4(genuine_multi, cl_g)).is_request,
+           "word gate failed to reject >12-word multi-line text")
+    # نفس قصد الاختبار الأصلي (multi-line = weak hint ليست قرارًا):
+    # نص قصير متعدد الأسطر (≤12 كلمة مضمونًا) يبقى ACCEPT.
+    short_multi = "ابي احد يسوي لي بحث\nضروري قبل يوم الاثنين"
+    cl_sm = make_scripted_v4_classifier([short_multi])
+    record("multi-line SHORT genuine (≤12 words): still ACCEPT (v4 pipeline)",
+           (await analyze_request_v4(short_multi, cl_sm)).is_request,
+           "multi-line signal must not block a short genuine request")
     record("multi-line genuine: has_many_lines=True (signal)",
            r4.has_many_lines is True)
     record("multi-line genuine: provider_confidence < 6 (signal)",

@@ -63,7 +63,7 @@ from intent_classifier import IntentDecision
 
 __all__ = ["RuleBasedIntentClassifier", "RULE_ENGINE_VERSION"]
 
-RULE_ENGINE_VERSION = "rule-v4.4.5"
+RULE_ENGINE_VERSION = "rule-v4.4.9"
 
 # ============================================================
 # [GENIUS-PLAN-v4.4.2] طبقة ما قبل الشلال — أنماط القمامة الإنتاجية
@@ -225,6 +225,11 @@ WANT_WORDS = (
 )
 
 # مفعول أكاديمي (homework_execution_request)
+# [REQ-CATCH-v4.4.9] أمر المُشغّل (2026-09-08): «ما اشوف البوت يسحب
+# بروجكت واسايمت ولابات» + «طلب من يحل رياضيات البوت ما يسحبه» —
+# فجوة موثقة: الطلبات الحقيقية تُرفض category=other لأن المترادفات
+# الدارجة غير موجودة في المعجم (الإنتاج: 0 قبول يحوي بروجكت/اسايمت/
+# لابات في 93 قبولًا، و«من يحل رياضيات» → REJECT other). الإضافات:
 HOMEWORK_NOUNS = (
     'واجب', 'واجبات', 'واجبه', 'واجباتي',
     'سكليف', 'سكاليف', 'تكليف', 'تكاليف', 'تكليفات',
@@ -233,12 +238,23 @@ HOMEWORK_NOUNS = (
     'مشروع', 'المشروع', 'مشاريع',
     'كويز', 'كويزات', 'الكويز', 'الكويزات',
     'اختبار', 'اختبارات', 'الاختبار',
-    'اسايمنت', 'اساينمنت', 'اساينمنت', 'assignment', 'assignments',
+    'اسايمنت', 'اساينمنت', 'اسايمت', 'ايسمنت', 'assignment', 'assignments',
     'هومورك', 'homework',
     'سليد', 'سلايد', 'سلايدات', 'slides', 'slide',
     'عرض', 'العرض', 'بوربوينت', 'برزنتيشن', 'برزنت', 'presentation',
     'اوراق', 'ورقة عمل', 'ورقه',
     'حلول', 'الحلول',
+    # [REQ-CATCH-v4.4.9] مترادفات دارجة كانت تُرفض:
+    'بروجكت', 'بروجك', 'بروجكتات',
+    'لابات', 'لابز', 'labs',
+    'رياضيات', 'رياضه', 'ريضه', 'ماث',
+)
+
+# [REQ-CATCH-v4.4.9] أسماء قصيرة تُطابق ككلمة مستقلة فقط (word-boundary)
+# — «لاب» المفردة لا تُلتقط كـsubstring لأنها داخل «لابد» الشائعة؛
+# و«math» لا تلتقط «timetable» — الكلمة المستقلة فقط هي المفعول الأكاديمي.
+HOMEWORK_NOUN_WORDS = (
+    'لاب', 'اللاب', 'ماث', 'الماث', 'math', 'lab',
 )
 
 # مفعول خدمة طلابية (student_service_execution_request)
@@ -510,7 +526,11 @@ class RuleBasedIntentClassifier:
         if exec_v:
             seeker = _has_any(t, SEEKER_WORDS)
             want = _has_any(t, WANT_WORDS)
-            hw_noun = _has_sub(t, HOMEWORK_NOUNS)
+            # [REQ-CATCH-v4.4.9] المفعول الأكاديمي: substring (المعتاد) +
+            # الكلمات المستقلة القصيرة (لاب/ماث/math) — word-boundary يمنع
+            # الاصطدام بـ«لابد» أو الكلمات الإنجليزية الحاوية لها.
+            hw_noun = _has_sub(t, HOMEWORK_NOUNS) \
+                or any(_has_word(t_words_only, w) for w in HOMEWORK_NOUN_WORDS)
             svc_noun = _has_sub(t, SERVICE_NOUNS)
             # [REQ-ACADEMIC-v4.4.5] التفويض المجرد يتطلب علامة قوية:
             # بدالي/نيابة/عني/رقم-مجهول. الضعيفة (لي/معي) حروف جر تظهر

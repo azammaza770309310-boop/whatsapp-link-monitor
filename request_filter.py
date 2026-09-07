@@ -43,7 +43,45 @@ import re
 from dataclasses import dataclass, field
 from typing import List, Tuple, Dict, Any, Optional
 
-FILTER_VERSION = "v4.4.5"
+# ---- [v4.4.9b] عدّ كلمات المضمون — تحية/نداء boilerplate لا تُعدّ ----
+# عبارات التحية الافتتاحية: ليست مضمون الطلب — الطلب الحقيقي الذي يبدأ
+# بها (مضمونه ≤12 كلمة) يمر، بينما النص الديني/الدعائي الطويل مضمونه
+# 20+ كلمة فيُصد بالحد نفسه. المطابقة على نسخة مطبّعة (همزات موحدة +
+# بلا تشكيل) لتصطاد كل الصيغ (السلام/السَّلَام/ألسلام...).
+try:  # pragma: no cover - import hygiene
+    from text_normalizer import _ARABIC_NORMALIZE_MAP, _ARABIC_DIACRITICS
+except ImportError:  # اختبارات نقل الملفات
+    _ARABIC_NORMALIZE_MAP = str.maketrans({
+        'أ': 'ا', 'إ': 'ا', 'آ': 'ا', 'ٱ': 'ا',
+        'ؤ': 'و', 'ئ': 'ي', 'ة': 'ه', 'ى': 'ي', 'ـ': '',
+    })
+    _ARABIC_DIACRITICS = re.compile(r'[\u0610-\u061A\u064B-\u065F\u0670\u06D6-\u06ED]')
+
+_GREETING_PHRASES = (
+    'السلام عليكم ورحمه الله وبركاته',
+    'السلام عليكم ورحمه الله',
+    'السلام عليكم',
+    'وعليكم السلام ورحمه الله وبركاته',
+    'وعليكم السلام',
+)
+# نداء المخاطبين (vocative) — كلمات مخاطبة لا مضمون
+_VOCATIVE_WORDS = ('يخوان', 'اخواني', 'اخوان', 'جماعه', 'شباب')
+
+
+def _content_word_count(clean_text: str) -> int:
+    """عدّ كلمات المضمون: التحية/النداء/التشكيل لا تدخل العدّ."""
+    t = clean_text or ''
+    t = t.translate(_ARABIC_NORMALIZE_MAP)
+    t = _ARABIC_DIACRITICS.sub('', t)
+    # حذف عبارات التحية (الأطول أولًا) ثم كلمات النداء (word-boundary)
+    t = re.sub('|'.join(
+        re.escape(p) for p in sorted(_GREETING_PHRASES, key=len, reverse=True)
+    ), ' ', t)
+    t = re.sub(r'\b(?:' + '|'.join(
+        re.escape(w) for w in _VOCATIVE_WORDS) + r')\b', ' ', t)
+    return len(t.split())
+
+FILTER_VERSION = "v4.4.9"
 FILTER_MODE = "ai_intent_classifier"
 
 
@@ -1435,6 +1473,9 @@ _GUARD_ACADEMIC_TERMS = (
     'امتحان', 'امتحانات', 'ميدتيرم', 'ميدترم', 'ميد', 'فاينل', 'فينل',
     'بارشال', 'بارشيال', 'ويكلي', 'تسك', 'برزنتيشن', 'برزنتيشن',
     'روبرت', 'ربورت', 'بحوثي', 'تزنيم', 'معمل',
+    # [REQ-CATCH-v4.4.9] أمر المُشغّل (2026-09-08): المترادفات الدارجة
+    # الناقصة — «لاب/لابات/اسايمت/بروجك» كانت تُصرف no_academic_content
+    'لاب', 'لابات', 'لابز', 'اسايمت', 'ايسمنت', 'بروجك', 'ريضه',
 )
 
 # [G5] مصطلحات إدارية/جدولة (+ [v4.3.1] مواقع الحرم: صاله/مبنى/قاعه/مكتب —
@@ -1707,6 +1748,22 @@ async def analyze_request_v4(
         res.intent_type = "relay_repost"
         res.decision_path = "relay_wrapper"
         res.confidence = 0.01
+        await _log_decision_safe(decision_logger, text, res, chat_id, msg_id, source_phone)
+        return res
+
+    # ---- [v4.4.9b] بوابة حد الكلمات — أمر المُشغّل (2026-09-08): ----
+    # «اي رسالة اكثر من ١٢ كلمه يستبعدها مباشرة» — REJECT حتمي قبل أي
+    # تصنيف/dedup. العدّ على كلمات المضمون (nt.clean: إيموجي/روابط/
+    # توقيعات/تحية/نداء مزالة — العد على الطلب الفعلي). الدليل الإنتاجي:
+    # كل التسريبات الموثقة (دعاء/نصوص دينية/تحذيرات إدارية/إعلانات/
+    # تجارب منشورة) مضمونها 20+ كلمة يحتوي مصادفةً أفعال تنفيذ + كلمات
+    # طالب، بينما الطلب الحقيقي 3–12 كلمة مضمونًا. (بعد relay-wrapper
+    # للحفاظ على كشف إعادة نشر البوتات الناقلة).
+    if _content_word_count(nt.clean) > 12:
+        res.reason = "request_too_long"
+        res.intent_type = "too_long"
+        res.decision_path = "word_count_gate"
+        res.confidence = 0.0
         await _log_decision_safe(decision_logger, text, res, chat_id, msg_id, source_phone)
         return res
 
