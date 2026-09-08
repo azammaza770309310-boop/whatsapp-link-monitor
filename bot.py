@@ -69,7 +69,7 @@ from request_filter import (
     FILTER_MODE as REQUEST_FILTER_MODE,
 )
 from intent_classifier import IntentClassifier
-from semantic_dedup import SemanticDeduper
+from semantic_dedup import SemanticDeduper, content_tokens
 from filter_store import DecisionLogger
 # NOTE: aliased to RequestRateLimiter to avoid shadowing link_system.RateLimiter.
 # link_system.RateLimiter(db) is instantiated at __init__ as self.rate_limiter
@@ -81,10 +81,65 @@ from filter_store import DecisionLogger
 #   TypeError: int() argument must be a string, a bytes-like object or a real
 #   number, not 'ProductionDB'   (request_guard.py:45, bot.py:3033)
 from request_guard import RateLimiter as RequestRateLimiter, CircuitBreaker, ContentDeduper
+from text_normalizer import normalize as _text_normalize
 
 # -------------------------------------------------------------------
 # Constants
 # -------------------------------------------------------------------
+
+# === [SENDER-BLOCK-v4.4.10] حظر مرسلين — أمر المُشغّل 2026-09-08 ===
+# «وش هذ التكرار وابيك تحضر هذول المستخدمين حتى ولو كان الطلب الذي
+# يرسله حقيقي»: ملؤوا قناة الطلبات بإعادة إرسال نفس الطلب (نفس الشخص
+# يكرر نفس النص كل دقائق + إعلانات دينية متكررة). الحظر على مستوى
+# المُرسل لا النص: أي رسالة من هؤلاء تُتخطى قاطعًا — قبل الفلترة
+# (فحص مبكر من الكيان المخبأ) وبعد حلّ المرسل عبر API (الفحص الحاسم).
+# يوزرنيمات lowercase بلا @ (مقارنة غير حساسة لحالة الأحرف).
+# للإضافة لاحقًا: أضف اليوزرنيم هنا ثم انشر — لا شيء آخر مطلوب.
+BLOCKED_SENDER_USERNAMES = frozenset({
+    'eng_mutasem',  # كرّر «احتاج شخص يسوي بحث جامعي» 3× خلال ~52 دقيقة
+    'han0f0',       # 4 طلبات متكررة/متبادلة خلال ~3 ساعات
+    'farmah5',      # أعاد نشر نفس الحديث الديني مرتين (تسرب + تكرار)
+    'x3badix',      # رسالة سوالف/نقل (تسرب ليس طلبًا)
+})
+
+# === [SENDER-REPEAT-v4.4.10] كبح تكرار الطلب لكل مُرسل ===
+# نفس المرسل يعيد إرسال نفس النص (نفس مجموعة الكلمات الدلالية —
+# الترتيب لا يهم) خلال نافذة الـ12 ساعة → تنبيه واحد فقط. نص مختلف
+# كليًا من نفس المرسل يمرّ عاديًا (مفتاح = المُرسل × بصمة النص).
+# البلاغ الإنتاجي 2026-09-08: نفس الشخص أرسل «احتاج شخص يسوي بحث
+# جامعي» 3 مرات خلال 52 دقيقة فملأ القناة تكرارًا.
+_SENDER_REPEAT_TTL_S = 12 * 3600
+_SENDER_REPEAT_REG_MAX = 5000
+
+
+def _sender_username_normalized(entity) -> str:
+    """[SENDER-BLOCK-v4.4.10] يوزرنيم المرسل من كيان Telethon معقّم:
+    lowercase بلا @، محارف تلغرام الصالحة فقط، '' لو أقصر من 4
+    (نفس عقد _uname_clean في التنبيه)."""
+    try:
+        if entity is None:
+            return ''
+        _u = str(getattr(entity, 'username', '') or '').strip().lstrip('@').lower()
+        _u = re.sub(r'[^a-z0-9_]', '', _u)
+        return _u if len(_u) >= 4 else ''
+    except Exception:
+        return ''
+
+
+def _sender_repeat_signature(raw_text: str) -> str:
+    """[SENDER-REPEAT-v4.4.10] بصمة تكرار الطلب: نفس مجموعة الكلمات
+    الدلالية (بعد التطبيع الكامل — تشكيل/همزات/لهجات) = نفس البصمة
+    بغض النظر عن ترتيب الكلمات. نفس منطق semantic_hash المُجرَّب
+    إنتاجيًا في semantic_dedup."""
+    try:
+        _canonical = _text_normalize(str(raw_text or '')).canonical
+        _toks = content_tokens(_canonical)
+        if not _toks:
+            return ''
+        return hashlib.md5(
+            ' '.join(sorted(_toks)).encode('utf-8', 'replace')).hexdigest()
+    except Exception:
+        return ''
 
 SESSIONS_DIR = "sessions"
 # [B01] DATA_DIR is env-configurable so the SQLite DB (link_queue, group_states,
@@ -6467,6 +6522,22 @@ class Monitor:
             )
             return
 
+        # === [SENDER-BLOCK-v4.4.10] فحص مبكر تزامني — مرسل محظور ===
+        # الكيان المخبأ (event.sender) قد يحمل username بالفعل بلا أي API:
+        # حظر قبل البذرة وقبل الفلترة (توفير كامل للمعالجة). الفحص الحاسم
+        # يأتي بعد حلّ المرسل عبر API (يلتقط من لم يحملهم هذا الفحص).
+        _early_blk = _sender_username_normalized(getattr(event, 'sender', None))
+        if _early_blk and _early_blk in BLOCKED_SENDER_USERNAMES:
+            logging.info(
+                f"[REQUEST-PATH] skip blocked sender (early) "
+                f"username=@{_early_blk} chat_id={chat_id} msg_id={msg_id}"
+            )
+            try:
+                await self.metrics.record_skip('request_sender_blocked')
+            except Exception:
+                pass  # metrics لا يوقف المسار
+            return
+
         # [FAST-REQUEST] قياس زمن المسار (للتحقق الحي من السرعة في السجلات)
         _req_t0 = time.time()
         # [PENDING-DELETE] الطلب قيد المعالجة من هذه اللحظة (قبل القرار):
@@ -6776,6 +6847,85 @@ class Monitor:
                     sender_display = sender_obj.title
         except Exception:
             pass
+
+        # === [SENDER-BLOCK-v4.4.10 + SENDER-REPEAT] الفحص الحاسم بعد حلّ المرسل ===
+        # (1) الحظر: يوزرنيم المرسل في قائمة الحظر → تخطٍ قاطع حتى لو
+        #     كان الطلب حقيقيًا (أمر المُشغّل الحرفي). هذا الفحص حاسم:
+        #     يلتقط من لم يحملهم الفحص المبكر (الكيان حُلّ للتو عبر
+        #     get_sender / get_entity من حساب الالتقاط).
+        # (2) التكرار: نفس المرسل أعاد نفس النص خلال نافذة 12 ساعة →
+        #     تنبيه واحد فقط. مفتاح مستقل عن المحتوى العام: (المُرسل ×
+        #     بصمة النص) — نص مختلف من نفس المرسل يمرّ عاديًا.
+        async def _abort_after_seeds(reason: str) -> None:
+            """[SEED-RACE] رفض بعد إنشاء البذور → نظّف النسختين (لا يتامى):
+            نسخة seed-race + نتيجة مهمة الجسر (تُحصد وتُحذف)."""
+            getattr(self, '_seed_race_cleanup',
+                    lambda *a, **k: None)(chat_id, msg_id, reason)
+            if _seed_task is not None:
+                try:
+                    _br_ab = await asyncio.wait_for(
+                        asyncio.shield(_seed_task), timeout=2.0)
+                    if isinstance(_br_ab, dict):
+                        _del_fn = getattr(self, '_seed_copy_delete', None)
+                        if callable(_del_fn):
+                            asyncio.create_task(_del_fn(_br_ab, reason))
+                except Exception:
+                    pass  # بذرة متأخرة/فاشلة — غير قاتل
+
+        _uname_norm = _sender_username_normalized(sender_obj)
+        if _uname_norm and _uname_norm in BLOCKED_SENDER_USERNAMES:
+            logging.info(
+                f"[REQUEST-PATH] REJECT reason=sender_blocked "
+                f"username=@{_uname_norm} chat_id={chat_id} msg_id={msg_id}"
+            )
+            try:
+                await self.metrics.record_skip('request_sender_blocked')
+            except Exception:
+                pass
+            await _abort_after_seeds('sender-blocked')
+            return
+
+        # (2) كبح التكرار — بصمة (المُرسل × النص) خلال 12 ساعة
+        _sender_key = _uname_norm or (
+            f'id:{int(sender_id)}' if sender_id > 0 else '')
+        _repeat_sig = _sender_repeat_signature(raw_text) \
+            if _sender_key else ''
+        if _sender_key and _repeat_sig:
+            _now_sr = time.time()
+            if not isinstance(getattr(self, '_sender_repeat_reg', None), dict):
+                self._sender_repeat_reg = {}
+            _sr_reg = self._sender_repeat_reg
+            _sr_bucket = _sr_reg.get(_sender_key)
+            if _sr_bucket is None:
+                _sr_bucket = _sr_reg[_sender_key] = {}
+            _sr_prev = _sr_bucket.get(_repeat_sig)
+            if _sr_prev is not None and \
+                    (_now_sr - float(_sr_prev)) < _SENDER_REPEAT_TTL_S:
+                logging.info(
+                    f"[REQUEST-PATH] REJECT reason=sender_repeat "
+                    f"sender={_sender_key} "
+                    f"gap={int(_now_sr - float(_sr_prev))}s "
+                    f"chat_id={chat_id} msg_id={msg_id}"
+                )
+                try:
+                    await self.metrics.record_skip('request_sender_repeat')
+                except Exception:
+                    pass
+                await _abort_after_seeds('sender-repeat')
+                return
+            # سجّل بصمة هذا النص — المسار متجه للإرسال: هذا هو التنبيه
+            # الوحيد المسموح لهذا (المُرسل × النص) خلال النافذة
+            _sr_bucket[_repeat_sig] = _now_sr
+            # prune دوري عند بلوغ حد أقصى (ذاكرة محدودة — نفس نمط _request_sent)
+            if len(_sr_reg) > _SENDER_REPEAT_REG_MAX:
+                _sr_cutoff = _now_sr - _SENDER_REPEAT_TTL_S
+                for _k_sr in list(_sr_reg.keys()):
+                    _b_sr = _sr_reg[_k_sr]
+                    for _s_sr in list(_b_sr.keys()):
+                        if float(_b_sr.get(_s_sr, 0) or 0) < _sr_cutoff:
+                            del _b_sr[_s_sr]
+                    if not _b_sr:
+                        del _sr_reg[_k_sr]
 
         # --- بناء رابط الرسالة (آمن للمجموعات الخاصة) ---
         # مجموعة عامة (لها username) → رابط عام

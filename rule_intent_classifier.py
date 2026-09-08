@@ -63,7 +63,10 @@ from intent_classifier import IntentDecision
 
 __all__ = ["RuleBasedIntentClassifier", "RULE_ENGINE_VERSION"]
 
-RULE_ENGINE_VERSION = "rule-v4.4.9"
+# [rule-v4.4.10 — 2026-09-08] لا تغيير في منطق القواعد — تزامن زوج
+# الإصدار مع إصدار الفلتر v4.4.10 (حظر المرسلين + كبح التكرار يعيشان
+# في خط الأنابيب bot.py).
+RULE_ENGINE_VERSION = "rule-v4.4.10"
 
 # ============================================================
 # [GENIUS-PLAN-v4.4.2] طبقة ما قبل الشلال — أنماط القمامة الإنتاجية

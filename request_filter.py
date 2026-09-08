@@ -81,7 +81,11 @@ def _content_word_count(clean_text: str) -> int:
         re.escape(w) for w in _VOCATIVE_WORDS) + r')\b', ' ', t)
     return len(t.split())
 
-FILTER_VERSION = "v4.4.9"
+# [v4.4.10 — 2026-09-08] ترقية إصدار خط الأنابيب: حظر المرسلين
+# (BLOCKED_SENDER_USERNAMES في bot.py — أمر المُشغّل) + كبح تكرار الطلب
+# لكل مُرسل (12 ساعة). منطق القواعد هنا لم يتغير — العلامة تُحدِّث
+# الإصدار المُتحقَّق منه في /api/filter_stats.
+FILTER_VERSION = "v4.4.10"
 FILTER_MODE = "ai_intent_classifier"
 
 
