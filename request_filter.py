@@ -85,7 +85,10 @@ def _content_word_count(clean_text: str) -> int:
 # (BLOCKED_SENDER_USERNAMES في bot.py — أمر المُشغّل) + كبح تكرار الطلب
 # لكل مُرسل (12 ساعة). منطق القواعد هنا لم يتغير — العلامة تُحدِّث
 # الإصدار المُتحقَّق منه في /api/filter_stats.
-FILTER_VERSION = "v4.4.10"
+# [v4.4.11 — 2026-09-08] PRIVATE-CHAT-BLOCK (أمر المُشغّل «لا تخليه
+# يسحب من المحادثات الشخصية»): البوابة في bot.py (_on_user_message +
+# _on_raw_new_message). منطق القواعد هنا لم يتغير.
+FILTER_VERSION = "v4.4.11"
 FILTER_MODE = "ai_intent_classifier"
 
 

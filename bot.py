@@ -4100,6 +4100,13 @@ class Monitor:
             chat_id = self._normalize_raw_chat_id(peer_id)
             if chat_id is None:
                 return  # نوع غير مدعوم — تجاهل بهدوء
+            # [PRIVATE-CHAT-BLOCK-v4.4.11] المحادثات الخاصة خارج النطاق
+            # (لا كتابة LRB لها حتى لو أُعيد تشغيل مهمة الروابط مستقبلًا).
+            try:
+                if int(chat_id) > 0:
+                    return
+            except (TypeError, ValueError):
+                pass
             # استخراج الروابط (regex نقي) + كتابة LRB
             # [FIX-FAST-CAPTURE] pre-write تزامني إلى _link_ring dict قبل أي
             # await — يُغلق نافذة السباق: أي حذف يصل بعد هذه النقطة يجد
@@ -6020,6 +6027,32 @@ class Monitor:
                                 return
                     except Exception:
                         pass
+
+            # === [PRIVATE-CHAT-BLOCK-v4.4.11] أمر المُشغّل 2026-09-08 ===
+            # «لا تخليه يسحب من المحادثات الشخصية» — المحادثات الخاصة
+            # (chat_id موجب = محادثة 1:1) خارج نطاق المراقبة تمامًا:
+            # لا روابط، لا LRB، لا PRE-CACHE، لا journal، لا مسار طلبات —
+            # المجموعات فقط. (جسر MENTION-BRIDGE سليم: بذوره في خاص
+            # البوت يعالجها عميل البوت نفسه (_on_private_message) وليس
+            # حسابات المراقبة.)
+            # [DEFENSIVE] getattr دفاعي: لو namespace اختبارات بلا is_private
+            # → نعتمد إشارة chat_id الموجبة وحدها.
+            try:
+                _is_private = bool(getattr(event, 'is_private', False))
+            except Exception:
+                _is_private = False
+            if not _is_private and chat_id is not None:
+                try:
+                    _is_private = int(chat_id) > 0
+                except (TypeError, ValueError):
+                    _is_private = False
+            if _is_private:
+                logging.info(
+                    f"[PRIVATE-CHAT-BLOCK] skipped private message "
+                    f"chat_id={chat_id} msg_id={event.id} "
+                    f"sender_id={event.sender_id or 0} source={source_phone}"
+                )
+                return
 
             # === [BOT-FILTER] لا نسحب أي رابط أو طلب من أي بوت كان ===
             # فحص المُرسِل BEFORE أي استخراج روابط أو مسار طلبات. لو بوت:
