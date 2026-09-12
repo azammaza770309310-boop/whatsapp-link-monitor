@@ -102,6 +102,27 @@ BLOCKED_SENDER_USERNAMES = frozenset({
     'x3badix',      # رسالة سوالف/نقل (تسرب ليس طلبًا)
 })
 
+# === [BRIDGE-BUTTON-v4.4.16] زر التواصل الأحمر — أمر المُشغّل (2026-09-12) ===
+# «زر احمر يشير الى الخطر وباجنه علامة استفهام عندما تضغط على علامة
+# استفهام يطلع نص يشرح وش عمل هذا الزر يعني تعليمات الاشخاص اللي
+# يستطيعون استخدام هذا الزر هم المشرفين فقط ونص الرسالة السلام
+# عليكم. هكذا فقط»
+# المشرف يضغط 🔴 → رقم المراقبة الذي التقط الطلب (مشترك بنفس مجموعة
+# المرسل) يرسل «السلام عليكم» لخاص المرسل فيظهر لديه رقم للمراسلة.
+# الحمايات (حسابات المراقبة رأس المال): مشرفو قناة الطلبات فقط +
+# ضغطة واحدة لكل تنبيه + سقف يومي لكل رقم + فاصل أدنى بين الإرسالات.
+# مفتاح إيقاف طارئ: BRIDGE_BUTTON_ENABLED=false (متغير بيئة).
+BRIDGE_HELP_TEXT = (
+    "🔴 ما هذا الزر؟\n"
+    "رقمُ مراقبة (بنفس مجموعة المرسل) يرسل «السلام عليكم» لخاص صاحب "
+    "الطلب لفتح محادثة.\n"
+    "⚡ للمشرفين فقط — ضغطة واحدة تنجح لكل طلب.\n"
+    "لو فشل الإرسال فالمرسل مقفل رسائله الخاصة غالبًا."
+)
+BRIDGE_DAILY_CAP_PER_PHONE = 15   # رسايل «السلام عليكم»/يوم لكل رقم مراقبة
+BRIDGE_MIN_INTERVAL_S = 20        # فاصل أدنى بين أي إرسالين (كل الأرقام)
+BRIDGE_DONE_TTL_S = 30 * 86400    # سجل dedup الضغطات (30 يومًا)
+
 # === [SENDER-REPEAT-v4.4.10] كبح تكرار الطلب لكل مُرسل ===
 # نفس المرسل يعيد إرسال نفس النص (نفس مجموعة الكلمات الدلالية —
 # الترتيب لا يهم) خلال نافذة الـ12 ساعة → تنبيه واحد فقط. نص مختلف
@@ -918,6 +939,12 @@ class Config:
             "1", "true", "yes", "on")
         self.seed_race_enabled = os.getenv(
             "SEED_RACE_ENABLED", "false").strip().lower() in (
+            "1", "true", "yes", "on")
+
+        # === [BRIDGE-BUTTON-v4.4.16] زر التواصل الأحمر (أمر المُشغّل
+        # 2026-09-12) — مفتاح إيقاف طارئ عبر متغير البيئة، الافتراضي مفعّل
+        self.bridge_button_enabled = os.getenv(
+            "BRIDGE_BUTTON_ENABLED", "true").strip().lower() in (
             "1", "true", "yes", "on")
 
         # === Request Filter v2 controls — Kill Switch + Rate Limit + Circuit Breaker ===
@@ -3563,6 +3590,16 @@ class Monitor:
             sender_id = sender.id if sender else None
 
             logging.info(f"[CALLBACK] {sender_id}: {data[:80]}")
+
+            # [BRIDGE-BUTTON-v4.4.16] زر 🔴 الأحمر + ❓ التعليمات
+            # (طلب المُشغّل 2026-09-12 — الشرح للمشرفين فقط والاستخدام
+            # للمشرفين فقط: الرقابة داخل _handle_bridge_press)
+            if data == "brhlp":
+                await event.answer(BRIDGE_HELP_TEXT, alert=True)
+                return
+            if data.startswith("brd:"):
+                await self._handle_bridge_press(event, data)
+                return
 
             # AUTHORIZATION: state-changing actions require owner verification
             # (login_start, scan_week, scan_month, scan_stop, reset_scan)
@@ -7104,6 +7141,38 @@ class Monitor:
             dm_buttons = None  # فشل بناء الزر لا يمنع إرسال التنبيه
             dm_mode = 'none'
 
+        # === [BRIDGE-BUTTON-v4.4.16] صف الزر الأحمر + علامة الاستفهام ===
+        # الحمولة داخل الزر نفسه (قيد تلغرام 64 بايت):
+        #   brd:<معرف المرسل>:<هاتف المراقبة الملتقط>:<access_hash>
+        # الكيان (access_hash) يُحفظ لحظة الالتقاط لأن StringSession لا
+        # يخزّن الكيانات عبر إعادة التشغيل — الزر يظل يعمل بعد الإقلاع.
+        # بلا معرف مرسل موجب (قناة/مجهول) → لا صف جسر.
+        _bridge_payload = ''
+        _bridge_row = None
+        try:
+            _b_on = getattr(getattr(self, 'config', None),
+                            'bridge_button_enabled', True)
+            _b_uid = int(sender_id or 0)
+            _b_phone = str(source_phone or '').lstrip('+')
+            _b_hash = int(getattr(sender_obj, 'access_hash', 0) or 0)
+            if _b_on and _b_uid > 0 and _b_phone:
+                _bridge_payload = f"brd:{_b_uid}:{_b_phone}:{_b_hash}"
+                if len(_bridge_payload.encode('utf-8')) <= 64:
+                    _bridge_row = [
+                        Button.inline("🔴", _bridge_payload.encode('utf-8')),
+                        Button.inline("❓", b"brhlp"),
+                    ]
+                else:
+                    _bridge_payload = ''
+        except Exception:
+            _bridge_payload = ''
+            _bridge_row = None
+        # لوحة الإرسال النهائية: زر مراسلة (لو username) + صف الجسر
+        _buttons_out = (
+            (dm_buttons + [_bridge_row])
+            if (dm_buttons and _bridge_row)
+            else (_bridge_row or dm_buttons))
+
         # [MENTION-BRIDGE-v4.4.7] الجسر يُزرع الآن قبل بناء سطر المرسل
         # ([SEED-RACE] أعلاه) — الوقت المناسب: قبل حلّ username النهائي
         # كي تُبنى الزر/السطر من الكيان المزروع. هذا القسم بقي للتوثيق
@@ -7146,7 +7215,7 @@ class Monitor:
             )
             sent_alert = await _bot_client.send_message(
                 target, alert, parse_mode='html', link_preview=False,
-                buttons=dm_buttons,
+                buttons=_buttons_out,
             )
             logging.info(
                 f"[REQUEST-PATH] ✅ sent request alert "
@@ -7165,12 +7234,14 @@ class Monitor:
             _post_send_fn = getattr(self, '_relay_and_register_request_alert', None)
             if callable(_post_send_fn):
                 await _post_send_fn(target, _bridge, sent_alert,
-                                    chat_id, msg_id, alert, dm_buttons)
+                                    chat_id, msg_id, alert, _buttons_out,
+                                    bridge_payload=_bridge_payload)
             else:
                 _reg_alert_fn = getattr(self, '_register_request_alert', None)
                 if callable(_reg_alert_fn):
                     _reg_alert_fn(chat_id, msg_id, target, sent_alert,
-                                  alert, dm_buttons)
+                                  alert, _buttons_out,
+                                  bridge_payload=_bridge_payload)
 
             # === [ENTITY-RESCUE] لا جسر ولا username (خسرنا سباق الحذف) ===
             # الكيان يظل حيًا بعد حذف الرسالة: حساب الالتقاط (رأى الطالب
@@ -7261,19 +7332,21 @@ class Monitor:
                 await asyncio.sleep(wait_s)
                 sent_alert = await _bot_client.send_message(
                     target, alert, parse_mode='html', link_preview=False,
-                    buttons=dm_buttons,
+                    buttons=_buttons_out,
                 )
                 logging.info(f"[REQUEST-PATH] ✅ sent after FloodWait chat_id={chat_id} msg_id={msg_id}")
                 # [REQ-DELETED-MARK + MENTION-BRIDGE] نفس الإجراء بعد إعادة المحاولة
                 _post_send_fn2 = getattr(self, '_relay_and_register_request_alert', None)
                 if callable(_post_send_fn2):
                     await _post_send_fn2(target, _bridge, sent_alert,
-                                         chat_id, msg_id, alert, dm_buttons)
+                                         chat_id, msg_id, alert, _buttons_out,
+                                         bridge_payload=_bridge_payload)
                 else:
                     _reg_alert_fn2 = getattr(self, '_register_request_alert', None)
                     if callable(_reg_alert_fn2):
                         _reg_alert_fn2(chat_id, msg_id, target, sent_alert,
-                                       alert, dm_buttons)
+                                       alert, _buttons_out,
+                                       bridge_payload=_bridge_payload)
                 # [PENDING-DELETE] نفس فحص ما بعد الإرسال (إعادة FloodWait:
                 # الحذف يصل غالبًا خلال انتظار الفلو — التسجيل تم للتو)
                 try:
@@ -7823,6 +7896,9 @@ class Monitor:
             _btns = None
             if _uname_clean:
                 _btns = [[Button.url("✉️ مراسلة", f"https://t.me/{_uname_clean}")]]
+                # [BRIDGE-BUTTON-v4.4.16] حافظ على صف 🔴/❓ — استبدال
+                # الأزرار هنا كان سيمسحه
+                _btns = self._bridge_row_append(_btns, chat_id, msg_id)
                 _new_text = _old_text.replace(
                     _HINT_OLD,
                     f"للتواصل: زر «مراسلة» أدناه أو @{_uname_clean} في سطر المُرسِل")
@@ -7929,6 +8005,9 @@ class Monitor:
             if _new_text == _old_text:
                 return
             _btns = [[Button.url("✉️ مراسلة", f"https://t.me/{_uname}")]]
+            # [BRIDGE-BUTTON-v4.4.16] حافظ على صف 🔴/❓ — استبدال
+            # الأزرار هنا كان سيمسحه
+            _btns = self._bridge_row_append(_btns, chat_id, msg_id)
             # (3) عدّل التنبيه (إعادة الإرسال تُقيّم ذكر tg://user?id —
             # الكيان الآن معروف للبوت → الاسم يصير ذكرًا حيًّا أيضًا)
             try:
@@ -7954,7 +8033,8 @@ class Monitor:
             logging.debug(f"[FAST-REQUEST] upgrade error (non-fatal): {_fu_e}")
 
     async def _relay_and_register_request_alert(self, target, bridge, sent_alert,
-                                                chat_id, msg_id, alert, dm_buttons):
+                                                chat_id, msg_id, alert, dm_buttons,
+                                                bridge_payload=''):
         """[MENTION-BRIDGE-v4.4.7] بعد نجاح إرسال التنبيه: أعد توجيه نسخة
         الأصل إلى القناة (مسار التواصل المضمون) ثم سجّل التنبيه للتعليم
         عند حذف الأصل (مع حالة الجسر). يجمع الخطوتين ليعمل المساران
@@ -7970,12 +8050,14 @@ class Monitor:
             _reg_fn = getattr(self, '_register_request_alert', None)
             if callable(_reg_fn):
                 _reg_fn(chat_id, msg_id, target, sent_alert, alert,
-                        dm_buttons, relay=bridge)
+                        dm_buttons, relay=bridge,
+                        bridge_payload=bridge_payload)
         except Exception:
             pass  # التسجيل تحسيني — لا يعطّل المسار أبدًا
 
     def _register_request_alert(self, chat_id, msg_id, target, sent_alert,
-                                alert_html, dm_buttons, relay=None):
+                                alert_html, dm_buttons, relay=None,
+                                bridge_payload=''):
         """يسجّل تنبيه طلب مُرسَلًا: (chat_id, msg_id) → معرّف رسالة
         التنبيه في قناة الطلبات، لكي يُعلّم لاحقًا عند حذف الأصل.
         [MENTION-BRIDGE-v4.4.7] يحفظ كذلك حالة جسر التوجيه (نسخة الأصل
@@ -8010,6 +8092,9 @@ class Monitor:
                 'target': target,
                 'text': alert_html,
                 'buttons': dm_buttons,
+                # [BRIDGE-BUTTON-v4.4.16] حمولة زر 🔴 — لإعادة بناء الصف
+                # في تعديلات ما بعد الإرسال كي لا يمسحها استبدال الأزرار
+                'bridge_payload': (bridge_payload or None),
                 'ts': now,
                 # [MENTION-BRIDGE-v4.4.7] نسخة الأصل المُوجَّهة في خاص البوت
                 # (seed_msg_id + cap_user_id + done) — لإعادة المحاولة عند
@@ -8023,6 +8108,295 @@ class Monitor:
             )
         except Exception:
             pass  # التسجيل تحسيني — لا يعطّل المسار أبدًا
+
+    # ------------------------------------------------------------------
+    # [BRIDGE-BUTTON-v4.4.16] زر التواصل الأحمر — أمر المُشغّل (2026-09-12)
+    # ------------------------------------------------------------------
+    def _bridge_row_append(self, rows, chat_id, msg_id):
+        """أعد بناء صف 🔴/❓ لو التنبيه يحمله — يُستدعى من تعديلات ما بعد
+        الإرسال (ENTITY-RESCUE / ترقية username) كي لا يمسح التعديلُ
+        الزرَ (buttons= في edit يستبدل كامل لوحة المفاتيح)."""
+        try:
+            reg = getattr(self, '_request_alerts', None)
+            if not isinstance(reg, dict):
+                return rows
+            _entry = reg.get((int(chat_id), int(msg_id)))
+            _payload = (_entry or {}).get('bridge_payload') if _entry else None
+            if not _payload:
+                return rows
+            _payload = str(_payload)
+            if len(_payload.encode('utf-8')) <= 64:
+                _row = [Button.inline("🔴", _payload.encode('utf-8')),
+                        Button.inline("❓", b"brhlp")]
+                return (rows or []) + [_row]
+        except Exception:
+            pass
+        return rows
+
+    async def _handle_bridge_press(self, event, data: str):
+        """[BRIDGE-BUTTON-v4.4.16] مشرف القناة ضغط 🔴 → رقم المراقبة
+        الذي التقط الطلب (مشترك بنفس مجموعة المرسل) يرسل «السلام عليكم»
+        لخاص صاحب الطلب. كل المسار non-fatal مع رد واضح للضاغط."""
+        # مفتاح الإيقاف الطارئ (BRIDGE_BUTTON_ENABLED=false)
+        if not getattr(getattr(self, 'config', None),
+                       'bridge_button_enabled', True):
+            await event.answer("⛔ ميزة التواصل معطلة حاليًا", alert=True)
+            return
+        # (1) تفكيك الحمولة: brd:<uid>:<phone>:<hash>
+        try:
+            _parts = data.split(':', 3)
+            if len(_parts) != 4:
+                raise ValueError('bad payload shape')
+            target_user_id = int(_parts[1])
+            phone_digits = str(_parts[2]).lstrip('+')
+            access_hash = int(_parts[3])
+        except Exception:
+            await event.answer("⚠️ بيانات الزر غير صالحة", alert=True)
+            return
+        alert_msg_id = 0
+        presser_id = 0
+        try:
+            alert_msg_id = int(getattr(event, 'message_id', 0) or 0)
+            _ps = await event.get_sender()
+            presser_id = int(getattr(_ps, 'id', 0) or 0)
+        except Exception:
+            pass
+        if target_user_id <= 0 or not phone_digits:
+            await event.answer("⚠️ بيانات الزر غير صالحة", alert=True)
+            return
+        # (2) مشرفو قناة الطلبات فقط — أمر المُشغّل الصريح
+        _is_admin, _why = await self._bridge_is_channel_admin(
+            getattr(event, 'chat_id', None), presser_id)
+        if not _is_admin:
+            await event.answer(f"⛔ {_why}", alert=True)
+            return
+        # (3) الضغطة الواحدة لكل تنبيه (ذاكرة + SQLite عبر إعادة التشغيل)
+        _already, _ = await self._bridge_done_check(alert_msg_id)
+        if _already:
+            await event.answer(
+                "✅ تم التواصل مع هذا المرسل مسبقًا من هذا التنبيه",
+                alert=True)
+            return
+        # (3b) قيد التزامن: ضغطتان متزامنتان لنفس التنبيه
+        _infl = getattr(self, '_bridge_inflight', None)
+        if not isinstance(_infl, set):
+            try:
+                _infl = self._bridge_inflight = set()
+            except Exception:
+                _infl = None
+        if isinstance(_infl, set):
+            if alert_msg_id in _infl:
+                await event.answer(
+                    "⏳ جارٍ تنفيذ طلب تواصل آخر لهذا التنبيه…", alert=True)
+                return
+            _infl.add(alert_msg_id)
+        try:
+            # (4) رقم المراقبة الملتقط — له كيان المرسل
+            _client = self._bridge_get_user_client(phone_digits)
+            if _client is None or not _client.is_connected():
+                logging.warning(
+                    f"[BRIDGE] watcher +{phone_digits} not connected — "
+                    f"admin={presser_id} target_user={target_user_id}")
+                await event.answer(
+                    "⚠️ رقم المراقبة الذي التقط الطلب غير متصل حاليًا — "
+                    "جرب لاحقًا", alert=True)
+                return
+            # (5) حمايات معدل الإرسال (حسابات المراقبة رأس المال)
+            _ok_rate, _why_rate = await self._bridge_rate_check(phone_digits)
+            if not _ok_rate:
+                await event.answer(f"⛔ {_why_rate}", alert=True)
+                return
+            # (6) الإرسال — «السلام عليكم» فقط، حرفيًا بأمر المُشغّل
+            try:
+                if access_hash:
+                    from telethon.tl.types import InputPeerUser as _IPU
+                    _peer = _IPU(int(target_user_id), int(access_hash))
+                else:
+                    _peer = await _client.get_input_entity(int(target_user_id))
+                await _client.send_message(_peer, "السلام عليكم")
+            except FloodWaitError as _fw_e:
+                _wait = int(getattr(_fw_e, 'seconds', 30) or 30)
+                logging.warning(
+                    f"[BRIDGE] FloodWait {_wait}s admin={presser_id} "
+                    f"target_user={target_user_id}")
+                await event.answer(
+                    f"⏳ تلغرام طلب انتظار {_wait} ثانية — جرب بعد قليل",
+                    alert=True)
+                return
+            except Exception as _dm_e:
+                _nm = type(_dm_e).__name__
+                if 'PrivacyRestricted' in _nm or 'UserIsBlocked' in _nm:
+                    _ans = ("🔒 المرسل مقفل رسائله الخاصة من الغرباء — "
+                            "تعذر إرسال الرسالة له")
+                else:
+                    _ans = "⚠️ تعذر إرسال الرسالة — راجع سجل الخدمة"
+                logging.warning(
+                    f"[BRIDGE] dm FAILED admin={presser_id} "
+                    f"target_user={target_user_id} via=+{phone_digits} "
+                    f"err={_dm_e}")
+                await event.answer(_ans, alert=True)
+                return
+            # (7) سجّل النجاح (dedup + معدل) قبل الرد
+            await self._bridge_done_record(alert_msg_id, target_user_id,
+                                           phone_digits, presser_id)
+            logging.info(
+                f"[BRIDGE] ✅ sent dm 'السلام عليكم' admin={presser_id} "
+                f"target_user={target_user_id} via=+{phone_digits} "
+                f"alert_msg={alert_msg_id}")
+            await event.answer("✅ أُرسلت «السلام عليكم» لخاص المرسل")
+        finally:
+            if isinstance(_infl, set):
+                try:
+                    _infl.discard(alert_msg_id)
+                except Exception:
+                    pass
+
+    async def _bridge_is_channel_admin(self, chat_id, user_id):
+        """هل الضاغط مشرف/مالك قناة الطلبات؟ عبر GetParticipant —
+        البوت مشرف بالقناة (هو الناشر). fail-closed: أي فشل = ليس مشرفًا."""
+        _bot = getattr(self, 'bot_client', None)
+        if not _bot or not _bot.is_connected() or not chat_id or not user_id:
+            return False, "البوت غير متصل — جرب لاحقًا"
+        try:
+            from telethon.tl import functions as _tl_fn, types as _tl_tp
+            _ch = await _bot.get_input_entity(int(chat_id))
+            _res = await _bot(_tl_fn.channels.GetParticipantRequest(
+                channel=_ch, participant=int(user_id)))
+            _part = None
+            _parts = getattr(_res, 'participants', None)
+            if _parts:
+                _part = _parts[0] if isinstance(_parts, list) else _parts
+            if isinstance(_part, (_tl_tp.ChannelParticipantAdmin,
+                                  _tl_tp.ChannelParticipantCreator)):
+                return True, ""
+            return False, "هذا الزر للمشرفين فقط"
+        except Exception as _e:
+            logging.info(
+                f"[BRIDGE] admin check failed user={user_id} chat={chat_id}: {_e}")
+            return False, "هذا الزر للمشرفين فقط"
+
+    def _bridge_get_user_client(self, phone_digits: str):
+        """عميل المراقبة بالهاتف — مفتاح user_clients بصيغة هاتف سجل
+        المراقبين؛ نجرب المطابقة المرنة (+digits / digits / تطبيع)."""
+        _uc = getattr(self, 'user_clients', None)
+        if not isinstance(_uc, dict) or not phone_digits:
+            return None
+        _d = str(phone_digits).lstrip('+')
+        for _k in (_d, f"+{_d}"):
+            if _k in _uc:
+                return _uc[_k]
+        for _k, _v in _uc.items():
+            if str(_k).lstrip('+') == _d:
+                return _v
+        return None
+
+    async def _bridge_conn(self):
+        """اتصال SQLite (نفس مسار DecisionLogger) + إنشاء جدول الضغطات
+        إن لم يوجد. أي فشل → None (الميزة تكمل بذاكرة حية فقط)."""
+        _pdb = getattr(self, 'prod_db', None)
+        if _pdb is None:
+            return None
+        try:
+            conn = await _pdb._conn()
+            await conn.execute(
+                "CREATE TABLE IF NOT EXISTS bridge_presses ("
+                "alert_msg_id INTEGER PRIMARY KEY, "
+                "target_user_id INTEGER NOT NULL, "
+                "source_phone TEXT NOT NULL, "
+                "sent_at INTEGER NOT NULL, "
+                "pressed_by INTEGER NOT NULL)")
+            await conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_bridge_phone_ts "
+                "ON bridge_presses(source_phone, sent_at)")
+            await conn.commit()
+            return conn
+        except Exception as _e:
+            logging.debug(f"[BRIDGE] sqlite unavailable: {_e}")
+            return None
+
+    async def _bridge_done_check(self, alert_msg_id):
+        """هل استُخدم زر هذا التنبيه قبل ذلك؟ (ذاكرة حية + قرص)"""
+        if not alert_msg_id:
+            return False, 0
+        _mem = getattr(self, '_bridge_done_mem', None)
+        if isinstance(_mem, dict) and alert_msg_id in _mem:
+            return True, int(_mem.get(alert_msg_id) or 0)
+        conn = await self._bridge_conn()
+        if conn is not None:
+            try:
+                cur = await conn.execute(
+                    "SELECT sent_at FROM bridge_presses "
+                    "WHERE alert_msg_id=?",
+                    (int(alert_msg_id),))
+                row = await cur.fetchone()
+                if row:
+                    return True, int(row[0] or 0)
+            except Exception:
+                pass
+        return False, 0
+
+    async def _bridge_done_record(self, alert_msg_id, target_user_id,
+                                  phone_digits, presser_id):
+        """سجّل ضغطة ناجحة: ذاكرة حية (سقف) + SQLite (TTL 30 يومًا)."""
+        now = int(time.time())
+        _mem = getattr(self, '_bridge_done_mem', None)
+        if not isinstance(_mem, dict):
+            try:
+                _mem = self._bridge_done_mem = {}
+            except Exception:
+                _mem = None
+        if isinstance(_mem, dict):
+            _mem[int(alert_msg_id)] = now
+            if len(_mem) > 2000:
+                _vals = sorted(_mem.values())
+                _cut = set(_vals[:len(_vals) - 1500])
+                for _k in [k for k, v in _mem.items() if v in _cut]:
+                    del _mem[_k]
+        # فاصل الإرسال الأدنى (يُحدَّث عند النجاح فقط)
+        try:
+            self._bridge_last_sent_ts = now
+        except Exception:
+            pass
+        conn = await self._bridge_conn()
+        if conn is not None:
+            try:
+                await conn.execute(
+                    "INSERT OR IGNORE INTO bridge_presses "
+                    "(alert_msg_id, target_user_id, source_phone, "
+                    " sent_at, pressed_by) VALUES (?,?,?,?,?)",
+                    (int(alert_msg_id), int(target_user_id),
+                     f"+{str(phone_digits).lstrip('+')}", now,
+                     int(presser_id)))
+                await conn.execute(
+                    "DELETE FROM bridge_presses WHERE sent_at < ?",
+                    (now - BRIDGE_DONE_TTL_S,))
+                await conn.commit()
+            except Exception as _e:
+                logging.debug(f"[BRIDGE] done record failed: {_e}")
+
+    async def _bridge_rate_check(self, phone_digits):
+        """حمايات معدل الإرسال: فاصل أدنى بين أي إرسالين + سقف يومي
+        لكل رقم مراقبة (15/يوم)."""
+        now = int(time.time())
+        _last = int(getattr(self, '_bridge_last_sent_ts', 0) or 0)
+        _gap = now - _last
+        if _gap < BRIDGE_MIN_INTERVAL_S:
+            return False, (f"انتظر {BRIDGE_MIN_INTERVAL_S - _gap} ثانية "
+                           "بين محاولات التواصل")
+        conn = await self._bridge_conn()
+        if conn is not None:
+            try:
+                cur = await conn.execute(
+                    "SELECT COUNT(*) FROM bridge_presses WHERE "
+                    "source_phone=? AND sent_at>=?",
+                    (f"+{str(phone_digits).lstrip('+')}", now - 86400))
+                row = await cur.fetchone()
+                if row and int(row[0] or 0) >= BRIDGE_DAILY_CAP_PER_PHONE:
+                    return False, ("تم بلوغ سقف اليوم لهذا الرقم المراقب — "
+                                   "جرب غدًا")
+            except Exception:
+                pass
+        return True, ""
 
     async def _mark_request_alert_deleted(self, chat_id, msg_id) -> bool:
         """يعلّم تنبيه الطلب بأن الرسالة الأصلية حُذفت من المجموعة.
