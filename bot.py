@@ -123,6 +123,12 @@ BRIDGE_DAILY_CAP_PER_PHONE = 15   # رسايل «السلام عليكم»/يو�
 BRIDGE_MIN_INTERVAL_S = 20        # فاصل أدنى بين أي إرسالين (كل الأرقام)
 BRIDGE_DONE_TTL_S = 30 * 86400    # سجل dedup الضغطات (30 يومًا)
 
+# === [CHANNEL-PRIVACY-v4.4.16] دعم تحويل قناة الطلبات إلى خاصة ===
+# طلب المُشغّل (2026-09-12): «اريد ان تكون القناه خاص اي احد بينضم
+# ياتيني طلب موافقه او رفض». بعد التخصخص يُحذف @username → الحل
+# بالاسم يفشل. المعرف الرقمي الموثق للقناة (getChat مباشر):
+REQUESTS_CHANNEL_ID_FALLBACK = -1004344657223
+
 # === [SENDER-REPEAT-v4.4.10] كبح تكرار الطلب لكل مُرسل ===
 # نفس المرسل يعيد إرسال نفس النص (نفس مجموعة الكلمات الدلالية —
 # الترتيب لا يهم) خلال نافذة الـ12 ساعة → تنبيه واحد فقط. نص مختلف
@@ -6510,6 +6516,14 @@ class Monitor:
         # getattr دفاعي: لو config بدون السمة (اختبارات قديمة / fake namespace)
         # → 0 = المسار معطّل بصمت، لا يرمي AttributeError.
         target = getattr(self.config, 'requests_target_channel', 0)
+        # [CHANNEL-PRIVACY-v4.4.16] هدف رقمي مُحلول (يدعم قناة خاصة بلا
+        # تغيير متغيرات البيئة — انظر _resolve_requests_channel_target)
+        if isinstance(target, str) and target.startswith('@'):
+            try:
+                target = (await self._resolve_requests_channel_target()
+                          or target)
+            except Exception:
+                pass
         if not target:
             # [CHANNEL-SEPARATION] NO FALLBACK to channel_id — explicit error log instead.
             # لو REQUESTS_TARGET_CHANNEL غير مضبوطة، المسار معطّل لكن يُسجّل خطأً واضحًا
@@ -8108,6 +8122,42 @@ class Monitor:
             )
         except Exception:
             pass  # التسجيل تحسيني — لا يعطّل المسار أبدًا
+
+    async def _resolve_requests_channel_target(self):
+        """[CHANNEL-PRIVACY-v4.4.16] حوّل هدف قناة الطلبات إلى معرف رقمي
+        مرة واحدة لكل إقلاع: يخزّن بالذاكرة بعد أول حل. بعد تخصخص
+        القناة (حذف @username — طلب المُشغّل 2026-09-12) يفشل الحل
+        بالاسم → نستخدم المعرف الرقمي الموثق. بلا تغيير env إطلاقًا
+        (تغييره في Render يطلق نشرًا من فرع main — غير مرغوب)."""
+        _raw = getattr(self.config, 'requests_target_channel', 0)
+        if not _raw or isinstance(_raw, int):
+            return _raw
+        _cached = getattr(self, '_requests_channel_resolved_id', None)
+        if _cached:
+            return _cached
+        marked = 0
+        # (1) حل حي باليوزرنيم (يعمل قبل التخصخص)
+        _bot = getattr(self, 'bot_client', None)
+        if _bot is not None and _bot.is_connected():
+            try:
+                _ent = await _bot.get_entity(str(_raw))
+                _cid = int(getattr(_ent, 'id', 0) or 0)
+                if _cid > 0:
+                    marked = int(f"-100{_cid}")
+            except Exception as _e:
+                logging.info(
+                    f"[CONFIG] requests channel username resolve "
+                    f"failed ({_e}) — القناة خاصة على الأغلب")
+        # (2) المعرف الرقمي الموثق (getChat مباشر — ثابت لا يتغير)
+        if not marked:
+            marked = REQUESTS_CHANNEL_ID_FALLBACK
+        try:
+            self._requests_channel_resolved_id = marked
+        except Exception:
+            pass
+        logging.info(
+            f"[CONFIG] requests channel target: {_raw} → {marked}")
+        return marked
 
     # ------------------------------------------------------------------
     # [BRIDGE-BUTTON-v4.4.16] زر التواصل الأحمر — أمر المُشغّل (2026-09-12)
@@ -11370,6 +11420,13 @@ class Monitor:
                     await self.bot_client.start(bot_token=self.config.bot_token)
                     me = await self.bot_client.get_me()
                     logging.info(f"Bot: @{me.username} ({me.first_name})")
+                    # [CHANNEL-PRIVACY-v4.4.16] سوّق حل قناة الطلبات الرقمية
+                    # مبكرًا (مرة واحدة لكل إقلاع — حرارة الكاش قبل أول طلب)
+                    try:
+                        asyncio.create_task(
+                            self._resolve_requests_channel_target())
+                    except Exception:
+                        pass
                     backoff = 5
                 await self.bot_client.run_until_disconnected()
             except FloodWaitError as e: await asyncio.sleep(e.seconds + 1)
