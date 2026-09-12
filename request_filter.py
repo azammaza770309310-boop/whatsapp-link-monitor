@@ -88,7 +88,14 @@ def _content_word_count(clean_text: str) -> int:
 # [v4.4.11 — 2026-09-08] PRIVATE-CHAT-BLOCK (أمر المُشغّل «لا تخليه
 # يسحب من المحادثات الشخصية»): البوابة في bot.py (_on_user_message +
 # _on_raw_new_message). منطق القواعد هنا لم يتغير.
-FILTER_VERSION = "v4.4.11"
+# [v4.4.16 — 2026-09-12] RED-CONTACT (أمر المُشغّل): زر «🔴 تواصل مع
+# المرسل» + علامة استفهام أعلى تنبيه الطلب في قناة الطلبات — الضغط
+# (للمشرفين فقط عبر Bot API getChatMember) يُرسل «السلام عليكم» حرفيًا
+# إلى خاص صاحب الطلب من الرقم المراقب الملتقط (source_phone). التغيير
+# كله في bot.py (بناء الأزرار + _handle_red_contact + فرع في
+# _on_callback). منطق القواعد هنا لم يتغير — العلامة تُحدِّث الإصدار
+# المُتحقَّق منه في /api/filter_stats.
+FILTER_VERSION = "v4.4.16"
 FILTER_MODE = "ai_intent_classifier"
 
 

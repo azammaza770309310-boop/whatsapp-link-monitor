@@ -38,7 +38,7 @@ import aiohttp
 import aiosqlite
 from dotenv import load_dotenv
 from telethon import TelegramClient, events, Button
-from telethon.errors import FloodWaitError, RPCError
+from telethon.errors import FloodWaitError, RPCError, UserPrivacyRestrictedError
 from telethon.sessions import StringSession
 from aiohttp import web
 import json as json_module
@@ -3548,6 +3548,83 @@ class Monitor:
                 [Button.inline("🔍 تحقق النظام", b"verify")],
             ]
 
+    async def _handle_red_contact(self, event, data, presser_id):
+        """[RED-CONTACT-v4.4.16] أمر المُشغّل 2026-09-12:
+        زر «🔴 تواصل مع المرسل» أعلى تنبيه الطلب — المشرفون فقط.
+        الضغط يُرسل «السلام عليكم» حرفيًا إلى خاص صاحب الطلب من الرقم
+        المراقب الذي التقط الطلب (source_phone — مشترك بنفس مجموعة
+        المرسل بحكم الالتقاط، فكيانه معروف لدى المرسل).
+        بوابة المشرفين عبر Bot API getChatMember (تعمل قبل وبعد جعل
+        القناة خاص — numeric chat_id من سياق الحدث نفسه).
+        فشل التحقق من الصلاحية = رفض آمن (fail-closed)."""
+        try:
+            # --- بوابة المشرفين فقط (طلب المُشغّل الحرفي) ---
+            _allowed = False
+            try:
+                async with aiohttp.ClientSession() as _s:
+                    async with _s.get(
+                        f"https://api.telegram.org/bot{self.bot_token}/getChatMember",
+                        params={"chat_id": int(event.chat_id),
+                                "user_id": int(presser_id)},
+                        timeout=aiohttp.ClientTimeout(total=10),
+                    ) as _r:
+                        _j = await _r.json(content_type=None)
+                _allowed = bool(_j.get("ok")) and (
+                    _j.get("result", {}).get("status")
+                    in ("administrator", "creator"))
+            except Exception as _e:
+                logging.warning(f"[RED-CONTACT] admin check failed: {_e!r}")
+                _allowed = False
+            if not _allowed:
+                await event.answer("⚠️ الزر للمشرفين فقط", alert=True)
+                return
+
+            # --- تفكيك callback: cbc:<chat_id>:<sender_id>:<phone> ---
+            try:
+                _parts = data.split(":")
+                _src_chat = int(_parts[1])
+                _sender_uid = int(_parts[2])
+                _phone = _parts[3] if len(_parts) > 3 else ""
+            except Exception:
+                await event.answer("❌ بيانات زر غير صالحة", alert=True)
+                return
+
+            # --- الرقم المراقب الملتقط يجب أن يكون متصلًا ---
+            _client = self.user_clients.get(_phone)
+            if not _client or not _client.is_connected():
+                await event.answer("❌ الرقم المراقب غير متصل حاليًا", alert=True)
+                return
+
+            # --- إرسال «السلام عليكم» حرفيًا (نص المُشغّل بلا إضافات) ---
+            try:
+                await _client.send_message(_sender_uid, "السلام عليكم")
+                logging.info(
+                    f"[RED-CONTACT] ✅ السلام عليكم sent uid={_sender_uid} "
+                    f"via={_phone} admin={presser_id} src_chat={_src_chat}")
+                await event.answer("✅ أُرسل «السلام عليكم» لخاص المرسل",
+                                   alert=True)
+            except UserPrivacyRestrictedError:
+                logging.info(
+                    f"[RED-CONTACT] privacy-restricted uid={_sender_uid} "
+                    f"admin={presser_id}")
+                await event.answer("❌ المرسل مقفل خاص — تعذّر الإرسال",
+                                   alert=True)
+            except FloodWaitError as _fw:
+                logging.warning(
+                    f"[RED-CONTACT] floodwait {_fw.seconds}s via {_phone}")
+                await event.answer(
+                    f"❌ تعذّر الإرسال (فيض {_fw.seconds}ث) — جرّب لاحقًا",
+                    alert=True)
+            except Exception as _e:
+                logging.warning(f"[RED-CONTACT] send failed: {_e!r}")
+                await event.answer("❌ تعذّر الإرسال — جرّب لاحقًا", alert=True)
+        except Exception as _e:
+            logging.warning(f"[RED-CONTACT] callback failed: {_e!r}")
+            try:
+                await event.answer("❌ خطأ غير متوقع", alert=True)
+            except Exception:
+                pass
+
     async def _on_callback(self, event):
         """معالج ضغطات الأزرار"""
         try:
@@ -3563,6 +3640,19 @@ class Monitor:
             sender_id = sender.id if sender else None
 
             logging.info(f"[CALLBACK] {sender_id}: {data[:80]}")
+
+            # === [RED-CONTACT-v4.4.16] زر التنبيه الأحمر + علامة الاستفهام ===
+            # cbh = شرح مفتوح للجميع (لا يُرسل شيئًا). cbc: = إرسال مشرفين
+            # فقط — البوابة داخل _handle_red_contact (fail-closed).
+            if data == "cbh":
+                await event.answer(
+                    "🔴 زر التواصل: يرسل «السلام عليكم» تلقائيًا إلى خاص "
+                    "صاحب الطلب من رقم مراقب مشترك بنفس مجموعته. "
+                    "الاستخدام: للمشرفين فقط.", alert=True)
+                return
+            if data.startswith("cbc:"):
+                await self._handle_red_contact(event, data, sender_id)
+                return
 
             # AUTHORIZATION: state-changing actions require owner verification
             # (login_start, scan_week, scan_month, scan_stop, reset_scan)
@@ -7103,6 +7193,27 @@ class Monitor:
         except Exception:
             dm_buttons = None  # فشل بناء الزر لا يمنع إرسال التنبيه
             dm_mode = 'none'
+
+        # === [RED-CONTACT-v4.4.16] زر أحمر + علامة استفهام — أمر المُشغّل ===
+        # 2026-09-12: «زر احمر يشير الى الخطر وبجانبه علامة استفهام ... الاشخاص
+        # اللي يستطيعون استخدام هذا الزر هم المشرفين فقط ونص الرسالة السلام عليكم».
+        #   - الصف الأول أعلى أزرار التنبيه: [🔴 تواصل مع المرسل] [❓]
+        #   - الضغط (للمشرفين فقط — بوابة داخل _handle_red_contact) تُرسل
+        #     «السلام عليكم» حرفيًا إلى خاص صاحب الطلب من الرقم المراقب
+        #     الذي التقط الطلب (مشترك بنفس مجموعة المرسل بحكم الالتقاط).
+        #   - callback data: cbc:<chat_id>:<sender_id>:<source_phone> (≤64B)
+        #   - ❓ (cbh): نص شرح مفتوح للجميع — لا يُرسل شيئًا.
+        #   - بلا sender_id حقيقي (≤0) → لا صف إطلاقًا (لا وجهة للإرسال).
+        #   - فشل بناء الصف لا يمنع إرسال التنبيه أبدًا (نمط الكود الحالي).
+        try:
+            _rc_sid = int(sender_id or 0)
+            if _rc_sid > 0:
+                _rc_cb = f"cbc:{int(chat_id)}:{_rc_sid}:{source_phone or ''}"
+                _rc_row = [[Button.inline("🔴 تواصل مع المرسل", _rc_cb.encode('utf-8')),
+                            Button.inline("❓", b"cbh")]]
+                dm_buttons = (_rc_row + dm_buttons) if dm_buttons else _rc_row
+        except Exception:
+            pass  # تعذّر بناء صف الزر الأحمر → التنبيه يُرسل بلا صف (غير قاتل)
 
         # [MENTION-BRIDGE-v4.4.7] الجسر يُزرع الآن قبل بناء سطر المرسل
         # ([SEED-RACE] أعلاه) — الوقت المناسب: قبل حلّ username النهائي
